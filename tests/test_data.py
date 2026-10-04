@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from stages.data import check_answer, parse_array
+from common.taskspec import TaskSpec
+from stages.data import check_answer, extract_code, parse_array, parse_code_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,3 +136,91 @@ def test_answer_max_tokens_env(monkeypatch):
     assert importlib.reload(data).ANSWER_MAX_TOKENS == 4096
     monkeypatch.delenv("LOBBOT_DATA_ANSWER_MAX_TOKENS")
     assert importlib.reload(data).ANSWER_MAX_TOKENS == 1536
+
+
+# --------------------------------------------------------------------------- code tasks
+
+CODE_SPECS = {"python": "python-utils", "c": "c-strings"}
+
+
+def code_job(tmp_path, lang):
+    if lang == "c" and not shutil.which("cc"):
+        pytest.skip("cc not installed")
+    j = tmp_path / f"job-{lang}"
+    j.mkdir()
+    shutil.copy(ROOT / f"examples/{CODE_SPECS[lang]}.code.taskspec.json", j / "taskspec.json")
+    (j / "config.json").write_text(json.dumps({"n_generate": 120, "n_heldout": 10}))
+    return j
+
+
+def test_old_taskspecs_still_load():
+    spec = TaskSpec.load(ROOT / "examples/support-tickets.taskspec.json")
+    assert spec.task_type == "text" and spec.language is None and not spec.is_code
+    assert TaskSpec.from_dict(json.loads(spec.to_json())) == spec
+
+
+@pytest.mark.parametrize("name", CODE_SPECS.values())
+def test_code_taskspec_validates(name):
+    spec = TaskSpec.load(ROOT / f"examples/{name}.code.taskspec.json")
+    assert spec.is_code and spec.language in {"python", "c"}
+    assert all(e.tests for e in spec.seed_examples)
+
+
+@pytest.mark.parametrize("change,msg", [
+    (lambda d: d.pop("language"), "language"),
+    (lambda d: d.update(language="rust"), "language"),
+    (lambda d: d["seed_examples"][1].update(tests=" "), "tests"),
+    (lambda d: d.update(task_type="essay"), "task_type"),
+    (lambda d: d.update(task_type="text"), "language is only valid"),
+])
+def test_bad_code_taskspec(change, msg):
+    d = json.loads((ROOT / "examples/python-utils.code.taskspec.json").read_text())
+    change(d)
+    with pytest.raises(ValueError, match=msg):
+        TaskSpec.from_dict(d)
+
+
+@pytest.mark.parametrize("lang", CODE_SPECS)
+def test_code_data_keeps_only_passing_answers(tmp_path, lang):
+    from stages import sandbox
+
+    job = code_job(tmp_path, lang)
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train, held = read(job / "data/train.jsonl"), read(job / "data/heldout.jsonl")
+    assert len(held) == 10 and len(train) >= 120
+    tests = {json.loads(r)["input"]: json.loads(r)["tests"]
+             for r in (job / "work/data_inputs.jsonl").read_text().splitlines()}
+    for e in TaskSpec.load(job / "taskspec.json").seed_examples:
+        tests[e.input] = e.tests
+    rows = [(r["messages"][1]["content"], r["messages"][2]["content"]) for r in train[:40]]
+    assert all(r.passed for r in sandbox.run_many([(lang, a, tests[i]) for i, a in rows]))
+    for r in held:
+        assert set(r) == {"input", "reference", "tests", "language"} and r["language"] == lang
+        assert r["tests"] == tests[r["input"]]
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["task_type"] == "code" and 0 < stats["sandbox_pass_rate"] < 1
+    assert stats["dropped"].get("compile_error") and stats["answered"] < stats["sandbox_runs"]
+    assert "answers passed their tests" in p.stdout
+
+
+def test_code_data_rejects_seeds_that_fail_their_tests(tmp_path):
+    job = code_job(tmp_path, "python")
+    spec = json.loads((job / "taskspec.json").read_text())
+    spec["seed_examples"][2]["output"] = "def is_balanced(s):\n    return True"
+    (job / "taskspec.json").write_text(json.dumps(spec))
+    p = run_data(job)
+    assert p.returncode != 0 and "fail their own tests; seed 2" in p.stdout + p.stderr
+
+
+def test_extract_code():
+    assert extract_code("Here you go:\n```python\ndef f():\n    return 1\n```\nDone.") == "def f():\n    return 1"
+    assert extract_code("<think>x</think>int f(void) { return 1; }") == "int f(void) { return 1; }"
+    ans, why = check_answer("```c\nint f(void);\n```", True, want_json=False, want_code=True)
+    assert ans == "int f(void);" and why == ""
+
+
+def test_parse_code_inputs():
+    text = '```json\n[{"input": "Write f(x) returning x", "tests": "assert f(1) == 1"}, ' \
+           '{"input": "no tests here at all", "tests": ""}, "just a string input"]\n```'
+    assert parse_code_inputs(text) == [("Write f(x) returning x", "assert f(1) == 1")]

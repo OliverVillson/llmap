@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "task_type": "code",
+  "language": "python",
+  "task_name": "python-utility-functions",
+  "description": "Write a small, self-contained Python utility function from a short specification.",
+  "input_format": "A short spec naming the function, its signature and its behaviour, including edge cases.",
+  "output_format": "Python source defining the requested function (standard library only).",
+  "eval_criteria": "The code runs and passes the example's tests; it handles the stated edge cases.",
+  "seed_examples": [
+    {
+      "input": "Write `slugify(text: str) -> str`: lowercase the text, replace every run of non-alphanumeric characters with a single hyphen, and strip leading and trailing hyphens.",
+      "output": "import re\n\n\ndef slugify(text: str) -> str:\n    return re.sub(r\"[^a-z0-9]+\", \"-\", text.lower()).strip(\"-\")",
+      "tests": "assert slugify(\"Hello, World!\") == \"hello-world\"\nassert slugify(\"  --Already-slugged--  \") == \"already-slugged\"\nassert slugify(\"\") == \"\"\nassert slugify(\"A1 b2\") == \"a1-b2\""
+    },
+    {
+      "input": "Write `chunk(items: list, size: int) -> list[list]` that splits a list into consecutive chunks of `size` (the last may be shorter). Raise ValueError if size < 1.",
+      "output": "def chunk(items: list, size: int) -> list[list]:\n    if size < 1:\n        raise ValueError(\"size must be >= 1\")\n    return [items[i:i + size] for i in range(0, len(items), size)]",
+      "tests": "assert chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\nassert chunk([], 3) == []\ntry:\n    chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError(\"expected ValueError\")"
+    },
+    {
+      "input": "Write `is_balanced(s: str) -> bool` that returns True when every (, [ and { in s is closed in the right order. Other characters are ignored.",
+      "output": "def is_balanced(s: str) -> bool:\n    pairs = {\")\": \"(\", \"]\": \"[\", \"}\": \"{\"}\n    stack = []\n    for c in s:\n        if c in \"([{\":\n            stack.append(c)\n        elif c in pairs:\n            if not stack or stack.pop() != pairs[c]:\n                return False\n    return not stack",
+      "tests": "assert is_balanced(\"f(a[1]) { }\")\nassert not is_balanced(\"(]\")\nassert not is_balanced(\"((\")\nassert is_balanced(\"\")"
+    },
+    {
+      "input": "Write `parse_duration(s: str) -> int` that turns strings like \"1h30m\", \"45s\" or \"2h5s\" into total seconds. Units are h, m and s, each used at most once, in that order. Raise ValueError on anything else, including an empty string.",
+      "output": "import re\n\n_DUR = re.compile(r\"(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+)s)?\")\n\n\ndef parse_duration(s: str) -> int:\n    m = _DUR.fullmatch(s)\n    if not s or not m:\n        raise ValueError(f\"bad duration: {s!r}\")\n    h, mi, sec = (int(g or 0) for g in m.groups())\n    return h * 3600 + mi * 60 + sec",
+      "tests": "assert parse_duration(\"1h30m\") == 5400\nassert parse_duration(\"45s\") == 45\nassert parse_duration(\"2h5s\") == 7205\nfor bad in (\"\", \"5x\", \"30m1h\"):\n    try:\n        parse_duration(bad)\n    except ValueError:\n        pass\n    else:\n        raise AssertionError(bad)"
+    },
+    {
+      "input": "Write `top_k_words(text: str, k: int) -> list[tuple[str, int]]` returning the k most frequent lowercase words (letters only) with their counts, sorted by count descending and then alphabetically.",
+      "output": "import re\nfrom collections import Counter\n\n\ndef top_k_words(text: str, k: int) -> list[tuple[str, int]]:\n    counts = Counter(re.findall(r\"[a-z]+\", text.lower()))\n    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:k]",
+      "tests": "assert top_k_words(\"b a b c a b\", 2) == [(\"b\", 3), (\"a\", 2)]\nassert top_k_words(\"The the THE cat\", 1) == [(\"the\", 3)]\nassert top_k_words(\"\", 3) == []\nassert top_k_words(\"x y\", 5) == [(\"x\", 1), (\"y\", 1)]"
+    }
+  ],
+  "target": {
+    "max_size_gb": 7,
+    "min_tok_s": 40,
+    "laptop_ram_gb": 16
+  }
+}
