@@ -77,6 +77,7 @@ def test_javascript_body_only_gets_closed():
     assert run(p, "```javascript\nfunction add(a, b) { return a + b; }\n```").passed
 
 
+@needs("g++")
 def test_cpp_includes_and_main_are_handled():
     stub = "#include<assert.h>\n#include<bits/stdc++.h>\nlong add(long a, long b) {\n"
     p = {"suite": "multipl-e-cpp", "language": "cpp", "entry": "add", "prompt": stub, "stub": stub,
@@ -85,6 +86,9 @@ def test_cpp_includes_and_main_are_handled():
     assert code.startswith("#include<assert.h>\n#include<bits/stdc++.h>\n") and "main" not in code
     code, _ = cb.assemble(p, "    return a + b;")
     assert code.rstrip().endswith("}") and code.count("{") == code.count("}")
+    assert run(p, "```cpp\nlong add(long a, long b) { return a + b; }\nint main() { return 0; }\n```").passed
+    assert run(p, "    return a + b;").passed
+    assert not run(p, "    return a - b;").passed
 
 
 @needs("python3")
