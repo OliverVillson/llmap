@@ -74,8 +74,10 @@ def to_gguf(job: Job, hf_dir: Path, name: str) -> tuple[Path, Path]:
     bf16 = job.path("work", f"{name}-bf16.gguf")
     imatrix = job.path("work", f"{name}-imatrix.gguf")
     if not bf16.exists():
+        from stages.moe_utils import gguf_convert_flags
         tmp = bf16.with_name(bf16.name + ".part")
-        run([sys.executable, str(lc / "convert_hf_to_gguf.py"), str(hf_dir), "--outtype", "bf16", "--outfile", str(tmp)], STAGE)
+        run([sys.executable, str(lc / "convert_hf_to_gguf.py"), str(hf_dir), "--outtype", "bf16", "--outfile", str(tmp),
+             *gguf_convert_flags(hf_dir)], STAGE)
         tmp.rename(bf16)
     if not imatrix.exists():
         calib = calibration_text(job, hf_dir)

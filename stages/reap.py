@@ -184,7 +184,7 @@ def run_stage(job: Job) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
         model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
         tok.save_pretrained(tmp)
-        mu.write_expert_count_alias(tmp)
+        mu.fix_saved_config(tmp)
         shutil.rmtree(out_dir, ignore_errors=True)
         tmp.rename(out_dir)
         job.path("work", "reap_saliency.json").write_text(json.dumps({

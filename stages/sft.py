@@ -20,6 +20,10 @@ from stages.taskdata import tokenize_example
 
 ATTN = ["q_proj", "k_proj", "v_proj", "o_proj"]
 MLP = ["gate_proj", "up_proj", "down_proj"]
+# Gated DeltaNet (linear attention) projections of Qwen3.5/3.6, which use it in
+# 3 of every 4 layers; heal adds them so it is not limited to the full-attention
+# layers. Models without these modules ignore them.
+LINEAR_ATTN = ["in_proj_qkv", "in_proj_z", "out_proj"]
 
 
 class NonFiniteTraining(RuntimeError):
@@ -46,7 +50,7 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
     names = {n.rsplit(".", 1)[-1] for n, m in model.named_modules() if isinstance(m, nn.Linear)}
     blocks = mu.find_moe_blocks(model)
     if train_experts or not blocks:
-        targets = list(targets) + MLP  # expert MLPs (4.x ModuleList) or dense MLPs
+        targets = list(targets) + MLP  # expert MLPs (4.x ModuleList), shared experts, or dense MLPs
     targets = [t for t in dict.fromkeys(targets) if t in names]
     attn_only = [t for t in targets if t not in MLP]
     if hasattr(getattr(model, "model", None), "language_model"):
@@ -58,6 +62,8 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
     if blocks and train_experts and not isinstance(blocks[0][1].experts, nn.ModuleList):
         # fused experts (transformers 5.x): LoRA on the stacked expert weights
         extra["target_parameters"] = ["experts.gate_up_proj", "experts.down_proj"]
+    # "gate" also matches Qwen3.5/3.6's shared_expert_gate (suffix match), so
+    # the shared expert's sigmoid gate is trained along with the router
     modules_to_save = ["gate"] if (blocks and train_router) else None
     cfg = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=0.0, target_modules=targets,
                      modules_to_save=modules_to_save, task_type="CAUSAL_LM", **extra)
@@ -234,7 +240,7 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
     tmp.mkdir(parents=True)
     model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
     tok.save_pretrained(tmp)
-    mu.write_expert_count_alias(tmp)
+    mu.fix_saved_config(tmp)
     shutil.rmtree(out_dir, ignore_errors=True)
     tmp.rename(out_dir)
     log(f"sft: saved merged model to {out_dir} (final loss {ema:.3f}"

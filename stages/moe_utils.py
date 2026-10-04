@@ -1,8 +1,18 @@
 """Version-tolerant access to the sparse MoE blocks of Qwen3-MoE style models
-(Qwen3MoeSparseMoeBlock / Qwen2MoeSparseMoeBlock / Mixtral), covering both the
-transformers 4.x layout (experts = ModuleList of MLPs, gate = nn.Linear) and the
-fused 5.x layout (experts = one module holding [E, ...] stacked weights,
-gate = a router module with a [E, H] weight)."""
+(Qwen3MoeSparseMoeBlock / Qwen2MoeSparseMoeBlock / Mixtral / Qwen3.5 and
+Qwen3.6 Qwen3_5MoeSparseMoeBlock), covering both the transformers 4.x layout
+(experts = ModuleList of MLPs, gate = nn.Linear) and the fused 5.x layout
+(experts = one module holding [E, ...] stacked weights, gate = a router module
+with a [E, H] weight).
+
+Shared experts (Qwen2-MoE, Qwen3.5/3.6: `shared_expert` plus a sigmoid
+`shared_expert_gate`) run on every token and are never scored or pruned; only
+the routed experts behind `gate` are.
+
+Qwen3.6-35B-A3B ships as a multimodal checkpoint (Qwen3_5MoeForConditionalGeneration).
+AutoModelForCausalLM loads only its text decoder (Qwen3_5MoeForCausalLM; the
+vision tower and the MTP head are skipped), which is what the pipeline wants.
+fix_saved_config makes such a text-only save consistent."""
 from __future__ import annotations
 
 import torch
@@ -49,8 +59,16 @@ def top_k(block, config) -> int:
 
 
 def route(block, config, x: torch.Tensor):
-    """Replicates the HF router: softmax over all experts, top-k, optional
-    renormalisation. x: [N, H]. Returns (weights [N, k], indices [N, k])."""
+    """The routing the block itself uses. x: [N, H]. Returns
+    (weights [N, k], indices [N, k]). Router modules (5.x) are called as is,
+    since their renormalisation differs by model (Qwen3.5/3.6 always
+    renormalises the top-k, Qwen3-MoE only with norm_topk_prob); a plain
+    nn.Linear gate (4.x) gets the HF softmax, top-k and optional renormalisation."""
+    gate = block.gate
+    if not isinstance(gate, nn.Linear):
+        out = gate(x)
+        if isinstance(out, tuple) and len(out) == 3:  # (logits, top-k weights, top-k indices)
+            return out[1], out[2]
     logits = F.linear(x, gate_weight(block))
     probs = F.softmax(logits, dim=-1, dtype=torch.float)
     w, idx = torch.topk(probs, top_k(block, config), dim=-1)
@@ -127,21 +145,61 @@ def prune_block(block, keep: list[int]) -> None:
 
 
 def set_config_experts(config, n: int) -> None:
-    for attr in ("num_experts", "num_local_experts", "n_routed_experts"):
-        if getattr(config, attr, None) is not None:
-            setattr(config, attr, n)
+    for c in (config, getattr(config, "text_config", None)):
+        for attr in ("num_experts", "num_local_experts", "n_routed_experts"):
+            if c is not None and getattr(c, attr, None) is not None:
+                setattr(c, attr, n)
 
 
-def write_expert_count_alias(model_dir) -> None:
-    """transformers 5 saves the expert count as num_local_experts; the Qwen
-    checkpoints and our quantize stage use num_experts. Write both."""
+def fix_saved_config(model_dir) -> None:
+    """Make a saved config.json match what the pipeline wrote and what the
+    quantize stage and llama.cpp read:
+    - transformers 5 may save the expert count as num_local_experts; the Qwen
+      checkpoints and our quantize stage use num_experts. Write both.
+    - Qwen3.5/3.6 configs announce an MTP head (mtp_num_hidden_layers) that a
+      text-only load drops; set it to 0 when no mtp.* tensors were saved, so
+      converters do not look for them."""
     import json
     from pathlib import Path
-    p = Path(model_dir) / "config.json"
+    d = Path(model_dir)
+    p = d / "config.json"
     cfg = json.loads(p.read_text())
-    n = cfg.get("num_experts") or cfg.get("num_local_experts")
-    if n is None:
-        return
-    cfg["num_experts"] = n
-    cfg["num_local_experts"] = n
+    for c in (cfg, cfg.get("text_config")):
+        if not isinstance(c, dict):
+            continue
+        n = c.get("num_experts") or c.get("num_local_experts")
+        if n is not None:
+            c["num_experts"] = n
+            c["num_local_experts"] = n
+        if c.get("mtp_num_hidden_layers") and not _has_tensor(d, "mtp."):
+            c["mtp_num_hidden_layers"] = 0
     p.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def gguf_convert_flags(model_dir) -> list[str]:
+    """Extra convert_hf_to_gguf.py flags a saved checkpoint needs. llama.cpp
+    expects an MTP head on Qwen3.5/3.6/Next models unless told --no-mtp, and a
+    text-only load does not keep it."""
+    import json
+    from pathlib import Path
+    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    mtype = cfg.get("model_type", "")
+    if mtype.startswith(("qwen3_5", "qwen3_next")) and not _has_tensor(model_dir, "mtp."):
+        return ["--no-mtp"]
+    return []
+
+
+def _has_tensor(model_dir, prefix: str) -> bool:
+    import json
+    from pathlib import Path
+    d = Path(model_dir)
+    idx = d / "model.safetensors.index.json"
+    if idx.exists():
+        names = json.loads(idx.read_text())["weight_map"]
+    else:
+        from safetensors import safe_open
+        names = []
+        for f in d.glob("*.safetensors"):
+            with safe_open(f, "pt") as fh:
+                names += list(fh.keys())
+    return any(k.startswith(prefix) or f".{prefix}" in k for k in names)

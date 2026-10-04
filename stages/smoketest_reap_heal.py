@@ -1,13 +1,15 @@
 """Smoke test for the reap and heal stages on tiny random Qwen3 models.
 
-Builds a 16-expert Qwen3-MoE teacher and a tiny dense student (Qwen3, or
+Builds a 16-expert Qwen3-MoE teacher (or, with --qwen36, a tiny Qwen3.6-style
+multimodal checkpoint: hybrid Gated DeltaNet attention, a shared expert next
+to the routed ones, and a vision tower) and a tiny dense student (Qwen3, or
 Gemma 4 with --gemma-tokenizer), runs the real reap and heal stages on
 synthetic task data, and checks that the pruned model is exactly the original
 with the pruned experts masked out of the router, that heal and the student
 train the right weights on the right tokens, and (with --llama-cpp) that all
 three outputs convert to GGUF and run.
 
-    python -m stages.smoketest_reap_heal [--tokenizer PATH] [--gemma-tokenizer [PATH]] [--llama-cpp DIR]
+    python -m stages.smoketest_reap_heal [--tokenizer PATH] [--qwen36] [--gemma-tokenizer [PATH]] [--llama-cpp DIR]
 """
 from __future__ import annotations
 
@@ -44,7 +46,25 @@ def tiny_gemma4(tok):
     return Gemma4ForConditionalGeneration(Gemma4Config(text_config=text, vision_config=vision, audio_config=audio))
 
 
-def build(root: Path, tok_path: str, gemma_tok: str | None = None):
+def tiny_qwen36(vocab_size: int, eos: int):
+    """Tiny Qwen3.6-35B-A3B lookalike, saved the way the real one ships: as
+    Qwen3_5MoeForConditionalGeneration with a vision tower. Layers 0-2 use
+    Gated DeltaNet, layer 3 full attention; every layer is sparse with 16
+    routed experts (top-4, always renormalised) plus a gated shared expert.
+    head_dim stays at the real 256 so its 64 rotary dims fit llama.cpp's
+    default MRoPE sections."""
+    from transformers import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
+    text = dict(vocab_size=vocab_size, hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+                num_key_value_heads=2, head_dim=256, moe_intermediate_size=32, shared_expert_intermediate_size=32,
+                num_experts=16, num_experts_per_tok=4, linear_num_value_heads=4, linear_num_key_heads=2,
+                linear_key_head_dim=16, linear_value_head_dim=16, full_attention_interval=4,
+                max_position_embeddings=2048, mtp_num_hidden_layers=1, eos_token_id=eos)
+    vision = dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64)
+    return Qwen3_5MoeForConditionalGeneration(
+        Qwen3_5MoeConfig(text_config=text, vision_config=vision, tie_word_embeddings=False))
+
+
+def build(root: Path, tok_path: str, gemma_tok: str | None = None, qwen36: bool = False):
     from transformers import (AutoTokenizer, Qwen3Config, Qwen3ForCausalLM,
                               Qwen3MoeConfig, Qwen3MoeForCausalLM)
     tok = AutoTokenizer.from_pretrained(tok_path)
@@ -52,9 +72,12 @@ def build(root: Path, tok_path: str, gemma_tok: str | None = None):
     common = dict(vocab_size=len(tok), hidden_size=64, intermediate_size=128, num_attention_heads=4,
                   num_key_value_heads=2, head_dim=16, max_position_embeddings=2048,
                   eos_token_id=tok.convert_tokens_to_ids("<|im_end|>"))
-    moe = Qwen3MoeForCausalLM(Qwen3MoeConfig(num_hidden_layers=4, moe_intermediate_size=32, num_experts=16,
-                                             num_experts_per_tok=4, norm_topk_prob=True,
-                                             tie_word_embeddings=False, **common))
+    if qwen36:
+        moe = tiny_qwen36(len(tok), common["eos_token_id"])
+    else:
+        moe = Qwen3MoeForCausalLM(Qwen3MoeConfig(num_hidden_layers=4, moe_intermediate_size=32, num_experts=16,
+                                                 num_experts_per_tok=4, norm_topk_prob=True,
+                                                 tie_word_embeddings=False, **common))
     moe.save_pretrained(root / "teacher")
     tok.save_pretrained(root / "teacher")
     if gemma_tok:
@@ -124,7 +147,7 @@ def _patch_router(blk, drop, config):
         logits[:, drop] = float("-inf")
         probs = logits.softmax(-1, dtype=torch.float)
         w, idx = probs.topk(k, -1)
-        if config.norm_topk_prob:
+        if getattr(gate, "norm_topk_prob", True):  # Qwen3.5/3.6 routers always renormalise
             w = w / w.sum(-1, keepdim=True)
         return logits, w.to(h.dtype), idx
 
@@ -150,16 +173,38 @@ def check_label_mask(root: Path):
     print(f"ok: student trains on the answer only ({trained[len(msgs[-1]['content']):]!r} as end marker)")
 
 
-def check_heal_trained(root: Path):
-    """Router, attention and expert weights all moved during heal."""
+def check_heal_trained(root: Path, qwen36: bool = False):
+    """Router, attention and expert weights all moved during heal (for Qwen3.6
+    also the shared expert, its gate and the Gated DeltaNet projections)."""
     from safetensors.torch import load_file
     a = load_file(root / "job" / "work" / "reaped" / "model.safetensors")
     b = load_file(root / "job" / "work" / "healed" / "model.safetensors")
+    if set(a) != set(b):
+        raise SystemExit(f"FAIL: heal changed tensor names: {sorted(set(a) ^ set(b))[:5]}")
     changed = {k for k in a if not torch.equal(a[k], b[k])}
-    for part in ("mlp.gate.weight", "experts.", "q_proj"):
+    parts = ["mlp.gate.weight", "experts.", "q_proj"]
+    if qwen36:
+        parts += ["shared_expert.", "shared_expert_gate.", "linear_attn.in_proj_qkv", "linear_attn.out_proj"]
+    for part in parts:
         if not any(part in k for k in changed):
             raise SystemExit(f"FAIL: heal did not update {part} weights")
-    print(f"ok: heal updated router, attention and expert weights ({len(changed)} tensors)")
+    print(f"ok: heal updated {', '.join(parts)} weights ({len(changed)} tensors)")
+
+
+def check_text_only(root: Path):
+    """The Qwen3.6 teacher's vision tower and MTP head are not carried into
+    the pruned model, and its config says so."""
+    from safetensors import safe_open
+    reaped = root / "job" / "work" / "reaped"
+    with safe_open(reaped / "model.safetensors", "pt") as f:
+        names = list(f.keys())
+    extra = [k for k in names if "visual" in k or "mtp." in k]
+    cfg = json.loads((reaped / "config.json").read_text())
+    if extra or cfg.get("vision_config") or cfg.get("mtp_num_hidden_layers"):
+        raise SystemExit(f"FAIL: pruned Qwen3.6 is not text-only ({extra[:3]}, {cfg.get('architectures')})")
+    if cfg["num_experts"] != 8 or cfg.get("shared_expert_intermediate_size") != 32:
+        raise SystemExit(f"FAIL: pruned Qwen3.6 config wrong: {cfg}")
+    print(f"ok: pruned Qwen3.6 is text-only ({cfg['architectures'][0]}, 8/16 experts, shared expert kept)")
 
 
 def check_dense_trained(root: Path):
@@ -232,8 +277,12 @@ def gguf_check(root: Path, llama: Path):
     for name in ("reaped", "healed", "dense"):
         src = root / "job" / "work" / name
         out = root / f"{name}.gguf"
-        subprocess.run([sys.executable, str(llama / "convert_hf_to_gguf.py"), str(src),
-                        "--outfile", str(out), "--outtype", "f16"], check=True, capture_output=True)
+        p = subprocess.run([sys.executable, str(llama / "convert_hf_to_gguf.py"), str(src),
+                            "--outfile", str(out), "--outtype", "f16", *mu.gguf_convert_flags(src)],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            print(p.stderr[-3000:])
+            raise SystemExit(f"FAIL: llama.cpp could not convert {name}")
         binary = next((llama / d / "llama-simple" for d in ("build/bin", "bin") if (llama / d / "llama-simple").exists()), None)
         if binary:
             r = subprocess.run([str(binary), "-m", str(out), "-n", "4", "Email: my"], capture_output=True, text=True)
@@ -246,18 +295,22 @@ def gguf_check(root: Path, llama: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", default=Config.teacher, help="any Qwen tokenizer (hub id or path)")
+    ap.add_argument("--qwen36", action="store_true",
+                    help="make the teacher a tiny Qwen3.6-style multimodal MoE with a shared expert")
     ap.add_argument("--gemma-tokenizer", nargs="?", const="google/gemma-4-E4B-it",
                     help="make the student a tiny Gemma 4 with this tokenizer (default google/gemma-4-E4B-it)")
     ap.add_argument("--llama-cpp", help="llama.cpp checkout to test GGUF conversion")
     a = ap.parse_args()
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        build(root, a.tokenizer, a.gemma_tokenizer)
+        build(root, a.tokenizer, a.gemma_tokenizer, a.qwen36)
         check_label_mask(root)
         run_stage("stages.reap", root)
         check_equivalence(root)
+        if a.qwen36:
+            check_text_only(root)
         run_stage("stages.heal", root)
-        check_heal_trained(root)
+        check_heal_trained(root, a.qwen36)
         check_dense_trained(root)
         check_nonfinite_guard(root)
         if a.llama_cpp:
