@@ -7,6 +7,7 @@ tests, in one file. It passes when it builds and exits 0 within the timeout.
   javascript  prog.js   node --check, then node prog.js      (tests throw on failure)
   typescript  prog.ts   tsc --strict ... then node prog.js   (type errors are compile errors)
   c           prog.c    cc -std=c11 -O1 prog.c -lm; ./prog   (tests own main(), use assert.h)
+  cpp         prog.cpp  g++ -std=c++17 -O1 prog.cpp; ./prog  (same as C; for eval suites)
 
 Isolation per run: a fresh temp dir, a scrubbed environment, rlimits on CPU time,
 memory and file size, its own process group (killed whole on timeout), and no
@@ -45,6 +46,8 @@ _LANG = {
                                "--lib", "es2022,dom", "--skipLibCheck", "prog.ts"],
                    ["node", "prog.js"]),
     "c": ("prog.c", ["cc", "-std=c11", "-O1", "-o", "prog", "prog.c", "-lm"], ["./prog"]),
+    # eval only (MultiPL-E C++); TaskSpec languages stay the four above
+    "cpp": ("prog.cpp", ["g++", "-std=c++17", "-O1", "-o", "prog", "prog.cpp"], ["./prog"]),
 }
 LANGUAGES = tuple(_LANG)
 

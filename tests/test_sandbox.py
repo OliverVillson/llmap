@@ -19,8 +19,11 @@ CASES = [
      "function add(a: number, b: number): string { return a + b; }", TS_TESTS),
     ("c", "int add(int a, int b) { return a + b; }", "int add(int a, int b) { return a - b; }",
      "int add(int a, int b) { return a + b }", C_TESTS),
+    ("cpp", "#include <string>\nint add(int a, int b) { return a + b; }",
+     "int add(int a, int b) { return a - b; }", "int add(int a, int b) { return a + b }",
+     "#include <cassert>\nint main() { assert(add(2, 3) == 5); return 0; }"),
 ]
-TOOL = {"python": "python3", "javascript": "node", "typescript": "tsc", "c": "cc"}
+TOOL = {"python": "python3", "javascript": "node", "typescript": "tsc", "c": "cc", "cpp": "g++"}
 
 
 def need(lang):
