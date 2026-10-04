@@ -22,7 +22,7 @@ BPW = {
     "q6_k": 6.5625,
     "q8_0": 8.5,
 }
-LADDER = ["q2_k", "q3_k", "q4_k", "q5_k", "q6_k"]
+LADDER = ["q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"]
 
 # Relative weight MSE, ||W - Q(W)||^2 / ||W||^2, measured by quantizing and
 # dequantizing Qwen3-MoE expert tensors with llama.cpp (2026-10-03, no imatrix).
