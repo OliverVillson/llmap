@@ -219,17 +219,20 @@ def run_stage(job: Job) -> None:
     emit(STAGE, pct=40, msg="allocating bits by saliency")
 
     out = cand_dir / "lobbot-moe.gguf"
+    static = bits.static_types(cfg.static_type)
+    # Tensors no flag names (shared expert, linear-attention blocks) get the base type.
+    base = cfg.static_type.upper() if cfg.static_type else "Q4_K_M"
     for attempt in range(3):
         layers = bits.allocate(shape, importance, budget, cfg.bit_floor, cfg.bit_ceiling,
-                               proj_energy=energy, max_gb_per_token=max_per_token)
-        est = bits.estimate_size_gb(shape, layers)
+                               proj_energy=energy, max_gb_per_token=max_per_token, static=static)
+        est = bits.estimate_size_gb(shape, layers, static)
         emit(STAGE, pct=45 + 5 * attempt, msg=f"allocation {est:.2f} GB est.; quantizing")
         if DRY_RUN:
             out.write_bytes(b"GGUF dry run")
-            actual = {"size_gb": est, "bytes_per_token_gb": bits.bytes_per_token_gb(shape, layers),
+            actual = {"size_gb": est, "bytes_per_token_gb": bits.bytes_per_token_gb(shape, layers, static),
                       "bit_widths": bits.heatmap(layers)}
             break
-        quantize(job, bf16, imatrix, out, bits.quantize_args(layers))
+        quantize(job, bf16, imatrix, out, bits.quantize_args(layers, static), base)
         actual = gguf_report(job, out)
         if actual["size_gb"] <= spec.target.max_size_gb:
             break

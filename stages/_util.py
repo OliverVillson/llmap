@@ -61,6 +61,8 @@ class Config:
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"
     bit_ceiling: str = "q6_k"
+    # One llama.cpp type (e.g. "q8_0") for every non-expert tensor; "" keeps bits.STATIC.
+    static_type: str = ""
     # Eval
     judge_model: str = "gemini-3.8-flash"  # gemini-* needs GEMINI_API_KEY, claude-* ANTHROPIC_API_KEY
     laptop_bandwidth_gb_s: float = 120.0  # MacBook Air M4; M5 is ~153

@@ -104,3 +104,12 @@ def test_q8_ceiling_reaches_eight_bits_with_room():
     layers = bits.allocate(shape(), imp, 14.0, floor="q2_k", ceiling="q8_0")
     assert layers[10].down == "q8_0"
     assert bits.estimate_size_gb(shape(), layers) <= 14.0
+
+
+def test_static_type_override_sets_every_non_expert_tensor():
+    static = bits.static_types("q8_0")
+    layers = bits.allocate(shape(), None, 9.0, ceiling="q8_0", static=static)
+    args = bits.quantize_args(layers, static)
+    assert args[1] == "q8_0" and args[3] == "q8_0" and args[5].endswith("=q8_0")
+    assert bits.estimate_size_gb(shape(), layers, static) > bits.estimate_size_gb(shape(), layers)
+    assert bits.static_types("") is bits.STATIC

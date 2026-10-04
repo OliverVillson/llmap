@@ -50,6 +50,11 @@ STATIC = {
 }
 
 
+def static_types(override: str = "") -> dict[str, str]:
+    """STATIC, or every non-expert tensor at one type (Config.static_type)."""
+    return {k: override for k in STATIC} if override else STATIC
+
+
 @dataclass
 class MoEShape:
     n_layers: int
@@ -106,11 +111,11 @@ def _gb(params: float, bpw: float) -> float:
     return params * bpw / 8 / 1e9
 
 
-def static_size_gb(shape: MoEShape) -> float:
+def static_size_gb(shape: MoEShape, static: dict[str, str] = STATIC) -> float:
     return (
-        _gb(shape.attn_params_per_layer * shape.n_layers, BPW[STATIC["attn"]])
-        + _gb(shape.embd_params, BPW[STATIC["output"]])
-        + _gb(shape.embd_params, BPW[STATIC["token_embd"]])
+        _gb(shape.attn_params_per_layer * shape.n_layers, BPW[static["attn"]])
+        + _gb(shape.embd_params, BPW[static["output"]])
+        + _gb(shape.embd_params, BPW[static["token_embd"]])
     )
 
 
@@ -178,6 +183,7 @@ def allocate(
     ceiling: str = "q6_k",
     proj_energy: dict[str, list[float]] | None = None,
     max_gb_per_token: float | None = None,
+    static: dict[str, str] = STATIC,
 ) -> list[LayerBits]:
     """Greedy rate-distortion allocation: start every layer at `floor`, then
     repeatedly buy the upgrade with the largest drop in weighted error
@@ -198,7 +204,7 @@ def allocate(
     proj = shape.expert_params_per_proj
 
     def size() -> float:
-        s = static_size_gb(shape)
+        s = static_size_gb(shape, static)
         for i in range(shape.n_layers):
             s += _gb(2 * proj, BPW[LADDER[gate_up[i]]]) + _gb(proj, BPW[LADDER[down[i]]])
         return s
@@ -206,7 +212,7 @@ def allocate(
     current = size()
     if current > budget_gb:
         raise ValueError(f"budget {budget_gb:.2f} GB is below the floor size {current:.2f} GB")
-    per_token = bytes_per_token_gb(shape, [LayerBits(i, LADDER[lo], LADDER[lo]) for i in range(shape.n_layers)])
+    per_token = bytes_per_token_gb(shape, [LayerBits(i, LADDER[lo], LADDER[lo]) for i in range(shape.n_layers)], static)
 
     def err(level: int) -> float:
         return REL_MSE[LADDER[level]]
@@ -245,22 +251,22 @@ def allocate(
     return [LayerBits(i, LADDER[gate_up[i]], LADDER[down[i]]) for i in range(shape.n_layers)]
 
 
-def estimate_size_gb(shape: MoEShape, layers: list[LayerBits]) -> float:
+def estimate_size_gb(shape: MoEShape, layers: list[LayerBits], static: dict[str, str] = STATIC) -> float:
     proj = shape.expert_params_per_proj
-    return static_size_gb(shape) + sum(
+    return static_size_gb(shape, static) + sum(
         _gb(2 * proj, BPW[l.gate_up]) + _gb(proj, BPW[l.down]) for l in layers
     )
 
 
-def bytes_per_token_gb(shape: MoEShape, layers: list[LayerBits]) -> float:
+def bytes_per_token_gb(shape: MoEShape, layers: list[LayerBits], static: dict[str, str] = STATIC) -> float:
     """Weights read per generated token: active experts, attention, output head."""
     frac = shape.n_experts_active / shape.n_experts
     proj = shape.expert_params_per_proj
     experts = sum(
         _gb(2 * proj * frac, BPW[l.gate_up]) + _gb(proj * frac, BPW[l.down]) for l in layers
     )
-    attn = _gb(shape.attn_params_per_layer * shape.n_layers, BPW[STATIC["attn"]])
-    head = _gb(shape.embd_params, BPW[STATIC["output"]])
+    attn = _gb(shape.attn_params_per_layer * shape.n_layers, BPW[static["attn"]])
+    head = _gb(shape.embd_params, BPW[static["output"]])
     return experts + attn + head
 
 
@@ -269,12 +275,12 @@ def estimate_tok_s(shape: MoEShape, layers: list[LayerBits], bandwidth_gb_s: flo
     return bandwidth_gb_s * efficiency / bytes_per_token_gb(shape, layers)
 
 
-def quantize_args(layers: list[LayerBits]) -> list[str]:
+def quantize_args(layers: list[LayerBits], static: dict[str, str] = STATIC) -> list[str]:
     """llama-quantize flags implementing an allocation."""
     args = [
-        "--output-tensor-type", STATIC["output"],
-        "--token-embedding-type", STATIC["token_embd"],
-        "--tensor-type", f"attn_(q|k|v|output)\\.weight={STATIC['attn']}",
+        "--output-tensor-type", static["output"],
+        "--token-embedding-type", static["token_embd"],
+        "--tensor-type", f"attn_(q|k|v|output)\\.weight={static['attn']}",
     ]
     for l in layers:
         args += ["--tensor-type", f"blk\\.{l.layer}\\.ffn_(gate|up)_exps={l.gate_up}"]
