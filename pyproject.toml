@@ -16,6 +16,10 @@ lobbot = "lobbot.app:main"
 [tool.setuptools.packages.find]
 include = ["lobbot*", "common*", "stages*", "agent*"]
 
+[tool.pytest.ini_options]
+# mugge/spike/project holds stubbed scaffold tests that fail until agents fill them in.
+testpaths = ["tests"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
