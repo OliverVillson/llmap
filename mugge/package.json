@@ -1,0 +1,16 @@
+{
+  "name": "mugge",
+  "version": "0.1.0",
+  "description": "Parallel coding with small specialist models: a ticket engine on the project VM and a terminal client with the dog.",
+  "type": "module",
+  "bin": { "mugge": "./src/cli.ts" },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "spike": "bun run spike/run-spike.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "files": {
+    "cli/src/config.ts": "import { DEFAULT_SERVER, type Config } from './types.ts';\n\nexport function resolveConfig(\n  env: Record<string, string | undefined>,\n  overrides: { server?: string; json?: boolean },\n): Config {\n  const raw = overrides.server ?? env.MUGGE_SERVER ?? DEFAULT_SERVER;\n  const server = raw.trim().replace(/\\/+$/, '');\n  if (!/^https?:\\/\\/[^\\s\\/]+/.test(server)) throw new Error(`invalid server url: ${raw}`);\n  const json = overrides.json === true || env.MUGGE_JSON === '1' || env.MUGGE_JSON === 'true';\n  return { server, json };\n}\n"
+  },
+  "note": "Implemented cli/src/config.ts."
+}

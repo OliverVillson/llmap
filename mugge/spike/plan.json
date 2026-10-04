@@ -1,0 +1,426 @@
+{
+  "interfaces": [
+    "libshort/include/short.h",
+    "api/API.md",
+    "cli/src/types.ts"
+  ],
+  "tickets": [
+    {
+      "id": "c-base62-encode",
+      "title": "libshort: base62 encode",
+      "role": "implement",
+      "model": "coder-c",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "libshort/src/encode.c"
+      ],
+      "reads": [
+        "libshort/include/short.h",
+        "libshort/tests/test_encode.c",
+        "libshort/Makefile"
+      ],
+      "context": "Implement short_encode in libshort/src/encode.c as documented in libshort/include/short.h: write n in base62 using SHORT_ALPHABET, most significant digit first, no padding (0 encodes as \"0\"), NUL-terminate, return the length. C11 with -Wall -Werror; include \"short.h\" and only standard headers.",
+      "acceptance": [
+        "make -C libshort test-encode"
+      ],
+      "image": "c",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "c-base62-decode",
+      "title": "libshort: base62 decode",
+      "role": "implement",
+      "model": "coder-c",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "libshort/src/decode.c"
+      ],
+      "reads": [
+        "libshort/include/short.h",
+        "libshort/tests/test_decode.c",
+        "libshort/Makefile"
+      ],
+      "context": "Implement short_decode in libshort/src/decode.c as documented in libshort/include/short.h: parse a base62 code (digit values follow SHORT_ALPHABET: 0-9, then a-z = 10..35, then A-Z = 36..61). Return -1 without touching *out for NULL, empty, a character outside the alphabet, or a value that overflows uint64_t (check before multiplying); else store the value and return 0. C11 with -Wall -Werror; include \"short.h\" and only standard headers.",
+      "acceptance": [
+        "make -C libshort test-decode"
+      ],
+      "image": "c",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "c-hash",
+      "title": "libshort: FNV-1a hash",
+      "role": "implement",
+      "model": "coder-c",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "libshort/src/hash.c"
+      ],
+      "reads": [
+        "libshort/include/short.h",
+        "libshort/tests/test_hash.c",
+        "libshort/Makefile"
+      ],
+      "context": "Implement short_hash in libshort/src/hash.c: 32-bit FNV-1a over the bytes of the NUL-terminated string (offset basis 2166136261, prime 16777619, xor then multiply, all in uint32_t). C11 with -Wall -Werror; include \"short.h\" and only standard headers.",
+      "acceptance": [
+        "make -C libshort test-hash"
+      ],
+      "image": "c",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "c-table",
+      "title": "libshort: string hash table",
+      "role": "implement",
+      "model": "coder-c",
+      "priority": 2,
+      "depends_on": [
+        "c-hash"
+      ],
+      "owns": [
+        "libshort/src/table.c"
+      ],
+      "reads": [
+        "libshort/include/short.h",
+        "libshort/tests/test_table.c",
+        "libshort/Makefile",
+        "libshort/src/hash.c"
+      ],
+      "context": "Implement the short_table API in libshort/src/table.c as documented in libshort/include/short.h: a string->string hash table with separate chaining, bucket = short_hash(key) % buckets (0 buckets means 1). Copy keys and values in with malloc+memcpy (strdup is not available under -std=c11). table_set overwrites an existing key (freeing the old value) and returns -1 on NULL arguments. Define struct short_table yourself (replace the stub struct). C11 with -Wall -Werror; include \"short.h\" and only standard headers.",
+      "acceptance": [
+        "make -C libshort test-table"
+      ],
+      "image": "c",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "c-short",
+      "title": "libshort: shortener",
+      "role": "implement",
+      "model": "coder-c",
+      "priority": 2,
+      "depends_on": [
+        "c-table",
+        "c-base62-encode"
+      ],
+      "owns": [
+        "libshort/src/shortener.c"
+      ],
+      "reads": [
+        "libshort/include/short.h",
+        "libshort/tests/test_short.c",
+        "libshort/Makefile",
+        "libshort/src/table.c",
+        "libshort/src/encode.c"
+      ],
+      "context": "Implement the shortener API in libshort/src/shortener.c as documented in libshort/include/short.h, on top of short_table and short_encode: ids start at 1; the code for an id is short_encode(id); keep two tables (code -> url and url -> code) so adding a known url returns its existing code. Returned strings must be the pointers stored in the tables. Define struct shortener yourself (replace the stub struct). C11 with -Wall -Werror; include \"short.h\" and only standard headers.",
+      "acceptance": [
+        "make -C libshort test-short"
+      ],
+      "image": "c",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "py-validate",
+      "title": "api: URL validation",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "api/mugge_api/validate.py"
+      ],
+      "reads": [
+        "api/API.md",
+        "api/tests/test_validate.py"
+      ],
+      "context": "Implement is_valid_url in api/mugge_api/validate.py exactly as specified in api/API.md. Standard library only (urllib.parse); it must never raise.",
+      "acceptance": [
+        "python3 -m unittest discover -t api -s api/tests -p test_validate.py"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "py-store",
+      "title": "api: in-memory store",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "api/mugge_api/store.py"
+      ],
+      "reads": [
+        "api/API.md",
+        "api/tests/test_store.py"
+      ],
+      "context": "Implement the Store class in api/mugge_api/store.py exactly as specified in api/API.md: ids from 1, the same url returns its existing id, hit counters, KeyError for unknown ids in hit/hits. Pure Python, standard library only.",
+      "acceptance": [
+        "python3 -m unittest discover -t api -s api/tests -p test_store.py"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "py-binding",
+      "title": "api: ctypes binding to libshort",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 3,
+      "depends_on": [
+        "c-base62-encode",
+        "c-base62-decode"
+      ],
+      "owns": [
+        "api/mugge_api/binding.py"
+      ],
+      "reads": [
+        "api/API.md",
+        "api/tests/test_binding.py",
+        "libshort/include/short.h"
+      ],
+      "context": "Implement encode and decode in api/mugge_api/binding.py with ctypes over libshort/build/libshort.so (declared in libshort/include/short.h), exactly as specified in api/API.md. Keep LIB_PATH as it is. Load the library lazily on first call and cache it; set argtypes/restype (c_uint64, c_char_p, c_size_t, POINTER(c_uint64), c_int). Encode into a ctypes.create_string_buffer of 12 bytes. Raise ValueError for out-of-range or non-int input to encode (bool and float are not ints here) and for non-str or invalid codes in decode.",
+      "acceptance": [
+        "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_binding.py"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "py-handlers",
+      "title": "api: request handlers",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 3,
+      "depends_on": [
+        "py-validate",
+        "py-store",
+        "py-binding"
+      ],
+      "owns": [
+        "api/mugge_api/handlers.py"
+      ],
+      "reads": [
+        "api/API.md",
+        "api/tests/test_handlers.py",
+        "api/mugge_api/store.py",
+        "api/mugge_api/validate.py",
+        "api/mugge_api/binding.py"
+      ],
+      "context": "Implement App.handle in api/mugge_api/handlers.py exactly as specified in api/API.md: route GET /health, POST /shorten, GET /lookup/<code>, GET /stats, returning (status, dict). Use self.store, self.codec.encode/decode and is_valid_url; ignore any query string; 405 for a known path with the wrong method, 404 otherwise. Keep the constructor as it is.",
+      "acceptance": [
+        "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_handlers.py"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "py-server",
+      "title": "api: HTTP server",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 3,
+      "depends_on": [
+        "py-handlers"
+      ],
+      "owns": [
+        "api/mugge_api/server.py"
+      ],
+      "reads": [
+        "api/API.md",
+        "api/tests/test_server.py",
+        "api/mugge_api/handlers.py"
+      ],
+      "context": "Implement make_server, start and main in api/mugge_api/server.py exactly as specified in api/API.md, with http.server.ThreadingHTTPServer and a BaseHTTPRequestHandler subclass that forwards GET and POST to app.handle(self.command, self.path, body) and writes the dict back as JSON with Content-Type application/json and Content-Length. Override log_message to stay quiet. start() runs serve_forever in a daemon thread.",
+      "acceptance": [
+        "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_server.py"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "ts-args",
+      "title": "cli: argument parser",
+      "role": "implement",
+      "model": "coder-ts",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "cli/src/args.ts"
+      ],
+      "reads": [
+        "cli/src/types.ts",
+        "cli/test/args.test.ts",
+        "cli/tsconfig.json"
+      ],
+      "context": "Implement parseArgs in cli/src/args.ts following its doc comment and the types in cli/src/types.ts. Error strings must match exactly. Leave `server` out of the result when --server was not given. Keep the exported signature; no Node or Bun APIs.",
+      "acceptance": [
+        "bun test ./cli/test/args.test.ts && tsc -p cli --noEmit"
+      ],
+      "image": "node",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "ts-format",
+      "title": "cli: output formatting",
+      "role": "implement",
+      "model": "coder-ts",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "cli/src/format.ts"
+      ],
+      "reads": [
+        "cli/src/types.ts",
+        "cli/test/format.test.ts",
+        "cli/tsconfig.json"
+      ],
+      "context": "Implement formatShorten, formatLookup, formatStats, formatError and usage in cli/src/format.ts following their doc comments (singular \"1 hit\" / \"1 link\"). Keep the exported signatures; no Node or Bun APIs.",
+      "acceptance": [
+        "bun test ./cli/test/format.test.ts && tsc -p cli --noEmit"
+      ],
+      "image": "node",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "ts-client",
+      "title": "cli: API client",
+      "role": "implement",
+      "model": "coder-ts",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "cli/src/client.ts"
+      ],
+      "reads": [
+        "cli/src/types.ts",
+        "cli/test/client.test.ts",
+        "cli/tsconfig.json",
+        "api/API.md"
+      ],
+      "context": "Implement createClient in cli/src/client.ts following its doc comment and api/API.md: call only the injected fetch, use exactly the URLs, methods, headers and body described, resolve 2xx responses to their JSON body and throw ApiError (from ./types.ts, a value import) for any other status. Keep the exported signature; no Node or Bun APIs.",
+      "acceptance": [
+        "bun test ./cli/test/client.test.ts && tsc -p cli --noEmit"
+      ],
+      "image": "node",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "ts-config",
+      "title": "cli: config resolution",
+      "role": "implement",
+      "model": "coder-ts",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "cli/src/config.ts"
+      ],
+      "reads": [
+        "cli/src/types.ts",
+        "cli/test/config.test.ts",
+        "cli/tsconfig.json"
+      ],
+      "context": "Implement resolveConfig in cli/src/config.ts following its doc comment: flags over env (MUGGE_SERVER, MUGGE_JSON) over DEFAULT_SERVER from ./types.ts, strip trailing slashes, throw Error(\"invalid server url: <value>\") for a bad server. Keep the exported signature; no Node or Bun APIs.",
+      "acceptance": [
+        "bun test ./cli/test/config.test.ts && tsc -p cli --noEmit"
+      ],
+      "image": "node",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "ts-main",
+      "title": "cli: main entry",
+      "role": "implement",
+      "model": "coder-ts",
+      "priority": 3,
+      "depends_on": [
+        "ts-args",
+        "ts-format",
+        "ts-client",
+        "ts-config"
+      ],
+      "owns": [
+        "cli/src/main.ts"
+      ],
+      "reads": [
+        "cli/src/types.ts",
+        "cli/test/main.test.ts",
+        "cli/tsconfig.json",
+        "cli/src/args.ts",
+        "cli/src/format.ts",
+        "cli/src/client.ts",
+        "cli/src/config.ts"
+      ],
+      "context": "Implement main in cli/src/main.ts following its doc comment, wiring parseArgs, resolveConfig, createClient and the format functions. All I/O goes through deps (fetch, env, out, err); return the exit code (0 ok, 1 runtime/API error, 2 usage or config error). Keep the exported signature; no Node or Bun APIs.",
+      "acceptance": [
+        "bun test ./cli/test/main.test.ts && tsc -p cli --noEmit"
+      ],
+      "image": "node",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 60000
+      },
+      "escalate_to": null
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "files": {
+    "libshort/src/shortener.c": "#include <stdlib.h>\n#include \"short.h\"\n\nstruct shortener {\n  uint64_t next_id;\n  short_table *by_code;\n  short_table *by_url;\n};\n\nshortener *shortener_new(void) {\n  shortener *s = malloc(sizeof *s);\n  if (!s) return NULL;\n  s->next_id = 1;\n  s->by_code = table_new(64);\n  s->by_url = table_new(64);\n  if (!s->by_code || !s->by_url) {\n    shortener_free(s);\n    return NULL;\n  }\n  return s;\n}\n\nvoid shortener_free(shortener *s) {\n  if (!s) return;\n  table_free(s->by_code);\n  table_free(s->by_url);\n  free(s);\n}\n\nconst char *shortener_add(shortener *s, const char *url) {\n  if (!s || !url) return NULL;\n  const char *existing = table_get(s->by_url, url);\n  if (existing) return existing;\n  char code[SHORT_CODE_MAX];\n  short_encode(s->next_id, code);\n  if (table_set(s->by_code, code, url) != 0 || table_set(s->by_url, url, code) != 0) return NULL;\n  s->next_id++;\n  return table_get(s->by_url, url);\n}\n\nconst char *shortener_lookup(const shortener *s, const char *code) {\n  if (!s || !code) return NULL;\n  return table_get(s->by_code, code);\n}\n\nsize_t shortener_count(const shortener *s) { return s ? table_len(s->by_url) : 0; }\n"
+  },
+  "note": "Implemented libshort/src/shortener.c."
+}
