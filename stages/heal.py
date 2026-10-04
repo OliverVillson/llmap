@@ -50,7 +50,7 @@ def _knob(cfg, name: str, env: str, default):
 
 
 def heal_moe(job: Job, progress) -> None:
-    from stages.sft import train_sft
+    from stages.sft import LINEAR_ATTN, train_sft
     from stages.taskdata import load_examples
 
     cfg = job.config
@@ -58,7 +58,7 @@ def heal_moe(job: Job, progress) -> None:
     train_sft(
         str(job.path("work", "reaped")), load_examples(job.path("data", "train.jsonl")), job.path("work", "healed"),
         epochs=cfg.heal_epochs, lr=cfg.heal_lr, r=cfg.heal_lora_r, alpha=2 * cfg.heal_lora_r,
-        targets=cfg.heal_targets, train_experts=bool(_knob(cfg, "heal_train_experts", "LOBBOT_HEAL_EXPERTS", True)),
+        targets=list(cfg.heal_targets) + LINEAR_ATTN, train_experts=bool(_knob(cfg, "heal_train_experts", "LOBBOT_HEAL_EXPERTS", True)),
         train_router=True, kd_teacher=job.model_path(cfg.teacher) if kd > 0 else None, kd_weight=kd,
         max_len=int(_knob(cfg, "heal_max_len", "LOBBOT_HEAL_MAX_LEN", 2048)),
         max_tokens=16384, max_minutes=float(_knob(cfg, "heal_max_minutes", "LOBBOT_HEAL_MAX_MINUTES", 60.0)),

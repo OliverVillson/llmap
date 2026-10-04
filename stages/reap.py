@@ -6,7 +6,8 @@ where g_j is the renormalised router weight and f_j the expert output, then
 drops the lowest-scoring experts in every layer. The same number is dropped
 in each layer so the expert count stays uniform (llama.cpp needs that).
 Experts the task never routes to score 0 and go first, which is what
-specialises the model. Also measures a per-layer importance score for the
+specialises the model (reap_calib "general" calibrates on general text
+instead, as an ablation). Also measures a per-layer importance score for the
 dynamic bit allocation in the quantize stage. Writes:
   work/reaped/                pruned HF model (uncompressed safetensors)
   work/layer_importance.json  one score per layer (quantize stage input)
@@ -79,6 +80,44 @@ def choose_keep(saliency: list[float], freq: list[float], n_keep: int) -> list[i
     return sorted(order[:n_keep])
 
 
+def calib_sequences(job: Job, tok) -> list[list[int]]:
+    """Token ids REAP calibrates on: the task's own train.jsonl (reap_calib
+    "task"), or a general-text file (reap_calib "general", see Config)."""
+    from stages.taskdata import load_examples, to_messages, tokenize_example
+
+    cfg = job.config
+    if cfg.reap_calib == "task":
+        examples = load_examples(job.path("data", "train.jsonl"))
+        random.Random(0).shuffle(examples)
+        return [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"]
+                for ex in examples[: cfg.reap_calib_samples]]
+    if cfg.reap_calib != "general":
+        raise ValueError(f'reap_calib must be "task" or "general", not {cfg.reap_calib!r}')
+    if not cfg.reap_calib_path:
+        raise ValueError('reap_calib "general" needs reap_calib_path')
+    path = job.root / cfg.reap_calib_path  # an absolute path stays as is
+    if path.suffix == ".jsonl":
+        items = []
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    row = json.loads(line)
+                    items.append(row["text"] if isinstance(row.get("text"), str) else to_messages(row))
+    else:
+        items = [d.strip() for d in path.read_text().split("\n\n") if d.strip()]
+    items = [x for x in items if x]
+    if not items:
+        raise ValueError(f"no calibration text in {path}")
+    random.Random(0).shuffle(items)
+    seqs = []
+    for x in items[: cfg.reap_calib_samples]:
+        if isinstance(x, str):
+            seqs.append(tok(x, add_special_tokens=False)["input_ids"][: cfg.reap_max_seq])
+        else:
+            seqs.append(tokenize_example(tok, x, cfg.reap_max_seq)["input_ids"])
+    return [s for s in seqs if s]
+
+
 def layer_importance(model, batches) -> list[float]:
     """Relative contribution of each MoE block: mean ||moe_out|| / ||moe_in||
     over calibration tokens. Layers whose experts move the residual stream
@@ -133,7 +172,6 @@ def run_stage(job: Job) -> None:
 
         from stages import moe_utils as mu
         from stages.sft import load_causal_lm
-        from stages.taskdata import load_examples, tokenize_example
 
         src = job.model_path(cfg.teacher)
         emit(STAGE, pct=1, msg=f"loading {src}")
@@ -141,17 +179,14 @@ def run_stage(job: Job) -> None:
         model = load_causal_lm(src).eval()
         dev = next(model.parameters()).device
 
-        examples = load_examples(job.path("data", "train.jsonl"))
-        random.Random(0).shuffle(examples)
-        examples = examples[: cfg.reap_calib_samples]
-        seqs = [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"] for ex in examples]
+        seqs = calib_sequences(job, tok)
 
         col = SaliencyCollector(model)
         first = col.blocks[0][1]
         E = mu.num_experts(first)
         n_keep = max(mu.top_k(first, model.config), E - int(round(E * cfg.reap_sparsity)))
         print(f"REAP: {len(col.blocks)} MoE layers x {E} experts, keeping {n_keep}; "
-              f"calibrating on {len(seqs)} task samples ({sum(map(len, seqs))} tokens)", flush=True)
+              f"calibrating on {len(seqs)} {cfg.reap_calib} samples ({sum(map(len, seqs))} tokens)", flush=True)
         t0 = time.time()
         with torch.no_grad():
             for i, ids in enumerate(seqs):
@@ -184,12 +219,12 @@ def run_stage(job: Job) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
         model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
         tok.save_pretrained(tmp)
-        mu.write_expert_count_alias(tmp)
+        mu.fix_saved_config(tmp)
         shutil.rmtree(out_dir, ignore_errors=True)
         tmp.rename(out_dir)
         job.path("work", "reap_saliency.json").write_text(json.dumps({
             "teacher": cfg.teacher, "num_experts_orig": E, "num_experts_kept": n_keep,
-            "calib_samples": len(seqs), "layers": layers,
+            "calib": cfg.reap_calib, "calib_samples": len(seqs), "layers": layers,
         }))
 
     job.path("work", "layer_importance.json").write_text(json.dumps(imp))
