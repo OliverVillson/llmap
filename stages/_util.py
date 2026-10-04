@@ -39,6 +39,11 @@ class Config:
     reap_sparsity: float = 0.5
     reap_calib_samples: int = 512
     reap_max_seq: int = 2048
+    # REAP calibration source: "task" = data/train.jsonl; "general" = reap_calib_path,
+    # a .jsonl (rows with "text", or chat/prompt-answer rows) or a plain-text file
+    # (documents split on blank lines). A relative path is resolved in the job dir.
+    reap_calib: str = "task"
+    reap_calib_path: str = ""
     # Heal (LoRA SFT on teacher answers)
     heal_epochs: float = 1.0
     heal_lr: float = 1e-4
@@ -59,6 +64,22 @@ class Config:
     # Eval
     judge_model: str = "gemini-3.8-flash"  # gemini-* needs GEMINI_API_KEY, claude-* ANTHROPIC_API_KEY
     laptop_bandwidth_gb_s: float = 120.0  # MacBook Air M4; M5 is ~153
+    # Execution-based code eval (stages/codebench.py), next to the judge. Empty = off.
+    # Suites: multipl-e-py/js/ts/cpp, c-set, livecodebench, heldout.
+    code_eval_suites: list[str] = field(default_factory=list)
+    code_eval_dir: str = os.environ.get("LOBBOT_CODEBENCH", "/mnt/nvme/codebench")  # scripts/fetch_codebench.py
+    code_eval_samples: int = 1  # answers per problem; 1 is greedy pass@1, more sample at code_eval_temperature
+    code_eval_k: list[int] = field(default_factory=lambda: [1])
+    code_eval_temperature: float = 0.2
+    code_eval_limit: int | None = None  # problems per suite (quick runs); None = all
+    code_eval_max_tokens: int = 4096
+    lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
+    # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
+    # eval-only job (pipeline.py --only eval) score an uncompressed reference.
+    eval_candidates: dict[str, str] = field(default_factory=dict)
+    # Reference job for code scores: its out/eval.json's pass@1 is the 100% mark
+    # (experiment 01's `ref`). Relative paths resolve against this job's parent dir.
+    code_eval_ref: str = ""
 
 
 class Job:

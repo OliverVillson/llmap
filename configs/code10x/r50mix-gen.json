@@ -1,0 +1,25 @@
+{
+  "teacher": "Qwen/Qwen3.6-35B-A3B",
+  "code_eval_suites": [
+    "multipl-e-py",
+    "multipl-e-js",
+    "multipl-e-ts",
+    "multipl-e-cpp",
+    "c-set",
+    "livecodebench",
+    "heldout"
+  ],
+  "code_eval_max_tokens": 4096,
+  "lcb_since": "2026-05-01",
+  "dense_fallback": false,
+  "data_answer_max_tokens": 4096,
+  "data_max_len": 16384,
+  "heal_max_len": 4096,
+  "reap_max_seq": 4096,
+  "code_eval_ref": "code10x-ref",
+  "reap_sparsity": 0.5,
+  "bit_floor": "q2_k",
+  "bit_ceiling": "q4_k",
+  "reap_calib": "general",
+  "reap_calib_path": "/mnt/nvme/codebench/general-calib.jsonl"
+}

@@ -105,5 +105,20 @@ uv pip install -q --python "$NVME/venv-train/bin/python" -r /tmp/convert-reqs.tx
 "$NVME/venv-train/bin/python" -c "import torch; assert torch.cuda.is_available(), torch.__version__; print('train venv torch', torch.__version__, 'cuda ok')"
 
 
+say "Code eval: Node 22 + TypeScript, and the benchmark suites (experiment 01)"
+if ! node -e 'process.exit(+process.versions.node.split(".")[0] < 22)' 2>/dev/null; then
+  NODE_TGZ=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o 'node-v22[^ ]*-linux-x64.tar.xz' | head -1)
+  curl -fsSL "https://nodejs.org/dist/latest-v22.x/$NODE_TGZ" | tar -xJ -C "$NVME"
+  ln -sfn "$NVME/${NODE_TGZ%.tar.xz}" "$NVME/node"
+fi
+export PATH="$NVME/node/bin:$PATH"
+command -v tsc >/dev/null || npm install -g -s --prefix "$NVME/node" typescript
+grep -q LOBBOT_CODEBENCH "$REPO/.env.vm" || cat >> "$REPO/.env.vm" <<ENV
+export PATH=$NVME/node/bin:\$PATH
+export LOBBOT_CODEBENCH=$NVME/codebench
+ENV
+[ -f "$NVME/codebench/livecodebench.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
+  python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" || echo 'WARNING: code suites not downloaded; code eval will fail'
+
 say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"

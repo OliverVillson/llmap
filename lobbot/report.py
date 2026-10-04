@@ -150,10 +150,10 @@ def why(rep: dict, target: dict) -> str:
     win = next(c for c in cands if c["name"] == rep["winner"])
     eligible = [c for c in cands if c["meets_target"]]
     fit = f"{target.get('max_size_gb', 7):g} GB / {target.get('min_tok_s', 40):g} tok/s target"
-    what = "judge score" if rep["score_method"] == "judge" else "agreement with the teacher"
+    what = {"judge": "judge score", "pass@1": "pass@1 on the code tests"}.get(rep["score_method"], "agreement with the teacher")
     if not eligible:
         return f"no candidate met the {fit}, so the best {what} won"
-    best = max(eligible, key=lambda c: c["score"])
+    best = max(eligible, key=lambda c: c["score"] if c["score"] is not None else -1)
     others = [c for c in cands if c is not win]
     if win is best:
         if len(cands) == 1:
@@ -177,6 +177,48 @@ def target_cell(c: dict, target: dict) -> str:
     if (c.get("tok_s_est") or 0) < target.get("min_tok_s", 40):
         why_not.append(f"{c.get('tok_s_est') or 0:.0f} tok/s")
     return "✗ " + ", ".join(why_not)
+
+
+def code_table(rep: dict, color: bool = True) -> list[str]:
+    """pass@1 per code suite and candidate, with the share of experiment 01's
+    `ref` when the eval stage had a reference (Config.code_eval_ref)."""
+    cands = [c for c in rep["candidates"] if c.get("code")]
+    if not cands:
+        return []
+    suites = list(dict.fromkeys(s for c in cands for s in c["code"]["suites"]))
+    has_ref = any(c["code"].get("share_of_ref") for c in cands)
+    dim = lambda t: _c(t, "2", color)
+    head = ["Suite"] + [c["name"] for c in cands]
+
+    def cell(c: dict, suite: str | None) -> str:
+        code = c["code"]
+        if suite is None:
+            v, share = code.get("mean_pass@1"), (code.get("share_of_ref") or {}).get("mean")
+        else:
+            s = code["suites"].get(suite) or {}
+            if s.get("skipped"):
+                return "skipped"
+            v, share = s.get("pass@1"), ((code.get("share_of_ref") or {}).get("suites") or {}).get(suite)
+        if v is None:
+            return "–"
+        return f"{v:.0%}" + (f" ({share:.0%} of ref)" if share is not None else "")
+
+    def label(suite: str) -> str:
+        lang = next((c["code"]["suites"][suite].get("language") for c in cands if suite in c["code"]["suites"]), "")
+        n = max(c["code"]["suites"].get(suite, {}).get("n", 0) for c in cands)
+        return f"{suite} ({lang}, {n})" if lang and lang not in suite else f"{suite} ({n})"
+
+    rows = [[label(s)] + [cell(c, s) for c in cands] for s in suites]
+    rows.append(["mean"] + [cell(c, None) for c in cands])
+    if has_ref:
+        rows.append(["lowest vs ref"] + [f"{(c['code'].get('share_of_ref') or {}).get('min', 0):.0%}"
+                                          if c["code"].get("share_of_ref") else "–" for c in cands])
+    widths = [max(_vis(r[i]) for r in [head] + rows) for i in range(len(head))]
+    out = [_c("  Code tests (pass@1" + (", share of ref" if has_ref else "") + ")", "1", color)]
+    out.append(("  " + "  ".join(_pad(dim(h), widths[i], i > 0) for i, h in enumerate(head))).rstrip())
+    for row in rows:
+        out.append(("  " + "  ".join(_pad(v, widths[i], i > 0) for i, v in enumerate(row))).rstrip())
+    return out + [""]
 
 
 def render(job: str, facts: dict, color: bool = True, width: int | None = None) -> list[str]:
@@ -216,10 +258,10 @@ def render(job: str, facts: dict, color: bool = True, width: int | None = None) 
     # Scoreboard
     student = str(cfg.get("student", "")).split("/")[-1]
     label = {"lobbot-moe": "lobbot-moe (pruned MoE)", "dense": f"dense ({student})" if student else "dense"}
-    head = ["Model", "Size", "Laptop tok/s", "VM tok/s", "Judge" if method == "judge" else "Agreement",
+    head = ["Model", "Size", "Laptop tok/s", "VM tok/s", {"judge": "Judge", "pass@1": "pass@1"}.get(method, "Agreement"),
             "vs teacher", "Target"]
     rows = [[f"{re.sub(r'-Instruct.*$', '', teacher['name'])} (teacher)", f"{teacher['size_gb']:.1f} GB", "–", "–", _score(t_score, method),
-             "100%", ""]]
+             "100%" if t_score else "–", ""]]
     for cand in rep["candidates"]:
         name = label.get(cand["name"], cand["name"])
         if cand["name"] == rep["winner"]:
@@ -234,6 +276,7 @@ def render(job: str, facts: dict, color: bool = True, width: int | None = None) 
     for row in rows:
         out.append(("  " + "  ".join(_pad(v, widths[i], i in right) for i, v in enumerate(row))).rstrip())
     out.append("")
+    out += code_table(rep, color)
 
     # Facts
     def fact(label: str, text: str) -> None:
@@ -244,10 +287,13 @@ def render(job: str, facts: dict, color: bool = True, width: int | None = None) 
     n_held = facts.get("heldout") or stats.get("heldout")
     source = stats.get("heldout_source")
     src = f", written by {source}" if source and source != "teacher" else (", written by the teacher" if source else "")
-    fact("Tests", f"{n_held or '?'} held-out examples{src}, never seen in training")
+    if n_held:
+        fact("Tests", f"{n_held} held-out examples{src}, never seen in training")
     fact("Scoring", (f"{cfg.get('judge_model')} grades each answer 0-10 against the task's criteria"
-                                          if method == "judge" else
-                                          "agreement with the teacher's answers (no judge key was set on the VM)"))
+                     if method == "judge" else
+                     "share of code problems whose answer passes its tests (pass@1), averaged over suites"
+                     if method == "pass@1" else
+                     "agreement with the teacher's answers (no judge key was set on the VM)"))
     n_train = facts.get("train") or stats.get("train")
     if n_train:
         fact("Data", f"{n_train} training examples written by {re.sub(r'-Instruct.*$', '', str(cfg.get('teacher', 'the teacher')).split('/')[-1])}"

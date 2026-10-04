@@ -1,0 +1,17 @@
+{
+  "teacher": "Qwen/Qwen3.6-35B-A3B",
+  "code_eval_suites": [
+    "multipl-e-py",
+    "multipl-e-js",
+    "multipl-e-ts",
+    "multipl-e-cpp",
+    "c-set",
+    "livecodebench"
+  ],
+  "code_eval_max_tokens": 4096,
+  "lcb_since": "2026-05-01",
+  "eval_candidates": {
+    "fp8": "/mnt/nvme/models/gguf/Qwen3.6-35B-A3B-Q8_0.gguf"
+  },
+  "code_eval_ref": "code10x-ref"
+}
