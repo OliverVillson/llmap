@@ -79,7 +79,12 @@ STYLE_HINTS = [
 
 # --------------------------------------------------------------------------- prompts
 
-LANGUAGE_NAMES = {"c": "C", "javascript": "JavaScript", "typescript": "TypeScript", "python": "Python"}
+LANGUAGE_NAMES = {"c": "C", "javascript": "JavaScript", "typescript": "TypeScript", "python": "Python",
+                  "asm": "x86-64 assembly (GNU as, System V ABI)"}
+# How tests reach the answer (stages/sandbox.py); assembly is linked against C tests.
+TESTS_JOIN = {"asm": "The tests are a separate C file with main() that declares the assembly functions it "
+                     "calls and is linked with the answer; it must exit non-zero on failure (use assert.h), "
+                     "like the examples."}
 
 
 def system_prompt(spec) -> str:
@@ -90,7 +95,7 @@ def system_prompt(spec) -> str:
             f"You are an expert {lang} programmer. Task: {spec.description}\n"
             f"Input format: {spec.input_format}\nOutput format: {spec.output_format}\n"
             f"Answer with the {lang} code only: no explanation, no tests"
-            + (", no main()." if spec.language == "c" else ".")
+            + (", no main()." if spec.language in ("c", "asm") else ".")
         )
     return (
         f"You are an expert at this task: {spec.description}\n"
@@ -130,11 +135,12 @@ def gen_code_inputs_prompt(spec, rng: random.Random, scenario: str, style: str) 
     lang = LANGUAGE_NAMES[spec.language]
     return [{"role": "user", "content": (
         f"Task: {spec.description}\nLanguage: {lang}\nInput format: {spec.input_format}\n\n"
-        f"Here are example inputs, each with the {lang} tests its answer must pass:\n\n{shown}\n\n"
+        f"Here are example inputs, each with the tests its answer must pass:\n\n{shown}\n\n"
         f"Write exactly {PER_PROMPT} NEW, realistic inputs for this task, each with its tests.\n"
         f"Scenario: {scenario}\nStyle: {style}\n"
-        "The tests are appended after the answer code in the same file and must exit non-zero on "
-        "failure, like the examples. Each input must name every function, type and signature its "
+        + TESTS_JOIN.get(spec.language, "The tests are appended after the answer code in the same file "
+                         "and must exit non-zero on failure, like the examples.")
+        + " Each input must name every function, type and signature its "
         "tests use, so a correct answer can be written from the input alone. Test behaviour, "
         "including edge cases, not implementation details. Make the inputs differ from the examples "
         "and from each other. Write only inputs and tests, not the answers. Return a JSON array of "
@@ -487,7 +493,7 @@ def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
     inp = r["messages"][1]["content"]
     row = {"input": inp, "reference": r["messages"][2]["content"]}
     if spec.is_code:
-        row.update(tests=tests_of[inp], language=spec.language)
+        row.update(tests=tests_of[inp], language=spec.language, system=system_prompt(spec))
     return row
 
 

@@ -196,7 +196,7 @@ def test_code_data_keeps_only_passing_answers(tmp_path, lang):
     rows = [(r["messages"][1]["content"], r["messages"][2]["content"]) for r in train[:40]]
     assert all(r.passed for r in sandbox.run_many([(lang, a, tests[i]) for i, a in rows]))
     for r in held:
-        assert set(r) == {"input", "reference", "tests", "language"} and r["language"] == lang
+        assert set(r) == {"input", "reference", "tests", "language", "system"} and r["language"] == lang
         assert r["tests"] == tests[r["input"]]
     stats = json.loads((job / "data/stats.json").read_text())
     assert stats["task_type"] == "code" and 0 < stats["sandbox_pass_rate"] < 1

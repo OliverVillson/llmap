@@ -36,9 +36,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BUNDLED = {"c-set": REPO / "benchmarks" / "c-set.jsonl"}
-LANGUAGE_NAMES = {"python": "Python", "javascript": "JavaScript", "typescript": "TypeScript", "c": "C", "cpp": "C++"}
+LANGUAGE_NAMES = {"python": "Python", "javascript": "JavaScript", "typescript": "TypeScript", "c": "C", "cpp": "C++",
+                  "asm": "x86-64 assembly"}
 ALIASES = {"py": "python", "js": "javascript", "ts": "typescript", "c++": "cpp", "cxx": "cpp"}
-FENCE = {"python": "python", "javascript": "javascript", "typescript": "typescript", "c": "c", "cpp": "cpp"}
+FENCE = {"python": "python", "javascript": "javascript", "typescript": "typescript", "c": "c", "cpp": "cpp", "asm": "asm"}
 SYSTEM = ("You are an expert programmer. Answer with one complete, correct code block "
           "and nothing else: no explanation, no example usage, no tests.")
 # Imports LiveCodeBench prepends for LeetCode-style answers, which assume them.
@@ -86,7 +87,7 @@ def heldout_problems(held: list[dict]) -> list[dict]:
         if h.get("language") and h.get("tests"):
             out.append({"id": f"heldout/{i}", "suite": "heldout", "language": normalize_language(h["language"]),
                         "prompt": h["input"], "stub": h.get("stub", ""), "entry": h.get("entry", ""),
-                        "tests": h["tests"], "raw_prompt": True})
+                        "tests": h["tests"], "raw_prompt": True, "system": h.get("system", "")})
     return out
 
 

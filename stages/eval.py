@@ -248,7 +248,8 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     n = max(cfg.code_eval_samples, max(cfg.code_eval_k))
     groups: dict[tuple[str, float], list[int]] = {}
     for j, p in enumerate(problems):
-        key = (task_system if p["suite"] == "heldout" else codebench.SYSTEM,
+        # Held-out rows of a merged multi-language job carry their own task prompt.
+        key = ((p.get("system") or task_system) if p["suite"] == "heldout" else codebench.SYSTEM,
                SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT))
         groups.setdefault(key, []).append(j)
     results: list[list] = [[] for _ in problems]

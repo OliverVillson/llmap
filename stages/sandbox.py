@@ -8,6 +8,8 @@ tests, in one file. It passes when it builds and exits 0 within the timeout.
   typescript  prog.ts   tsc --strict ... then node prog.js   (type errors are compile errors)
   c           prog.c    cc -std=c11 -O1 prog.c -lm; ./prog   (tests own main(), use assert.h)
   cpp         prog.cpp  g++ -std=c++17 -O1 prog.cpp; ./prog  (same as C; for eval suites)
+  asm         prog.s + tests.c   cc prog.s tests.c; ./prog   (the one exception: x86-64 GNU as
+                        answer, C tests with main() in their own file, linked together)
 
 Isolation per run: a fresh temp dir, a scrubbed environment, rlimits on CPU time,
 memory and file size, its own process group (killed whole on timeout), and no
@@ -48,7 +50,11 @@ _LANG = {
     "c": ("prog.c", ["cc", "-std=c11", "-O1", "-o", "prog", "prog.c", "-lm"], ["./prog"]),
     # eval only (MultiPL-E C++); TaskSpec languages stay the four above
     "cpp": ("prog.cpp", ["g++", "-std=c++17", "-O1", "-o", "prog", "prog.cpp"], ["./prog"]),
+    "asm": ("prog.s", ["cc", "-std=c11", "-O1", "-Wa,--noexecstack", "-o", "prog", "prog.s", "tests.c", "-lm"],
+            ["./prog"]),
 }
+# Languages whose tests go in their own file (name) instead of after the answer.
+_SPLIT_TESTS = {"asm": "tests.c"}
 LANGUAGES = tuple(_LANG)
 
 
@@ -71,8 +77,13 @@ def run_tests(language: str, code: str, tests: str, timeout: float = TIMEOUT) ->
         if argv and argv[0] != "./prog" and not shutil.which(argv[0]):
             return Result(False, "missing_toolchain", argv[0])
     with tempfile.TemporaryDirectory(prefix="lobbot-sbx-") as d:
-        with open(os.path.join(d, src), "w") as f:
-            f.write(program(language, code, tests))
+        if language in _SPLIT_TESTS:
+            files = {src: code.rstrip() + "\n", _SPLIT_TESTS[language]: tests.strip() + "\n"}
+        else:
+            files = {src: program(language, code, tests)}
+        for name, text in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
         if build:
             rc, out = _exec(build, d, timeout)
             if rc is None:
