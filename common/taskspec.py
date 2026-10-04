@@ -11,10 +11,18 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
+TASK_TYPES = ("text", "code")
+# Languages a code task can target; stages/sandbox.py knows how to build and run each.
+LANGUAGES = ("c", "javascript", "typescript", "python")
+
+
 @dataclass
 class Example:
     input: str
     output: str
+    # Code tasks: test code appended after the answer; the example passes when the
+    # program builds and exits 0 (see stages/sandbox.py). Empty for text tasks.
+    tests: str = ""
 
 
 @dataclass
@@ -34,6 +42,12 @@ class TaskSpec:
     eval_criteria: str
     target: Target = field(default_factory=Target)
     version: int = 1
+    task_type: str = "text"
+    language: str | None = None  # required for code tasks, one of LANGUAGES
+
+    @property
+    def is_code(self) -> bool:
+        return self.task_type == "code"
 
     def validate(self) -> None:
         if self.version != 1:
@@ -44,6 +58,16 @@ class TaskSpec:
             raise ValueError("seed_examples must have 3 to 50 entries")
         if not 1.0 <= self.target.max_size_gb <= 64:
             raise ValueError("target.max_size_gb out of range")
+        if self.task_type not in TASK_TYPES:
+            raise ValueError(f"task_type must be one of {', '.join(TASK_TYPES)}")
+        if self.is_code:
+            if self.language not in LANGUAGES:
+                raise ValueError(f"code tasks need language, one of {', '.join(LANGUAGES)}")
+            missing = [i for i, e in enumerate(self.seed_examples) if not e.tests.strip()]
+            if missing:
+                raise ValueError(f"code tasks need tests on every seed example (missing: {missing})")
+        elif self.language is not None:
+            raise ValueError("language is only valid when task_type is code")
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -59,6 +83,8 @@ class TaskSpec:
             eval_criteria=d.get("eval_criteria", ""),
             target=Target(**d.get("target", {})),
             version=d.get("version", 1),
+            task_type=d.get("task_type", "text"),
+            language=d.get("language"),
         )
         spec.validate()
         return spec

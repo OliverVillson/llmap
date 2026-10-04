@@ -5,10 +5,14 @@ Reads taskspec.json and uses the teacher (vLLM) to:
   2. write new task inputs per scenario + style hint, deduplicated,
   3. answer every input (the distillation targets),
 then drops bad answers (empty, truncated, invalid JSON when the output format
-is JSON) and splits off a held-out set. Writes:
+is JSON) and splits off a held-out set. Code TaskSpecs (task_type "code") differ:
+the teacher writes each new input together with its tests, and an answer is kept only
+when it builds and passes those tests in stages/sandbox.py. Seeds must pass their own
+tests first. Writes:
   data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included
   data/heldout.jsonl  held-out inputs with teacher reference answers (inputs written
-                      by Gemini when Config.testgen_model and GEMINI_API_KEY are set)
+                      by Gemini when Config.testgen_model and GEMINI_API_KEY are set;
+                      code specs: always teacher inputs, rows add "tests" and "language")
   data/calib.txt      plain text for llama.cpp imatrix
   data/stats.json     counts, drop reasons, timings
   work/data_scenarios.json, work/data_inputs.jsonl   resume cache for a crashed run
@@ -33,7 +37,7 @@ import time
 from dataclasses import dataclass
 
 from common.progress import emit
-from stages import testgen
+from stages import sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "data"
@@ -75,8 +79,19 @@ STYLE_HINTS = [
 
 # --------------------------------------------------------------------------- prompts
 
+LANGUAGE_NAMES = {"c": "C", "javascript": "JavaScript", "typescript": "TypeScript", "python": "Python"}
+
+
 def system_prompt(spec) -> str:
     """The task prompt the student is trained with. package.py puts it in the Modelfile."""
+    if spec.is_code:
+        lang = LANGUAGE_NAMES[spec.language]
+        return (
+            f"You are an expert {lang} programmer. Task: {spec.description}\n"
+            f"Input format: {spec.input_format}\nOutput format: {spec.output_format}\n"
+            f"Answer with the {lang} code only: no explanation, no tests"
+            + (", no main()." if spec.language == "c" else ".")
+        )
     return (
         f"You are an expert at this task: {spec.description}\n"
         f"Input format: {spec.input_format}\nOutput format: {spec.output_format}\n"
@@ -105,6 +120,25 @@ def gen_inputs_prompt(spec, rng: random.Random, scenario: str, style: str) -> li
         f"Scenario: {scenario}\nStyle: {style}\n"
         "Make them differ from the examples and from each other (length, wording, names, details). "
         "Write only the inputs, not the answers. Return a JSON array of strings and nothing else."
+    )}]
+
+
+def gen_code_inputs_prompt(spec, rng: random.Random, scenario: str, style: str) -> list[dict]:
+    """Code specs: each new input comes with the tests its answer must pass."""
+    shots = rng.sample(spec.seed_examples, k=min(3, len(spec.seed_examples)))
+    shown = "\n\n".join(json.dumps({"input": e.input, "tests": e.tests}, ensure_ascii=False) for e in shots)
+    lang = LANGUAGE_NAMES[spec.language]
+    return [{"role": "user", "content": (
+        f"Task: {spec.description}\nLanguage: {lang}\nInput format: {spec.input_format}\n\n"
+        f"Here are example inputs, each with the {lang} tests its answer must pass:\n\n{shown}\n\n"
+        f"Write exactly {PER_PROMPT} NEW, realistic inputs for this task, each with its tests.\n"
+        f"Scenario: {scenario}\nStyle: {style}\n"
+        "The tests are appended after the answer code in the same file and must exit non-zero on "
+        "failure, like the examples. Each input must name every function, type and signature its "
+        "tests use, so a correct answer can be written from the input alone. Test behaviour, "
+        "including edge cases, not implementation details. Make the inputs differ from the examples "
+        "and from each other. Write only inputs and tests, not the answers. Return a JSON array of "
+        'objects {"input": "...", "tests": "..."} and nothing else.'
     )}]
 
 
@@ -147,15 +181,44 @@ def parse_array(text: str) -> list[str]:
     return out
 
 
+def parse_code_inputs(text: str) -> list[tuple[str, str]]:
+    """[(input, tests)] from a JSON array of {"input", "tests"} objects; rows without tests are skipped."""
+    text = clean(text)
+    a, b = text.find("["), text.rfind("]")
+    if a < 0 or b <= a:
+        return []
+    try:
+        items = json.loads(text[a:b + 1])
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict) and isinstance(it.get("input"), str) and isinstance(it.get("tests"), str):
+            if len(it["input"].strip()) > 10 and it["tests"].strip():
+                out.append((it["input"].strip(), it["tests"].strip()))
+    return out
+
+
 def expects_json(spec) -> bool:
-    return "json" in f"{spec.output_format} {spec.eval_criteria}".lower()
+    return not spec.is_code and "json" in f"{spec.output_format} {spec.eval_criteria}".lower()
 
 
-def check_answer(text: str, finished: bool, want_json: bool) -> tuple[str | None, str]:
+_CODE_BLOCK = re.compile(r"```[\w+#-]*[ \t]*\n(.*?)```", re.S)
+
+
+def extract_code(text: str) -> str:
+    """The code in an answer: the longest fenced block if there is one ("Here it is: ```c ...```"),
+    else the cleaned text."""
+    text = _THINK.sub("", text).strip()
+    blocks = _CODE_BLOCK.findall(text)
+    return max(blocks, key=len).strip() if blocks else clean(text)
+
+
+def check_answer(text: str, finished: bool, want_json: bool, want_code: bool = False) -> tuple[str | None, str]:
     """(cleaned answer, "") or (None, drop reason)."""
     if not finished:
         return None, "truncated"
-    ans = clean(text)
+    ans = extract_code(text) if want_code else clean(text)
     if not ans:
         return None, "empty"
     if want_json:
@@ -228,6 +291,8 @@ class DryRunTeacher:
             prompt = conv[-1]["content"]
             if "real-world scenarios" in prompt:
                 out.append(Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True))
+            elif self.spec.is_code:
+                out.append(self._code(prompt))
             elif "NEW, realistic inputs" in prompt:
                 base = self.rng.choice(self.spec.seed_examples).input
                 out.append(Gen("```json\n" + json.dumps(
@@ -237,6 +302,23 @@ class DryRunTeacher:
                 ex = self.spec.seed_examples[len(prompt) % len(self.spec.seed_examples)].output
                 out.append(Gen("{broken" if r < 0.03 else ex, r > 0.01))
         return out
+
+    def _code(self, prompt: str) -> Gen:
+        """Inputs reuse a seed's tests; answers are that seed's code, sometimes a wrong seed's
+        (fails its tests) or garbage (does not build)."""
+        seeds = self.spec.seed_examples
+        if "NEW, realistic inputs" in prompt:
+            picks = [self.rng.choice(seeds) for _ in range(PER_PROMPT)]
+            return Gen("```json\n" + json.dumps([
+                {"input": f"{e.input} (case {self.rng.randrange(10**9)})", "tests": e.tests} for e in picks
+            ]) + "\n```", True)
+        own = max((e for e in seeds if prompt.startswith(e.input)), key=lambda e: len(e.input), default=seeds[0])
+        r = self.rng.random()
+        if r < 0.05:
+            return Gen("{broken", True)
+        if r < 0.15:
+            return Gen(next(e for e in seeds if e is not own).output, True)
+        return Gen(f"Here is the code:\n```\n{own.output}\n```", True)
 
 
 # --------------------------------------------------------------------------- stage
@@ -249,6 +331,9 @@ def run_stage(job: Job) -> None:
     target = int((cfg.n_generate + n_held) * OVERSHOOT)
     want_json = expects_json(spec)
     stats: dict = {"seeds": len(spec.seed_examples), "expects_json": want_json, "dry_run": DRY_RUN}
+    if spec.is_code:
+        stats.update(task_type="code", language=spec.language)
+        check_seeds(spec)
 
     if DRY_RUN:
         teacher = DryRunTeacher(spec, rng)
@@ -274,27 +359,38 @@ def run_stage(job: Job) -> None:
     inputs_path = job.path("work", "data_inputs.jsonl")
     seen = {norm_key(e.input) for e in spec.seed_examples}
     inputs: list[str] = []
+    tests_of: dict[str, str] = {}  # code specs: input -> its tests
     for r in read_jsonl(inputs_path) if inputs_path.exists() else []:
+        if spec.is_code and not r.get("tests"):
+            continue
         if norm_key(r["input"]) not in seen:
             seen.add(norm_key(r["input"]))
             inputs.append(r["input"])
+            if spec.is_code:
+                tests_of[r["input"]] = r["tests"]
     rounds = 0
     while len(inputs) < target and rounds < MAX_ROUNDS:
         rounds += 1
         n_prompts = -(-(target - len(inputs)) // PER_PROMPT) + 2
-        convs = [gen_inputs_prompt(spec, rng, rng.choice(scenarios), rng.choice(STYLE_HINTS))
-                 for _ in range(n_prompts)]
+        make = gen_code_inputs_prompt if spec.is_code else gen_inputs_prompt
+        convs = [make(spec, rng, rng.choice(scenarios), rng.choice(STYLE_HINTS)) for _ in range(n_prompts)]
         lo = 12 + 33 * len(inputs) / target
-        gens = chat_batched(teacher, convs, 1.0, 4096, lo, 45, f"writing inputs (round {rounds})")
+        # code inputs carry their tests, so they need more room
+        gens = chat_batched(teacher, convs, 1.0, 6144 if spec.is_code else 4096, lo, 45,
+                            f"writing inputs (round {rounds})")
         added = 0
         for g in gens:
-            for s in parse_array(g.text):
+            pairs = parse_code_inputs(g.text) if spec.is_code else [(s, "") for s in parse_array(g.text)]
+            for s, tests in pairs:
                 k = norm_key(s)
-                if k not in seen and len(s) <= MAX_INPUT_CHARS:
+                if k not in seen and len(s) + len(tests) <= MAX_INPUT_CHARS:
                     seen.add(k)
                     inputs.append(s)
                     added += 1
-        write_jsonl(inputs_path, [{"input": s} for s in inputs])
+                    if spec.is_code:
+                        tests_of[s] = tests
+        write_jsonl(inputs_path, [{"input": s, "tests": tests_of[s]} if spec.is_code else {"input": s}
+                                  for s in inputs])
         print(f"[data] round {rounds}: +{added} unique inputs, {len(inputs)}/{target}", flush=True)
         if added == 0:
             break
@@ -308,10 +404,10 @@ def run_stage(job: Job) -> None:
     # 2b) optional: Gemini writes the held-out test inputs (stages/testgen.py); the teacher answers them
     ext: list[str] = []
     testgen_path = job.path("work", "data_testgen.jsonl")  # cached so a rerun keeps the same test set
-    if testgen_path.exists():
+    if testgen_path.exists() and not spec.is_code:
         ext = [r["input"] for r in read_jsonl(testgen_path) if norm_key(r["input"]) not in seen]
         print(f"[data] {len(ext)} held-out inputs from cache {testgen_path.name}", flush=True)
-    elif not DRY_RUN and testgen.enabled(cfg):
+    elif not DRY_RUN and testgen.enabled(cfg) and not spec.is_code:  # Gemini inputs come without tests
         emit(STAGE, pct=45, msg=f"{cfg.testgen_model} writing {n_held} held-out test inputs")
         ext = testgen.held_out_inputs(spec, cfg, n_held, seen, norm_key, parse_array, MAX_INPUT_CHARS)
         if ext:
@@ -324,14 +420,29 @@ def run_stage(job: Job) -> None:
     gens = chat_batched(teacher, convs, 0.3, answer_max_tokens(cfg), 45, 95, "teacher answering")
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
+    candidates = []  # code specs: (input, answer) waiting for the sandbox
     for i, (s, g) in enumerate(zip(inputs + ext, gens)):
-        ans, why = check_answer(g.text, g.finished, want_json)
+        ans, why = check_answer(g.text, g.finished, want_json, want_code=spec.is_code)
         is_ext = i >= len(inputs)
         if ans is None:
             d = ext_drops if is_ext else drops
             d[why] = d.get(why, 0) + 1
+        elif spec.is_code:
+            candidates.append((s, ans))
         else:
             (ext_rows if is_ext else rows).append(_row(sys, s, ans))
+    if spec.is_code:
+        emit(STAGE, pct=95, msg=f"running tests for {len(candidates)} answers")
+        results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a in candidates])
+        for (s, a), res in zip(candidates, results):
+            if res.passed:
+                rows.append(_row(sys, s, a))
+            else:
+                drops[res.reason] = drops.get(res.reason, 0) + 1
+        n_pass = len(rows)
+        stats.update(sandbox_runs=len(candidates),
+                     sandbox_pass_rate=round(n_pass / len(candidates), 3) if candidates else 0.0)
+        print(f"[data] sandbox: {n_pass}/{len(candidates)} answers passed their tests", flush=True)
     stats.update(answered=len(rows), dropped=drops)
     if ext:
         stats.update(heldout_answered=len(ext_rows), heldout_dropped=ext_drops)
@@ -351,9 +462,7 @@ def run_stage(job: Job) -> None:
     train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
     rng.shuffle(train)
     write_jsonl(job.path("data", "train.jsonl"), train)
-    write_jsonl(job.path("data", "heldout.jsonl"), [
-        {"input": r["messages"][1]["content"], "reference": r["messages"][2]["content"]} for r in heldout
-    ])
+    write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
     job.path("data", "calib.txt").write_text(
         "\n\n".join(r["messages"][1]["content"] + "\n" + r["messages"][2]["content"] for r in train[:1000])
     )
@@ -362,6 +471,24 @@ def run_stage(job: Job) -> None:
     print(f"[data] stats {json.dumps(stats)}", flush=True)
     job.mark_done(STAGE, {"train": len(train), "heldout": len(heldout)})
     emit(STAGE, "done", 100, f"{len(train)} train, {len(heldout)} held out")
+
+
+def check_seeds(spec) -> None:
+    """Code specs: every seed answer must pass its own tests, or the teacher learns from broken shots."""
+    res = sandbox.run_many([(spec.language, e.output, e.tests) for e in spec.seed_examples])
+    bad = [(i, r) for i, r in enumerate(res) if not r.passed]
+    if bad:
+        i, r = bad[0]
+        raise RuntimeError(f"{len(bad)} seed example(s) fail their own tests; seed {i}: {r.reason}\n{r.output}")
+    print(f"[data] all {len(res)} seed examples pass their tests ({spec.language})", flush=True)
+
+
+def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
+    inp = r["messages"][1]["content"]
+    row = {"input": inp, "reference": r["messages"][2]["content"]}
+    if spec.is_code:
+        row.update(tests=tests_of[inp], language=spec.language)
+    return row
 
 
 def _row(sys: str, inp: str, out: str) -> dict:
