@@ -20,5 +20,6 @@
   "reap_sparsity": 0.5,
   "bit_floor": "q2_k",
   "bit_ceiling": "q4_k",
-  "reap_calib": "general"
+  "reap_calib": "general",
+  "reap_calib_path": "/mnt/nvme/codebench/general-calib.jsonl"
 }

@@ -186,6 +186,7 @@ def test_code10x_configs_load_with_job(tmp_path, variant):
         assert list(cfg.eval_candidates) == [variant]
     else:
         assert "heldout" in cfg.code_eval_suites and not cfg.dense_fallback
+        assert (cfg.reap_calib == "general") == (variant == "r50mix-gen") and (cfg.reap_calib_path != "") == (variant == "r50mix-gen")
     assert (variant == "ref") == (cfg.code_eval_ref == "")
 
 

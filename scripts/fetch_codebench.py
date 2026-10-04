@@ -7,6 +7,8 @@ Writes <out>/<suite>.jsonl in the problem shape stages/codebench.py reads:
                             falls back to openai/openai_humaneval)
   livecodebench             livecodebench/code_generation_lite, every release
                             file; stages/eval.py keeps the recent ones (Config.lcb_since)
+  general-calib             general English text (WikiText-103) for REAP calibration
+                            in experiment 01's r50mix-gen ablation (Config.reap_calib_path)
 Run it once per VM; eval reads the files offline.
 """
 
@@ -119,6 +121,24 @@ def fetch_livecodebench(out: Path, max_cases: int) -> None:
         print(f"livecodebench: {rows[0]['date']} .. {rows[-1]['date']}")
 
 
+def fetch_general_calib(out: Path, n: int = 2000) -> None:
+    """Wikipedia articles of at least ~200 words, one {"text"} row each."""
+    from datasets import load_dataset
+
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
+    rows, doc = [], []
+    for line in ds["text"]:
+        if line.startswith(" = ") and not line.startswith(" = = "):  # a new article
+            text = "".join(doc).strip()
+            if len(text.split()) >= 200:
+                rows.append({"text": text})
+                if len(rows) >= n:
+                    break
+            doc = []
+        doc.append(line)
+    write(out / "general-calib.jsonl", rows)
+
+
 def write(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     print(f"{path}: {len(rows)} problems")
@@ -127,7 +147,7 @@ def write(path: Path, rows: list[dict]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--only", choices=["multipl-e", "livecodebench"])
+    ap.add_argument("--only", choices=["multipl-e", "livecodebench", "general-calib"])
     ap.add_argument("--max-cases", type=int, default=50, help="test cases kept per LiveCodeBench problem")
     args = ap.parse_args()
     out = Path(args.out)
@@ -136,6 +156,8 @@ def main() -> None:
         fetch_multipl_e(out)
     if args.only in (None, "livecodebench"):
         fetch_livecodebench(out, args.max_cases)
+    if args.only in (None, "general-calib"):
+        fetch_general_calib(out)
 
 
 if __name__ == "__main__":

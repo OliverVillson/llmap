@@ -39,7 +39,11 @@ class Config:
     reap_sparsity: float = 0.5
     reap_calib_samples: int = 512
     reap_max_seq: int = 2048
-    reap_calib: str = "task"  # "task": data/train.jsonl; "general": general text (experiment 01's r50mix-gen ablation)
+    # REAP calibration source: "task" = data/train.jsonl; "general" = reap_calib_path,
+    # a .jsonl (rows with "text", or chat/prompt-answer rows) or a plain-text file
+    # (documents split on blank lines). A relative path is resolved in the job dir.
+    reap_calib: str = "task"
+    reap_calib_path: str = ""
     # Heal (LoRA SFT on teacher answers)
     heal_epochs: float = 1.0
     heal_lr: float = 1e-4
