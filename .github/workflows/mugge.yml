@@ -1,0 +1,41 @@
+name: mugge
+
+on:
+  push:
+    paths: ['mugge/**', '.github/workflows/mugge.yml']
+  pull_request:
+    paths: ['mugge/**', '.github/workflows/mugge.yml']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mugge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: npm install -g typescript
+      - run: bun install
+      - run: bun run typecheck
+      - run: bun test
+      - name: spike (fake model, local sandbox)
+        run: bun run spike/run-spike.ts --fake --latency 200 --flaky c-hash,py-store,ts-format --out metrics.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-metrics
+          path: mugge/metrics.json
+
+  sandbox-images:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mugge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - name: build c, node and python images
+        run: ENGINE=docker sandbox/build.sh c node python
+      - name: spike in containers (fake model)
+        run: bun run spike/run-spike.ts --fake --sandbox docker --concurrency 4

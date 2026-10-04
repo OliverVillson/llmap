@@ -1,0 +1,6 @@
+{
+  "files": {
+    "libshort/src/encode.c": "#include \"short.h\"\n\nsize_t short_encode(uint64_t n, char *out) {\n  char tmp[SHORT_CODE_MAX];\n  size_t len = 0;\n  do {\n    tmp[len++] = SHORT_ALPHABET[n % 62];\n    n /= 62;\n  } while (n > 0);\n  for (size_t i = 0; i < len; i++) out[i] = tmp[len - 1 - i];\n  out[len] = '\\0';\n  return len;\n}\n"
+  },
+  "note": "Implemented libshort/src/encode.c."
+}

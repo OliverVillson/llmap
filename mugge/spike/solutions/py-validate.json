@@ -1,0 +1,6 @@
+{
+  "files": {
+    "api/mugge_api/validate.py": "\"\"\"URL validation. See api/API.md.\"\"\"\nfrom urllib.parse import urlsplit\n\nMAX_LEN = 2048\n\n\ndef is_valid_url(url) -> bool:\n    if not isinstance(url, str) or not 1 <= len(url) <= MAX_LEN:\n        return False\n    if any(ord(c) < 33 or ord(c) == 127 for c in url):\n        return False\n    try:\n        parts = urlsplit(url)\n    except ValueError:\n        return False\n    return parts.scheme.lower() in (\"http\", \"https\") and bool(parts.hostname)\n"
+  },
+  "note": "Implemented api/mugge_api/validate.py."
+}

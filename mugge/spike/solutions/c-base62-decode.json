@@ -1,0 +1,6 @@
+{
+  "files": {
+    "libshort/src/decode.c": "#include \"short.h\"\n\nstatic int digit(char c) {\n  if (c >= '0' && c <= '9') return c - '0';\n  if (c >= 'a' && c <= 'z') return c - 'a' + 10;\n  if (c >= 'A' && c <= 'Z') return c - 'A' + 36;\n  return -1;\n}\n\nint short_decode(const char *s, uint64_t *out) {\n  if (s == NULL || *s == '\\0') return -1;\n  uint64_t n = 0;\n  for (; *s; s++) {\n    int d = digit(*s);\n    if (d < 0) return -1;\n    if (n > (UINT64_MAX - (uint64_t)d) / 62) return -1;\n    n = n * 62 + (uint64_t)d;\n  }\n  *out = n;\n  return 0;\n}\n"
+  },
+  "note": "Implemented libshort/src/decode.c."
+}

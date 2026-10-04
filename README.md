@@ -27,3 +27,7 @@ The code is LobBot's and works as described in [docs/lobbot-readme.md](docs/lobb
 LOBBOT_DRY_RUN=1 python pipeline.py --job /tmp/llmap-job   # every stage without a GPU (copy a taskspec.json in first)
 python -m pytest
 ```
+
+## Mugge
+
+[`mugge/`](mugge/README.md) is the product side: the ticket engine that runs these models as parallel coding agents on the project VM, and the `mugge` terminal client with the dog. Bun/TypeScript, tested on its own (`cd mugge && bun test`).

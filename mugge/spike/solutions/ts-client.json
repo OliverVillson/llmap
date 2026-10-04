@@ -1,0 +1,6 @@
+{
+  "files": {
+    "cli/src/client.ts": "import { ApiError, type Client, type FetchInit, type FetchLike, type LookupResult, type ShortenResult, type Stats } from './types.ts';\n\nexport function createClient(base: string, fetch: FetchLike): Client {\n  const root = base.replace(/\\/+$/, '');\n\n  async function call<T>(path: string, init: FetchInit): Promise<T> {\n    const res = await fetch(root + path, init);\n    let body: unknown;\n    try {\n      body = await res.json();\n    } catch {\n      body = undefined;\n    }\n    if (res.status < 200 || res.status > 299) {\n      const msg = (body as { error?: unknown } | undefined)?.error;\n      throw new ApiError(res.status, typeof msg === 'string' ? msg : `HTTP ${res.status}`);\n    }\n    return body as T;\n  }\n\n  return {\n    shorten: (url) =>\n      call<ShortenResult>('/shorten', {\n        method: 'POST',\n        headers: { 'content-type': 'application/json' },\n        body: JSON.stringify({ url }),\n      }),\n    lookup: (code) => call<LookupResult>(`/lookup/${encodeURIComponent(code)}`, { method: 'GET' }),\n    stats: () => call<Stats>('/stats', { method: 'GET' }),\n  };\n}\n"
+  },
+  "note": "Implemented cli/src/client.ts."
+}

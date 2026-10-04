@@ -1,0 +1,6 @@
+{
+  "files": {
+    "cli/src/format.ts": "import type { ApiError, LookupResult, ShortenResult, Stats } from './types.ts';\n\nconst plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;\n\nexport function formatShorten(r: ShortenResult): string {\n  return `${r.code} -> ${r.url}`;\n}\n\nexport function formatLookup(r: LookupResult): string {\n  return `${r.code} -> ${r.url} (${plural(r.hits, 'hit')})`;\n}\n\nexport function formatStats(s: Stats): string {\n  return plural(s.count, 'link');\n}\n\nexport function formatError(e: ApiError): string {\n  return `error: ${e.message} (HTTP ${e.status})`;\n}\n\nexport function usage(): string {\n  return [\n    'usage: short [--server <url>] [--json] <command>',\n    '  shorten <url>   create a short code for url',\n    '  lookup <code>   show the url behind a code',\n    '  stats           show how many links are stored',\n    '  help            show this help',\n  ].join('\\n');\n}\n"
+  },
+  "note": "Implemented cli/src/format.ts."
+}

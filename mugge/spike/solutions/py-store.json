@@ -1,0 +1,6 @@
+{
+  "files": {
+    "api/mugge_api/store.py": "\"\"\"In-memory url store. See api/API.md.\"\"\"\n\n\nclass Store:\n    def __init__(self):\n        self._urls: dict[int, str] = {}\n        self._ids: dict[str, int] = {}\n        self._hits: dict[int, int] = {}\n\n    def add(self, url: str) -> int:\n        if url in self._ids:\n            return self._ids[url]\n        id = len(self._urls) + 1\n        self._urls[id] = url\n        self._ids[url] = id\n        self._hits[id] = 0\n        return id\n\n    def get(self, id: int) -> str | None:\n        return self._urls.get(id)\n\n    def hit(self, id: int) -> int:\n        self._hits[id] = self.hits(id) + 1\n        return self._hits[id]\n\n    def hits(self, id: int) -> int:\n        if id not in self._hits:\n            raise KeyError(id)\n        return self._hits[id]\n\n    def __len__(self) -> int:\n        return len(self._urls)\n"
+  },
+  "note": "Implemented api/mugge_api/store.py."
+}

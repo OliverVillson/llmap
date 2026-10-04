@@ -1,0 +1,6 @@
+{
+  "files": {
+    "api/mugge_api/binding.py": "\"\"\"ctypes wrapper over libshort. See api/API.md.\"\"\"\nimport ctypes\nimport os\nfrom pathlib import Path\n\nLIB_PATH = Path(os.environ.get(\"MUGGE_LIBSHORT\", Path(__file__).resolve().parents[2] / \"libshort\" / \"build\" / \"libshort.so\"))\nCODE_MAX = 12\n_lib = None\n\n\ndef _load():\n    global _lib\n    if _lib is None:\n        lib = ctypes.CDLL(str(LIB_PATH))\n        lib.short_encode.argtypes = [ctypes.c_uint64, ctypes.c_char_p]\n        lib.short_encode.restype = ctypes.c_size_t\n        lib.short_decode.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)]\n        lib.short_decode.restype = ctypes.c_int\n        _lib = lib\n    return _lib\n\n\ndef encode(n: int) -> str:\n    if type(n) is not int or not 0 <= n < 2**64:\n        raise ValueError(f\"cannot encode {n!r}\")\n    buf = ctypes.create_string_buffer(CODE_MAX)\n    length = _load().short_encode(n, buf)\n    return buf.raw[:length].decode(\"ascii\")\n\n\ndef decode(code: str) -> int:\n    if not isinstance(code, str):\n        raise ValueError(f\"cannot decode {code!r}\")\n    out = ctypes.c_uint64()\n    if _load().short_decode(code.encode(\"utf-8\"), ctypes.byref(out)) != 0:\n        raise ValueError(f\"invalid code {code!r}\")\n    return out.value\n"
+  },
+  "note": "Implemented api/mugge_api/binding.py."
+}

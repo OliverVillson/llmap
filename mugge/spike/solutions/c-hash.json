@@ -1,0 +1,6 @@
+{
+  "files": {
+    "libshort/src/hash.c": "#include \"short.h\"\n\nuint32_t short_hash(const char *s) {\n  uint32_t h = 2166136261u;\n  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {\n    h ^= *p;\n    h *= 16777619u;\n  }\n  return h;\n}\n"
+  },
+  "note": "Implemented libshort/src/hash.c."
+}
