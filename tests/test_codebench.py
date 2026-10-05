@@ -237,7 +237,7 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -263,7 +263,7 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     probs = cb.load_suite("c-set", "/nonexistent", limit=1)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
         calls.append((max_tokens, temperature, seed, thinking))
         on_answer()
         return [""], None
@@ -303,3 +303,67 @@ def test_eval_context_fits_code_answer_cap(monkeypatch):
     monkeypatch.delenv("LOBBOT_EVAL_CTX", raising=False)
     cfg = Config(code_eval_suites=["livecodebench"], code_eval_max_tokens=24576, data_answer_max_tokens=2048)
     assert ev.limits(cfg) == (2048, 24576 + 4096)
+    cfg.code_eval_thinking = True  # room for the answer after a thinking that used it all
+    assert ev.limits(cfg) == (2048, 24576 + ev.ANSWER_TOKENS + 4096)
+
+
+def test_split_reasoning_handles_split_and_inline_tags():
+    from stages.eval import split_reasoning
+
+    assert split_reasoning({"content": "x = 1", "reasoning_content": "hmm"}) == ("hmm", "x = 1")
+    assert split_reasoning({"content": "<think>hmm</think>\n\nx = 1"}) == ("hmm", "x = 1")
+    assert split_reasoning({"content": "hmm</think>x = 1"}) == ("hmm", "x = 1")  # template opened it
+    assert split_reasoning({"content": "<think>hmm, still going"}) == ("hmm, still going", "")
+    assert split_reasoning({"content": None, "reasoning_content": "hmm"}) == ("hmm", "")
+    assert split_reasoning({"content": "", "reasoning_content": "hmm</think>\n\nx = 1"}) == ("hmm", "x = 1")
+
+
+def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
+    """A thinking that ends with no answer gets </think> appended (plus Qwen's
+    early-stop line when it ran out of budget) and the model answers on top."""
+    import httpx
+    from stages import eval as ev
+
+    finish = {"a": "stop", "b": "length"}
+    sent = []
+
+    class R:
+        def __init__(self, body): self.body = body
+        def raise_for_status(self): pass
+        def json(self): return self.body
+
+    def post(url, timeout, json):
+        sent.append((url.rsplit("/", 1)[1], json))
+        if url.endswith("/chat/completions"):
+            return R({"choices": [{"finish_reason": finish[json["messages"][1]["content"]],
+                                   "message": {"content": "", "reasoning_content": "plan it"}}],
+                      "usage": {"completion_tokens": 900}})
+        if url.endswith("/apply-template"):
+            assert json["chat_template_kwargs"] == {"enable_thinking": True}
+            return R({"prompt": "<|im_start|>assistant\n<think>\n"})
+        return R({"content": "```py\nx = 1\n```", "tokens_predicted": 12})
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(ev, "SLOTS", 1)
+    infos = []
+    answers, _ = ev.generate("sys", ["a", "b"], 24576, 0.6, 0, thinking=True, infos=infos)
+    assert answers == ["```py\nx = 1\n```"] * 2
+    assert [(i["forced"], i["tokens"], i["forced_tokens"]) for i in infos] == [("stop", 900, 12), ("length", 900, 12)]
+    stop, length = [j["prompt"] for name, j in sent if name == "completion"]
+    assert stop == "<|im_start|>assistant\n<think>\nplan it\n</think>\n\n"
+    assert length == "<|im_start|>assistant\n<think>\nplan it" + ev.EARLY_STOP + "\n</think>\n\n"
+
+
+def test_thinking_off_never_forces_an_answer(monkeypatch):
+    import httpx
+    from stages import eval as ev
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+
+    urls = []
+    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: urls.append(url) or R())
+    infos = []
+    assert ev.generate("sys", ["a"], 4096, infos=infos)[0] == [""]
+    assert len(urls) == 1 and infos[0]["forced"] is None and infos[0]["finish"] == "length"

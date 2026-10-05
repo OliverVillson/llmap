@@ -51,13 +51,21 @@ MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_
 # (~2k tokens) and the answer.
 CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 
+# With thinking, the answer cap for the step that makes the model answer when its
+# thinking ended without one (see generate).
+ANSWER_TOKENS = 4096
+# Qwen's wording for cutting thinking short (the Qwen3 model card's thinking budget).
+EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now."
+
 
 def limits(cfg) -> tuple[int, int]:
     """(max answer tokens, context per slot) for this job: follows the job's
     data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set.
-    The context also fits the code eval's answer cap (code_eval_max_tokens)."""
+    The context also fits the code eval's answer cap (code_eval_max_tokens), plus
+    the forced answer after it when thinking."""
     max_tokens = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.answer_max_tokens(cfg))))
-    longest = max(max_tokens, cfg.code_eval_max_tokens if cfg.code_eval_suites else 0)
+    code = cfg.code_eval_max_tokens + (ANSWER_TOKENS if cfg.code_eval_thinking else 0)
+    longest = max(max_tokens, code if cfg.code_eval_suites else 0)
     return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", longest + 4096))
 
 
@@ -86,48 +94,93 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     raise RuntimeError(f"llama-server did not become healthy for {name}; see {log_path}")
 
 
+def split_reasoning(message: dict) -> tuple[str, str]:
+    """(reasoning, answer) from a chat completion message. llama-server returns
+    the reasoning separately; when it does not, the tags are still in the content."""
+    content, reasoning = message.get("content") or "", message.get("reasoning_content") or ""
+    if "</think>" in content:
+        head, content = content.rsplit("</think>", 1)
+        reasoning = reasoning or head.replace("<think>", "", 1)
+    elif "<think>" in content:  # thinking that never closed
+        reasoning, content = reasoning or content.split("<think>", 1)[1], ""
+    elif "</think>" in reasoning and not content.strip():  # answer left inside the reasoning
+        reasoning, content = reasoning.rsplit("</think>", 1)
+    return reasoning.strip(), content.strip()
+
+
 def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
              temperature: float = 0.0, seed: int | None = None,
-             thinking: bool = False, on_answer=None) -> tuple[list[str], float | None]:
-    """Answers plus the median decode speed (tok/s) the server reported. With
-    thinking, llama-server returns the reasoning separately, so the answer is
-    only what follows it ("" when the thinking ran out of max_tokens).
-    on_answer() is called from a worker thread as each answer finishes."""
+             thinking: bool = False, on_answer=None, infos: list | None = None) -> tuple[list[str], float | None]:
+    """Answers plus the median decode speed (tok/s) the server reported.
+
+    With thinking, a thinking that ends without an answer (out of max_tokens, or
+    the model stopped inside it) is closed and the model is asked for the answer
+    on top of it, with up to ANSWER_TOKENS more. on_answer() is called from a
+    worker thread as each answer finishes. infos, when given, receives one dict
+    per input: finish reason, tokens, reasoning size and how the answer came."""
     import httpx
 
+    url = f"http://127.0.0.1:{PORT}"
     speeds: list[float] = []
+    sampling = {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
 
-    def one(text: str) -> str:
+    def force_answer(messages: list[dict], reasoning: str, why: str) -> tuple[str, int]:
+        prompt = httpx.post(f"{url}/apply-template", timeout=60, json={
+            "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
+        if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
+            prompt += "<think>\n"
+        prompt += reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
+        r = httpx.post(f"{url}/completion", timeout=max(600, ANSWER_TOKENS / 4), json={
+            "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
+        r.raise_for_status()
+        body = r.json()
+        return (body.get("content") or "").strip(), body.get("tokens_predicted") or 0
+
+    def one(text: str) -> tuple[str, dict]:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
         for attempt in range(2):
             try:
-                r = httpx.post(f"http://127.0.0.1:{PORT}/v1/chat/completions", timeout=max(600, max_tokens / 4), json={
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-                    "temperature": temperature, "max_tokens": max_tokens,
-                    "chat_template_kwargs": {"enable_thinking": thinking},
-                    **({"seed": seed, "top_p": 0.95} if seed is not None else {}),
-                    **({"top_k": 20} if thinking else {}),
+                r = httpx.post(f"{url}/v1/chat/completions", timeout=max(600, max_tokens / 4), json={
+                    "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+                    "chat_template_kwargs": {"enable_thinking": thinking}, **sampling,
                 })
                 r.raise_for_status()
                 body = r.json()
                 tps = (body.get("timings") or {}).get("predicted_per_second")
                 if tps:
                     speeds.append(float(tps))
-                content = body["choices"][0]["message"].get("content") or ""
-                return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+                choice = body["choices"][0]
+                reasoning, answer = split_reasoning(choice["message"])
+                info = {"finish": choice.get("finish_reason"), "tokens": (body.get("usage") or {}).get("completion_tokens"),
+                        "reasoning_chars": len(reasoning), "forced": None}
+                if thinking and not answer:
+                    # "length": out of budget; "stop": the model ended inside its thinking;
+                    # "no_reasoning": nothing came back at all (then this is a thinking-off answer).
+                    info["forced"] = "no_reasoning" if not reasoning else "length" if info["finish"] == "length" else "stop"
+                    info["reasoning_tail"] = reasoning[-1500:]
+                    try:
+                        answer, info["forced_tokens"] = force_answer(messages, reasoning, info["forced"])
+                    except Exception as e:  # keep the thinking; don't redo it
+                        print(f"[eval] answer after thinking failed: {e}", flush=True)
+                        info["error"] = str(e)[:300]
+                return answer, info
             except Exception as e:
                 if attempt:
                     print(f"[eval] generation failed: {e}", flush=True)
-        return ""
+                    return "", {"finish": "error", "error": str(e)[:300], "forced": None}
+        return "", {}
 
-    def counted(text: str) -> str:
-        answer = one(text)
+    def counted(text: str) -> tuple[str, dict]:
+        got = one(text)
         if on_answer:
             on_answer()
-        return answer
+        return got
 
     with ThreadPoolExecutor(SLOTS) as ex:
-        answers = list(ex.map(counted, inputs))
-    return answers, (round(statistics.median(speeds), 1) if speeds else None)
+        got = list(ex.map(counted, inputs))
+    if infos is not None:
+        infos.extend(i for _, i in got)
+    return [a for a, _ in got], (round(statistics.median(speeds), 1) if speeds else None)
 
 
 def _tokens(s: str) -> list[str]:
@@ -286,13 +339,14 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         # recommended 0.6 for the single-sample case), seeded for repeatability.
         temperature = cfg.code_eval_temperature if not greedy else 0.6 if cfg.code_eval_thinking else 0.0
         seed = i if cfg.code_eval_thinking or not greedy else None
-        answers = [""] * len(problems)
+        answers, infos = [""] * len(problems), [{}] * len(problems)
         for (system, _), idx in groups.items():
+            got_info: list[dict] = []
             got, tps = generate(system, [codebench.build_prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                temperature, seed, cfg.code_eval_thinking, answered)
+                                temperature, seed, cfg.code_eval_thinking, answered, infos=got_info)
             speeds += [tps] if tps else []
-            for j, a in zip(idx, got):
-                answers[j] = a
+            for j, a, info in zip(idx, got, got_info or [{}] * len(idx)):
+                answers[j], infos[j] = a, info
         ran: list = [None] * len(problems)
         for (_, timeout), idx in groups.items():
             items = []
@@ -304,7 +358,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         for j, (p, a, r) in enumerate(zip(problems, answers, ran)):
             results[j].append(r)
             rows.append({"suite": p["suite"], "id": p["id"], "sample": i, "passed": r.passed,
-                         "reason": r.reason, "output": r.output[-500:], "answer": a})
+                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j]})
     out_dir = job.path("work", "code_eval")
     out_dir.mkdir(exist_ok=True)
     write_jsonl(out_dir / f"{name}.jsonl", rows)

@@ -94,23 +94,29 @@ EOF
   [ -f "$d/.done/eval" ] || { echo "$1 failed; last lines of $d/run.log:"; tail -20 "$d/run.log"; exit 1; }
 }
 
-[ "$THINK_OFF" = 0 ] || run "lcb-$MODEL-think-off" false 4096
-run "lcb-$MODEL-think-on" true "$THINK_TOKENS"
+[ "$THINK_OFF" = 0 ] || run "lcb-$MODEL-think-off-n$N" false 4096
+run "lcb-$MODEL-think-on-n$N" true "$THINK_TOKENS"
 
 say "Result"
-"$WORK/venv/bin/python" - "$WORK/jobs" "$MODEL" <<'PY'
-import json, sys
+"$WORK/venv/bin/python" - "$WORK/jobs" "$MODEL" "$N" <<'PY'
+import json, statistics, sys
 from pathlib import Path
-jobs, model = Path(sys.argv[1]), sys.argv[2]
+jobs, model, n = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 for mode in ("off", "on"):
-    d = jobs / f"lcb-{model}-think-{mode}"
+    d = jobs / f"lcb-{model}-think-{mode}-n{n}"
     if not (d / "out" / "eval.json").exists():
         continue
     c = json.loads((d / "out" / "eval.json").read_text())["candidates"][0]
     s = c["code"]["suites"]["livecodebench"]
     rows = [json.loads(l) for l in (d / "work" / "code_eval" / f"{model}.jsonl").read_text().splitlines() if l.strip()]
-    empty = sum(not r["answer"].strip() for r in rows)
-    note = f", {empty} ran out of thinking budget" if mode == "on" and empty else ""
-    print(f"{model} thinking {mode:3}: LiveCodeBench {s['pass@1']:.0%} on {s['n']} problems, "
-          f"{c['tok_s_vm'] or '?'} tok/s{note}")
+    print(f"{model} thinking {mode}: LiveCodeBench {s['pass@1']:.0%} on {s['n']} problems, {c['tok_s_vm'] or '?'} tok/s")
+    tokens = [r["tokens"] for r in rows if r.get("tokens")]
+    if mode == "on" and tokens:
+        print(f"  thinking: median {statistics.median(tokens):.0f} tokens, longest {max(tokens)}")
+        why = {"stop": "stopped thinking without answering", "length": "used the whole thinking budget",
+               "no_reasoning": "returned no thinking at all"}
+        for k, label in why.items():
+            hit = [r for r in rows if r.get("forced") == k]
+            if hit:
+                print(f"  {len(hit)} {label}; asked to answer after it, {sum(r['passed'] for r in hit)} passed")
 PY
