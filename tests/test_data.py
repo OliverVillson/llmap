@@ -224,3 +224,58 @@ def test_parse_code_inputs():
     text = '```json\n[{"input": "Write f(x) returning x", "tests": "assert f(1) == 1"}, ' \
            '{"input": "no tests here at all", "tests": ""}, "just a string input"]\n```'
     assert parse_code_inputs(text) == [("Write f(x) returning x", "assert f(1) == 1")]
+
+
+def test_thinking_data_keeps_the_thinking(tmp_path):
+    """data_thinking: every train row carries the teacher's thinking, the human seeds
+    (which have none) stay out, and answers whose thinking never closed are dropped."""
+    job = code_job(tmp_path, "python")
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "data_thinking": True}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    assert train and all(r["messages"][2]["reasoning_content"] == "Let me work this out first." for r in train)
+    assert "</think>" not in "".join(r["messages"][2]["content"] for r in train)
+    seeds = {e.input for e in TaskSpec.load(job / "taskspec.json").seed_examples}
+    assert not seeds & {r["messages"][1]["content"] for r in train}
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["dropped"].get("no_thinking_end") and stats["thinking_chars_median"] > 0
+    assert "<think>\nLet me work this out first.\n</think>" in (job / "data/calib.txt").read_text()
+
+
+class CharTok:
+    """A character-level tokenizer with a Qwen3.6-style chat template: thinking on
+    opens <think> in the generation prompt, thinking off closes an empty one."""
+    chat_template = "qwen-ish"
+    eos_token = "<|im_end|>"
+
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=False, enable_thinking=True):
+        text = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in msgs)
+        if add_generation_prompt:
+            text += "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+        return text
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+
+def _target(ex):
+    return "".join(chr(i) for i, l in zip(ex["input_ids"], ex["labels"]) if l != -100)
+
+
+def _prompt(ex):
+    return "".join(chr(i) for i, l in zip(ex["input_ids"], ex["labels"]) if l == -100)
+
+
+def test_tokenize_trains_thinking_turns_on_the_thinking():
+    from stages.taskdata import tokenize_example
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "add"},
+            {"role": "assistant", "content": "x = 1", "reasoning_content": "plan it"}]
+    ex = tokenize_example(CharTok(), msgs, 10_000)
+    assert _prompt(ex).endswith("<|im_start|>assistant\n<think>\n")
+    assert _target(ex) == "plan it\n</think>\n\nx = 1<|im_end|>"
+
+    off = tokenize_example(CharTok(), [*msgs[:2], {"role": "assistant", "content": "x = 1"}], 10_000)
+    assert _prompt(off).endswith("<think>\n\n</think>\n\n") and _target(off) == "x = 1<|im_end|>"

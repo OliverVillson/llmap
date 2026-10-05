@@ -32,6 +32,11 @@ class Config:
     # Length limits for long-output tasks (code). None uses the env knob or built-in default:
     data_answer_max_tokens: int | None = None  # LOBBOT_DATA_ANSWER_MAX_TOKENS or 1536; eval follows it
     data_max_len: int | None = None  # vLLM context, LOBBOT_DATA_MAX_LEN or 8192
+    # Teacher answers with thinking on, and the thinking is kept in the training rows
+    # (the assistant message's reasoning_content), so REAP calibrates on it and heal
+    # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
+    # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50think).
+    data_thinking: bool = False
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.

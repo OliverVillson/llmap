@@ -33,6 +33,7 @@ import json
 import os
 import random
 import re
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -165,6 +166,15 @@ _THINK = re.compile(r"<think>.*?</think>\s*", re.S)
 _FENCE = re.compile(r"^```[\w-]*\s*\n?|\n?```\s*$")
 
 
+def split_think(text: str) -> tuple[str, str]:
+    """(thinking, answer) from a raw generation. The thinking ends at the last
+    </think>; templates that open <think> in the prompt leave only the closing tag."""
+    if "</think>" not in text:
+        return "", text
+    head, tail = text.rsplit("</think>", 1)
+    return head.replace("<think>", "", 1).strip(), tail
+
+
 def clean(text: str) -> str:
     return _FENCE.sub("", _THINK.sub("", text).strip()).strip()
 
@@ -267,20 +277,20 @@ class Teacher:
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
 
-    def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int) -> list[Gen]:
+    def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
-                                 max_tokens=max_tokens)
-        try:  # Qwen3 hybrid checkpoints: no <think>; Instruct-2507 ignores the flag
-            res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": False})
+                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}))
+        try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
+            res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
         except TypeError:
             res = self.llm.chat(convs, sp, use_tqdm=False)
         return [Gen(r.outputs[0].text, r.outputs[0].finish_reason != "length") for r in res]
 
 
-def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label) -> list[Gen]:
+def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label, thinking: bool = False) -> list[Gen]:
     out: list[Gen] = []
     for i in range(0, len(convs), BATCH):
-        out += teacher.chat(convs[i:i + BATCH], temperature, max_tokens)
+        out += teacher.chat(convs[i:i + BATCH], temperature, max_tokens, thinking)
         emit(STAGE, pct=lo + (hi - lo) * len(out) / len(convs), msg=f"{label} {len(out)}/{len(convs)}")
     return out
 
@@ -291,23 +301,26 @@ class DryRunTeacher:
     def __init__(self, spec, rng: random.Random):
         self.spec, self.rng = spec, rng
 
-    def chat(self, convs, temperature, max_tokens):
-        out = []
-        for conv in convs:
-            prompt = conv[-1]["content"]
-            if "real-world scenarios" in prompt:
-                out.append(Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True))
-            elif self.spec.is_code:
-                out.append(self._code(prompt))
-            elif "NEW, realistic inputs" in prompt:
-                base = self.rng.choice(self.spec.seed_examples).input
-                out.append(Gen("```json\n" + json.dumps(
-                    [f"{base} (case {self.rng.randrange(10**9)})" for _ in range(PER_PROMPT)]) + "\n```", True))
-            else:
-                r = self.rng.random()
-                ex = self.spec.seed_examples[len(prompt) % len(self.spec.seed_examples)].output
-                out.append(Gen("{broken" if r < 0.03 else ex, r > 0.01))
+    def chat(self, convs, temperature, max_tokens, thinking=False):
+        out = [self._one(conv) for conv in convs]
+        if thinking:  # an open <think> in the prompt, as Qwen3.6's template does; a few never close
+            out = [Gen(g.text if self.rng.random() < 0.05 else f"Let me work this out first.\n</think>\n\n{g.text}",
+                       g.finished) for g in out]
         return out
+
+    def _one(self, conv) -> Gen:
+        prompt = conv[-1]["content"]
+        if "real-world scenarios" in prompt:
+            return Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True)
+        if self.spec.is_code:
+            return self._code(prompt)
+        if "NEW, realistic inputs" in prompt:
+            base = self.rng.choice(self.spec.seed_examples).input
+            return Gen("```json\n" + json.dumps(
+                [f"{base} (case {self.rng.randrange(10**9)})" for _ in range(PER_PROMPT)]) + "\n```", True)
+        r = self.rng.random()
+        ex = self.spec.seed_examples[len(prompt) % len(self.spec.seed_examples)].output
+        return Gen("{broken" if r < 0.03 else ex, r > 0.01)
 
     def _code(self, prompt: str) -> Gen:
         """Inputs reuse a seed's tests; answers are that seed's code, sometimes a wrong seed's
@@ -423,26 +436,32 @@ def run_stage(job: Job) -> None:
     # 3) answers
     shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
-    gens = chat_batched(teacher, convs, 0.3, answer_max_tokens(cfg), 45, 95, "teacher answering")
+    think = cfg.data_thinking
+    # Thinking samples at Qwen's recommended 0.6; greedy-ish decoding makes it loop.
+    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 45, 95,
+                        "teacher answering" + (" (thinking)" if think else ""), think)
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
-    candidates = []  # code specs: (input, answer) waiting for the sandbox
+    candidates = []  # code specs: (input, answer, thinking) waiting for the sandbox
     for i, (s, g) in enumerate(zip(inputs + ext, gens)):
-        ans, why = check_answer(g.text, g.finished, want_json, want_code=spec.is_code)
+        reasoning, text = split_think(g.text) if think else ("", g.text)
+        ans, why = check_answer(text, g.finished, want_json, want_code=spec.is_code)
+        if ans is not None and think and not reasoning:
+            ans, why = None, "no_thinking_end"  # the thinking never closed; nothing to learn it from
         is_ext = i >= len(inputs)
         if ans is None:
             d = ext_drops if is_ext else drops
             d[why] = d.get(why, 0) + 1
         elif spec.is_code:
-            candidates.append((s, ans))
+            candidates.append((s, ans, reasoning))
         else:
-            (ext_rows if is_ext else rows).append(_row(sys, s, ans))
+            (ext_rows if is_ext else rows).append(_row(sys, s, ans, reasoning))
     if spec.is_code:
         emit(STAGE, pct=95, msg=f"running tests for {len(candidates)} answers")
-        results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a in candidates])
-        for (s, a), res in zip(candidates, results):
+        results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a, _ in candidates])
+        for (s, a, reasoning), res in zip(candidates, results):
             if res.passed:
-                rows.append(_row(sys, s, a))
+                rows.append(_row(sys, s, a, reasoning))
             else:
                 drops[res.reason] = drops.get(res.reason, 0) + 1
         n_pass = len(rows)
@@ -465,12 +484,16 @@ def run_stage(job: Job) -> None:
         n_held = min(n_held, len(rows) // 5)
         heldout, train = rows[:n_held], rows[n_held:n_held + cfg.n_generate]
         stats["heldout_source"] = "teacher"
-    train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
+    if not think:  # the human seeds have no thinking, and every row of a thinking model thinks
+        train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
+    if think:
+        stats["thinking_chars_median"] = statistics.median(
+            len(r["messages"][2]["reasoning_content"]) for r in train) if train else 0
     rng.shuffle(train)
     write_jsonl(job.path("data", "train.jsonl"), train)
     write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
     job.path("data", "calib.txt").write_text(
-        "\n\n".join(r["messages"][1]["content"] + "\n" + r["messages"][2]["content"] for r in train[:1000])
+        "\n\n".join(r["messages"][1]["content"] + "\n" + _with_thinking(r["messages"][2]) for r in train[:1000])
     )
     stats.update(train=len(train), heldout=len(heldout), elapsed_s=round(time.monotonic() - t0, 1))
     job.path("data", "stats.json").write_text(json.dumps(stats, indent=2))
@@ -497,12 +520,18 @@ def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
     return row
 
 
-def _row(sys: str, inp: str, out: str) -> dict:
+def _row(sys: str, inp: str, out: str, reasoning: str = "") -> dict:
+    """A chat row. The teacher's thinking, when kept, goes in reasoning_content (the
+    field Qwen's chat templates render inside <think>); taskdata trains on it."""
     return {"messages": [
         {"role": "system", "content": sys},
         {"role": "user", "content": inp},
-        {"role": "assistant", "content": out},
+        {"role": "assistant", "content": out, **({"reasoning_content": reasoning} if reasoning else {})},
     ]}
+
+
+def _with_thinking(msg: dict) -> str:
+    return (f"<think>\n{msg['reasoning_content']}\n</think>\n\n" if msg.get("reasoning_content") else "") + msg["content"]
 
 
 if __name__ == "__main__":

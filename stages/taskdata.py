@@ -46,9 +46,9 @@ def to_messages(row: dict) -> list[dict] | None:
     return None
 
 
-def _template(tok, msgs, **kw):
+def _template(tok, msgs, thinking: bool = False, **kw):
     try:
-        return tok.apply_chat_template(msgs, tokenize=False, enable_thinking=False, **kw)
+        return tok.apply_chat_template(msgs, tokenize=False, enable_thinking=thinking, **kw)
     except TypeError:
         return tok.apply_chat_template(msgs, tokenize=False, **kw)
 
@@ -58,17 +58,26 @@ def tokenize_example(tok, msgs: list[dict], max_len: int) -> dict:
     the teacher's answer. The prompt is rendered exactly as at inference
     (add_generation_prompt=True), which matters for templates whose generation
     prompt differs from a rendered past turn (Gemma 4 adds an empty thought
-    channel). The answer is followed by the template's end-of-turn marker."""
+    channel). The answer is followed by the template's end-of-turn marker.
+
+    An answer with reasoning_content (data_thinking) is trained as a thinking
+    turn: the prompt is rendered with thinking on and the target is the thinking,
+    </think>, then the answer, so the model learns to think and to close it."""
     answer = msgs[-1]["content"]
+    reasoning = (msgs[-1].get("reasoning_content") or "").strip()
     if tok.chat_template:
-        prompt = _template(tok, msgs[:-1], add_generation_prompt=True)
-        full = _template(tok, msgs)
+        prompt = _template(tok, msgs[:-1], thinking=bool(reasoning), add_generation_prompt=True)
+        full = _template(tok, [*msgs[:-1], {"role": "assistant", "content": answer}])
         at = full.rfind(answer)
         suffix = full[at + len(answer):] if at >= 0 else (tok.eos_token or "")
         suffix = suffix.rstrip("\n")  # keep e.g. <|im_end|> / <turn|> as a target, not the newline
     else:  # bare tokenizer (tests): plain concatenation
         prompt = "".join(m["content"] + "\n" for m in msgs[:-1])
         suffix = tok.eos_token or ""
+    if reasoning:
+        if not prompt.rstrip().endswith("<think>"):  # templates that leave opening it to the model
+            prompt += "<think>\n"
+        answer = f"{reasoning}\n</think>\n\n{answer}"
     p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
     a_ids = tok(answer + suffix, add_special_tokens=False)["input_ids"]
     ids = (p_ids + a_ids)[:max_len]

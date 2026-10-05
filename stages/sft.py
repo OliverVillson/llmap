@@ -125,13 +125,18 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
     tok = AutoTokenizer.from_pretrained(base)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     data = [tokenize_example(tok, ex["messages"], max_len) for ex in examples]
-    n_cut = sum(len(d["input_ids"]) >= max_len for d in data)
+    cut = [len(d["input_ids"]) >= max_len for d in data]
+    n_cut = sum(cut)
+    # A thinking example cut short would teach a thinking that never closes, so it is dropped.
+    thinks = [bool(ex["messages"][-1].get("reasoning_content")) for ex in examples]
+    n_think_cut = sum(c and t for c, t in zip(cut, thinks))
+    data = [d for d, c, t in zip(data, cut, thinks) if not (c and t)]
     data = [d for d in data if any(l != -100 for l in d["labels"][1:])]
     if not data:
         raise ValueError("no training examples with answer tokens")
     if n_cut:
         log(f"sft: {n_cut}/{len(examples)} examples hit max_len={max_len} and were cut short "
-            f"(raise LOBBOT_HEAL_MAX_LEN for long answers)")
+            f"({n_think_cut} of them thinking, dropped; raise LOBBOT_HEAL_MAX_LEN for long answers)")
 
     progress(1, f"loading {base}")
     model = load_causal_lm(base)

@@ -10,6 +10,9 @@
     python pipeline.py --job $LOBBOT_JOBS/code10x-r50mix-gen
     python scripts/code10x.py report --jobs $LOBBOT_JOBS
 
+Thinking (a separate thinking model next to r50w95s; setup also creates these jobs):
+    python pipeline.py --job $LOBBOT_JOBS/code10x-ref-think --only eval   # the full model, thinking on
+    python pipeline.py --job $LOBBOT_JOBS/code10x-r50think                # data with thinking onwards
 Multi-language heal data (one data job per language, then one merged job):
 
     python scripts/code10x.py lang-jobs --taskspec examples/c-strings.code.taskspec.json ...
@@ -40,7 +43,7 @@ sys.path.insert(0, str(ROOT))
 
 from stages._util import Config, Job  # noqa: E402
 
-VARIANTS = ["ref", "fp8", "r25q4", "r50mix", "r50mix-gen"]
+VARIANTS = ["ref", "fp8", "r25q4", "r50mix", "r50mix-gen", "ref-think", "r50think"]
 CONFIGS = ROOT / "configs" / "code10x"
 # Size budget per compressed variant (GB, with quantize's margin under it). Laptop
 # speed is not what this experiment measures, so the tok/s floor is low.
@@ -48,6 +51,9 @@ TARGETS = {
     "r25q4": {"max_size_gb": 16.0, "min_tok_s": 10.0},
     "r50mix": {"max_size_gb": 7.5, "min_tok_s": 10.0},
     "r50mix-gen": {"max_size_gb": 7.5, "min_tok_s": 10.0},
+    # The thinking model: r50w95s's recipe (2-8 bit experts, 8-bit rest at 9.5 GB),
+    # with thinking kept in its data, REAP calibration and heal.
+    "r50think": {"max_size_gb": 9.5, "min_tok_s": 10.0},
 }
 # The pass bar from the experiment doc: (mean share of ref, lowest suite share).
 BARS = {"r50mix": (0.90, 0.80), "r25q4": (0.95, None)}
@@ -108,6 +114,9 @@ def share_data(args) -> None:
         d = job_dir(args.jobs, v)
         if (d / ".done" / "data").exists():
             print(f"{d}: data already done")
+            continue
+        if config(v).get("data_thinking", False) != config(args.source).get("data_thinking", False):
+            print(f"{d}: makes its own data (thinking differs from {args.source})")
             continue
         shutil.copytree(src / "data", d / "data", dirs_exist_ok=True)
         (d / ".done").mkdir(exist_ok=True)
