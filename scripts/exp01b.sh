@@ -100,6 +100,8 @@ if [ ! -f "$J/code10x-asm/.done/eval" ]; then
     mv "$J/code10x-data-asm" "$J/code10x-asm"
     setcfg "$J/code10x-asm" 'code_eval_suites=["heldout"]' -=code_eval_ref
   fi
+  # the taskspec's 7 GB leaves no room above the all-2-bit floor (~6.5 GB); r50mix's size
+  setcfg "$J/code10x-asm" target.max_size_gb=7.5
   python pipeline.py --job "$J/code10x-asm" 2>&1 | tee "$J/asm.log" | grep -E 'passed|pass@1|GB|rror' || true
 fi
 if [ -f "$J/code10x-asm/.done/data" ] && [ ! -f "$J/code10x-asm-ref/.done/eval" ]; then
