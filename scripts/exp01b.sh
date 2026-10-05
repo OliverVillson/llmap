@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Experiment 01 follow-ups on the B200, in one go (each step is skipped once done):
 #   1. 2..8-bit mixed quant of r50mix's pruned+healed model at 7.5 and 9.5 GB, and at
-#      9.5 GB with every non-expert tensor at 8-bit (r50w75, r50w95, r50w95s)
+#      7.5 and 9.5 GB with every non-expert tensor at 8-bit (r50w75, r50w95, r50w95s, r50w75s)
 #   2. heal on Python, C, JavaScript and TypeScript together (multi)
 #   3. an x86-64 assembly-only model (asm), and the full model on its held-out tasks (asm-ref)
 #
@@ -49,7 +49,7 @@ summary() {
 import json, sys, collections
 from pathlib import Path
 j = Path(sys.argv[1])
-for name in ["ref", "r50mix", "r50q4", "r50q6", "r50w75", "r50w95", "r50w95s", "multi", "asm", "asm-ref"]:
+for name in ["ref", "r50mix", "r50q4", "r50q6", "r50w75", "r50w95", "r50w95s", "r50w75s", "multi", "asm", "asm-ref"]:
     p = j / f"code10x-{name}" / "out" / "eval.json"
     if not p.exists():
         print(f"{name:9} not run"); continue
@@ -75,6 +75,7 @@ PY
 requant r50w75  bit_floor=q2_k bit_ceiling=q8_0 target.max_size_gb=7.5
 requant r50w95  bit_floor=q2_k bit_ceiling=q8_0 target.max_size_gb=9.5
 requant r50w95s bit_floor=q2_k bit_ceiling=q8_0 static_type=q8_0 target.max_size_gb=9.5
+requant r50w75s bit_floor=q2_k bit_ceiling=q8_0 static_type=q8_0 target.max_size_gb=7.5
 
 # 2. multi-language heal (Python data comes from r50mix)
 python scripts/code10x.py lang-jobs --taskspec examples/c-strings.code.taskspec.json \
