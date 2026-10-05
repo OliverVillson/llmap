@@ -37,7 +37,8 @@ if [ ! -s "$GGUF" ]; then
   say "Model qwen36-$MODEL.gguf from the mugge-library bucket"
   command -v evroc >/dev/null || curl -fsSL https://docs.evroc.com/install.sh | bash
   # Credentials last about an hour; a fresh login is only needed when this fails.
-  evroc storage bucket get-s3-credentials >/dev/null 2>&1 || { evroc login; evroc storage bucket get-s3-credentials >/dev/null; }
+  evroc storage bucket get-s3-credentials >/dev/null 2>&1 || {
+    evroc login; evroc config set-project "${EVROC_PROJECT:-mugge-11a5}"; evroc storage bucket get-s3-credentials >/dev/null; }
   evroc storage bucket copy --from "bucket://mugge-library/gguf/qwen36-$MODEL.gguf" --to "$GGUF.part" >/dev/null
   mv "$GGUF.part" "$GGUF"
 fi
