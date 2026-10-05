@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# LiveCodeBench with thinking off and on, for one compressed model, on an
-# Apple Silicon Mac (16 GB or more).
+# LiveCodeBench with thinking on, for one compressed model, on an Apple Silicon
+# Mac (16 GB or more).
 #   bash scripts/mac_lcb.sh                  # r50w95s, the first 40 problems from 2025-01-01
+#   THINK_OFF=1 bash scripts/mac_lcb.sh      # also a thinking-off run, for comparison
 #   N=0 bash scripts/mac_lcb.sh              # every problem in the window (overnight)
 #   MODEL=r50mix bash scripts/mac_lcb.sh     # another GGUF from the mugge-library bucket
 # Needs Homebrew. The first run installs llama.cpp, uv and the evroc CLI, logs in to
@@ -15,6 +16,7 @@ MODEL=${MODEL:-r50w95s}
 N=${N:-40}
 SLOTS=${SLOTS:-2}
 THINK_TOKENS=${THINK_TOKENS:-24576}
+THINK_OFF=${THINK_OFF:-0}
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -81,7 +83,7 @@ EOF
   [ -f "$d/.done/eval" ] || { echo "$1 failed; last lines of $d/run.log:"; tail -20 "$d/run.log"; exit 1; }
 }
 
-run "lcb-$MODEL-think-off" false 4096
+[ "$THINK_OFF" = 0 ] || run "lcb-$MODEL-think-off" false 4096
 run "lcb-$MODEL-think-on" true "$THINK_TOKENS"
 
 say "Result"
@@ -91,6 +93,8 @@ from pathlib import Path
 jobs, model = Path(sys.argv[1]), sys.argv[2]
 for mode in ("off", "on"):
     d = jobs / f"lcb-{model}-think-{mode}"
+    if not (d / "out" / "eval.json").exists():
+        continue
     c = json.loads((d / "out" / "eval.json").read_text())["candidates"][0]
     s = c["code"]["suites"]["livecodebench"]
     rows = [json.loads(l) for l in (d / "work" / "code_eval" / f"{model}.jsonl").read_text().splitlines() if l.strip()]
