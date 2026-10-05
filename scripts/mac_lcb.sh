@@ -3,6 +3,8 @@
 # Mac (16 GB or more).
 #   bash scripts/mac_lcb.sh                  # r50w95s, the first 40 problems from 2025-01-01
 #   THINK_OFF=1 bash scripts/mac_lcb.sh      # also a thinking-off run, for comparison
+# A progress bar shows problems answered and the time left; the full output is in
+# $WORK/jobs/<run>/run.log.
 #   N=0 bash scripts/mac_lcb.sh              # every problem in the window (overnight)
 #   MODEL=r50mix bash scripts/mac_lcb.sh     # another GGUF from the mugge-library bucket
 # Needs Homebrew. The first run installs llama.cpp, uv and the evroc CLI, logs in to
@@ -79,7 +81,7 @@ EOF
   say "$1 (started $(date +%H:%M); log in $d/run.log)"
   # caffeinate keeps the Mac awake while it runs.
   (cd "$REPO" && LOBBOT_EVAL_SLOTS=$SLOTS caffeinate -i "$WORK/venv/bin/python" pipeline.py --job "$d" --only eval) \
-    2>&1 | tee "$d/run.log" | grep --line-buffered -E 'answering|pass@1|error|Error' || true
+    2>&1 | "$WORK/venv/bin/python" "$REPO/scripts/progress_bar.py" "$d/run.log" || true
   [ -f "$d/.done/eval" ] || { echo "$1 failed; last lines of $d/run.log:"; tail -20 "$d/run.log"; exit 1; }
 }
 

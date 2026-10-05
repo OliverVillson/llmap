@@ -237,7 +237,7 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -263,13 +263,18 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     probs = cb.load_suite("c-set", "/nonexistent", limit=1)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None):
         calls.append((max_tokens, temperature, seed, thinking))
+        on_answer()
         return [""], None
 
+    events = []
     monkeypatch.setattr(ev, "generate", fake_generate)
+    monkeypatch.setattr(ev, "emit", lambda stage, **kw: events.append(kw))
     ev.code_eval(job, "cand", probs, "task system")
     assert calls == [(24576, 0.6, 0, True)]
+    # Progress for the Mac runner's bar: 0 of 1 before answering, 1 of 1 after.
+    assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
 
 
 def test_generate_sends_thinking_flag(monkeypatch):

@@ -88,10 +88,11 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
 
 def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
              temperature: float = 0.0, seed: int | None = None,
-             thinking: bool = False) -> tuple[list[str], float | None]:
+             thinking: bool = False, on_answer=None) -> tuple[list[str], float | None]:
     """Answers plus the median decode speed (tok/s) the server reported. With
     thinking, llama-server returns the reasoning separately, so the answer is
-    only what follows it ("" when the thinking ran out of max_tokens)."""
+    only what follows it ("" when the thinking ran out of max_tokens).
+    on_answer() is called from a worker thread as each answer finishes."""
     import httpx
 
     speeds: list[float] = []
@@ -118,8 +119,14 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
                     print(f"[eval] generation failed: {e}", flush=True)
         return ""
 
+    def counted(text: str) -> str:
+        answer = one(text)
+        if on_answer:
+            on_answer()
+        return answer
+
     with ThreadPoolExecutor(SLOTS) as ex:
-        answers = list(ex.map(one, inputs))
+        answers = list(ex.map(counted, inputs))
     return answers, (round(statistics.median(speeds), 1) if speeds else None)
 
 
@@ -263,6 +270,16 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         groups.setdefault(key, []).append(j)
     results: list[list] = [[] for _ in problems]
     rows, speeds = [], []
+    done, total, lock = 0, n * len(problems), threading.Lock()
+
+    def answered():  # progress events with answered/total, at most ~100 per eval
+        nonlocal done
+        with lock:
+            done += 1
+            if done == total or done % max(1, total // 100) == 0:
+                emit(STAGE, msg=f"{name}: {done}/{total} code answers", answered=done, total=total)
+
+    emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
     for i in range(n):
         greedy = n == 1
         # Greedy decoding loops when thinking, so thinking always samples (Qwen's
@@ -272,7 +289,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         answers = [""] * len(problems)
         for (system, _), idx in groups.items():
             got, tps = generate(system, [codebench.build_prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                temperature, seed, cfg.code_eval_thinking)
+                                temperature, seed, cfg.code_eval_thinking, answered)
             speeds += [tps] if tps else []
             for j, a in zip(idx, got):
                 answers[j] = a
