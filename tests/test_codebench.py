@@ -237,7 +237,7 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -250,3 +250,51 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     assert {c[0] for c in calls} == {cb.SYSTEM} and {c[2] for c in calls} == {0, 1}
     rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
     assert len(rows) == 4 and sum(r["passed"] for r in rows) == 1
+
+
+def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch):
+    """Thinking loops under greedy decoding, so a single-sample thinking eval
+    samples at 0.6 with a fixed seed and passes thinking through."""
+    from stages import eval as ev
+    from stages._util import Job
+
+    job = Job(tmp_path)
+    job.config.code_eval_thinking, job.config.code_eval_max_tokens = True, 24576
+    probs = cb.load_suite("c-set", "/nonexistent", limit=1)
+    calls = []
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False):
+        calls.append((max_tokens, temperature, seed, thinking))
+        return [""], None
+
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    ev.code_eval(job, "cand", probs, "task system")
+    assert calls == [(24576, 0.6, 0, True)]
+
+
+def test_generate_sends_thinking_flag(monkeypatch):
+    import httpx
+    from stages import eval as ev
+
+    sent = []
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]}
+
+    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: sent.append((timeout, json)) or R())
+    ev.generate("sys", ["a"], 24576, 0.6, 0, thinking=True)
+    ev.generate("sys", ["b"], 2048)
+    (t1, on), (t2, off) = sent
+    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and t1 >= 24576 / 4
+    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off and t2 == 600
+
+
+def test_eval_context_fits_code_answer_cap(monkeypatch):
+    from stages import eval as ev
+    from stages._util import Config
+
+    monkeypatch.delenv("LOBBOT_EVAL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LOBBOT_EVAL_CTX", raising=False)
+    cfg = Config(code_eval_suites=["livecodebench"], code_eval_max_tokens=24576, data_answer_max_tokens=2048)
+    assert ev.limits(cfg) == (2048, 24576 + 4096)

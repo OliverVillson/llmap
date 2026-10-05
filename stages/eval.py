@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import threading
@@ -42,7 +43,7 @@ from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "eval"
 PORT = int(os.environ.get("LOBBOT_EVAL_PORT", "8091"))
-SLOTS = 8
+SLOTS = int(os.environ.get("LOBBOT_EVAL_SLOTS", 8))  # parallel requests; 2 on a 16 GB Mac
 # Must cover the longest teacher answer the data stage keeps
 # (LOBBOT_DATA_ANSWER_MAX_TOKENS), or long correct answers are judged as truncated.
 MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_MAX_TOKENS)))
@@ -53,15 +54,19 @@ CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 
 def limits(cfg) -> tuple[int, int]:
     """(max answer tokens, context per slot) for this job: follows the job's
-    data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set."""
+    data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set.
+    The context also fits the code eval's answer cap (code_eval_max_tokens)."""
     max_tokens = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.answer_max_tokens(cfg))))
-    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", max_tokens + 4096))
+    longest = max(max_tokens, cfg.code_eval_max_tokens if cfg.code_eval_suites else 0)
+    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", longest + 4096))
 
 
 def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     import httpx
 
     binary = Path(job.config.llama_cpp) / "build/bin/llama-server"
+    if not binary.exists() and shutil.which("llama-server"):
+        binary = Path(shutil.which("llama-server"))  # e.g. Homebrew's llama.cpp on a Mac
     log_path = job.path("work", f"llama-server-{name}.log")
     log = open(log_path, "w")
     proc = subprocess.Popen(
@@ -82,8 +87,11 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
 
 
 def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
-             temperature: float = 0.0, seed: int | None = None) -> tuple[list[str], float | None]:
-    """Answers plus the median decode speed (tok/s) the server reported."""
+             temperature: float = 0.0, seed: int | None = None,
+             thinking: bool = False) -> tuple[list[str], float | None]:
+    """Answers plus the median decode speed (tok/s) the server reported. With
+    thinking, llama-server returns the reasoning separately, so the answer is
+    only what follows it ("" when the thinking ran out of max_tokens)."""
     import httpx
 
     speeds: list[float] = []
@@ -91,11 +99,12 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
     def one(text: str) -> str:
         for attempt in range(2):
             try:
-                r = httpx.post(f"http://127.0.0.1:{PORT}/v1/chat/completions", timeout=600, json={
+                r = httpx.post(f"http://127.0.0.1:{PORT}/v1/chat/completions", timeout=max(600, max_tokens / 4), json={
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
                     "temperature": temperature, "max_tokens": max_tokens,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "chat_template_kwargs": {"enable_thinking": thinking},
                     **({"seed": seed, "top_p": 0.95} if seed is not None else {}),
+                    **({"top_k": 20} if thinking else {}),
                 })
                 r.raise_for_status()
                 body = r.json()
@@ -256,10 +265,14 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     rows, speeds = [], []
     for i in range(n):
         greedy = n == 1
+        # Greedy decoding loops when thinking, so thinking always samples (Qwen's
+        # recommended 0.6 for the single-sample case), seeded for repeatability.
+        temperature = cfg.code_eval_temperature if not greedy else 0.6 if cfg.code_eval_thinking else 0.0
+        seed = i if cfg.code_eval_thinking or not greedy else None
         answers = [""] * len(problems)
         for (system, _), idx in groups.items():
             got, tps = generate(system, [codebench.build_prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                0.0 if greedy else cfg.code_eval_temperature, None if greedy else i)
+                                temperature, seed, cfg.code_eval_thinking)
             speeds += [tps] if tps else []
             for j, a in zip(idx, got):
                 answers[j] = a

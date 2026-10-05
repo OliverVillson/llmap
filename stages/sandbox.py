@@ -136,7 +136,10 @@ def _limits(timeout: float):
         # Node and V8 reserve large virtual ranges up front, so RLIMIT_AS would kill them;
         # cap the data segment instead, which still stops runaway heap growth.
         mem = MEM_MB << 20
-        resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
+        try:
+            resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
+        except (ValueError, OSError):  # macOS can refuse it; CPU time and file size still apply
+            pass
         os.setsid()
     return apply
 

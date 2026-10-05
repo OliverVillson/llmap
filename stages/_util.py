@@ -75,6 +75,9 @@ class Config:
     code_eval_temperature: float = 0.2
     code_eval_limit: int | None = None  # problems per suite (quick runs); None = all
     code_eval_max_tokens: int = 4096
+    # Let the model think before answering (chat template enable_thinking). Thinking
+    # runs for thousands of tokens, so raise code_eval_max_tokens to ~24k-32k with it.
+    code_eval_thinking: bool = False
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
     # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
     # eval-only job (pipeline.py --only eval) score an uncompressed reference.
