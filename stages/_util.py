@@ -35,7 +35,7 @@ class Config:
     # Teacher answers with thinking on, and the thinking is kept in the training rows
     # (the assistant message's reasoning_content), so REAP calibrates on it and heal
     # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
-    # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50think).
+    # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50w95s-t).
     data_thinking: bool = False
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
