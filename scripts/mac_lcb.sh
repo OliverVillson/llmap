@@ -43,7 +43,16 @@ if [ ! -s "$GGUF" ]; then
   # Credentials last about an hour; a fresh login is only needed when this fails.
   evroc storage bucket get-s3-credentials >/dev/null 2>&1 || {
     evroc login; evroc config set-project "${EVROC_PROJECT:-mugge-11a5}"; evroc storage bucket get-s3-credentials >/dev/null; }
-  evroc storage bucket copy --from "bucket://mugge-library/gguf/qwen36-$MODEL.gguf" --to "$GGUF.part" >/dev/null
+  evroc storage bucket copy --from "bucket://mugge-library/gguf/qwen36-$MODEL.gguf" --to "$GGUF.part" \
+    >"$WORK/models/download.log" 2>&1 &
+  pid=$! t0=$(date +%s)
+  while kill -0 $pid 2>/dev/null; do  # how much has arrived, while it downloads
+    got=$(stat -f %z "$GGUF.part" 2>/dev/null || echo 0) secs=$(( $(date +%s) - t0 ))
+    awk -v b="$got" -v s="$secs" 'BEGIN { printf "\r  downloading: %s%dm%02ds", (b > 0 ? sprintf("%.1f GB so far, ", b / 1e9) : ""), s / 60, s % 60 }'
+    sleep 2
+  done
+  echo
+  wait $pid || { cat "$WORK/models/download.log"; exit 1; }
   mv "$GGUF.part" "$GGUF"
 fi
 ls -lh "$GGUF"
