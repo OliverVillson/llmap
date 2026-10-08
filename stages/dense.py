@@ -199,7 +199,9 @@ def ffn_report(job: Job, path: Path, layers: int) -> dict:
 
 # ---------- subcommands ----------
 
-def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
+def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path | None) -> None:
+    """The BF16 GGUF, and the 8-bit copy that writes the calibration answers when the
+    BF16 model doesn't fit the GPU (q8 is None when it does)."""
     stage = "gguf"
     lc = Path(job.config.llama_cpp)
     bf16.parent.mkdir(parents=True, exist_ok=True)
@@ -214,7 +216,7 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
             run([sys.executable, str(lc / "convert_hf_to_gguf.py"), str(hf_dir), "--outtype", "bf16",
                  "--outfile", str(tmp), *gguf_convert_flags(hf_dir)], stage)
         tmp.rename(bf16)
-    if not q8.exists():
+    if q8 and not q8.exists():
         emit(stage, pct=70, msg="the 8-bit copy")
         tmp = q8.with_name("tmp-" + q8.name)
         if DRY_RUN:
@@ -222,7 +224,7 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
         else:
             run([quantize.bin_path(job, "llama-quantize"), str(bf16), str(tmp), "Q8_0"], stage)
         tmp.rename(q8)
-    emit(stage, "done", 100, f"{bf16.name}, {q8.name}")
+    emit(stage, "done", 100, f"{bf16.name}, {q8.name}" if q8 else bf16.name)
 
 
 def calib_problems(bench_dir: str) -> list[dict]:
@@ -292,14 +294,21 @@ def free_vram_gb() -> float:
 
 
 def gpu_layers(tensors: list[Tensor], free_gb: float, reserve_gb: float = 6.0) -> int:
-    """How many BF16 layers fit on the GPU; llama.cpp runs the rest from RAM."""
+    """How many BF16 layers fit on the GPU; llama.cpp runs the rest from RAM. 999
+    when the whole model fits, so the output head is on the GPU too."""
     per: dict[int, float] = {}
+    rest = 0.0
     for t in tensors:
+        gb = t.n * (2 if t.dims > 1 else 4) / 1e9
         m = re.match(r"blk\.(\d+)\.", t.name)
         if m:
-            per[int(m[1])] = per.get(int(m[1]), 0.0) + t.n * (2 if t.dims > 1 else 4) / 1e9
+            per[int(m[1])] = per.get(int(m[1]), 0.0) + gb
+        else:
+            rest += gb
     if not per:
         return 0
+    if sum(per.values()) + rest <= free_gb - reserve_gb:
+        return 999
     layer = max(per.values())
     return max(0, min(len(per), int((free_gb - reserve_gb) / layer)))
 
@@ -317,7 +326,8 @@ def importance(job: Job, bf16: Path) -> Path:
         return out
     tensors, _ = read_tensors(job, bf16)
     ngl = gpu_layers(tensors, free_vram_gb())
-    emit(stage, pct=5, msg=f"{ngl} layers on the GPU, the rest in RAM; {IMATRIX_CHUNKS} chunks of 512 tokens")
+    where = "the whole model on the GPU" if ngl == 999 else f"{ngl} layers on the GPU, the rest in RAM"
+    emit(stage, pct=5, msg=f"{where}; {IMATRIX_CHUNKS} chunks of 512 tokens")
     tmp = out.with_name("tmp-" + out.name)  # imatrix wants a .gguf suffix
     proc = subprocess.Popen([quantize.bin_path(job, "llama-imatrix"), "-m", str(bf16), "-f", str(calib),
                              "-o", str(tmp), "-ngl", str(ngl), "-c", "512", "--chunks", str(IMATRIX_CHUNKS),
@@ -331,7 +341,7 @@ def importance(job: Job, bf16: Path) -> Path:
     if proc.wait() != 0:
         raise RuntimeError(f"llama-imatrix exited with {proc.returncode}")
     tmp.rename(out)
-    emit(stage, "done", 100, f"imatrix from {ngl} GPU layers")
+    emit(stage, "done", 100, "imatrix, all on the GPU" if ngl == 999 else f"imatrix from {ngl} GPU layers")
     return out
 
 
@@ -378,7 +388,7 @@ def main() -> None:
     g.add_argument("--job", required=True)
     g.add_argument("--hf", required=True)
     g.add_argument("--bf16", required=True)
-    g.add_argument("--q8", required=True)
+    g.add_argument("--q8", help="also make this 8-bit copy, for calibration when BF16 doesn't fit the GPU")
     c = sub.add_parser("calib")
     c.add_argument("--job", required=True)
     c.add_argument("--model", required=True)
@@ -393,7 +403,7 @@ def main() -> None:
     a = ap.parse_args()
     job = Job(a.job)
     if a.cmd == "gguf":
-        make_ggufs(job, Path(a.hf), Path(a.bf16), Path(a.q8))
+        make_ggufs(job, Path(a.hf), Path(a.bf16), Path(a.q8) if a.q8 else None)
     elif a.cmd == "calib":
         calibration(job, Path(a.model))
     elif a.cmd == "imatrix":

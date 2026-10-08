@@ -49,9 +49,10 @@ def test_quantize_flags_name_the_right_tensors():
 
 def test_gpu_layers_leaves_the_rest_in_ram():
     t = dense.synthetic_tensors()
-    assert dense.gpu_layers(t, 200.0) == L
+    assert dense.gpu_layers(t, 180.0) == 999  # a B200: the output head goes on the GPU too
+    assert dense.gpu_layers(t, 58.0) == L  # every layer fits, but not with the head and embeddings
     n = dense.gpu_layers(t, 45.0)
-    assert 30 < n < L  # ~0.84 GB per BF16 layer, 6 GB kept free
+    assert 30 < n < L  # ~0.76 GB per BF16 layer, 6 GB kept free
     assert dense.gpu_layers(t, 4.0) == 0
 
 

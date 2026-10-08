@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experiment 03 on one L40S: Qwen3.8-27B with thinking on, in one command.
+"""Experiment 03 on one B200 (or an L40S): Qwen3.8-27B with thinking on, in one command.
 
     python3 scripts/exp03.py          # everything; re-run after a stop and finished steps are skipped
     python3 scripts/exp03.py --list   # the steps and their time guesses
@@ -11,18 +11,20 @@ repair: each code10x recipe comes down to its bits (stages/dense.py).
   w18s  r50w95s's bits: feed-forward 2-8 bit by saliency averaging ~3.35, the rest
         q8_0, ~17.6 GB
 
-Steps (docs: /mnt/project-files/plan/l40s-exp03-qwen38.md):
+Steps (docs: /mnt/project-files/plan/exp03-qwen38.md):
   1. VM setup (scripts/setup_vm.sh) and the Qwen3.8-27B download
-  2. a BF16 GGUF (text only) and an 8-bit copy
-  3. calibration text: the 8-bit copy answers MultiPL-E and C problems with thinking on
-  4. the importance matrix on that text, the BF16 model split between GPU and RAM
+  2. a BF16 GGUF (text only), plus an 8-bit copy on an L40S
+  3. calibration text: the model answers MultiPL-E and C problems with thinking on
+     (BF16 on a B200, the 8-bit copy on an L40S)
+  4. the importance matrix on that text from the BF16 model (on an L40S split
+     between GPU and RAM)
   5. per recipe: quantize, LiveCodeBench v6 (2025-01..04) with thinking on and a 64k
      budget, then the 16k and 32k scores by cutting that thinking (stages/budget.py)
   6. both GGUFs and the job results to the mugge-library bucket
 
 There is no reference run: scores are compared with the model card's LiveCodeBench
 v6 90.3. Runs with the system python3 (stdlib only); each step sources .env.vm.
-Logs are in ~/exp03-logs.
+Logs are in ~/exp03-logs. The GPU's memory picks the plan (EXP03_VRAM_GB overrides it).
 """
 
 from __future__ import annotations
@@ -50,11 +52,36 @@ CARD_LCB = 0.903  # Qwen3.8-27B model card, LiveCodeBench v6
 MAX_TOKENS = 65536
 BUDGETS = [16384, 32768]
 CALIB_SUITES = ["multipl-e-py", "multipl-e-js", "multipl-e-ts", "multipl-e-cpp", "c-set"]
-# Answers at once. At 64k a slot's q8_0 KV cache is ~2.6 GB, so 8 fit on the
-# 48 GB card next to w18s's 17.6 GB; calibration answers are shorter.
-EVAL_SLOTS, CALIB_SLOTS = "8", "16"
+
+
+def vram_gb() -> float:
+    """The GPU's memory in GiB; EXP03_VRAM_GB overrides it (dry runs)."""
+    if os.environ.get("EXP03_VRAM_GB"):
+        return float(os.environ["EXP03_VRAM_GB"])
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, check=True).stdout
+        return int(out.split()[0]) / 1024
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
+        sys.exit("nvidia-smi found no GPU. On a new VM the driver may still be installing: "
+                 "wait for the reboot, SSH back in and re-run.")
+
+
+# The plan follows the GPU. A B200 (~180 GB) holds the BF16 model (~54 GB), so the
+# model itself writes the calibration answers and the importance pass runs fully on
+# the GPU. Scoring keeps the default 16-bit KV cache, ~4.8 GB per answer at 64k, for
+# 24 answers at once next to w18s's 17.6 GB. An L40S (48 GB) writes the calibration
+# answers with an 8-bit copy, splits the importance pass between GPU and RAM, and
+# scores with an 8-bit KV cache (~2.6 GB per answer) to fit 8 at once.
+B200 = vram_gb() >= 150
+EVAL_SLOTS, CALIB_SLOTS = ("24", "48") if B200 else ("8", "16")
+KV_TYPE = "" if B200 else "q8_0"
+CALIB_MODEL = BF16 if B200 else Q8
+MINUTES = ({"setup": 40, "download": 15, "gguf": 10, "calib": 15, "imatrix": 10, "eval": 90, "budgets": 10}
+           if B200 else
+           {"setup": 45, "download": 20, "gguf": 25, "calib": 35, "imatrix": 20, "eval": 360, "budgets": 30})
 # The thinking settings from the Qwen3.8 card: temperature 1.0, top_p 0.95, top_k 20.
-THINKING = {"teacher": MODEL, "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0, "eval_kv_type": "q8_0"}
+THINKING = {"teacher": MODEL, "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0, "eval_kv_type": KV_TYPE}
 
 
 def job_dir(recipe: str) -> Path:
@@ -116,12 +143,13 @@ def base_job() -> Path:
 
 def run_ggufs(step: Step) -> None:
     base_job()
-    sh(step, f"python -m stages.dense gguf --job {BASE} --hf {HF_DIR} --bf16 {BF16} --q8 {Q8}")
+    q8 = "" if B200 else f" --q8 {Q8}"
+    sh(step, f"python -m stages.dense gguf --job {BASE} --hf {HF_DIR} --bf16 {BF16}{q8}")
 
 
 def run_calib(step: Step) -> None:
     base_job()
-    sh(step, f"python -m stages.dense calib --job {BASE} --model {Q8}", {"LOBBOT_EVAL_SLOTS": CALIB_SLOTS})
+    sh(step, f"python -m stages.dense calib --job {BASE} --model {CALIB_MODEL}", {"LOBBOT_EVAL_SLOTS": CALIB_SLOTS})
 
 
 def run_imatrix(step: Step) -> None:
@@ -170,14 +198,15 @@ def run_upload(step: Step) -> None:
 
 def steps() -> list[Step]:
     return [
-        Step("VM setup", {"": 45}, run_setup, setup_done),
-        Step("Qwen3.8-27B download", {"": 20}, run_download, download_done, download_progress),
-        Step("BF16 GGUF and 8-bit copy", {"gguf": 25}, run_ggufs, Q8.exists),
-        Step("calibration answers (thinking on)", {"calib": 35}, run_calib,
-             (BASE / "work" / "calib-chat.txt").exists),
-        Step("importance pass (BF16, GPU + RAM)", {"imatrix": 20}, run_imatrix,
-             (BASE / "work" / "imatrix.gguf").exists),
-        *[Step(r, {"quantize": 5, "eval": 360, "budgets": 30}, run_recipe(r),
+        Step("VM setup", {"": MINUTES["setup"]}, run_setup, setup_done),
+        Step("Qwen3.8-27B download", {"": MINUTES["download"]}, run_download, download_done, download_progress),
+        Step("BF16 GGUF" if B200 else "BF16 GGUF and 8-bit copy", {"gguf": MINUTES["gguf"]}, run_ggufs,
+             CALIB_MODEL.exists),
+        Step(f"calibration answers ({'BF16' if B200 else '8-bit copy'})", {"calib": MINUTES["calib"]},
+             run_calib, (BASE / "work" / "calib-chat.txt").exists),
+        Step(f"importance pass (BF16, {'GPU' if B200 else 'GPU + RAM'})", {"imatrix": MINUTES["imatrix"]},
+             run_imatrix, (BASE / "work" / "imatrix.gguf").exists),
+        *[Step(r, {"quantize": 5, "eval": MINUTES["eval"], "budgets": MINUTES["budgets"]}, run_recipe(r),
                (job_dir(r) / ".done" / "budgets").exists) for r in RECIPES],
         Step("upload to the bucket", {"": 25}, run_upload, (LOGS / ".uploaded").exists),
     ]
@@ -220,7 +249,7 @@ def summary() -> str:
                     for row in table)
     return out + (f"\n\nof card: the 64k score against the card's LiveCodeBench v6 {CARD_LCB:.1%}, which used its own "
                   f"window and budget, so it is approximate. hit 64k: answers whose thinking reached the cap. "
-                  f"tok/s: per answer, with {EVAL_SLOTS} running at once.")
+                  f"tok/s: per answer, with {EVAL_SLOTS} running at once and {'a 16-bit' if not KV_TYPE else 'an 8-bit'} KV cache.")
 
 
 def main() -> int:
