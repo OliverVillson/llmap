@@ -13,7 +13,8 @@ Steps (docs: /mnt/project-files/plan/b200-exp02-thinking.md):
      and r50w95s-t is skipped
   3. side tests, thinking off, against r50w95s: 6 routed experts per token instead
      of 8 (r50w95s-k6 vs r50w95s-k8), and REAP keeping 37.5% of the experts at 9.5 GB
-     and 7.5 GB (r62w95s, r62w75s), healed on experiment 01's r50mix data
+     and 7.5 GB (r62w95s, r62w75s), healed on experiment 01's r50mix data. Each also
+     scores one fix turn (fix@1, Mugge's write-check-fix loop)
   4. r50w95s-t, the thinking model
   5. the r50w95s-t GGUF and the job results to the bucket
 
@@ -91,14 +92,16 @@ def write(p: Path, d: dict) -> None:
 
 
 def new_job(name: str, max_size_gb: float, **cfg) -> Path:
-    """A job with experiment 01 r50mix's config, taskspec and finished data stage, plus cfg."""
+    """A job with experiment 01 r50mix's config, taskspec and finished data stage, plus cfg.
+    Every side test also scores one fix turn (fix@1): if the harness loop wins back
+    what compression loses, we can compress harder."""
     d, src = J / f"code10x-{name}", M / "jobs" / "code10x-r50mix"
     for sub in (".done", "work", "out"):
         (d / sub).mkdir(parents=True, exist_ok=True)
     if not (d / ".done" / "data").exists():
         shutil.copytree(src / "data", d / "data", dirs_exist_ok=True)
         shutil.copy(src / ".done" / "data", d / ".done" / "data")
-    write(d / "config.json", {**read(src / "config.json"), **cfg})
+    write(d / "config.json", {**read(src / "config.json"), "code_eval_fix": True, **cfg})
     spec = read(src / "taskspec.json")
     spec["target"] = {**spec.get("target", {}), "max_size_gb": max_size_gb}
     write(d / "taskspec.json", spec)
@@ -398,8 +401,8 @@ def steps() -> list[Step]:
         Step("base model download", {"": 15}, run_download, download_done, download_progress),
         Step("jobs and the BF16 GGUF", {"": 15}, run_jobs, jobs_done),
         Step("ref-think eval", {"eval": 100}, run_ref_think, eval_done("ref-think")),
-        Step("r50w95s-k8 eval", {"eval": 15}, run_experts(8), eval_done("r50w95s-k8")),
-        Step("r50w95s-k6 eval", {"eval": 15}, run_experts(6), eval_done("r50w95s-k6")),
+        Step("r50w95s-k8 eval", {"eval": 20}, run_experts(8), eval_done("r50w95s-k8")),
+        Step("r50w95s-k6 eval", {"eval": 20}, run_experts(6), eval_done("r50w95s-k6")),
         Step("r62w95s", {"reap": 10, "heal": 30, "quantize": 10, "eval": 15, "package": 1}, run_r62w95s, eval_done("r62w95s")),
         Step("r62w75s", {"quantize": 10, "eval": 15, "package": 1}, run_r62w75s, eval_done("r62w75s")),
         Step("r50w95s-t", {"data": 90, "reap": 25, "heal": 180, "quantize": 20, "eval": 100, "package": 2},
@@ -416,7 +419,7 @@ SHORT = {"multipl-e-py": "py", "multipl-e-js": "js", "multipl-e-ts": "ts", "mult
 
 def summary() -> str:
     """pass@1 per suite, and the mean share of the reference (and its lowest suite)."""
-    head = ["model", "size"] + list(SHORT.values()) + ["vs", "of ref", "lowest", "tok/s"]
+    head = ["model", "size"] + list(SHORT.values()) + ["mean", "+1 fix", "vs", "of ref", "lowest", "tok/s"]
     table = [head]
     for name, ref in [("ref-think", ""), ("r50w95s-t", "ref-think"), ("r50w95s-k8", "ref"),
                       ("r50w95s-k6", "ref"), ("r62w95s", "ref"), ("r62w75s", "ref")]:
@@ -431,10 +434,12 @@ def summary() -> str:
         tps = c.get("tok_s_vm")
         table.append([name, f"{c.get('size_gb', 0):.1f} GB"]
                      + [f"{suites[k]['pass@1']:.0%}" if "pass@1" in suites.get(k, {}) else "–" for k in SHORT]
-                     + [ref if share else "", f"{share['mean']:.0%}" if share else "",
+                     + [f"{code['mean_pass@1']:.0%}" if code.get("mean_pass@1") is not None else "",
+                        f"{code['mean_fix@1']:.0%}" if code.get("mean_fix@1") is not None else "",
+                        ref if share else "", f"{share['mean']:.0%}" if share else "",
                         f"{share['min']:.0%}" if share else "", f"{tps:.0f}" if tps else ""])
     widths = [max(len(r[i]) for r in table) for i in range(len(head))]
-    return "\n".join("  ".join(x.ljust(widths[i]) if i in (0, len(SHORT) + 2) else x.rjust(widths[i])
+    return "\n".join("  ".join(x.ljust(widths[i]) if i in (0, len(SHORT) + 4) else x.rjust(widths[i])
                                for i, x in enumerate(r)).rstrip() for r in table)
 
 

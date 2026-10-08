@@ -369,6 +369,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 emit(STAGE, msg=f"{name}: {done}/{total} code answers", answered=done, total=total)
 
     emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
+    fixed: list = [None] * len(problems)
     for i in range(n):
         greedy = n == 1
         # Greedy decoding loops when thinking, so thinking always samples (Qwen's
@@ -391,19 +392,45 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 items.append((problems[j]["language"], code, tests))
             for j, r in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 ran[j] = r
+        fix_answers = [""] * len(problems)
+        if cfg.code_eval_fix and greedy:
+            todo = {j for j, r in enumerate(ran) if not r.passed and r.reason not in codebench.CANNOT_RUN}
+            with lock:
+                total += len(todo)
+            emit(STAGE, msg=f"{name}: one fix turn for {len(todo)} failed answers", answered=done, total=total)
+            for (system, timeout), idx in groups.items():
+                sel = [j for j in idx if j in todo]
+                if not sel:
+                    continue
+                got, tps = generate(system, [codebench.fix_prompt(problems[j], answers[j], ran[j]) for j in sel],
+                                    cfg.code_eval_max_tokens, temperature, seed, cfg.code_eval_thinking, answered)
+                speeds += [tps] if tps else []
+                items = []
+                for j, a in zip(sel, got):
+                    fix_answers[j] = a
+                    code, tests = codebench.assemble(problems[j], a)
+                    items.append((problems[j]["language"], code, tests))
+                for j, r in zip(sel, sandbox.run_many(items, timeout=timeout)):
+                    fixed[j] = r
         for j, (p, a, r) in enumerate(zip(problems, answers, ran)):
             results[j].append(r)
+            fix = ({"fix_passed": fixed[j].passed, "fix_reason": fixed[j].reason, "fix_output": fixed[j].output[-500:],
+                    "fix_answer": fix_answers[j]} if fixed[j] else {})
             rows.append({"suite": p["suite"], "id": p["id"], "sample": i, "passed": r.passed,
-                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j]})
+                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j], **fix})
     out_dir = job.path("work", "code_eval")
     out_dir.mkdir(exist_ok=True)
     write_jsonl(out_dir / f"{name}.jsonl", rows)
     suites = codebench.summarize(problems, results, cfg.code_eval_k)
+    fix = {}
+    if cfg.code_eval_fix and n == 1:
+        codebench.add_fix_scores(suites, problems, [rs[0] for rs in results], fixed)
+        fix = {"mean_fix@1": codebench.mean_fix1(suites)}
     for suite, v in suites.items():
         broken = sum(v["status"].get(r, 0) for r in ("missing_toolchain", "unsupported_language"))
         if broken:
             emit(STAGE, msg=f"{suite}: {broken} answers could not run ({', '.join(k for k in v['status'] if k in ('missing_toolchain', 'unsupported_language'))}); check the VM toolchains")
-    return {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": n,
+    return {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), **fix, "samples_per_problem": n,
             "tok_s_vm": round(statistics.median(speeds), 1) if speeds else None}
 
 
@@ -477,9 +504,11 @@ def run_stage(job: Job) -> None:
             if problems:
                 langs = {p["suite"]: p["language"] for p in problems}
                 suites = {s: {"language": lang, "n": sum(p["suite"] == s for p in problems), "status": {},
-                              **{f"pass@{k}": round(0.8 - 0.07 * i, 4) for k in cfg.code_eval_k}}
+                              **{f"pass@{k}": round(0.8 - 0.07 * i, 4) for k in cfg.code_eval_k},
+                              **({"fix@1": round(0.9 - 0.07 * i, 4)} if cfg.code_eval_fix else {})}
                           for s, lang in langs.items()}
-                code = {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": 1}
+                code = {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": 1,
+                        **({"mean_fix@1": codebench.mean_fix1(suites)} if cfg.code_eval_fix else {})}
             results[name] = {"agreement": 0.85 - 0.07 * i if inputs else None, "judge": None, "tok_s_vm": None,
                              "code": code, "samples": []}
     else:

@@ -252,6 +252,45 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     assert len(rows) == 4 and sum(r["passed"] for r in rows) == 1
 
 
+@needs("cc")
+def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monkeypatch):
+    """With code_eval_fix, a failed greedy answer gets one more call that shows the
+    code and the failing output; fix@1 counts first passes plus fixes."""
+    from stages import eval as ev
+    from stages._util import Job
+
+    job = Job(tmp_path)
+    job.config.code_eval_fix = True
+    probs = cb.load_suite("c-set", "/nonexistent", limit=3)
+    good = lambda p: "```c\n" + p["canonical"] + "\n```"
+    calls = []
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+        calls.append(prompts)
+        for _ in prompts:
+            on_answer()
+        if len(calls) == 1:  # first answers: 0 passes, 1 and 2 do not build
+            return [good(probs[0]), "```c\nint broken(\n```", "```c\nint nope;\n```"], None
+        return [good(probs[1]), "```c\nint still_nope;\n```"], None  # the fix turn
+
+    events = []
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    monkeypatch.setattr(ev, "emit", lambda stage, **kw: events.append(kw))
+    out = ev.code_eval(job, "cand", probs, "task system")
+    s = out["suites"]["c-set"]
+    assert s["pass@1"] == round(1 / 3, 4) and s["fix@1"] == round(2 / 3, 4) and s["fixed"] == 1
+    assert out["mean_fix@1"] == s["fix@1"]
+    fix_prompts = calls[1]
+    assert len(fix_prompts) == 2 and "int broken(" in fix_prompts[0] and "It did not build:" in fix_prompts[0]
+    assert "## Fix" in fix_prompts[1] and "int nope;" in fix_prompts[1]
+    failed = type("R", (), {"reason": "test_failed", "output": "x" * 5000})()
+    text = cb.fix_prompt(probs[0], "```c\nint f;\n```", failed)
+    assert "It failed its tests:\n…" + "x" * cb.FIX_OUTPUT_CHARS in text and "x" * 2001 not in text
+    rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
+    assert [r.get("fix_passed") for r in rows] == [None, True, False]
+    assert [(e["answered"], e["total"]) for e in events if "answered" in e][-1] == (5, 5)
+
+
 def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch):
     """Thinking loops under greedy decoding, so a single-sample thinking eval
     samples at 0.6 with a fixed seed and passes thinking through."""

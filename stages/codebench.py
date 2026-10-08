@@ -114,6 +114,41 @@ def extract_code(answer: str) -> str:
     return re.sub(r"^```[\w+#.-]*\s*\n|\n?```\s*$", "", answer.strip("\n").rstrip())  # keeps a body's indent
 
 
+FIX_OUTPUT_CHARS = 2000
+_FAILED = {"compile_error": "It did not build:", "timeout": "It ran out of time:"}
+
+
+def fix_prompt(p: dict, answer: str, failed) -> str:
+    """One repair turn, the way Mugge's harness asks for a fix: the task again, the
+    code as it is now and what the failing run printed, in one fresh message (no
+    chat history). The model answers with the whole code again. failed is the
+    sandbox Result of the first answer."""
+    lang = FENCE[p["language"]]
+    out = (failed.output or "").strip()
+    if len(out) > FIX_OUTPUT_CHARS:
+        out = "…" + out[-FIX_OUTPUT_CHARS:]
+    return (f"{build_prompt(p)}\n\n## Your code as it is now\n```{lang}\n{extract_code(answer)}\n```\n\n"
+            f"## Fix\n{_FAILED.get(failed.reason, 'It failed its tests:')}\n{out or '(no output)'}\n\n"
+            f"Reply with the whole fixed code in one ```{lang} code block.")
+
+
+def add_fix_scores(suites: dict, problems: list[dict], first: list, fixed: list) -> None:
+    """fix@1 per suite: the share of problems whose first answer passed, or whose one
+    fix did. first and fixed hold one sandbox Result (or None) per problem."""
+    for name, s in suites.items():
+        if "pass@1" not in s:
+            continue
+        idx = [j for j, p in enumerate(problems) if p["suite"] == name]
+        ok = sum(first[j].passed or bool(fixed[j] and fixed[j].passed) for j in idx)
+        s["fix@1"] = round(ok / len(idx), 4)
+        s["fixed"] = sum(bool(fixed[j] and fixed[j].passed) for j in idx)
+
+
+def mean_fix1(suites: dict) -> float | None:
+    vals = [s["fix@1"] for s in suites.values() if "fix@1" in s]
+    return round(sum(vals) / len(vals), 4) if vals else None
+
+
 _PREAMBLE = re.compile(r"^\s*(#include\b|using namespace\b|from \S+ import\b|import \S|const \w+ = require\()")
 
 

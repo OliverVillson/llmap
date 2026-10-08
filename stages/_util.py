@@ -83,6 +83,9 @@ class Config:
     # Let the model think before answering (chat template enable_thinking). Thinking
     # runs for thousands of tokens, so raise code_eval_max_tokens to ~24k-32k with it.
     code_eval_thinking: bool = False
+    # After a greedy answer fails, ask once more with the failing output (Mugge's fix
+    # call) and report fix@1 next to pass@1: what the harness loop gets in one repair.
+    code_eval_fix: bool = False
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). A llama-server override at serve time, so a top-k test needs no rebuild.
     eval_experts_used: int = 0
