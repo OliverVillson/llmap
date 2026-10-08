@@ -12,9 +12,12 @@ answer's whole thinking kept (Config.code_eval_budgets), gives every shorter one
              cut at B, as a capped run would have returned it
 
 Writes work/code_eval/<name>-<B>.jsonl per budget and adds code.budgets to
-out/eval.json: {"<B>": {"mean_pass@1", "suites", "how": {same, cut, truncated}}},
-with the long run itself under its own budget ("how" there counts the answers
-whose thinking hit the cap).
+out/eval.json: {"<B>": {"mean_pass@1", "suites", "how": {same, cut, truncated},
+"errors"}}, with the long run itself under its own budget ("how" there counts the
+answers whose thinking hit the cap). "errors" counts answers the server never
+returned (each is retried once, then scored as a failure). Redone answers are kept
+in work/code_eval/<name>-<B>.redo.jsonl as they come, so a re-run after a stop
+only redoes the rest.
 
     python -m stages.budget --job <job>    # after the eval stage
 """
@@ -50,7 +53,7 @@ def classify(row: dict, reasoning_tokens: int, budget: int) -> str:
 def _post(path: str, body: dict) -> dict:
     import httpx
 
-    r = httpx.post(f"http://127.0.0.1:{ev.PORT}{path}", json=body, timeout=300)
+    r = httpx.post(f"http://127.0.0.1:{ev.PORT}{path}", json=body, timeout=600)
     r.raise_for_status()
     return r.json()
 
@@ -75,21 +78,42 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
     how = {b: [classify(r, len(t), b) for r, t in zip(rows, toks)] for b in budgets}
     total = sum(h != "same" for b in budgets for h in how[b])
     done, lock = 0, threading.Lock()
-    emit(STAGE, msg=f"{name}: {total} answers to redo across {len(budgets)} budgets", answered=0, total=max(total, 1))
+    job.path("work", "code_eval").mkdir(exist_ok=True)
+    kept = {b: job.path("work", "code_eval", f"{name}-{b}.redo.jsonl") for b in budgets}
+    cached = {b: {x["key"]: x["answer"] for x in read_jsonl(f)} if f.exists() else {} for b, f in kept.items()}
+    errors = dict.fromkeys(budgets, 0)
+    emit(STAGE, msg=f"{name}: {total} answers to redo across {len(budgets)} budgets"
+                    + (f", {sum(map(len, cached.values()))} kept from before" if any(cached.values()) else ""),
+         answered=0, total=max(total, 1))
 
-    def redo(b: int, j: int) -> str:
-        nonlocal done
+    def answer_at(b: int, j: int) -> str:
         r, p = rows[j], problems[j]
         if how[b][j] == "cut":
             messages = [{"role": "system", "content": system_of(p)}, {"role": "user", "content": prompt(p)}]
             answer, _ = ev.force_answer(messages, detokenize(toks[j][:b]), "length",
                                         cfg.code_eval_thinking_temperature, sampling)
-        else:
-            answer = detokenize(tokenize(r.get("answer") or "")[:max(0, b - len(toks[j]) - CLOSE_TOKENS)])
+            return answer
+        return detokenize(tokenize(r.get("answer") or "")[:max(0, b - len(toks[j]) - CLOSE_TOKENS)])
+
+    def redo(b: int, j: int) -> str:
+        nonlocal done
+        key = f"{rows[j]['suite']}|{rows[j]['id']}"
+        answer = cached[b].get(key)
+        for attempt in range(2 if answer is None else 0):
+            try:
+                answer = answer_at(b, j)
+                break
+            except Exception as e:  # e.g. a timeout under load: once more, then it counts as failed
+                print(f"[{STAGE}] {key} at {b} tokens, try {attempt + 1}: {e}", flush=True)
         with lock:
+            if answer is None:
+                errors[b] += 1
+            elif key not in cached[b]:
+                with open(kept[b], "a") as f:
+                    f.write(json.dumps({"key": key, "answer": answer}) + "\n")
             done += 1
             emit(STAGE, msg=f"{name}: {done}/{total} redone", answered=done, total=total)
-        return answer
+        return answer or ""
 
     out = {}
     for b in budgets:
@@ -107,13 +131,13 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
                 items.append((problems[j]["language"], code, tests))
             for j, res in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 results[j] = res
-        job.path("work", "code_eval").mkdir(exist_ok=True)
         write_jsonl(job.path("work", "code_eval", f"{name}-{b}.jsonl"),
                     [{"suite": r["suite"], "id": r["id"], "how": how[b][j], "passed": results[j].passed,
                       "reason": results[j].reason, **({"answer": redone[j]} if j in redone else {})}
                      for j, r in enumerate(rows)])
         suites = codebench.summarize(problems, [[x] for x in results], [1])
-        out[str(b)] = {"mean_pass@1": codebench.mean_pass1(suites), "suites": suites, "how": dict(Counter(how[b]))}
+        out[str(b)] = {"mean_pass@1": codebench.mean_pass1(suites), "suites": suites, "how": dict(Counter(how[b])),
+                       "errors": errors[b]}
     return out
 
 
@@ -147,7 +171,8 @@ def run_stage(job: Job) -> None:
             finally:
                 ev.stop(proc)
         scores[str(cfg.code_eval_max_tokens)] = {"mean_pass@1": code.get("mean_pass@1"), "suites": code.get("suites"),
-                                                 "how": {"hit the cap": sum(r.get("forced") == "length" for r in rows)}}
+                                                 "how": {"hit the cap": sum(r.get("forced") == "length" for r in rows)},
+                                                 "errors": sum(bool(r.get("error")) for r in rows)}
         code["budgets"] = scores
         cand["code"] = code
     report_path.write_text(json.dumps(report, indent=2))

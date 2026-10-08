@@ -168,7 +168,9 @@ def force_answer(messages: list[dict], reasoning: str, why: str, temperature: fl
     import httpx
 
     prompt = thinking_prompt(messages) + reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
-    r = httpx.post(f"http://127.0.0.1:{PORT}/completion", timeout=max(600, ANSWER_TOKENS / 4), json={
+    # An hour: with many answers at once, a long prompt to read in and up to
+    # ANSWER_TOKENS to write can take well over the ~17 minutes this used to allow.
+    r = httpx.post(f"http://127.0.0.1:{PORT}/completion", timeout=3600, json={
         "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
     r.raise_for_status()
     body = r.json()

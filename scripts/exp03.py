@@ -218,7 +218,7 @@ def summary() -> str:
     """LiveCodeBench pass@1 at each thinking budget, and the 64k score as a share of the card."""
     head = ["model", "size", "FFN bits"] + [f"LCB {b // 1024}k" for b in BUDGETS + [MAX_TOKENS]] \
         + ["of card", "hit 64k", "tok/s"]
-    table = [head]
+    table, lost = [head], []
     for r in RECIPES:
         d, name = job_dir(r), f"qwen38-{r}"
         alloc = read(d / "work" / "allocation.json") if (d / "work" / "allocation.json").exists() else {}
@@ -240,6 +240,8 @@ def summary() -> str:
         scores = [lcb(b) for b in BUDGETS + [MAX_TOKENS]]
         top, tps = scores[-1], c.get("tok_s_vm")
         hit = (budgets.get(str(MAX_TOKENS)) or {}).get("how", {}).get("hit the cap")
+        lost += [f"{name} {int(b) // 1024}k: {s['errors']}" for b, s in sorted(budgets.items(), key=lambda kv: int(kv[0]))
+                 if s.get("errors")]
         table.append([name, f"{c.get('size_gb') or alloc.get('size_gb') or 0:.1f} GB", f"{alloc['ffn_bits']:.2f}" if alloc.get("ffn_bits") else ""]
                      + [f"{s:.0%}" if s is not None else "–" for s in scores]
                      + [f"{top / CARD_LCB:.0%}" if top is not None else "", "" if hit is None else str(hit),
@@ -249,7 +251,8 @@ def summary() -> str:
                     for row in table)
     return out + (f"\n\nof card: the 64k score against the card's LiveCodeBench v6 {CARD_LCB:.1%}, which used its own "
                   f"window and budget, so it is approximate. hit 64k: answers whose thinking reached the cap. "
-                  f"tok/s: per answer, with {EVAL_SLOTS} running at once and {'a 16-bit' if not KV_TYPE else 'an 8-bit'} KV cache.")
+                  f"tok/s: per answer, with {EVAL_SLOTS} running at once and {'a 16-bit' if not KV_TYPE else 'an 8-bit'} KV cache."
+                  + (f"\nAnswers the server never returned, scored as failures: {', '.join(lost)}." if lost else ""))
 
 
 def main() -> int:

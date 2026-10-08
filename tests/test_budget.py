@@ -49,12 +49,45 @@ def test_rescore_cuts_thinking_and_retests(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
         sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, _ in items])
     out = budget.rescore(job, "m", rows, probs, [10])["10"]
-    assert out["how"] == {"same": 2, "cut": 1, "truncated": 1}
+    assert out["how"] == {"same": 2, "cut": 1, "truncated": 1} and out["errors"] == 0
     assert seen["cut"] == (" ".join(["w"] * 10), "length", 0.6)
     got = {r["id"]: r for r in read_jsonl(tmp_path / "work/code_eval/m-10.jsonl")}
     assert got["p2"]["answer"] == "good x" and got["p2"]["passed"]  # 10 - 6 thinking - 2 closing words
     assert not got["p1"]["passed"] and got["p0"]["passed"] and not got["p3"]["passed"]
     assert out["suites"]["livecodebench"]["pass@1"] == 0.5
+
+    # A re-run keeps the answers redone before and asks the server for none of them.
+    def no_server(*a, **k):
+        raise AssertionError("asked again")
+
+    monkeypatch.setattr(ev, "force_answer", no_server)
+    assert budget.rescore(job, "m", rows, probs, [10])["10"]["suites"]["livecodebench"]["pass@1"] == 0.5
+
+
+def test_rescore_retries_once_then_scores_a_lost_answer_as_failed(tmp_path, monkeypatch):
+    job = Job(tmp_path)
+    (tmp_path / "taskspec.json").write_text((ROOT / "examples/python-utils.code.taskspec.json").read_text())
+    job.config = Config(code_eval_thinking=True, code_eval_budgets=[10], code_eval_max_tokens=100)
+    probs = [{"suite": "livecodebench", "id": f"p{i}", "language": "python", "prompt": "q", "stub": "", "entry": "",
+              "tests": [{"input": "", "output": ""}]} for i in range(2)]
+    rows = [{"suite": "livecodebench", "id": f"p{i}", "tokens": 40, "reasoning": " ".join(["w"] * 30), "answer": "good",
+             "passed": True} for i in range(2)]
+    monkeypatch.setattr(budget, "tokenize", lambda text: text.split())
+    monkeypatch.setattr(budget, "detokenize", lambda toks: " ".join(toks))
+    calls = []
+
+    def force(*args, **kwargs):
+        calls.append(1)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(ev, "force_answer", force)
+    monkeypatch.setattr(budget.codebench, "assemble", lambda p, a, code=None: (a, ""))
+    monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
+        sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, _ in items])
+    out = budget.rescore(job, "m", rows, probs, [10])["10"]
+    assert out["errors"] == 2 and len(calls) == 4  # two tries each
+    assert out["suites"]["livecodebench"]["pass@1"] == 0.0
+    assert not (tmp_path / "work/code_eval/m-10.redo.jsonl").exists()  # nothing kept, so a re-run tries again
 
 
 def test_budget_stage_adds_scores_to_eval_json(tmp_path, monkeypatch):
