@@ -15,9 +15,9 @@ Steps (docs: /mnt/project-files/plan/b200-exp02-thinking.md):
      of 8 (r50w95s-k6 vs r50w95s-k8), and REAP keeping 37.5% of the experts at 9.5 GB
      and 7.5 GB (r62w95s, r62w75s), healed on experiment 01's r50mix data. Each also
      scores one fix turn (fix@1, Mugge's write-check-fix loop)
-  4. Mugge's own loop, with EXP02_MUGGE=1: r50w95s asked the way Mugge asks
-     (r50w95s-mugge), and the same recipe healed on Mugge-shaped data (r50w95s-h,
-     stages/harness.py)
+  4. Mugge's own loop: r50w95s asked the way Mugge asks (r50w95s-mugge), and the same
+     recipe healed on Mugge-shaped data (r50w95s-h, stages/harness.py). EXP02_MUGGE=0
+     leaves it out.
   5. r50w95s-t, the thinking model
   6. the r50w95s-t GGUF and the job results to the bucket
 
@@ -55,8 +55,8 @@ SIDE = ["r50w95s-k8", "r50w95s-k6", "r62w95s", "r62w75s"]
 # The model card says 80.4 with thinking on and exp01's ref got 45% with it off, so
 # a score near the thinking-off one means the thinking eval is broken.
 LCB_FLOOR = 0.55
-# Step 4 (Mugge's own loop) runs only with EXP02_MUGGE=1, until Oliver picks it for this run.
-WITH_MUGGE = os.environ.get("EXP02_MUGGE", "0") == "1"
+# Step 4 (Mugge's own loop); EXP02_MUGGE=0 leaves it out.
+WITH_MUGGE = os.environ.get("EXP02_MUGGE", "1") == "1"
 WIDTH = 30
 TTY = sys.stdout.isatty()
 
@@ -410,16 +410,17 @@ def run_thinking_model(step: Step) -> None:
 
 
 def run_upload(step: Step) -> None:
-    """Every job file under 200 MB (configs, data, scores) and the r50w95s-t GGUF."""
+    """Every job file under 200 MB (configs, data, scores) and the r50w95s-t and r50w95s-h GGUFs."""
     if not evroc_ok():
         raise Skip("no evroc login. Log in (runbook step D) and re-run to upload.")
     tar = NVME / "exp02-jobs.tar"
     sh(step, f"mkdir -p {J}/_logs_exp02 && cp {LOGS}/*.log {J}/_logs_exp02/ && cd {J.parent} && "
              f"find {J.name} -type f -size -200M -print0 | tar cf {tar} --null -T -")
     up = [(tar, "exp02/exp02-jobs.tar")]
-    gguf = J / "code10x-r50w95s-t/out/model.gguf"
-    if gguf.exists():
-        up.append((gguf, "gguf/qwen36-r50w95s-t.gguf"))
+    for name in ("r50w95s-t", "r50w95s-h"):
+        gguf = J / f"code10x-{name}/out/model.gguf"
+        if gguf.exists():
+            up.append((gguf, f"gguf/qwen36-{name}.gguf"))
     for src, key in up:
         sh(step, f"evroc storage bucket get-s3-credentials >/dev/null && "
                  f"evroc storage bucket copy --from {src} --to {BUCKET}/{key}")
