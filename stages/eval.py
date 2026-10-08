@@ -69,6 +69,45 @@ def limits(cfg) -> tuple[int, int]:
     return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", longest + 4096))
 
 
+def gguf_arch(path: str) -> str:
+    """general.architecture from a GGUF header (no gguf-py, which a Mac lacks)."""
+    import struct
+
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with open(path, "rb") as f:
+        magic, _version, _tensors, n_kv = struct.unpack("<4sIQQ", f.read(24))
+        if magic != b"GGUF":
+            raise ValueError(f"{path} is not a GGUF file")
+
+        def string() -> bytes:
+            return f.read(struct.unpack("<Q", f.read(8))[0])
+
+        def skip(vtype: int) -> None:
+            if vtype == 8:
+                string()
+            elif vtype == 9:
+                item, n = struct.unpack("<IQ", f.read(12))
+                for _ in range(n):
+                    skip(item)
+            else:
+                f.seek(sizes[vtype], 1)
+
+        for _ in range(n_kv):
+            key, vtype = string(), struct.unpack("<I", f.read(4))[0]
+            if key == b"general.architecture" and vtype == 8:
+                return string().decode()
+            skip(vtype)
+    raise ValueError(f"{path} has no general.architecture")
+
+
+def server_args(cfg, gguf: str) -> list[str]:
+    args = ["-m", gguf, "-ngl", "999", "--host", "127.0.0.1", "--port", str(PORT),
+            "-c", str(SLOTS * limits(cfg)[1]), "-np", str(SLOTS), "--jinja"]
+    if cfg.eval_experts_used:
+        args += ["--override-kv", f"{gguf_arch(gguf)}.expert_used_count=int:{cfg.eval_experts_used}"]
+    return args
+
+
 def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     import httpx
 
@@ -77,10 +116,7 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
         binary = Path(shutil.which("llama-server"))  # e.g. Homebrew's llama.cpp on a Mac
     log_path = job.path("work", f"llama-server-{name}.log")
     log = open(log_path, "w")
-    proc = subprocess.Popen(
-        [str(binary), "-m", gguf, "-ngl", "999", "--host", "127.0.0.1", "--port", str(PORT),
-         "-c", str(SLOTS * limits(job.config)[1]), "-np", str(SLOTS), "--jinja"],
-        stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([str(binary), *server_args(job.config, gguf)], stdout=log, stderr=subprocess.STDOUT)
     for _ in range(600):
         if proc.poll() is not None:
             raise RuntimeError(f"llama-server exited for {name}:\n" + "\n".join(log_path.read_text().splitlines()[-20:]))

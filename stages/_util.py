@@ -83,6 +83,9 @@ class Config:
     # Let the model think before answering (chat template enable_thinking). Thinking
     # runs for thousands of tokens, so raise code_eval_max_tokens to ~24k-32k with it.
     code_eval_thinking: bool = False
+    # Route each token to this many experts instead of the model's own count (0 keeps
+    # it). A llama-server override at serve time, so a top-k test needs no rebuild.
+    eval_experts_used: int = 0
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
     # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
     # eval-only job (pipeline.py --only eval) score an uncompressed reference.

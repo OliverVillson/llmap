@@ -307,6 +307,34 @@ def test_eval_context_fits_code_answer_cap(monkeypatch):
     assert ev.limits(cfg) == (2048, 24576 + ev.ANSWER_TOKENS + 4096)
 
 
+def write_gguf_header(path, kvs):
+    """A GGUF with only a header: kvs is [(key, value type, packed value)]."""
+    import struct
+
+    s = lambda b: struct.pack("<Q", len(b)) + b
+    body = b"".join(s(k.encode()) + struct.pack("<I", t) + v for k, t, v in kvs)
+    path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kvs)) + body)
+
+
+def test_experts_override_names_the_files_architecture(tmp_path):
+    import struct
+
+    from stages import eval as ev
+    from stages._util import Config
+
+    gguf = tmp_path / "m.gguf"
+    s = lambda b: struct.pack("<Q", len(b)) + b
+    write_gguf_header(gguf, [
+        ("general.alignment", 4, struct.pack("<I", 32)),
+        ("general.tags", 9, struct.pack("<IQ", 8, 2) + s(b"a") + s(b"bc")),  # arrays are skipped too
+        ("general.architecture", 8, s(b"qwen35moe")),
+    ])
+    assert ev.gguf_arch(str(gguf)) == "qwen35moe"
+    assert "--override-kv" not in ev.server_args(Config(), str(gguf))
+    args = ev.server_args(Config(eval_experts_used=6), str(gguf))
+    assert args[args.index("--override-kv") + 1] == "qwen35moe.expert_used_count=int:6"
+
+
 def test_split_reasoning_handles_split_and_inline_tags():
     from stages.eval import split_reasoning
 
