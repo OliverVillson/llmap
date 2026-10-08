@@ -184,6 +184,7 @@ def allocate(
     proj_energy: dict[str, list[float]] | None = None,
     max_gb_per_token: float | None = None,
     static: dict[str, str] = STATIC,
+    static_gb: float | None = None,
 ) -> list[LayerBits]:
     """Greedy rate-distortion allocation: start every layer at `floor`, then
     repeatedly buy the upgrade with the largest drop in weighted error
@@ -192,6 +193,10 @@ def allocate(
     laptop tok/s).
 
     ffn_down may sit up to two steps above gate/up; gate/up never above down.
+    static_gb replaces the size of everything outside the allocated tensors when
+    it is measured rather than computed from the shape (stages/dense.py: a dense
+    model's feed-forward tensors as one "expert", with hybrid attention layers
+    that static_size_gb does not model).
     """
     lo, hi = LADDER.index(floor), LADDER.index(ceiling)
     sens = sensitivities(shape.n_layers, importance, proj_energy)
@@ -204,7 +209,7 @@ def allocate(
     proj = shape.expert_params_per_proj
 
     def size() -> float:
-        s = static_size_gb(shape, static)
+        s = static_size_gb(shape, static) if static_gb is None else static_gb
         for i in range(shape.n_layers):
             s += _gb(2 * proj, BPW[LADDER[gate_up[i]]]) + _gb(proj, BPW[LADDER[down[i]]])
         return s

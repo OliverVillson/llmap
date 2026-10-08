@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup for the evroc B200 VM (Ubuntu 24.04).
+# One-time setup for an evroc GPU VM, B200 or L40S (Ubuntu 24.04).
 #   NVME=/mnt/nvme bash scripts/setup_vm.sh
 # Creates two venvs (vLLM and training, which pin different torch versions),
 # builds llama.cpp with CUDA, and downloads the teacher and student weights to
@@ -9,7 +9,7 @@ set -euo pipefail
 NVME=${NVME:-/mnt/nvme}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TEACHER=${TEACHER:-Qwen/Qwen3-30B-A3B-Instruct-2507}
-STUDENT=${STUDENT:-google/gemma-4-E4B-it}
+STUDENT=${STUDENT-google/gemma-4-E4B-it}  # STUDENT= (empty) skips it
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -51,7 +51,9 @@ else
 say "Downloading weights in the background (log: $NVME/download.log)"
 (
   uv tool run --from huggingface_hub hf download "$TEACHER" --local-dir "$NVME/models/${TEACHER##*/}"
-  uv tool run --from huggingface_hub hf download "$STUDENT" --local-dir "$NVME/models/${STUDENT##*/}"
+  if [ -n "$STUDENT" ]; then
+    uv tool run --from huggingface_hub hf download "$STUDENT" --local-dir "$NVME/models/${STUDENT##*/}"
+  fi
   echo DOWNLOADS_DONE
 ) > "$NVME/download.log" 2>&1 &
 fi
@@ -97,7 +99,9 @@ if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
 fi
 export PATH="/usr/local/cuda/bin:$PATH"
 [ -d "$NVME/llama.cpp" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$NVME/llama.cpp"
-cmake -S "$NVME/llama.cpp" -B "$NVME/llama.cpp/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=100 -DCMAKE_BUILD_TYPE=Release >/dev/null
+# The GPU's own architecture: 100 on a B200, 89 on an L40S.
+CUDA_ARCH=${CUDA_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.[:space:]')}
+cmake -S "$NVME/llama.cpp" -B "$NVME/llama.cpp/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$NVME/llama.cpp/build" -j"$(nproc)" --target llama-quantize llama-imatrix llama-server llama-cli
 # llama.cpp pins a CPU-only torch; installing it as-is replaces the venv's CUDA torch.
 grep -v -E '^(torch|--extra-index-url)' "$NVME/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt" > /tmp/convert-reqs.txt

@@ -105,6 +105,8 @@ def server_args(cfg, gguf: str) -> list[str]:
             "-c", str(SLOTS * limits(cfg)[1]), "-np", str(SLOTS), "--jinja"]
     if cfg.eval_experts_used:
         args += ["--override-kv", f"{gguf_arch(gguf)}.expert_used_count=int:{cfg.eval_experts_used}"]
+    if cfg.eval_kv_type:  # a quantized V cache needs flash attention
+        args += ["-ctk", cfg.eval_kv_type, "-ctv", cfg.eval_kv_type, "-fa", "on"]
     return args
 
 
@@ -144,33 +146,52 @@ def split_reasoning(message: dict) -> tuple[str, str]:
     return reasoning.strip(), content.strip()
 
 
+def sampling_params(seed: int | None, thinking: bool) -> dict:
+    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
+
+
+def thinking_prompt(messages: list[dict]) -> str:
+    """The chat-template prompt up to and including the opened thinking."""
+    import httpx
+
+    prompt = httpx.post(f"http://127.0.0.1:{PORT}/apply-template", timeout=60, json={
+        "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
+    if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
+        prompt += "<think>\n"
+    return prompt
+
+
+def force_answer(messages: list[dict], reasoning: str, why: str, temperature: float,
+                 sampling: dict) -> tuple[str, int]:
+    """Closes the thinking (with Qwen's early-stop line when it ran out of budget)
+    and has the model answer on top of it: (answer, tokens)."""
+    import httpx
+
+    prompt = thinking_prompt(messages) + reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
+    r = httpx.post(f"http://127.0.0.1:{PORT}/completion", timeout=max(600, ANSWER_TOKENS / 4), json={
+        "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
+    r.raise_for_status()
+    body = r.json()
+    return (body.get("content") or "").strip(), body.get("tokens_predicted") or 0
+
+
 def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
              temperature: float = 0.0, seed: int | None = None,
-             thinking: bool = False, on_answer=None, infos: list | None = None) -> tuple[list[str], float | None]:
+             thinking: bool = False, on_answer=None, infos: list | None = None,
+             keep_reasoning: bool = False) -> tuple[list[str], float | None]:
     """Answers plus the median decode speed (tok/s) the server reported.
 
     With thinking, a thinking that ends without an answer (out of max_tokens, or
     the model stopped inside it) is closed and the model is asked for the answer
     on top of it, with up to ANSWER_TOKENS more. on_answer() is called from a
     worker thread as each answer finishes. infos, when given, receives one dict
-    per input: finish reason, tokens, reasoning size and how the answer came."""
+    per input: finish reason, tokens, reasoning size and how the answer came, and
+    with keep_reasoning the whole thinking."""
     import httpx
 
     url = f"http://127.0.0.1:{PORT}"
     speeds: list[float] = []
-    sampling = {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
-
-    def force_answer(messages: list[dict], reasoning: str, why: str) -> tuple[str, int]:
-        prompt = httpx.post(f"{url}/apply-template", timeout=60, json={
-            "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
-        if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
-            prompt += "<think>\n"
-        prompt += reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
-        r = httpx.post(f"{url}/completion", timeout=max(600, ANSWER_TOKENS / 4), json={
-            "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
-        r.raise_for_status()
-        body = r.json()
-        return (body.get("content") or "").strip(), body.get("tokens_predicted") or 0
+    sampling = sampling_params(seed, thinking)
 
     def one(text: str) -> tuple[str, dict]:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
@@ -188,14 +209,14 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
                 choice = body["choices"][0]
                 reasoning, answer = split_reasoning(choice["message"])
                 info = {"finish": choice.get("finish_reason"), "tokens": (body.get("usage") or {}).get("completion_tokens"),
-                        "reasoning_chars": len(reasoning), "forced": None}
+                        "reasoning_chars": len(reasoning), "forced": None, **({"reasoning": reasoning} if keep_reasoning else {})}
                 if thinking and not answer:
                     # "length": out of budget; "stop": the model ended inside its thinking;
                     # "no_reasoning": nothing came back at all (then this is a thinking-off answer).
                     info["forced"] = "no_reasoning" if not reasoning else "length" if info["finish"] == "length" else "stop"
                     info["reasoning_tail"] = reasoning[-1500:]
                     try:
-                        answer, info["forced_tokens"] = force_answer(messages, reasoning, info["forced"])
+                        answer, info["forced_tokens"] = force_answer(messages, reasoning, info["forced"], temperature, sampling)
                     except Exception as e:  # keep the thinking; don't redo it
                         print(f"[eval] answer after thinking failed: {e}", flush=True)
                         info["error"] = str(e)[:300]
@@ -339,6 +360,21 @@ def code_problems(job: Job, held: list[dict]) -> list[dict]:
     return problems
 
 
+def prompting(cfg, task_system: str):
+    """(system_of(p), prompt(p), code_of(p, answer)) for the configured code eval format."""
+    mugge = cfg.code_eval_format == "harness"
+    prompt = (lambda p: harness.pack_text(codebench.ticket(p))) if mugge else codebench.build_prompt
+    code_of = codebench.harness_code if mugge else lambda p, a: codebench.extract_code(a)
+
+    def system_of(p: dict) -> str:
+        # Held-out rows of a merged multi-language job carry their own task prompt.
+        if mugge:
+            return harness.SYSTEM
+        return (p.get("system") or task_system) if p["suite"] == "heldout" else codebench.SYSTEM
+
+    return system_of, prompt, code_of
+
+
 # LiveCodeBench runs every test case in one process, so it gets a longer budget.
 SUITE_TIMEOUT = {"livecodebench": max(sandbox.TIMEOUT, 60.0)}
 
@@ -352,14 +388,10 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     cfg = job.config
     n = max(cfg.code_eval_samples, max(cfg.code_eval_k))
     mugge = cfg.code_eval_format == "harness"
-    prompt = (lambda p: harness.pack_text(codebench.ticket(p))) if mugge else codebench.build_prompt
-    code_of = codebench.harness_code if mugge else lambda p, a: codebench.extract_code(a)
+    system_of, prompt, code_of = prompting(cfg, task_system)
     groups: dict[tuple[str, float], list[int]] = {}
     for j, p in enumerate(problems):
-        # Held-out rows of a merged multi-language job carry their own task prompt.
-        system = (harness.SYSTEM if mugge else (p.get("system") or task_system) if p["suite"] == "heldout"
-                  else codebench.SYSTEM)
-        groups.setdefault((system, SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT)), []).append(j)
+        groups.setdefault((system_of(p), SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT)), []).append(j)
     results: list[list] = [[] for _ in problems]
     rows, speeds = [], []
     done, total, lock = 0, n * len(problems), threading.Lock()
@@ -375,15 +407,17 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     fixed: list = [None] * len(problems)
     for i in range(n):
         greedy = n == 1
-        # Greedy decoding loops when thinking, so thinking always samples (Qwen's
-        # recommended 0.6 for the single-sample case), seeded for repeatability.
-        temperature = cfg.code_eval_temperature if not greedy else 0.6 if cfg.code_eval_thinking else 0.0
+        # Greedy decoding loops when thinking, so thinking always samples (at the
+        # model card's temperature), seeded for repeatability.
+        temperature = (cfg.code_eval_temperature if not greedy
+                       else cfg.code_eval_thinking_temperature if cfg.code_eval_thinking else 0.0)
         seed = i if cfg.code_eval_thinking or not greedy else None
         answers, infos = [""] * len(problems), [{}] * len(problems)
         for (system, _), idx in groups.items():
             got_info: list[dict] = []
             got, tps = generate(system, [prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                temperature, seed, cfg.code_eval_thinking, answered, infos=got_info)
+                                temperature, seed, cfg.code_eval_thinking, answered, infos=got_info,
+                                **({"keep_reasoning": True} if cfg.code_eval_budgets else {}))
             speeds += [tps] if tps else []
             for j, a, info in zip(idx, got, got_info or [{}] * len(idx)):
                 answers[j], infos[j] = a, info

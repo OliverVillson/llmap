@@ -90,6 +90,13 @@ class Config:
     # Let the model think before answering (chat template enable_thinking). Thinking
     # runs for thousands of tokens, so raise code_eval_max_tokens to ~24k-32k with it.
     code_eval_thinking: bool = False
+    # Sampling temperature for one thinking answer per problem (greedy decoding loops
+    # when thinking). The Qwen3 cards say 0.6; Qwen3.8's says 1.0.
+    code_eval_thinking_temperature: float = 0.6
+    # Keep each answer's whole thinking in work/code_eval/<name>.jsonl and re-score it
+    # cut at these token budgets (stages/budget.py), so one long run also gives the
+    # scores at every shorter budget.
+    code_eval_budgets: list[int] = field(default_factory=list)
     # After a greedy answer fails, ask once more with the failing output (Mugge's fix
     # call) and report fix@1 next to pass@1: what the harness loop gets in one repair.
     code_eval_fix: bool = False
@@ -99,6 +106,9 @@ class Config:
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). A llama-server override at serve time, so a top-k test needs no rebuild.
     eval_experts_used: int = 0
+    # llama-server KV cache type at eval ("q8_0" halves it, so more long thinking
+    # answers run at once); "" keeps llama.cpp's f16.
+    eval_kv_type: str = ""
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
     # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
     # eval-only job (pipeline.py --only eval) score an uncompressed reference.
