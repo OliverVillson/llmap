@@ -77,11 +77,13 @@ def write_messages(t: Ticket) -> list[dict]:
     return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": pack_text(t)}]
 
 
+def fix_text(t: Ticket, command: str, output: str) -> str:
+    """The fix call's message; t.current holds the files that failed."""
+    return f"{pack_text(t)}\n\n## Fix\nThis command failed:\n$ {command}\n{output}\n\nReturn your files fixed so it passes."
+
+
 def fix_messages(t: Ticket, command: str, output: str) -> list[dict]:
-    """t.current holds the files that failed."""
-    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": (
-        f"{pack_text(t)}\n\n## Fix\nThis command failed:\n$ {command}\n{output}\n\n"
-        "Return your files fixed so it passes.")}]
+    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": fix_text(t, command, output)}]
 
 
 def tail(text: str, n: int = 4000) -> str:

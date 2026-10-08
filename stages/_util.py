@@ -93,6 +93,9 @@ class Config:
     # After a greedy answer fails, ask once more with the failing output (Mugge's fix
     # call) and report fix@1 next to pass@1: what the harness loop gets in one repair.
     code_eval_fix: bool = False
+    # "plain": benchmark prompts as published. "harness": every problem is asked the way
+    # Mugge's harness asks (stages/harness.py: a ticket in, files out), fixes too.
+    code_eval_format: str = "plain"
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). A llama-server override at serve time, so a top-k test needs no rebuild.
     eval_experts_used: int = 0

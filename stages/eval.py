@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from common.progress import emit
-from stages import codebench, data, sandbox
+from stages import codebench, data, harness, sandbox
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "eval"
@@ -351,12 +351,15 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     codebench.SYSTEM."""
     cfg = job.config
     n = max(cfg.code_eval_samples, max(cfg.code_eval_k))
+    mugge = cfg.code_eval_format == "harness"
+    prompt = (lambda p: harness.pack_text(codebench.ticket(p))) if mugge else codebench.build_prompt
+    code_of = codebench.harness_code if mugge else lambda p, a: codebench.extract_code(a)
     groups: dict[tuple[str, float], list[int]] = {}
     for j, p in enumerate(problems):
         # Held-out rows of a merged multi-language job carry their own task prompt.
-        key = ((p.get("system") or task_system) if p["suite"] == "heldout" else codebench.SYSTEM,
-               SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT))
-        groups.setdefault(key, []).append(j)
+        system = (harness.SYSTEM if mugge else (p.get("system") or task_system) if p["suite"] == "heldout"
+                  else codebench.SYSTEM)
+        groups.setdefault((system, SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT)), []).append(j)
     results: list[list] = [[] for _ in problems]
     rows, speeds = [], []
     done, total, lock = 0, n * len(problems), threading.Lock()
@@ -379,7 +382,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         answers, infos = [""] * len(problems), [{}] * len(problems)
         for (system, _), idx in groups.items():
             got_info: list[dict] = []
-            got, tps = generate(system, [codebench.build_prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
+            got, tps = generate(system, [prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
                                 temperature, seed, cfg.code_eval_thinking, answered, infos=got_info)
             speeds += [tps] if tps else []
             for j, a, info in zip(idx, got, got_info or [{}] * len(idx)):
@@ -388,7 +391,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         for (_, timeout), idx in groups.items():
             items = []
             for j in idx:
-                code, tests = codebench.assemble(problems[j], answers[j])
+                code, tests = codebench.assemble(problems[j], answers[j], code_of(problems[j], answers[j]))
                 items.append((problems[j]["language"], code, tests))
             for j, r in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 ran[j] = r
@@ -402,13 +405,15 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 sel = [j for j in idx if j in todo]
                 if not sel:
                     continue
-                got, tps = generate(system, [codebench.fix_prompt(problems[j], answers[j], ran[j]) for j in sel],
+                fix_text = ((lambda j: codebench.harness_fix_text(problems[j], code_of(problems[j], answers[j]), ran[j]))
+                            if mugge else (lambda j: codebench.fix_prompt(problems[j], answers[j], ran[j])))
+                got, tps = generate(system, [fix_text(j) for j in sel],
                                     cfg.code_eval_max_tokens, temperature, seed, cfg.code_eval_thinking, answered)
                 speeds += [tps] if tps else []
                 items = []
                 for j, a in zip(sel, got):
                     fix_answers[j] = a
-                    code, tests = codebench.assemble(problems[j], a)
+                    code, tests = codebench.assemble(problems[j], a, code_of(problems[j], a))
                     items.append((problems[j]["language"], code, tests))
                 for j, r in zip(sel, sandbox.run_many(items, timeout=timeout)):
                     fixed[j] = r

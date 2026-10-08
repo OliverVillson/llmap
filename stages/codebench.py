@@ -114,6 +114,51 @@ def extract_code(answer: str) -> str:
     return re.sub(r"^```[\w+#.-]*\s*\n|\n?```\s*$", "", answer.strip("\n").rstrip())  # keeps a body's indent
 
 
+def ticket(p: dict, code: str = ""):
+    """A problem as a Mugge ticket (stages/harness.py), for code_eval_format "harness":
+    the problem is the context, the answer file is the one owned file and the sandbox's
+    build and run are the acceptance commands. code is the file as it is now."""
+    from stages import harness, sandbox
+
+    lang, name = p["language"], LANGUAGE_NAMES[p["language"]]
+    src, cmds, where = sandbox.layout(lang)
+    if p.get("raw_prompt"):
+        task = p["prompt"]
+    elif p.get("stub"):
+        task = f"Complete the following {name} function.\n\n```{FENCE[lang]}\n{p['prompt'].rstrip()}\n```"
+    elif isinstance(p["tests"], list):
+        task = f"{p['prompt'].rstrip()}\n\nWrite a complete {name} program that reads the input from stdin and writes the answer to stdout."
+        where = f"{src} is run on the test inputs and its output is compared with the expected output."
+    else:
+        task = p["prompt"].rstrip()
+    first = next((l.strip() for l in task.splitlines() if l.strip() and not l.startswith("```")), "Write the code")
+    pid = str(p["id"]) if str(p["id"]).startswith(p["suite"]) else f"{p['suite']}-{p['id']}"
+    return harness.Ticket(id=re.sub(r"[^\w.-]+", "-", pid), title=(f"Implement {p['entry']}" if p.get("entry") else first)[:80],
+                          context=f"{task.rstrip()}\n\n{where}", owns=[src], acceptance=cmds,
+                          current={src: code} if code else {})
+
+
+def harness_code(p: dict, answer: str) -> str:
+    """The owned file out of a harness-format answer; a lone fenced block also counts."""
+    from stages import harness, sandbox
+
+    files, _ = harness.parse_files(answer)
+    src = sandbox.layout(p["language"])[0]
+    if src in files:
+        return files[src]
+    return next(iter(files.values())) if len(files) == 1 else extract_code(answer)
+
+
+def harness_fix_text(p: dict, code: str, failed) -> str:
+    """Mugge's fix call for a failed harness-format answer."""
+    from stages import harness, sandbox
+
+    _, cmds, _ = sandbox.layout(p["language"])
+    cmd = cmds[0] if failed.reason == "compile_error" and len(cmds) > 1 else cmds[-1]
+    out = harness.tail(failed.output or "", FIX_OUTPUT_CHARS) or ("(timed out)" if failed.reason == "timeout" else "(no output)")
+    return harness.fix_text(ticket(p, code), cmd, out)
+
+
 FIX_OUTPUT_CHARS = 2000
 _FAILED = {"compile_error": "It did not build:", "timeout": "It ran out of time:"}
 
@@ -163,12 +208,13 @@ def _strip_main(code: str, lang: str) -> str:
     return code
 
 
-def assemble(p: dict, answer: str) -> tuple[str, str]:
-    """(code, tests) for sandbox.run_tests: the answer's code, completed with the
-    stub when the model only wrote a body and with the stub's imports/includes
-    up front; stdin/stdout cases become a Python harness around the answer."""
+def assemble(p: dict, answer: str, code: str | None = None) -> tuple[str, str]:
+    """(code, tests) for sandbox.run_tests: the answer's code (or code, when the caller
+    already took it out of the answer), completed with the stub when the model only
+    wrote a body and with the stub's imports/includes up front; stdin/stdout cases
+    become a Python harness around the answer."""
     lang = p["language"]
-    code = extract_code(answer)
+    code = extract_code(answer) if code is None else code
     tests = p["tests"]
     if isinstance(tests, str) and (lang == "python" or re.search(r"\bmain\s*\(", tests)):
         code = _strip_main(code, lang)  # the tests are the entry point (stdin programs keep theirs)

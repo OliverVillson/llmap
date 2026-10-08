@@ -77,3 +77,34 @@ def test_data_stage_adds_write_and_fix_rows(tmp_path):
         assert "/tmp/" not in user  # the sandbox's temp dir is not in the output
         task = user.split("Role: implement\n\n", 1)[1].split("\n\nThe tests are appended", 1)[0]
         assert task not in held
+
+
+@pytest.mark.skipif(not __import__("shutil").which("cc"), reason="needs cc")
+def test_code_eval_in_mugge_format(tmp_path, monkeypatch):
+    """code_eval_format "harness": problems go out as tickets with Mugge's system prompt,
+    answers come back as files, and the fix turn is Mugge's fix call."""
+    from stages import codebench as cb
+    from stages import eval as ev
+    from stages._util import Job
+
+    job = Job(tmp_path)
+    job.config.code_eval_fix, job.config.code_eval_format = True, "harness"
+    probs = cb.load_suite("c-set", "/nonexistent", limit=2)
+    calls = []
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+        calls.append((system, prompts))
+        if len(calls) == 1:
+            return [harness.render_files({"prog.c": probs[0]["canonical"]}), harness.render_files({"prog.c": "int broken("})], None
+        return [harness.render_files({"prog.c": probs[1]["canonical"]}, "fixed the syntax")], None
+
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    out = ev.code_eval(job, "cand", probs, "task system")
+    s = out["suites"]["c-set"]
+    assert s["pass@1"] == 0.5 and s["fix@1"] == 1.0
+    (sys1, first), (sys2, fixes) = calls
+    assert sys1 == sys2 == harness.SYSTEM
+    assert first[0].startswith("Ticket: c-set-") and "Files you own (write each in full): prog.c" in first[0]
+    assert "\nTitle: Implement " in first[0] and probs[0]["prompt"].strip()[:40] in first[0]
+    assert len(fixes) == 1 and "--- prog.c\nint broken(\n" in fixes[0]
+    assert "## Fix\nThis command failed:\n$ cc -std=c11" in fixes[0] and "/tmp/" not in fixes[0]
