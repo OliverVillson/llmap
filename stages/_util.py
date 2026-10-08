@@ -37,6 +37,13 @@ class Config:
     # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
     # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50w95s-t).
     data_thinking: bool = False
+    # Mugge-shaped heal data for code specs (stages/harness.py): this share of the train
+    # rows is asked the way Mugge's harness asks (context pack in, files out), and
+    # data_fix_rows fix rows are added: a failed draft and its error in, the teacher's
+    # passing fix out. Drafts are the teacher's own failed answers, topped up with
+    # extra answers sampled at temperature 1.0. 0 and 0 = plain rows only.
+    data_harness_share: float = 0.0
+    data_fix_rows: int = 0
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.

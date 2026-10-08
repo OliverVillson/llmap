@@ -69,6 +69,15 @@ def program(language: str, code: str, tests: str) -> str:
     return f"{code.rstrip()}\n\n{tests.strip()}\n"
 
 
+def layout(language: str) -> tuple[str, list[str], str]:
+    """(file the answer is saved as, the commands that check it, where the tests are),
+    for prompts that show a run the way Mugge's harness does (stages/harness.py)."""
+    src, build, run = _LANG[language]
+    where = (f"The tests are in {_SPLIT_TESTS[language]}, built and linked with {src}." if language in _SPLIT_TESTS
+             else f"The tests are appended to {src} when these run.")
+    return src, [" ".join(c) for c in (build, run) if c], where
+
+
 def run_tests(language: str, code: str, tests: str, timeout: float = TIMEOUT) -> Result:
     if language not in _LANG:
         return Result(False, "unsupported_language", language)
@@ -155,7 +164,7 @@ def _exec(argv: list[str], d: str, timeout: float) -> tuple[int | None, str]:
         _kill(p)
         out, _ = p.communicate()
         rc = None
-    text = out.decode("utf-8", "replace")
+    text = out.decode("utf-8", "replace").replace(d + os.sep, "")  # "prog.py", not the temp dir path
     return rc, text[-MAX_OUTPUT:]
 
 

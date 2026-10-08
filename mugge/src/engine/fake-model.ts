@@ -1,12 +1,14 @@
 /**
  * A fake OpenAI-compatible model server for tests and CI: it answers each ticket from canned
  * solutions (spike/solutions/<ticket>.json), found by the `Ticket: <id>` line of the prompt.
+ * Calls with a JSON schema get JSON back; coder calls get the files as plain fenced files.
  * `flaky` tickets get a useless first answer so the fix loop runs; `latencyMs` stands in for
  * inference time so the parallel speed-up shows.
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorkerOutput } from '../tickets/schema.ts';
+import { renderFiles } from './files.ts';
 
 export interface FakeOptions {
   solutions: Record<string, WorkerOutput>;
@@ -53,7 +55,7 @@ export function startFakeModel(o: FakeOptions) {
         if (o.broken?.includes(id)) answer = { files: {}, note: 'no idea' };
         else if (o.flaky?.includes(id) && n === 1) answer = { files: {}, note: 'first try, wrote nothing' };
         else answer = o.solutions[id] ?? { files: {}, note: `no canned answer for ${id || 'this prompt'}` };
-        const content = JSON.stringify(answer);
+        const content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
         return Response.json({
           id: `fake-${requests}`,
           object: 'chat.completion',

@@ -1,0 +1,62 @@
+{
+  "parse": [
+    {
+      "why": "plain answer with a note",
+      "answer": "src/a.py\n```python\nx = 1\n```\n\nNote: set x",
+      "files": {
+        "src/a.py": "x = 1\n"
+      },
+      "note": "set x"
+    },
+    {
+      "why": "markdown around the paths, two files",
+      "answer": "**src/a.ts**\n```ts\nexport const a = 1;\n```\n### `b.c`:\n```c\nint b;\n```",
+      "files": {
+        "src/a.ts": "export const a = 1;\n",
+        "b.c": "int b;\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a longer fence keeps a fence inside the content",
+      "answer": "README.md\n````markdown\n# T\n```sh\nmake\n```\n````",
+      "files": {
+        "README.md": "# T\n```sh\nmake\n```\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "thinking is ignored, and a block with no path line is not a file",
+      "answer": "<think>\nfoo.py\n```python\nbad\n```\n</think>\nHere is the fix:\n```python\nloose\n```\nfoo.py\n```python\ngood\n```",
+      "files": {
+        "foo.py": "good\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "an empty file",
+      "answer": "empty.txt\n```\n```",
+      "files": {
+        "empty.txt": ""
+      },
+      "note": ""
+    }
+  ],
+  "render": [
+    {
+      "files": {
+        "a.py": "x = 1\n\n"
+      },
+      "note": "n",
+      "answer": "a.py\n```python\nx = 1\n```\n\nNote: n"
+    },
+    {
+      "files": {
+        "doc.md": "```js\nx\n```\n",
+        "Makefile": "all:\n"
+      },
+      "note": "",
+      "answer": "doc.md\n````markdown\n```js\nx\n```\n````\n\nMakefile\n```\nall:\n```"
+    }
+  ]
+}

@@ -72,7 +72,10 @@ describe('architect and planner', () => {
     decisions: [{ decision: 'C for the core', why: 'speed' }],
     questions: [],
   };
-  const canned = (value: unknown): Inference => ({ complete: async () => ({ value: value as any, raw: '', promptTokens: 1, completionTokens: 1, ms: 1 }) });
+  const canned = (value: unknown): Inference => ({
+    complete: async () => ({ value: value as any, raw: '', promptTokens: 1, completionTokens: 1, ms: 1 }),
+    text: async () => ({ value: '', raw: '', promptTokens: 1, completionTokens: 1, ms: 1 }),
+  });
   test('design renders ARCHITECTURE.md', async () => {
     const got = await design(canned(d), 'shortener');
     const md = architectureMarkdown(got);

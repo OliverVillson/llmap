@@ -1,6 +1,7 @@
 /**
  * Client for any OpenAI-compatible chat endpoint: vLLM or SGLang on the project VM, or a
- * hosted service later. Output is constrained to a JSON schema so every answer parses.
+ * hosted service later. Planner calls are constrained to a JSON schema so every answer parses;
+ * coder calls are plain text (files.ts), since code escaped inside JSON comes out worse.
  *
  * Specialists are LoRA adapters served under their own model names by vLLM
  * (`--lora-modules coder-ts=/models/adapters/coder-ts`), so routing is only a name lookup.
@@ -36,7 +37,10 @@ export interface InferenceConfig {
 }
 
 export interface Inference {
+  /** An answer constrained to `schema`, parsed. */
   complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>>;
+  /** A free-text answer. */
+  text(model: string, messages: ChatMessage[], maxTokens: number): Promise<Completion<string>>;
 }
 
 export class OpenAICompatible implements Inference {
@@ -47,6 +51,11 @@ export class OpenAICompatible implements Inference {
   }
 
   async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>> {
+    const c = await this.text(model, messages, maxTokens, schema);
+    return { ...c, value: parseJsonAnswer<T>(c.raw) };
+  }
+
+  async text(model: string, messages: ChatMessage[], maxTokens: number, schema?: object): Promise<Completion<string>> {
     const started = performance.now();
     const body: Record<string, unknown> = {
       model: this.served(model),
@@ -55,8 +64,8 @@ export class OpenAICompatible implements Inference {
       temperature: this.cfg.temperature ?? 0.2,
     };
     const guided = this.cfg.guided ?? 'response_format';
-    if (guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
-    else if (guided === 'guided_json') body.guided_json = schema;
+    if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
+    else if (schema && guided === 'guided_json') body.guided_json = schema;
     const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
@@ -67,7 +76,7 @@ export class OpenAICompatible implements Inference {
     const data: any = await res.json();
     const raw: string = data?.choices?.[0]?.message?.content ?? '';
     return {
-      value: parseJsonAnswer<T>(raw),
+      value: raw,
       raw,
       promptTokens: data?.usage?.prompt_tokens ?? 0,
       completionTokens: data?.usage?.completion_tokens ?? 0,

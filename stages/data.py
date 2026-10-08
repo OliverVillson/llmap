@@ -35,10 +35,11 @@ import random
 import re
 import statistics
 import time
+import zlib
 from dataclasses import dataclass
 
 from common.progress import emit
-from stages import sandbox, testgen
+from stages import harness, sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "data"
@@ -331,6 +332,11 @@ class DryRunTeacher:
             return Gen("```json\n" + json.dumps([
                 {"input": f"{e.input} (case {self.rng.randrange(10**9)})", "tests": e.tests} for e in picks
             ]) + "\n```", True)
+        if prompt.startswith("Ticket: "):  # a harness fix call: the task's seed code, as a file
+            own = max((e for e in seeds if e.input in prompt), key=lambda e: len(e.input), default=seeds[0])
+            src = re.search(r"^Files you own \(write each in full\): (\S+)", prompt, re.M).group(1)
+            code = own.output if self.rng.random() < 0.8 else next(e for e in seeds if e is not own).output
+            return Gen(harness.render_files({src: code}, "fixed"), True)
         own = max((e for e in seeds if prompt.startswith(e.input)), key=lambda e: len(e.input), default=seeds[0])
         r = self.rng.random()
         if r < 0.05:
@@ -456,6 +462,7 @@ def run_stage(job: Job) -> None:
             candidates.append((s, ans, reasoning))
         else:
             (ext_rows if is_ext else rows).append(_row(sys, s, ans, reasoning))
+    failed = []  # code specs: (input, answer, sandbox result) that did not pass, drafts for fix rows
     if spec.is_code:
         emit(STAGE, pct=95, msg=f"running tests for {len(candidates)} answers")
         results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a, _ in candidates])
@@ -464,6 +471,7 @@ def run_stage(job: Job) -> None:
                 rows.append(_row(sys, s, a, reasoning))
             else:
                 drops[res.reason] = drops.get(res.reason, 0) + 1
+                failed.append((s, a, res))
         n_pass = len(rows)
         stats.update(sandbox_runs=len(candidates),
                      sandbox_pass_rate=round(n_pass / len(candidates), 3) if candidates else 0.0)
@@ -484,6 +492,9 @@ def run_stage(job: Job) -> None:
         n_held = min(n_held, len(rows) // 5)
         heldout, train = rows[:n_held], rows[n_held:n_held + cfg.n_generate]
         stats["heldout_source"] = "teacher"
+    if spec.is_code and (cfg.data_harness_share > 0 or cfg.data_fix_rows > 0):
+        held = {r["messages"][1]["content"] for r in heldout}
+        train = harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats)
     if not think:  # the human seeds have no thinking, and every row of a thinking model thinks
         train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
     if think:
@@ -500,6 +511,87 @@ def run_stage(job: Job) -> None:
     print(f"[data] stats {json.dumps(stats)}", flush=True)
     job.mark_done(STAGE, {"train": len(train), "heldout": len(heldout)})
     emit(STAGE, "done", 100, f"{len(train)} train, {len(heldout)} held out")
+
+
+def task_ticket(spec, task: str, code: str = "") -> harness.Ticket:
+    """A code task as a Mugge ticket: the task is the context, the answer file is the one
+    owned file and the sandbox's build and run are the acceptance commands."""
+    src, cmds, where = sandbox.layout(spec.language)
+    title = task.strip().splitlines()[0][:80] if task.strip() else "Write the code"
+    return harness.Ticket(id=f"T{zlib.crc32(norm_key(task).encode()) % 100000:05d}", title=title,
+                          context=f"{task.strip()}\n\n{where}", owns=[src], acceptance=cmds,
+                          current={src: code} if code else {})
+
+
+def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) -> list[dict]:
+    """Mugge-shaped rows (stages/harness.py). data_harness_share of the plain train rows become
+    write calls with the same answer, as a file. Then up to data_fix_rows fix rows: a failed
+    draft and the failing command's output in, the teacher's fix out when it passes the tests.
+    Drafts are the teacher's failed answers, topped up with answers sampled at temperature 1.0
+    (thinking off). Held-out inputs never become drafts."""
+    src, cmds, _ = sandbox.layout(spec.language)
+    think = cfg.data_thinking
+    out, n_write = [], 0
+    for r in train:
+        m = r["messages"]
+        if rng.random() < cfg.data_harness_share:
+            msgs = harness.write_messages(task_ticket(spec, m[1]["content"]))
+            out.append(_chat_row(msgs, harness.render_files({src: m[2]["content"]}), m[2].get("reasoning_content", "")))
+            n_write += 1
+        else:
+            out.append(r)
+    stats["harness_write_rows"] = n_write
+    if cfg.data_fix_rows <= 0:
+        return out
+
+    pool = [d for d in failed if d[0] not in held and d[2].reason in ("compile_error", "test_failed", "timeout")]
+    need = int(cfg.data_fix_rows * 1.5)  # room for fixes that fail too
+    if len(pool) < need:
+        pick = [s for s in tests_of if s not in held]
+        rng.shuffle(pick)
+        pick = pick[:min(len(pick), 4 * (need - len(pool)))]  # ~15-25% of quick drafts fail (a guess)
+        shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
+        gens = chat_batched(teacher, [answer_messages(spec, shots, s) for s in pick], 1.0, answer_max_tokens(cfg),
+                            95, 96, "quick drafts to fix")
+        drafts = [(s, a) for s, g in zip(pick, gens) for a, _ in [check_answer(g.text, g.finished, False, True)] if a]
+        res = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a in drafts])
+        pool += [(s, a, r) for (s, a), r in zip(drafts, res)
+                 if not r.passed and r.reason in ("compile_error", "test_failed", "timeout")]
+    rng.shuffle(pool)
+    pool = pool[:need]
+    convs = []
+    for s, a, r in pool:
+        cmd = cmds[0] if r.reason == "compile_error" and len(cmds) > 1 else cmds[-1]
+        out_text = harness.tail(r.output, 2000) or ("(timed out)" if r.reason == "timeout" else "(no output)")
+        convs.append(harness.fix_messages(task_ticket(spec, s, a), cmd, out_text))
+    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 96, 98,
+                        "teacher fixing drafts" + (" (thinking)" if think else ""), think)
+    drops, fixes = {}, []
+    for (s, _, _), conv, g in zip(pool, convs, gens):
+        reasoning, text = split_think(g.text) if think else ("", g.text)
+        files, note = harness.parse_files(text)
+        why = ("truncated" if not g.finished else "no_thinking_end" if think and not reasoning
+               else "no_file" if not files.get(src, "").strip() else "")
+        if why:
+            drops[why] = drops.get(why, 0) + 1
+        else:
+            fixes.append((s, conv, files[src], note, reasoning))
+    res = sandbox.run_many([(spec.language, code, tests_of[s]) for s, _, code, _, _ in fixes])
+    n_fix = 0
+    for (s, conv, code, note, reasoning), r in zip(fixes, res):
+        if not r.passed:
+            drops[r.reason] = drops.get(r.reason, 0) + 1
+        elif n_fix < cfg.data_fix_rows:
+            out.append(_chat_row(conv, harness.render_files({src: code}, note), reasoning))
+            n_fix += 1
+    stats.update(fix_pool=len(pool), fix_rows=n_fix, fix_dropped=drops)
+    print(f"[data] harness: {n_write} write rows, {n_fix} fix rows from {len(pool)} drafts, dropped {drops}", flush=True)
+    return out
+
+
+def _chat_row(msgs: list[dict], answer: str, reasoning: str = "") -> dict:
+    return {"messages": [*msgs, {"role": "assistant", "content": answer,
+                                 **({"reasoning_content": reasoning} if reasoning else {})}]}
 
 
 def check_seeds(spec) -> None:
