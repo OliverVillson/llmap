@@ -200,8 +200,6 @@ def ffn_report(job: Job, path: Path, layers: int) -> dict:
 # ---------- subcommands ----------
 
 def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
-    from stages.moe_utils import gguf_convert_flags
-
     stage = "gguf"
     lc = Path(job.config.llama_cpp)
     bf16.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +209,8 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
         if DRY_RUN:
             tmp.write_bytes(b"GGUF dry run")
         else:
+            from stages.moe_utils import gguf_convert_flags  # imports torch
+
             run([sys.executable, str(lc / "convert_hf_to_gguf.py"), str(hf_dir), "--outtype", "bf16",
                  "--outfile", str(tmp), *gguf_convert_flags(hf_dir)], stage)
         tmp.rename(bf16)
@@ -226,11 +226,13 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path) -> None:
 
 
 def calib_problems(bench_dir: str) -> list[dict]:
-    out = []
+    """Spread over each suite, and interleaved, so the imatrix's first chunks already
+    cover every language when the text is longer than IMATRIX_CHUNKS."""
+    picks = []
     for suite, n in CALIB_SUITES.items():
         rows = codebench.load_suite(suite, bench_dir)
-        out += rows[:: max(1, len(rows) // n)][:n]
-    return out
+        picks.append(rows[:: max(1, len(rows) // n)][:n])
+    return [p for i in range(max(map(len, picks))) for rows in picks if i < len(rows) for p in [rows[i]]]
 
 
 def chat_text(prompt: str, reasoning: str, answer: str) -> str:

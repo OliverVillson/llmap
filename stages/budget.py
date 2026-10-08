@@ -107,6 +107,7 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
                 items.append((problems[j]["language"], code, tests))
             for j, res in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 results[j] = res
+        job.path("work", "code_eval").mkdir(exist_ok=True)
         write_jsonl(job.path("work", "code_eval", f"{name}-{b}.jsonl"),
                     [{"suite": r["suite"], "id": r["id"], "how": how[b][j], "passed": results[j].passed,
                       "reason": results[j].reason, **({"answer": redone[j]} if j in redone else {})}
