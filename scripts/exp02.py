@@ -15,8 +15,11 @@ Steps (docs: /mnt/project-files/plan/b200-exp02-thinking.md):
      of 8 (r50w95s-k6 vs r50w95s-k8), and REAP keeping 37.5% of the experts at 9.5 GB
      and 7.5 GB (r62w95s, r62w75s), healed on experiment 01's r50mix data. Each also
      scores one fix turn (fix@1, Mugge's write-check-fix loop)
-  4. r50w95s-t, the thinking model
-  5. the r50w95s-t GGUF and the job results to the bucket
+  4. Mugge's own loop, with EXP02_MUGGE=1: r50w95s asked the way Mugge asks
+     (r50w95s-mugge), and the same recipe healed on Mugge-shaped data (r50w95s-h,
+     stages/harness.py)
+  5. r50w95s-t, the thinking model
+  6. the r50w95s-t GGUF and the job results to the bucket
 
 Runs with the system python3 (stdlib only); each step sources .env.vm. Logs are in
 ~/exp02-logs. The bucket steps need an evroc login first; without one they are
@@ -52,6 +55,8 @@ SIDE = ["r50w95s-k8", "r50w95s-k6", "r62w95s", "r62w75s"]
 # The model card says 80.4 with thinking on and exp01's ref got 45% with it off, so
 # a score near the thinking-off one means the thinking eval is broken.
 LCB_FLOOR = 0.55
+# Step 4 (Mugge's own loop) runs only with EXP02_MUGGE=1, until Oliver picks it for this run.
+WITH_MUGGE = os.environ.get("EXP02_MUGGE", "0") == "1"
 WIDTH = 30
 TTY = sys.stdout.isatty()
 
@@ -91,14 +96,19 @@ def write(p: Path, d: dict) -> None:
     p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
 
 
-def new_job(name: str, max_size_gb: float, **cfg) -> Path:
+def new_job(name: str, max_size_gb: float, data: bool = True, **cfg) -> Path:
     """A job with experiment 01 r50mix's config, taskspec and finished data stage, plus cfg.
     Every side test also scores one fix turn (fix@1): if the harness loop wins back
-    what compression loses, we can compress harder."""
+    what compression loses, we can compress harder. data=False makes its own data from
+    the same tasks (r50mix's cached task list, when the bucket tar has it)."""
     d, src = J / f"code10x-{name}", M / "jobs" / "code10x-r50mix"
     for sub in (".done", "work", "out"):
         (d / sub).mkdir(parents=True, exist_ok=True)
-    if not (d / ".done" / "data").exists():
+    if not data:
+        for f in ("data_scenarios.json", "data_inputs.jsonl"):
+            if (src / "work" / f).exists() and not (d / "work" / f).exists():
+                shutil.copy(src / "work" / f, d / "work" / f)
+    elif not (d / ".done" / "data").exists():
         shutil.copytree(src / "data", d / "data", dirs_exist_ok=True)
         shutil.copy(src / ".done" / "data", d / ".done" / "data")
     write(d / "config.json", {**read(src / "config.json"), "code_eval_fix": True, **cfg})
@@ -362,6 +372,28 @@ def run_r62w75s(step: Step) -> None:
     sh(step, f"python pipeline.py --job {dst} --from quantize", {"LOBBOT_EVAL_SLOTS": "16"})
 
 
+def run_mugge_baseline(step: Step) -> None:
+    """r50w95s asked the way Mugge asks (tickets in, files out, Mugge's fix call)."""
+    needs_exp01()
+    new_job("r50w95s-mugge", 9.5, eval_candidates={"r50w95s": str(M / "qwen36-r50w95s.gguf")},
+            code_eval_format="harness", code_eval_ref="")
+    sh(step, f"python pipeline.py --job {J}/code10x-r50w95s-mugge --only eval", {"LOBBOT_EVAL_SLOTS": "16"})
+
+
+def run_mugge_model(step: Step) -> None:
+    """r50w95s's recipe healed on Mugge-shaped data: half the rows as write calls, plus
+    600 fix rows; scored the same way as r50w95s-mugge."""
+    needs_exp01()
+    d = new_job("r50w95s-h", 9.5, data=False, data_harness_share=0.5, data_fix_rows=600, bit_floor="q2_k",
+                bit_ceiling="q8_0", static_type="q8_0", code_eval_format="harness", code_eval_ref="")
+    sh(step, f"python pipeline.py --job {d}", {"LOBBOT_EVAL_SLOTS": "16"})
+    stats = d / "data" / "stats.json"
+    if stats.exists():
+        st = read(stats)
+        above(f"    data: {st.get('harness_write_rows')} write rows, {st.get('fix_rows')} fix rows "
+              f"from {st.get('fix_pool')} drafts, dropped {st.get('fix_dropped')}")
+
+
 def run_thinking_model(step: Step) -> None:
     score = lcb("ref-think")
     if score is None:
@@ -405,6 +437,9 @@ def steps() -> list[Step]:
         Step("r50w95s-k6 eval", {"eval": 20}, run_experts(6), eval_done("r50w95s-k6")),
         Step("r62w95s", {"reap": 10, "heal": 30, "quantize": 10, "eval": 15, "package": 1}, run_r62w95s, eval_done("r62w95s")),
         Step("r62w75s", {"quantize": 10, "eval": 15, "package": 1}, run_r62w75s, eval_done("r62w75s")),
+        *([Step("r50w95s-mugge eval", {"eval": 25}, run_mugge_baseline, eval_done("r50w95s-mugge")),
+           Step("r50w95s-h", {"data": 45, "reap": 10, "heal": 30, "quantize": 10, "eval": 25, "package": 1},
+                run_mugge_model, eval_done("r50w95s-h"))] if WITH_MUGGE else []),
         Step("r50w95s-t", {"data": 90, "reap": 25, "heal": 180, "quantize": 20, "eval": 100, "package": 2},
              run_thinking_model, lambda: (J / "code10x-r50w95s-t/.done/package").exists()),
         Step("upload to the bucket", {"": 15}, run_upload, (LOGS / ".uploaded").exists),
@@ -422,7 +457,8 @@ def summary() -> str:
     head = ["model", "size"] + list(SHORT.values()) + ["mean", "+1 fix", "vs", "of ref", "lowest", "tok/s"]
     table = [head]
     for name, ref in [("ref-think", ""), ("r50w95s-t", "ref-think"), ("r50w95s-k8", "ref"),
-                      ("r50w95s-k6", "ref"), ("r62w95s", "ref"), ("r62w75s", "ref")]:
+                      ("r50w95s-k6", "ref"), ("r62w95s", "ref"), ("r62w75s", "ref"),
+                      *([("r50w95s-mugge", ""), ("r50w95s-h", "")] if WITH_MUGGE else [])]:
         rep = eval_json(name)
         if not rep:
             table.append([name, "not run"] + [""] * (len(head) - 2))
