@@ -159,6 +159,11 @@ def download_progress() -> float:
     return min(0.99, got / 86e9)  # the base (~70 GB) and the unused dense student (~16 GB)
 
 
+# Answers at once in every eval. 16 left the B200 mostly idle (exp03: 46% busy at
+# 24). These models are MoE with a small KV cache, ~0.9 GB per answer at the 32k
+# thinking budget, so 64 fit next to even the 70 GB BF16 ref.
+EVAL_SLOTS = "64"
+
 def run_jobs(step: Step) -> None:
     sh(step, f"python scripts/code10x.py setup --jobs {J} --taskspec {TASKSPEC} && python scripts/code10x.py ref-ggufs")
 
@@ -172,7 +177,7 @@ def eval_done(name: str) -> Callable[[], bool]:
 
 
 def run_ref_think(step: Step) -> None:
-    sh(step, f"python pipeline.py --job {J}/code10x-ref-think --only eval", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {J}/code10x-ref-think --only eval", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
     score = lcb("ref-think")
     above(f"    ref-think LiveCodeBench pass@1: {score:.0%}" if score is not None else "    ref-think has no LiveCodeBench score")
 
@@ -188,14 +193,14 @@ def run_experts(k: int) -> Callable[[Step], None]:
         name = f"r50w95s-k{k}"
         new_job(name, 9.5, eval_candidates={"r50w95s": str(M / "qwen36-r50w95s.gguf")},
                 eval_experts_used=0 if k == 8 else k)
-        sh(step, f"python pipeline.py --job {J}/code10x-{name} --only eval", {"LOBBOT_EVAL_SLOTS": "16"})
+        sh(step, f"python pipeline.py --job {J}/code10x-{name} --only eval", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
     return run
 
 
 def run_r62w95s(step: Step) -> None:
     needs_exp01()
     d = new_job("r62w95s", 9.5, reap_sparsity=0.625, bit_floor="q2_k", bit_ceiling="q8_0", static_type="q8_0")
-    sh(step, f"python pipeline.py --job {d}", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {d}", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
 
 
 def run_r62w75s(step: Step) -> None:
@@ -215,7 +220,7 @@ def run_r62w75s(step: Step) -> None:
     spec = read(dst / "taskspec.json")
     spec["target"]["max_size_gb"] = 7.5
     write(dst / "taskspec.json", spec)
-    sh(step, f"python pipeline.py --job {dst} --from quantize", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {dst} --from quantize", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
 
 
 def run_mugge_baseline(step: Step) -> None:
@@ -223,7 +228,7 @@ def run_mugge_baseline(step: Step) -> None:
     needs_exp01()
     new_job("r50w95s-mugge", 9.5, eval_candidates={"r50w95s": str(M / "qwen36-r50w95s.gguf")},
             code_eval_format="harness", code_eval_ref="")
-    sh(step, f"python pipeline.py --job {J}/code10x-r50w95s-mugge --only eval", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {J}/code10x-r50w95s-mugge --only eval", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
 
 
 def run_mugge_model(step: Step) -> None:
@@ -232,7 +237,7 @@ def run_mugge_model(step: Step) -> None:
     needs_exp01()
     d = new_job("r50w95s-h", 9.5, data=False, data_harness_share=0.5, data_fix_rows=600, bit_floor="q2_k",
                 bit_ceiling="q8_0", static_type="q8_0", code_eval_format="harness", code_eval_ref="")
-    sh(step, f"python pipeline.py --job {d}", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {d}", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
     stats = d / "data" / "stats.json"
     if stats.exists():
         st = read(stats)
@@ -247,7 +252,7 @@ def run_thinking_model(step: Step) -> None:
     if score < LCB_FLOOR:
         raise Skip(f"ref-think scored {score:.0%} on LiveCodeBench, far below the model card's 80%, "
                    "so the thinking eval looks broken. Send Claude the summary before spending hours here.")
-    sh(step, f"python pipeline.py --job {J}/code10x-r50w95s-t", {"LOBBOT_EVAL_SLOTS": "16"})
+    sh(step, f"python pipeline.py --job {J}/code10x-r50w95s-t", {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS})
     stats = J / "code10x-r50w95s-t/data/stats.json"
     if stats.exists():
         s = read(stats)
