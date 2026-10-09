@@ -44,6 +44,7 @@ M = NVME / "exp01"  # experiment 01's files from the bucket
 LOGS = Path(os.environ.get("EXP02_LOGS", Path.home() / "exp02-logs"))
 BUCKET = "bucket://mugge-library"
 TEACHER = "Qwen/Qwen3.6-35B-A3B"
+TEACHER_DIR = NVME / "models" / TEACHER.split("/")[-1]
 TASKSPEC = "examples/python-utils.code.taskspec.json"
 SIDE = ["r50w95s-k8", "r50w95s-k6", "r62w95s", "r62w75s"]
 # The model card says 80.4 with thinking on and exp01's ref got 45% with it off, so
@@ -137,20 +138,31 @@ def fetch_progress() -> float:
     return min(0.99, got / sum(EXP01_FILES.values()))
 
 
+def downloading() -> bool:
+    return subprocess.run(["pgrep", "-f", "hf download"], stdout=subprocess.DEVNULL).returncode == 0
+
+
 def run_download(step: Step) -> None:
     log = NVME / "download.log"
-    while not (log.exists() and "DOWNLOADS_DONE" in log.read_text(errors="replace")):
-        if subprocess.run(["pgrep", "-f", "hf download"], stdout=subprocess.DEVNULL).returncode != 0:
+    if not (TEACHER_DIR / "config.json").exists() and not downloading():
+        # A VM set up for another experiment (exp03) has a finished download.log but
+        # not this base model: fetch it the way setup_vm.sh does.
+        if log.exists():
+            log.rename(log.with_name("download-before-exp02.log"))
+        sh(step, f"export PATH=$HOME/.local/bin:$PATH && nohup bash -c 'uv tool run --from huggingface_hub hf download {TEACHER} --local-dir {TEACHER_DIR}"
+                 f" && echo DOWNLOADS_DONE' > {log} 2>&1 &")
+    while not download_done():
+        if not downloading():
             time.sleep(10)  # between the two downloads
-            if subprocess.run(["pgrep", "-f", "hf download"], stdout=subprocess.DEVNULL).returncode != 0 and \
-                    "DOWNLOADS_DONE" not in log.read_text(errors="replace"):
+            if not downloading() and not download_done():
                 raise RuntimeError(f"the model download stopped; see {log} and re-run scripts/setup_vm.sh")
         time.sleep(5)
 
 
 def download_done() -> bool:
     log = NVME / "download.log"
-    return log.exists() and "DOWNLOADS_DONE" in log.read_text(errors="replace")
+    return (log.exists() and "DOWNLOADS_DONE" in log.read_text(errors="replace")
+            and (TEACHER_DIR / "config.json").exists())
 
 
 def download_progress() -> float:
