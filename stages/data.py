@@ -33,11 +33,13 @@ import json
 import os
 import random
 import re
+import statistics
 import time
+import zlib
 from dataclasses import dataclass
 
 from common.progress import emit
-from stages import sandbox, testgen
+from stages import harness, sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "data"
@@ -79,7 +81,12 @@ STYLE_HINTS = [
 
 # --------------------------------------------------------------------------- prompts
 
-LANGUAGE_NAMES = {"c": "C", "javascript": "JavaScript", "typescript": "TypeScript", "python": "Python"}
+LANGUAGE_NAMES = {"c": "C", "javascript": "JavaScript", "typescript": "TypeScript", "python": "Python",
+                  "asm": "x86-64 assembly (GNU as, System V ABI)"}
+# How tests reach the answer (stages/sandbox.py); assembly is linked against C tests.
+TESTS_JOIN = {"asm": "The tests are a separate C file with main() that declares the assembly functions it "
+                     "calls and is linked with the answer; it must exit non-zero on failure (use assert.h), "
+                     "like the examples."}
 
 
 def system_prompt(spec) -> str:
@@ -90,7 +97,7 @@ def system_prompt(spec) -> str:
             f"You are an expert {lang} programmer. Task: {spec.description}\n"
             f"Input format: {spec.input_format}\nOutput format: {spec.output_format}\n"
             f"Answer with the {lang} code only: no explanation, no tests"
-            + (", no main()." if spec.language == "c" else ".")
+            + (", no main()." if spec.language in ("c", "asm") else ".")
         )
     return (
         f"You are an expert at this task: {spec.description}\n"
@@ -130,11 +137,12 @@ def gen_code_inputs_prompt(spec, rng: random.Random, scenario: str, style: str) 
     lang = LANGUAGE_NAMES[spec.language]
     return [{"role": "user", "content": (
         f"Task: {spec.description}\nLanguage: {lang}\nInput format: {spec.input_format}\n\n"
-        f"Here are example inputs, each with the {lang} tests its answer must pass:\n\n{shown}\n\n"
+        f"Here are example inputs, each with the tests its answer must pass:\n\n{shown}\n\n"
         f"Write exactly {PER_PROMPT} NEW, realistic inputs for this task, each with its tests.\n"
         f"Scenario: {scenario}\nStyle: {style}\n"
-        "The tests are appended after the answer code in the same file and must exit non-zero on "
-        "failure, like the examples. Each input must name every function, type and signature its "
+        + TESTS_JOIN.get(spec.language, "The tests are appended after the answer code in the same file "
+                         "and must exit non-zero on failure, like the examples.")
+        + " Each input must name every function, type and signature its "
         "tests use, so a correct answer can be written from the input alone. Test behaviour, "
         "including edge cases, not implementation details. Make the inputs differ from the examples "
         "and from each other. Write only inputs and tests, not the answers. Return a JSON array of "
@@ -157,6 +165,15 @@ def answer_messages(spec, shots, text: str) -> list[dict]:
 
 _THINK = re.compile(r"<think>.*?</think>\s*", re.S)
 _FENCE = re.compile(r"^```[\w-]*\s*\n?|\n?```\s*$")
+
+
+def split_think(text: str) -> tuple[str, str]:
+    """(thinking, answer) from a raw generation. The thinking ends at the last
+    </think>; templates that open <think> in the prompt leave only the closing tag."""
+    if "</think>" not in text:
+        return "", text
+    head, tail = text.rsplit("</think>", 1)
+    return head.replace("<think>", "", 1).strip(), tail
 
 
 def clean(text: str) -> str:
@@ -261,20 +278,20 @@ class Teacher:
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
 
-    def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int) -> list[Gen]:
+    def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
-                                 max_tokens=max_tokens)
-        try:  # Qwen3 hybrid checkpoints: no <think>; Instruct-2507 ignores the flag
-            res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": False})
+                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}))
+        try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
+            res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
         except TypeError:
             res = self.llm.chat(convs, sp, use_tqdm=False)
         return [Gen(r.outputs[0].text, r.outputs[0].finish_reason != "length") for r in res]
 
 
-def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label) -> list[Gen]:
+def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label, thinking: bool = False) -> list[Gen]:
     out: list[Gen] = []
     for i in range(0, len(convs), BATCH):
-        out += teacher.chat(convs[i:i + BATCH], temperature, max_tokens)
+        out += teacher.chat(convs[i:i + BATCH], temperature, max_tokens, thinking)
         emit(STAGE, pct=lo + (hi - lo) * len(out) / len(convs), msg=f"{label} {len(out)}/{len(convs)}")
     return out
 
@@ -285,23 +302,26 @@ class DryRunTeacher:
     def __init__(self, spec, rng: random.Random):
         self.spec, self.rng = spec, rng
 
-    def chat(self, convs, temperature, max_tokens):
-        out = []
-        for conv in convs:
-            prompt = conv[-1]["content"]
-            if "real-world scenarios" in prompt:
-                out.append(Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True))
-            elif self.spec.is_code:
-                out.append(self._code(prompt))
-            elif "NEW, realistic inputs" in prompt:
-                base = self.rng.choice(self.spec.seed_examples).input
-                out.append(Gen("```json\n" + json.dumps(
-                    [f"{base} (case {self.rng.randrange(10**9)})" for _ in range(PER_PROMPT)]) + "\n```", True))
-            else:
-                r = self.rng.random()
-                ex = self.spec.seed_examples[len(prompt) % len(self.spec.seed_examples)].output
-                out.append(Gen("{broken" if r < 0.03 else ex, r > 0.01))
+    def chat(self, convs, temperature, max_tokens, thinking=False):
+        out = [self._one(conv) for conv in convs]
+        if thinking:  # an open <think> in the prompt, as Qwen3.6's template does; a few never close
+            out = [Gen(g.text if self.rng.random() < 0.05 else f"Let me work this out first.\n</think>\n\n{g.text}",
+                       g.finished) for g in out]
         return out
+
+    def _one(self, conv) -> Gen:
+        prompt = conv[-1]["content"]
+        if "real-world scenarios" in prompt:
+            return Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True)
+        if self.spec.is_code:
+            return self._code(prompt)
+        if "NEW, realistic inputs" in prompt:
+            base = self.rng.choice(self.spec.seed_examples).input
+            return Gen("```json\n" + json.dumps(
+                [f"{base} (case {self.rng.randrange(10**9)})" for _ in range(PER_PROMPT)]) + "\n```", True)
+        r = self.rng.random()
+        ex = self.spec.seed_examples[len(prompt) % len(self.spec.seed_examples)].output
+        return Gen("{broken" if r < 0.03 else ex, r > 0.01)
 
     def _code(self, prompt: str) -> Gen:
         """Inputs reuse a seed's tests; answers are that seed's code, sometimes a wrong seed's
@@ -312,6 +332,11 @@ class DryRunTeacher:
             return Gen("```json\n" + json.dumps([
                 {"input": f"{e.input} (case {self.rng.randrange(10**9)})", "tests": e.tests} for e in picks
             ]) + "\n```", True)
+        if prompt.startswith("Ticket: "):  # a harness fix call: the task's seed code, as a file
+            own = max((e for e in seeds if e.input in prompt), key=lambda e: len(e.input), default=seeds[0])
+            src = re.search(r"^Files you own \(write each in full\): (\S+)", prompt, re.M).group(1)
+            code = own.output if self.rng.random() < 0.8 else next(e for e in seeds if e is not own).output
+            return Gen(harness.render_files({src: code}, "fixed"), True)
         own = max((e for e in seeds if prompt.startswith(e.input)), key=lambda e: len(e.input), default=seeds[0])
         r = self.rng.random()
         if r < 0.05:
@@ -417,28 +442,36 @@ def run_stage(job: Job) -> None:
     # 3) answers
     shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
-    gens = chat_batched(teacher, convs, 0.3, answer_max_tokens(cfg), 45, 95, "teacher answering")
+    think = cfg.data_thinking
+    # Thinking samples at Qwen's recommended 0.6; greedy-ish decoding makes it loop.
+    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 45, 95,
+                        "teacher answering" + (" (thinking)" if think else ""), think)
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
-    candidates = []  # code specs: (input, answer) waiting for the sandbox
+    candidates = []  # code specs: (input, answer, thinking) waiting for the sandbox
     for i, (s, g) in enumerate(zip(inputs + ext, gens)):
-        ans, why = check_answer(g.text, g.finished, want_json, want_code=spec.is_code)
+        reasoning, text = split_think(g.text) if think else ("", g.text)
+        ans, why = check_answer(text, g.finished, want_json, want_code=spec.is_code)
+        if ans is not None and think and not reasoning:
+            ans, why = None, "no_thinking_end"  # the thinking never closed; nothing to learn it from
         is_ext = i >= len(inputs)
         if ans is None:
             d = ext_drops if is_ext else drops
             d[why] = d.get(why, 0) + 1
         elif spec.is_code:
-            candidates.append((s, ans))
+            candidates.append((s, ans, reasoning))
         else:
-            (ext_rows if is_ext else rows).append(_row(sys, s, ans))
+            (ext_rows if is_ext else rows).append(_row(sys, s, ans, reasoning))
+    failed = []  # code specs: (input, answer, sandbox result) that did not pass, drafts for fix rows
     if spec.is_code:
         emit(STAGE, pct=95, msg=f"running tests for {len(candidates)} answers")
-        results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a in candidates])
-        for (s, a), res in zip(candidates, results):
+        results = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a, _ in candidates])
+        for (s, a, reasoning), res in zip(candidates, results):
             if res.passed:
-                rows.append(_row(sys, s, a))
+                rows.append(_row(sys, s, a, reasoning))
             else:
                 drops[res.reason] = drops.get(res.reason, 0) + 1
+                failed.append((s, a, res))
         n_pass = len(rows)
         stats.update(sandbox_runs=len(candidates),
                      sandbox_pass_rate=round(n_pass / len(candidates), 3) if candidates else 0.0)
@@ -459,18 +492,106 @@ def run_stage(job: Job) -> None:
         n_held = min(n_held, len(rows) // 5)
         heldout, train = rows[:n_held], rows[n_held:n_held + cfg.n_generate]
         stats["heldout_source"] = "teacher"
-    train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
+    if spec.is_code and (cfg.data_harness_share > 0 or cfg.data_fix_rows > 0):
+        held = {r["messages"][1]["content"] for r in heldout}
+        train = harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats)
+    if not think:  # the human seeds have no thinking, and every row of a thinking model thinks
+        train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
+    if think:
+        stats["thinking_chars_median"] = statistics.median(
+            len(r["messages"][2]["reasoning_content"]) for r in train) if train else 0
     rng.shuffle(train)
     write_jsonl(job.path("data", "train.jsonl"), train)
     write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
     job.path("data", "calib.txt").write_text(
-        "\n\n".join(r["messages"][1]["content"] + "\n" + r["messages"][2]["content"] for r in train[:1000])
+        "\n\n".join(r["messages"][1]["content"] + "\n" + _with_thinking(r["messages"][2]) for r in train[:1000])
     )
     stats.update(train=len(train), heldout=len(heldout), elapsed_s=round(time.monotonic() - t0, 1))
     job.path("data", "stats.json").write_text(json.dumps(stats, indent=2))
     print(f"[data] stats {json.dumps(stats)}", flush=True)
     job.mark_done(STAGE, {"train": len(train), "heldout": len(heldout)})
     emit(STAGE, "done", 100, f"{len(train)} train, {len(heldout)} held out")
+
+
+def task_ticket(spec, task: str, code: str = "") -> harness.Ticket:
+    """A code task as a Mugge ticket: the task is the context, the answer file is the one
+    owned file and the sandbox's build and run are the acceptance commands."""
+    src, cmds, where = sandbox.layout(spec.language)
+    title = task.strip().splitlines()[0][:80] if task.strip() else "Write the code"
+    return harness.Ticket(id=f"T{zlib.crc32(norm_key(task).encode()) % 100000:05d}", title=title,
+                          context=f"{task.strip()}\n\n{where}", owns=[src], acceptance=cmds,
+                          current={src: code} if code else {})
+
+
+def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) -> list[dict]:
+    """Mugge-shaped rows (stages/harness.py). data_harness_share of the plain train rows become
+    write calls with the same answer, as a file. Then up to data_fix_rows fix rows: a failed
+    draft and the failing command's output in, the teacher's fix out when it passes the tests.
+    Drafts are the teacher's failed answers, topped up with answers sampled at temperature 1.0
+    (thinking off). Held-out inputs never become drafts."""
+    src, cmds, _ = sandbox.layout(spec.language)
+    think = cfg.data_thinking
+    out, n_write = [], 0
+    for r in train:
+        m = r["messages"]
+        if rng.random() < cfg.data_harness_share:
+            msgs = harness.write_messages(task_ticket(spec, m[1]["content"]))
+            out.append(_chat_row(msgs, harness.render_files({src: m[2]["content"]}), m[2].get("reasoning_content", "")))
+            n_write += 1
+        else:
+            out.append(r)
+    stats["harness_write_rows"] = n_write
+    if cfg.data_fix_rows <= 0:
+        return out
+
+    pool = [d for d in failed if d[0] not in held and d[2].reason in ("compile_error", "test_failed", "timeout")]
+    need = int(cfg.data_fix_rows * 1.5)  # room for fixes that fail too
+    if len(pool) < need:
+        pick = [s for s in tests_of if s not in held]
+        rng.shuffle(pick)
+        pick = pick[:min(len(pick), 4 * (need - len(pool)))]  # ~15-25% of quick drafts fail (a guess)
+        shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
+        gens = chat_batched(teacher, [answer_messages(spec, shots, s) for s in pick], 1.0, answer_max_tokens(cfg),
+                            95, 96, "quick drafts to fix")
+        drafts = [(s, a) for s, g in zip(pick, gens) for a, _ in [check_answer(g.text, g.finished, False, True)] if a]
+        res = sandbox.run_many([(spec.language, a, tests_of[s]) for s, a in drafts])
+        pool += [(s, a, r) for (s, a), r in zip(drafts, res)
+                 if not r.passed and r.reason in ("compile_error", "test_failed", "timeout")]
+    rng.shuffle(pool)
+    pool = pool[:need]
+    convs = []
+    for s, a, r in pool:
+        cmd = cmds[0] if r.reason == "compile_error" and len(cmds) > 1 else cmds[-1]
+        out_text = harness.tail(r.output, 2000) or ("(timed out)" if r.reason == "timeout" else "(no output)")
+        convs.append(harness.fix_messages(task_ticket(spec, s, a), cmd, out_text))
+    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 96, 98,
+                        "teacher fixing drafts" + (" (thinking)" if think else ""), think)
+    drops, fixes = {}, []
+    for (s, _, _), conv, g in zip(pool, convs, gens):
+        reasoning, text = split_think(g.text) if think else ("", g.text)
+        files, note = harness.parse_files(text)
+        why = ("truncated" if not g.finished else "no_thinking_end" if think and not reasoning
+               else "no_file" if not files.get(src, "").strip() else "")
+        if why:
+            drops[why] = drops.get(why, 0) + 1
+        else:
+            fixes.append((s, conv, files[src], note, reasoning))
+    res = sandbox.run_many([(spec.language, code, tests_of[s]) for s, _, code, _, _ in fixes])
+    n_fix = 0
+    for (s, conv, code, note, reasoning), r in zip(fixes, res):
+        if not r.passed:
+            drops[r.reason] = drops.get(r.reason, 0) + 1
+        elif n_fix < cfg.data_fix_rows:
+            out.append(_chat_row(conv, harness.render_files({src: code}, note), reasoning))
+            n_fix += 1
+    stats.update(fix_pool=len(pool), fix_rows=n_fix, fix_dropped=drops)
+    print(f"[data] harness: {n_write} write rows, {n_fix} fix rows from {len(pool)} drafts, dropped {drops}", flush=True)
+    return out
+
+
+def _chat_row(msgs: list[dict], answer: str, reasoning: str = "") -> dict:
+    return {"messages": [*msgs, {"role": "assistant", "content": answer,
+                                 **({"reasoning_content": reasoning} if reasoning else {})}]}
 
 
 def check_seeds(spec) -> None:
@@ -487,16 +608,22 @@ def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
     inp = r["messages"][1]["content"]
     row = {"input": inp, "reference": r["messages"][2]["content"]}
     if spec.is_code:
-        row.update(tests=tests_of[inp], language=spec.language)
+        row.update(tests=tests_of[inp], language=spec.language, system=system_prompt(spec))
     return row
 
 
-def _row(sys: str, inp: str, out: str) -> dict:
+def _row(sys: str, inp: str, out: str, reasoning: str = "") -> dict:
+    """A chat row. The teacher's thinking, when kept, goes in reasoning_content (the
+    field Qwen's chat templates render inside <think>); taskdata trains on it."""
     return {"messages": [
         {"role": "system", "content": sys},
         {"role": "user", "content": inp},
-        {"role": "assistant", "content": out},
+        {"role": "assistant", "content": out, **({"reasoning_content": reasoning} if reasoning else {})},
     ]}
+
+
+def _with_thinking(msg: dict) -> str:
+    return (f"<think>\n{msg['reasoning_content']}\n</think>\n\n" if msg.get("reasoning_content") else "") + msg["content"]
 
 
 if __name__ == "__main__":

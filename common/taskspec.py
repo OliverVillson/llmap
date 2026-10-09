@@ -13,7 +13,7 @@ from pathlib import Path
 
 TASK_TYPES = ("text", "code")
 # Languages a code task can target; stages/sandbox.py knows how to build and run each.
-LANGUAGES = ("c", "javascript", "typescript", "python")
+LANGUAGES = ("c", "javascript", "typescript", "python", "asm")
 
 
 @dataclass

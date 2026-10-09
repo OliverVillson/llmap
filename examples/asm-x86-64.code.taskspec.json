@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "task_type": "code",
+  "language": "asm",
+  "task_name": "x86-64-assembly-functions",
+  "description": "Write a small x86-64 Linux assembly function (GNU as, System V AMD64 ABI) that C code can call, from a short specification.",
+  "input_format": "A short spec naming the function, its exact C prototype and its behaviour, including edge cases.",
+  "output_format": "GNU as source for x86-64 (Intel syntax via .intel_syntax noprefix, or AT&T) with a .globl symbol per requested function, no main, no libc calls.",
+  "eval_criteria": "The code assembles, links with the example's C tests and passes them.",
+  "seed_examples": [
+    {
+      "input": "Implement `long sum_array(const long *a, long n)` returning the sum of n 64-bit integers; 0 when n is 0.",
+      "output": ".intel_syntax noprefix\n    .text\n    .globl sum_array\nsum_array:\n    xor eax, eax\n    test rsi, rsi\n    jle 2f\n1:\n    add rax, [rdi]\n    add rdi, 8\n    dec rsi\n    jnz 1b\n2:\n    ret\n",
+      "tests": "#include <assert.h>\nlong sum_array(const long *a, long n);\nint main(void) {\n    long a[] = {1, 2, 3, -4};\n    assert(sum_array(a, 4) == 2);\n    assert(sum_array(a, 0) == 0);\n    return 0;\n}"
+    },
+    {
+      "input": "Implement `unsigned long my_strlen(const char *s)` returning the length of a NUL-terminated string.",
+      "output": ".intel_syntax noprefix\n    .text\n    .globl my_strlen\nmy_strlen:\n    mov rax, rdi\n1:\n    cmp byte ptr [rax], 0\n    je 2f\n    inc rax\n    jmp 1b\n2:\n    sub rax, rdi\n    ret\n",
+      "tests": "#include <assert.h>\nunsigned long my_strlen(const char *s);\nint main(void) {\n    assert(my_strlen(\"hello\") == 5);\n    assert(my_strlen(\"\") == 0);\n    return 0;\n}"
+    },
+    {
+      "input": "Implement `long max3(long a, long b, long c)` returning the largest of three signed 64-bit integers, without branches.",
+      "output": ".intel_syntax noprefix\n    .text\n    .globl max3\nmax3:\n    mov rax, rdi\n    cmp rax, rsi\n    cmovl rax, rsi\n    cmp rax, rdx\n    cmovl rax, rdx\n    ret\n",
+      "tests": "#include <assert.h>\nlong max3(long a, long b, long c);\nint main(void) {\n    assert(max3(1, 2, 3) == 3);\n    assert(max3(-1, -5, -3) == -1);\n    assert(max3(7, 7, 2) == 7);\n    return 0;\n}"
+    },
+    {
+      "input": "Implement `void to_upper(char *s)` that converts ASCII a-z to A-Z in place in a NUL-terminated string, leaving every other byte unchanged.",
+      "output": ".intel_syntax noprefix\n    .text\n    .globl to_upper\nto_upper:\n1:\n    mov al, [rdi]\n    test al, al\n    je 3f\n    lea ecx, [rax - 'a']\n    cmp cl, 25\n    ja 2f\n    sub al, 32\n    mov [rdi], al\n2:\n    inc rdi\n    jmp 1b\n3:\n    ret\n",
+      "tests": "#include <assert.h>\n#include <string.h>\nvoid to_upper(char *s);\nint main(void) {\n    char a[] = \"Hello, World! z{\";\n    to_upper(a);\n    assert(strcmp(a, \"HELLO, WORLD! Z{\") == 0);\n    char b[] = \"\";\n    to_upper(b);\n    assert(b[0] == 0);\n    return 0;\n}"
+    },
+    {
+      "input": "Implement `unsigned long gcd(unsigned long a, unsigned long b)` with Euclid's algorithm; gcd(0, b) is b.",
+      "output": ".intel_syntax noprefix\n    .text\n    .globl gcd\ngcd:\n    mov rax, rdi\n1:\n    test rsi, rsi\n    je 2f\n    xor edx, edx\n    div rsi\n    mov rax, rsi\n    mov rsi, rdx\n    jmp 1b\n2:\n    ret\n",
+      "tests": "#include <assert.h>\nunsigned long gcd(unsigned long a, unsigned long b);\nint main(void) {\n    assert(gcd(12, 18) == 6);\n    assert(gcd(0, 5) == 5);\n    assert(gcd(7, 0) == 7);\n    assert(gcd(17, 13) == 1);\n    return 0;\n}"
+    }
+  ],
+  "target": {
+    "max_size_gb": 7,
+    "min_tok_s": 40,
+    "laptop_ram_gb": 16
+  }
+}

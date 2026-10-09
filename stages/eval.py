@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import threading
@@ -37,12 +38,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from common.progress import emit
-from stages import codebench, data, sandbox
+from stages import codebench, data, harness, sandbox
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "eval"
 PORT = int(os.environ.get("LOBBOT_EVAL_PORT", "8091"))
-SLOTS = 8
+SLOTS = int(os.environ.get("LOBBOT_EVAL_SLOTS", 8))  # parallel requests; 2 on a 16 GB Mac
 # Must cover the longest teacher answer the data stage keeps
 # (LOBBOT_DATA_ANSWER_MAX_TOKENS), or long correct answers are judged as truncated.
 MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_MAX_TOKENS)))
@@ -50,24 +51,74 @@ MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_
 # (~2k tokens) and the answer.
 CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 
+# With thinking, the answer cap for the step that makes the model answer when its
+# thinking ended without one (see generate).
+ANSWER_TOKENS = 4096
+# Qwen's wording for cutting thinking short (the Qwen3 model card's thinking budget).
+EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now."
+
 
 def limits(cfg) -> tuple[int, int]:
     """(max answer tokens, context per slot) for this job: follows the job's
-    data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set."""
+    data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set.
+    The context also fits the code eval's answer cap (code_eval_max_tokens), plus
+    the forced answer after it when thinking."""
     max_tokens = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.answer_max_tokens(cfg))))
-    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", max_tokens + 4096))
+    code = cfg.code_eval_max_tokens + (ANSWER_TOKENS if cfg.code_eval_thinking else 0)
+    longest = max(max_tokens, code if cfg.code_eval_suites else 0)
+    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", longest + 4096))
+
+
+def gguf_arch(path: str) -> str:
+    """general.architecture from a GGUF header (no gguf-py, which a Mac lacks)."""
+    import struct
+
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with open(path, "rb") as f:
+        magic, _version, _tensors, n_kv = struct.unpack("<4sIQQ", f.read(24))
+        if magic != b"GGUF":
+            raise ValueError(f"{path} is not a GGUF file")
+
+        def string() -> bytes:
+            return f.read(struct.unpack("<Q", f.read(8))[0])
+
+        def skip(vtype: int) -> None:
+            if vtype == 8:
+                string()
+            elif vtype == 9:
+                item, n = struct.unpack("<IQ", f.read(12))
+                for _ in range(n):
+                    skip(item)
+            else:
+                f.seek(sizes[vtype], 1)
+
+        for _ in range(n_kv):
+            key, vtype = string(), struct.unpack("<I", f.read(4))[0]
+            if key == b"general.architecture" and vtype == 8:
+                return string().decode()
+            skip(vtype)
+    raise ValueError(f"{path} has no general.architecture")
+
+
+def server_args(cfg, gguf: str) -> list[str]:
+    args = ["-m", gguf, "-ngl", "999", "--host", "127.0.0.1", "--port", str(PORT),
+            "-c", str(SLOTS * limits(cfg)[1]), "-np", str(SLOTS), "--jinja"]
+    if cfg.eval_experts_used:
+        args += ["--override-kv", f"{gguf_arch(gguf)}.expert_used_count=int:{cfg.eval_experts_used}"]
+    if cfg.eval_kv_type:  # a quantized V cache needs flash attention
+        args += ["-ctk", cfg.eval_kv_type, "-ctv", cfg.eval_kv_type, "-fa", "on"]
+    return args
 
 
 def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     import httpx
 
     binary = Path(job.config.llama_cpp) / "build/bin/llama-server"
+    if not binary.exists() and shutil.which("llama-server"):
+        binary = Path(shutil.which("llama-server"))  # e.g. Homebrew's llama.cpp on a Mac
     log_path = job.path("work", f"llama-server-{name}.log")
     log = open(log_path, "w")
-    proc = subprocess.Popen(
-        [str(binary), "-m", gguf, "-ngl", "999", "--host", "127.0.0.1", "--port", str(PORT),
-         "-c", str(SLOTS * limits(job.config)[1]), "-np", str(SLOTS), "--jinja"],
-        stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([str(binary), *server_args(job.config, gguf)], stdout=log, stderr=subprocess.STDOUT)
     for _ in range(600):
         if proc.poll() is not None:
             raise RuntimeError(f"llama-server exited for {name}:\n" + "\n".join(log_path.read_text().splitlines()[-20:]))
@@ -81,37 +132,114 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     raise RuntimeError(f"llama-server did not become healthy for {name}; see {log_path}")
 
 
-def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
-             temperature: float = 0.0, seed: int | None = None) -> tuple[list[str], float | None]:
-    """Answers plus the median decode speed (tok/s) the server reported."""
+def split_reasoning(message: dict) -> tuple[str, str]:
+    """(reasoning, answer) from a chat completion message. llama-server returns
+    the reasoning separately; when it does not, the tags are still in the content."""
+    content, reasoning = message.get("content") or "", message.get("reasoning_content") or ""
+    if "</think>" in content:
+        head, content = content.rsplit("</think>", 1)
+        reasoning = reasoning or head.replace("<think>", "", 1)
+    elif "<think>" in content:  # thinking that never closed
+        reasoning, content = reasoning or content.split("<think>", 1)[1], ""
+    elif "</think>" in reasoning and not content.strip():  # answer left inside the reasoning
+        reasoning, content = reasoning.rsplit("</think>", 1)
+    return reasoning.strip(), content.strip()
+
+
+def sampling_params(seed: int | None, thinking: bool) -> dict:
+    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
+
+
+def thinking_prompt(messages: list[dict]) -> str:
+    """The chat-template prompt up to and including the opened thinking."""
     import httpx
 
-    speeds: list[float] = []
+    prompt = httpx.post(f"http://127.0.0.1:{PORT}/apply-template", timeout=60, json={
+        "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
+    if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
+        prompt += "<think>\n"
+    return prompt
 
-    def one(text: str) -> str:
+
+def force_answer(messages: list[dict], reasoning: str, why: str, temperature: float,
+                 sampling: dict) -> tuple[str, int]:
+    """Closes the thinking (with Qwen's early-stop line when it ran out of budget)
+    and has the model answer on top of it: (answer, tokens)."""
+    import httpx
+
+    prompt = thinking_prompt(messages) + reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
+    # An hour: with many answers at once, a long prompt to read in and up to
+    # ANSWER_TOKENS to write can take well over the ~17 minutes this used to allow.
+    r = httpx.post(f"http://127.0.0.1:{PORT}/completion", timeout=3600, json={
+        "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
+    r.raise_for_status()
+    body = r.json()
+    return (body.get("content") or "").strip(), body.get("tokens_predicted") or 0
+
+
+def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
+             temperature: float = 0.0, seed: int | None = None,
+             thinking: bool = False, on_answer=None, infos: list | None = None,
+             keep_reasoning: bool = False) -> tuple[list[str], float | None]:
+    """Answers plus the median decode speed (tok/s) the server reported.
+
+    With thinking, a thinking that ends without an answer (out of max_tokens, or
+    the model stopped inside it) is closed and the model is asked for the answer
+    on top of it, with up to ANSWER_TOKENS more. on_answer() is called from a
+    worker thread as each answer finishes. infos, when given, receives one dict
+    per input: finish reason, tokens, reasoning size and how the answer came, and
+    with keep_reasoning the whole thinking."""
+    import httpx
+
+    url = f"http://127.0.0.1:{PORT}"
+    speeds: list[float] = []
+    sampling = sampling_params(seed, thinking)
+
+    def one(text: str) -> tuple[str, dict]:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
         for attempt in range(2):
             try:
-                r = httpx.post(f"http://127.0.0.1:{PORT}/v1/chat/completions", timeout=600, json={
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-                    "temperature": temperature, "max_tokens": max_tokens,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    **({"seed": seed, "top_p": 0.95} if seed is not None else {}),
+                r = httpx.post(f"{url}/v1/chat/completions", timeout=max(600, max_tokens / 4), json={
+                    "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+                    "chat_template_kwargs": {"enable_thinking": thinking}, **sampling,
                 })
                 r.raise_for_status()
                 body = r.json()
                 tps = (body.get("timings") or {}).get("predicted_per_second")
                 if tps:
                     speeds.append(float(tps))
-                content = body["choices"][0]["message"].get("content") or ""
-                return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+                choice = body["choices"][0]
+                reasoning, answer = split_reasoning(choice["message"])
+                info = {"finish": choice.get("finish_reason"), "tokens": (body.get("usage") or {}).get("completion_tokens"),
+                        "reasoning_chars": len(reasoning), "forced": None, **({"reasoning": reasoning} if keep_reasoning else {})}
+                if thinking and not answer:
+                    # "length": out of budget; "stop": the model ended inside its thinking;
+                    # "no_reasoning": nothing came back at all (then this is a thinking-off answer).
+                    info["forced"] = "no_reasoning" if not reasoning else "length" if info["finish"] == "length" else "stop"
+                    info["reasoning_tail"] = reasoning[-1500:]
+                    try:
+                        answer, info["forced_tokens"] = force_answer(messages, reasoning, info["forced"], temperature, sampling)
+                    except Exception as e:  # keep the thinking; don't redo it
+                        print(f"[eval] answer after thinking failed: {e}", flush=True)
+                        info["error"] = str(e)[:300]
+                return answer, info
             except Exception as e:
                 if attempt:
                     print(f"[eval] generation failed: {e}", flush=True)
-        return ""
+                    return "", {"finish": "error", "error": str(e)[:300], "forced": None}
+        return "", {}
+
+    def counted(text: str) -> tuple[str, dict]:
+        got = one(text)
+        if on_answer:
+            on_answer()
+        return got
 
     with ThreadPoolExecutor(SLOTS) as ex:
-        answers = list(ex.map(one, inputs))
-    return answers, (round(statistics.median(speeds), 1) if speeds else None)
+        got = list(ex.map(counted, inputs))
+    if infos is not None:
+        infos.extend(i for _, i in got)
+    return [a for a, _ in got], (round(statistics.median(speeds), 1) if speeds else None)
 
 
 def _tokens(s: str) -> list[str]:
@@ -234,6 +362,21 @@ def code_problems(job: Job, held: list[dict]) -> list[dict]:
     return problems
 
 
+def prompting(cfg, task_system: str):
+    """(system_of(p), prompt(p), code_of(p, answer)) for the configured code eval format."""
+    mugge = cfg.code_eval_format == "harness"
+    prompt = (lambda p: harness.pack_text(codebench.ticket(p))) if mugge else codebench.build_prompt
+    code_of = codebench.harness_code if mugge else lambda p, a: codebench.extract_code(a)
+
+    def system_of(p: dict) -> str:
+        # Held-out rows of a merged multi-language job carry their own task prompt.
+        if mugge:
+            return harness.SYSTEM
+        return (p.get("system") or task_system) if p["suite"] == "heldout" else codebench.SYSTEM
+
+    return system_of, prompt, code_of
+
+
 # LiveCodeBench runs every test case in one process, so it gets a longer budget.
 SUITE_TIMEOUT = {"livecodebench": max(sandbox.TIMEOUT, 60.0)}
 
@@ -246,43 +389,89 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
     codebench.SYSTEM."""
     cfg = job.config
     n = max(cfg.code_eval_samples, max(cfg.code_eval_k))
+    mugge = cfg.code_eval_format == "harness"
+    system_of, prompt, code_of = prompting(cfg, task_system)
     groups: dict[tuple[str, float], list[int]] = {}
     for j, p in enumerate(problems):
-        key = (task_system if p["suite"] == "heldout" else codebench.SYSTEM,
-               SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT))
-        groups.setdefault(key, []).append(j)
+        groups.setdefault((system_of(p), SUITE_TIMEOUT.get(p["suite"], sandbox.TIMEOUT)), []).append(j)
     results: list[list] = [[] for _ in problems]
     rows, speeds = [], []
+    done, total, lock = 0, n * len(problems), threading.Lock()
+
+    def answered():  # progress events with answered/total, at most ~100 per eval
+        nonlocal done
+        with lock:
+            done += 1
+            if done == total or done % max(1, total // 100) == 0:
+                emit(STAGE, msg=f"{name}: {done}/{total} code answers", answered=done, total=total)
+
+    emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
+    fixed: list = [None] * len(problems)
     for i in range(n):
         greedy = n == 1
-        answers = [""] * len(problems)
+        # Greedy decoding loops when thinking, so thinking always samples (at the
+        # model card's temperature), seeded for repeatability.
+        temperature = (cfg.code_eval_temperature if not greedy
+                       else cfg.code_eval_thinking_temperature if cfg.code_eval_thinking else 0.0)
+        seed = i if cfg.code_eval_thinking or not greedy else None
+        answers, infos = [""] * len(problems), [{}] * len(problems)
         for (system, _), idx in groups.items():
-            got, tps = generate(system, [codebench.build_prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                0.0 if greedy else cfg.code_eval_temperature, None if greedy else i)
+            got_info: list[dict] = []
+            got, tps = generate(system, [prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
+                                temperature, seed, cfg.code_eval_thinking, answered, infos=got_info,
+                                **({"keep_reasoning": True} if cfg.code_eval_budgets else {}))
             speeds += [tps] if tps else []
-            for j, a in zip(idx, got):
-                answers[j] = a
+            for j, a, info in zip(idx, got, got_info or [{}] * len(idx)):
+                answers[j], infos[j] = a, info
         ran: list = [None] * len(problems)
         for (_, timeout), idx in groups.items():
             items = []
             for j in idx:
-                code, tests = codebench.assemble(problems[j], answers[j])
+                code, tests = codebench.assemble(problems[j], answers[j], code_of(problems[j], answers[j]))
                 items.append((problems[j]["language"], code, tests))
             for j, r in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 ran[j] = r
+        fix_answers = [""] * len(problems)
+        if cfg.code_eval_fix and greedy:
+            todo = {j for j, r in enumerate(ran) if not r.passed and r.reason not in codebench.CANNOT_RUN}
+            with lock:
+                total += len(todo)
+            emit(STAGE, msg=f"{name}: one fix turn for {len(todo)} failed answers", answered=done, total=total)
+            for (system, timeout), idx in groups.items():
+                sel = [j for j in idx if j in todo]
+                if not sel:
+                    continue
+                fix_text = ((lambda j: codebench.harness_fix_text(problems[j], code_of(problems[j], answers[j]), ran[j]))
+                            if mugge else (lambda j: codebench.fix_prompt(problems[j], answers[j], ran[j])))
+                got, tps = generate(system, [fix_text(j) for j in sel],
+                                    cfg.code_eval_max_tokens, temperature, seed, cfg.code_eval_thinking, answered)
+                speeds += [tps] if tps else []
+                items = []
+                for j, a in zip(sel, got):
+                    fix_answers[j] = a
+                    code, tests = codebench.assemble(problems[j], a, code_of(problems[j], a))
+                    items.append((problems[j]["language"], code, tests))
+                for j, r in zip(sel, sandbox.run_many(items, timeout=timeout)):
+                    fixed[j] = r
         for j, (p, a, r) in enumerate(zip(problems, answers, ran)):
             results[j].append(r)
+            fix = ({"fix_passed": fixed[j].passed, "fix_reason": fixed[j].reason, "fix_output": fixed[j].output[-500:],
+                    "fix_answer": fix_answers[j]} if fixed[j] else {})
             rows.append({"suite": p["suite"], "id": p["id"], "sample": i, "passed": r.passed,
-                         "reason": r.reason, "output": r.output[-500:], "answer": a})
+                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j], **fix})
     out_dir = job.path("work", "code_eval")
     out_dir.mkdir(exist_ok=True)
     write_jsonl(out_dir / f"{name}.jsonl", rows)
     suites = codebench.summarize(problems, results, cfg.code_eval_k)
+    fix = {}
+    if cfg.code_eval_fix and n == 1:
+        codebench.add_fix_scores(suites, problems, [rs[0] for rs in results], fixed)
+        fix = {"mean_fix@1": codebench.mean_fix1(suites)}
     for suite, v in suites.items():
         broken = sum(v["status"].get(r, 0) for r in ("missing_toolchain", "unsupported_language"))
         if broken:
             emit(STAGE, msg=f"{suite}: {broken} answers could not run ({', '.join(k for k in v['status'] if k in ('missing_toolchain', 'unsupported_language'))}); check the VM toolchains")
-    return {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": n,
+    return {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), **fix, "samples_per_problem": n,
             "tok_s_vm": round(statistics.median(speeds), 1) if speeds else None}
 
 
@@ -356,9 +545,11 @@ def run_stage(job: Job) -> None:
             if problems:
                 langs = {p["suite"]: p["language"] for p in problems}
                 suites = {s: {"language": lang, "n": sum(p["suite"] == s for p in problems), "status": {},
-                              **{f"pass@{k}": round(0.8 - 0.07 * i, 4) for k in cfg.code_eval_k}}
+                              **{f"pass@{k}": round(0.8 - 0.07 * i, 4) for k in cfg.code_eval_k},
+                              **({"fix@1": round(0.9 - 0.07 * i, 4)} if cfg.code_eval_fix else {})}
                           for s, lang in langs.items()}
-                code = {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": 1}
+                code = {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": 1,
+                        **({"mean_fix@1": codebench.mean_fix1(suites)} if cfg.code_eval_fix else {})}
             results[name] = {"agreement": 0.85 - 0.07 * i if inputs else None, "judge": None, "tok_s_vm": None,
                              "code": code, "samples": []}
     else:

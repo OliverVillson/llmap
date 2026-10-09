@@ -8,9 +8,10 @@
     "c-set",
     "livecodebench"
   ],
-  "code_eval_max_tokens": 4096,
+  "code_eval_max_tokens": 32768,
   "lcb_since": "2025-01-01",
   "eval_candidates": {
     "ref": "/mnt/nvme/models/gguf/Qwen3.6-35B-A3B-BF16.gguf"
-  }
+  },
+  "code_eval_thinking": true
 }

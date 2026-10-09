@@ -10,7 +10,7 @@
     "heldout"
   ],
   "code_eval_max_tokens": 4096,
-  "lcb_since": "2026-05-01",
+  "lcb_since": "2025-01-01",
   "dense_fallback": false,
   "data_answer_max_tokens": 4096,
   "data_max_len": 16384,

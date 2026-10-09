@@ -11,8 +11,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Plan, Ticket, WorkerOutput } from '../tickets/schema.ts';
-import { WORKER_OUTPUT_JSON_SCHEMA } from '../tickets/schema.ts';
 import type { EventSink } from './events.ts';
+import { parseFiles } from './files.ts';
 import type { Inference } from './inference.ts';
 import { buildPack, fixMessages, writeMessages } from './prompts.ts';
 import { tail, type Sandbox } from './sandbox.ts';
@@ -75,12 +75,12 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       const messages = failed ? fixMessages(worktree, pack, failed) : writeMessages(worktree, pack);
       let out: WorkerOutput;
       try {
-        const c = await ctx.inference.complete<WorkerOutput>(model, messages, WORKER_OUTPUT_JSON_SCHEMA, ticket.budget.max_tokens - spent);
+        const c = await ctx.inference.text(model, messages, ticket.budget.max_tokens - spent);
         spent += c.completionTokens;
         r.promptTokens += c.promptTokens;
         r.completionTokens += c.completionTokens;
         r.inferenceMs += c.ms;
-        out = c.value;
+        out = parseFiles(c.value);
         ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, ms: c.ms, note: String(out?.note ?? '').slice(0, 200) });
       } catch (e) {
         failed = { command: '(model call)', output: String((e as Error).message ?? e) };

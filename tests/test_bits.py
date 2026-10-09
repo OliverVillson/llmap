@@ -95,3 +95,21 @@ def test_sensitivity_is_clipped():
     s = bits.sensitivities(4, [1, 1, 1, 1000], {"gate": [1, 1, 1, 1e6], "up": [1] * 4, "down": [1] * 4})
     lo, hi = bits.SENS_CLIP
     assert max(s["gate"]) <= hi * bits.KIND_WEIGHT["gate"] and min(s["gate"]) >= lo * bits.KIND_WEIGHT["gate"]
+
+
+def test_q8_ceiling_reaches_eight_bits_with_room():
+    # A 2..8-bit range: with a generous budget the most important layers get q8_0.
+    imp = [1.0] * 48
+    imp[10] = 10.0
+    layers = bits.allocate(shape(), imp, 14.0, floor="q2_k", ceiling="q8_0")
+    assert layers[10].down == "q8_0"
+    assert bits.estimate_size_gb(shape(), layers) <= 14.0
+
+
+def test_static_type_override_sets_every_non_expert_tensor():
+    static = bits.static_types("q8_0")
+    layers = bits.allocate(shape(), None, 9.0, ceiling="q8_0", static=static)
+    args = bits.quantize_args(layers, static)
+    assert args[1] == "q8_0" and args[3] == "q8_0" and args[5].endswith("=q8_0")
+    assert bits.estimate_size_gb(shape(), layers, static) > bits.estimate_size_gb(shape(), layers)
+    assert bits.static_types("") is bits.STATIC

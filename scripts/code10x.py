@@ -10,6 +10,16 @@
     python pipeline.py --job $LOBBOT_JOBS/code10x-r50mix-gen
     python scripts/code10x.py report --jobs $LOBBOT_JOBS
 
+Thinking (a separate thinking model next to r50w95s; setup also creates these jobs):
+    python pipeline.py --job $LOBBOT_JOBS/code10x-ref-think --only eval   # the full model, thinking on
+    python pipeline.py --job $LOBBOT_JOBS/code10x-r50w95s-t                # data with thinking onwards
+Multi-language heal data (one data job per language, then one merged job):
+
+    python scripts/code10x.py lang-jobs --taskspec examples/c-strings.code.taskspec.json ...
+    python pipeline.py --job $LOBBOT_JOBS/code10x-data-c --only data      # once per language
+    python scripts/code10x.py merge-data --into code10x-multi --sources code10x-r50mix code10x-data-c ...
+    python pipeline.py --job $LOBBOT_JOBS/code10x-multi                   # reap onwards
+
 The job configs are configs/code10x/<variant>.json. Each compressed variant's
 size budget lives in its TaskSpec target, so setup writes the taskspec per job
 with TARGETS below. Every job also needs the code suites on the VM
@@ -19,8 +29,10 @@ with TARGETS below. Every job also needs the code suites on the VM
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -31,7 +43,7 @@ sys.path.insert(0, str(ROOT))
 
 from stages._util import Config, Job  # noqa: E402
 
-VARIANTS = ["ref", "fp8", "r25q4", "r50mix", "r50mix-gen"]
+VARIANTS = ["ref", "fp8", "r25q4", "r50mix", "r50mix-gen", "ref-think", "r50w95s-t"]
 CONFIGS = ROOT / "configs" / "code10x"
 # Size budget per compressed variant (GB, with quantize's margin under it). Laptop
 # speed is not what this experiment measures, so the tok/s floor is low.
@@ -39,6 +51,9 @@ TARGETS = {
     "r25q4": {"max_size_gb": 16.0, "min_tok_s": 10.0},
     "r50mix": {"max_size_gb": 7.5, "min_tok_s": 10.0},
     "r50mix-gen": {"max_size_gb": 7.5, "min_tok_s": 10.0},
+    # The thinking model: r50w95s's recipe (2-8 bit experts, 8-bit rest at 9.5 GB),
+    # with thinking kept in its data, REAP calibration and heal.
+    "r50w95s-t": {"max_size_gb": 9.5, "min_tok_s": 10.0},
 }
 # The pass bar from the experiment doc: (mean share of ref, lowest suite share).
 BARS = {"r50mix": (0.90, 0.80), "r25q4": (0.95, None)}
@@ -100,10 +115,66 @@ def share_data(args) -> None:
         if (d / ".done" / "data").exists():
             print(f"{d}: data already done")
             continue
+        if config(v).get("data_thinking", False) != config(args.source).get("data_thinking", False):
+            print(f"{d}: makes its own data (thinking differs from {args.source})")
+            continue
         shutil.copytree(src / "data", d / "data", dirs_exist_ok=True)
         (d / ".done").mkdir(exist_ok=True)
         shutil.copy(src / ".done" / "data", d / ".done" / "data")
         print(f"{d}: data copied from {args.source}")
+
+
+def lang_jobs(args) -> None:
+    """One data-only job per code TaskSpec, with r50mix's data settings and a smaller n_generate."""
+    for ts in args.taskspec:
+        spec = json.loads(Path(ts).read_text())
+        d = Path(args.jobs) / f"code10x-data-{spec['language']}"
+        d.mkdir(parents=True, exist_ok=True)
+        cfg = {**config(args.base), "n_generate": args.n, "n_heldout": args.heldout}
+        (d / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+        (d / "taskspec.json").write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n")
+        Job(d).spec  # validates
+        print(f"{d}: ready ({spec['language']})")
+
+
+def merge_data(args) -> None:
+    """Merge finished data stages into one job: up to --per-source train rows from each,
+    all held-out rows (each keeps its own language and task prompt), calib text interleaved.
+    The merged job gets r50mix's config and the first source's taskspec unless it has its own."""
+    from stages.data import system_prompt
+
+    out = Path(args.jobs) / args.into
+    (out / "data").mkdir(parents=True, exist_ok=True)
+    (out / ".done").mkdir(exist_ok=True)
+    if not (out / "config.json").exists():
+        (out / "config.json").write_text(json.dumps(config(args.base), indent=2) + "\n")
+    train, held, calib, per = [], [], [], {}
+    rng = random.Random(0)
+    for name in args.sources:
+        src = Path(args.jobs) / name
+        if not (src / ".done" / "data").exists():
+            sys.exit(f"{src} has not finished its data stage yet")
+        if not (out / "taskspec.json").exists():
+            shutil.copy(src / "taskspec.json", out / "taskspec.json")
+        system = system_prompt(Job(src).spec)
+        rows = [json.loads(l) for l in (src / "data" / "train.jsonl").read_text().splitlines() if l.strip()]
+        rng.shuffle(rows)
+        rows = rows[: args.per_source]
+        hrows = [json.loads(l) for l in (src / "data" / "heldout.jsonl").read_text().splitlines() if l.strip()]
+        hrows = [{**h, "system": h.get("system") or system} for h in hrows][: args.heldout_per_source]
+        train += rows
+        held += hrows
+        calib.append([c for c in (src / "data" / "calib.txt").read_text().split("\n\n") if c.strip()])
+        per[name] = {"language": Job(src).spec.language, "train": len(rows), "heldout": len(hrows)}
+    rng.shuffle(train)
+    mixed = [c for group in itertools.zip_longest(*calib) for c in group if c]
+    (out / "data" / "train.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in train))
+    (out / "data" / "heldout.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in held))
+    (out / "data" / "calib.txt").write_text("\n\n".join(mixed[:1000 * len(calib)]))
+    stats = {"merged_from": per, "train": len(train), "heldout": len(held)}
+    (out / "data" / "stats.json").write_text(json.dumps(stats, indent=2))
+    Job(out).mark_done("data", {"train": len(train), "heldout": len(held)})
+    print(json.dumps(stats, indent=2))
 
 
 def pick(rep: dict, variant: str) -> dict | None:
@@ -168,8 +239,22 @@ def main() -> int:
     d.add_argument("--source", default="r50mix", choices=list(TARGETS))
     r = sub.add_parser("report")
     r.add_argument("--jobs", default=jobs)
+    lj = sub.add_parser("lang-jobs")
+    lj.add_argument("--jobs", default=jobs)
+    lj.add_argument("--taskspec", nargs="+", required=True)
+    lj.add_argument("--base", default="r50mix", choices=VARIANTS)
+    lj.add_argument("--n", type=int, default=800, help="n_generate per language")
+    lj.add_argument("--heldout", type=int, default=40)
+    m = sub.add_parser("merge-data")
+    m.add_argument("--jobs", default=jobs)
+    m.add_argument("--into", required=True, help="job folder name under --jobs")
+    m.add_argument("--sources", nargs="+", required=True, help="job folder names with a finished data stage")
+    m.add_argument("--base", default="r50mix", choices=VARIANTS)
+    m.add_argument("--per-source", type=int, default=800)
+    m.add_argument("--heldout-per-source", type=int, default=40)
     args = ap.parse_args()
-    return {"setup": setup, "ref-ggufs": ref_ggufs, "share-data": share_data, "report": report}[args.cmd](args) or 0
+    return {"setup": setup, "ref-ggufs": ref_ggufs, "share-data": share_data, "report": report,
+            "lang-jobs": lang_jobs, "merge-data": merge_data}[args.cmd](args) or 0
 
 
 if __name__ == "__main__":

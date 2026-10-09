@@ -8,6 +8,8 @@ tests, in one file. It passes when it builds and exits 0 within the timeout.
   typescript  prog.ts   tsc --strict ... then node prog.js   (type errors are compile errors)
   c           prog.c    cc -std=c11 -O1 prog.c -lm; ./prog   (tests own main(), use assert.h)
   cpp         prog.cpp  g++ -std=c++17 -O1 prog.cpp; ./prog  (same as C; for eval suites)
+  asm         prog.s + tests.c   cc prog.s tests.c; ./prog   (the one exception: x86-64 GNU as
+                        answer, C tests with main() in their own file, linked together)
 
 Isolation per run: a fresh temp dir, a scrubbed environment, rlimits on CPU time,
 memory and file size, its own process group (killed whole on timeout), and no
@@ -48,7 +50,11 @@ _LANG = {
     "c": ("prog.c", ["cc", "-std=c11", "-O1", "-o", "prog", "prog.c", "-lm"], ["./prog"]),
     # eval only (MultiPL-E C++); TaskSpec languages stay the four above
     "cpp": ("prog.cpp", ["g++", "-std=c++17", "-O1", "-o", "prog", "prog.cpp"], ["./prog"]),
+    "asm": ("prog.s", ["cc", "-std=c11", "-O1", "-Wa,--noexecstack", "-o", "prog", "prog.s", "tests.c", "-lm"],
+            ["./prog"]),
 }
+# Languages whose tests go in their own file (name) instead of after the answer.
+_SPLIT_TESTS = {"asm": "tests.c"}
 LANGUAGES = tuple(_LANG)
 
 
@@ -63,6 +69,15 @@ def program(language: str, code: str, tests: str) -> str:
     return f"{code.rstrip()}\n\n{tests.strip()}\n"
 
 
+def layout(language: str) -> tuple[str, list[str], str]:
+    """(file the answer is saved as, the commands that check it, where the tests are),
+    for prompts that show a run the way Mugge's harness does (stages/harness.py)."""
+    src, build, run = _LANG[language]
+    where = (f"The tests are in {_SPLIT_TESTS[language]}, built and linked with {src}." if language in _SPLIT_TESTS
+             else f"The tests are appended to {src} when these run.")
+    return src, [" ".join(c) for c in (build, run) if c], where
+
+
 def run_tests(language: str, code: str, tests: str, timeout: float = TIMEOUT) -> Result:
     if language not in _LANG:
         return Result(False, "unsupported_language", language)
@@ -71,8 +86,13 @@ def run_tests(language: str, code: str, tests: str, timeout: float = TIMEOUT) ->
         if argv and argv[0] != "./prog" and not shutil.which(argv[0]):
             return Result(False, "missing_toolchain", argv[0])
     with tempfile.TemporaryDirectory(prefix="lobbot-sbx-") as d:
-        with open(os.path.join(d, src), "w") as f:
-            f.write(program(language, code, tests))
+        if language in _SPLIT_TESTS:
+            files = {src: code.rstrip() + "\n", _SPLIT_TESTS[language]: tests.strip() + "\n"}
+        else:
+            files = {src: program(language, code, tests)}
+        for name, text in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
         if build:
             rc, out = _exec(build, d, timeout)
             if rc is None:
@@ -125,7 +145,10 @@ def _limits(timeout: float):
         # Node and V8 reserve large virtual ranges up front, so RLIMIT_AS would kill them;
         # cap the data segment instead, which still stops runaway heap growth.
         mem = MEM_MB << 20
-        resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
+        try:
+            resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
+        except (ValueError, OSError):  # macOS can refuse it; CPU time and file size still apply
+            pass
         os.setsid()
     return apply
 
@@ -141,7 +164,7 @@ def _exec(argv: list[str], d: str, timeout: float) -> tuple[int | None, str]:
         _kill(p)
         out, _ = p.communicate()
         rc = None
-    text = out.decode("utf-8", "replace")
+    text = out.decode("utf-8", "replace").replace(d + os.sep, "")  # "prog.py", not the temp dir path
     return rc, text[-MAX_OUTPUT:]
 
 

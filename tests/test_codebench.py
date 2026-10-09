@@ -237,7 +237,7 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -250,3 +250,187 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     assert {c[0] for c in calls} == {cb.SYSTEM} and {c[2] for c in calls} == {0, 1}
     rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
     assert len(rows) == 4 and sum(r["passed"] for r in rows) == 1
+
+
+@needs("cc")
+def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monkeypatch):
+    """With code_eval_fix, a failed greedy answer gets one more call that shows the
+    code and the failing output; fix@1 counts first passes plus fixes."""
+    from stages import eval as ev
+    from stages._util import Job
+
+    job = Job(tmp_path)
+    job.config.code_eval_fix = True
+    probs = cb.load_suite("c-set", "/nonexistent", limit=3)
+    good = lambda p: "```c\n" + p["canonical"] + "\n```"
+    calls = []
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+        calls.append(prompts)
+        for _ in prompts:
+            on_answer()
+        if len(calls) == 1:  # first answers: 0 passes, 1 and 2 do not build
+            return [good(probs[0]), "```c\nint broken(\n```", "```c\nint nope;\n```"], None
+        return [good(probs[1]), "```c\nint still_nope;\n```"], None  # the fix turn
+
+    events = []
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    monkeypatch.setattr(ev, "emit", lambda stage, **kw: events.append(kw))
+    out = ev.code_eval(job, "cand", probs, "task system")
+    s = out["suites"]["c-set"]
+    assert s["pass@1"] == round(1 / 3, 4) and s["fix@1"] == round(2 / 3, 4) and s["fixed"] == 1
+    assert out["mean_fix@1"] == s["fix@1"]
+    fix_prompts = calls[1]
+    assert len(fix_prompts) == 2 and "int broken(" in fix_prompts[0] and "It did not build:" in fix_prompts[0]
+    assert "## Fix" in fix_prompts[1] and "int nope;" in fix_prompts[1]
+    failed = type("R", (), {"reason": "test_failed", "output": "x" * 5000})()
+    text = cb.fix_prompt(probs[0], "```c\nint f;\n```", failed)
+    assert "It failed its tests:\n…" + "x" * cb.FIX_OUTPUT_CHARS in text and "x" * 2001 not in text
+    rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
+    assert [r.get("fix_passed") for r in rows] == [None, True, False]
+    assert [(e["answered"], e["total"]) for e in events if "answered" in e][-1] == (5, 5)
+
+
+def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch):
+    """Thinking loops under greedy decoding, so a single-sample thinking eval
+    samples at 0.6 with a fixed seed and passes thinking through."""
+    from stages import eval as ev
+    from stages._util import Job
+
+    job = Job(tmp_path)
+    job.config.code_eval_thinking, job.config.code_eval_max_tokens = True, 24576
+    probs = cb.load_suite("c-set", "/nonexistent", limit=1)
+    calls = []
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+        calls.append((max_tokens, temperature, seed, thinking))
+        on_answer()
+        return [""], None
+
+    events = []
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    monkeypatch.setattr(ev, "emit", lambda stage, **kw: events.append(kw))
+    ev.code_eval(job, "cand", probs, "task system")
+    assert calls == [(24576, 0.6, 0, True)]
+    # Progress for the Mac runner's bar: 0 of 1 before answering, 1 of 1 after.
+    assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
+
+
+def test_generate_sends_thinking_flag(monkeypatch):
+    import httpx
+    from stages import eval as ev
+
+    sent = []
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]}
+
+    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: sent.append((timeout, json)) or R())
+    ev.generate("sys", ["a"], 24576, 0.6, 0, thinking=True)
+    ev.generate("sys", ["b"], 2048)
+    (t1, on), (t2, off) = sent
+    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and t1 >= 24576 / 4
+    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off and t2 == 600
+
+
+def test_eval_context_fits_code_answer_cap(monkeypatch):
+    from stages import eval as ev
+    from stages._util import Config
+
+    monkeypatch.delenv("LOBBOT_EVAL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LOBBOT_EVAL_CTX", raising=False)
+    cfg = Config(code_eval_suites=["livecodebench"], code_eval_max_tokens=24576, data_answer_max_tokens=2048)
+    assert ev.limits(cfg) == (2048, 24576 + 4096)
+    cfg.code_eval_thinking = True  # room for the answer after a thinking that used it all
+    assert ev.limits(cfg) == (2048, 24576 + ev.ANSWER_TOKENS + 4096)
+
+
+def write_gguf_header(path, kvs):
+    """A GGUF with only a header: kvs is [(key, value type, packed value)]."""
+    import struct
+
+    s = lambda b: struct.pack("<Q", len(b)) + b
+    body = b"".join(s(k.encode()) + struct.pack("<I", t) + v for k, t, v in kvs)
+    path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kvs)) + body)
+
+
+def test_experts_override_names_the_files_architecture(tmp_path):
+    import struct
+
+    from stages import eval as ev
+    from stages._util import Config
+
+    gguf = tmp_path / "m.gguf"
+    s = lambda b: struct.pack("<Q", len(b)) + b
+    write_gguf_header(gguf, [
+        ("general.alignment", 4, struct.pack("<I", 32)),
+        ("general.tags", 9, struct.pack("<IQ", 8, 2) + s(b"a") + s(b"bc")),  # arrays are skipped too
+        ("general.architecture", 8, s(b"qwen35moe")),
+    ])
+    assert ev.gguf_arch(str(gguf)) == "qwen35moe"
+    assert "--override-kv" not in ev.server_args(Config(), str(gguf))
+    args = ev.server_args(Config(eval_experts_used=6), str(gguf))
+    assert args[args.index("--override-kv") + 1] == "qwen35moe.expert_used_count=int:6"
+
+
+def test_split_reasoning_handles_split_and_inline_tags():
+    from stages.eval import split_reasoning
+
+    assert split_reasoning({"content": "x = 1", "reasoning_content": "hmm"}) == ("hmm", "x = 1")
+    assert split_reasoning({"content": "<think>hmm</think>\n\nx = 1"}) == ("hmm", "x = 1")
+    assert split_reasoning({"content": "hmm</think>x = 1"}) == ("hmm", "x = 1")  # template opened it
+    assert split_reasoning({"content": "<think>hmm, still going"}) == ("hmm, still going", "")
+    assert split_reasoning({"content": None, "reasoning_content": "hmm"}) == ("hmm", "")
+    assert split_reasoning({"content": "", "reasoning_content": "hmm</think>\n\nx = 1"}) == ("hmm", "x = 1")
+
+
+def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
+    """A thinking that ends with no answer gets </think> appended (plus Qwen's
+    early-stop line when it ran out of budget) and the model answers on top."""
+    import httpx
+    from stages import eval as ev
+
+    finish = {"a": "stop", "b": "length"}
+    sent = []
+
+    class R:
+        def __init__(self, body): self.body = body
+        def raise_for_status(self): pass
+        def json(self): return self.body
+
+    def post(url, timeout, json):
+        sent.append((url.rsplit("/", 1)[1], json))
+        if url.endswith("/chat/completions"):
+            return R({"choices": [{"finish_reason": finish[json["messages"][1]["content"]],
+                                   "message": {"content": "", "reasoning_content": "plan it"}}],
+                      "usage": {"completion_tokens": 900}})
+        if url.endswith("/apply-template"):
+            assert json["chat_template_kwargs"] == {"enable_thinking": True}
+            return R({"prompt": "<|im_start|>assistant\n<think>\n"})
+        return R({"content": "```py\nx = 1\n```", "tokens_predicted": 12})
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(ev, "SLOTS", 1)
+    infos = []
+    answers, _ = ev.generate("sys", ["a", "b"], 24576, 0.6, 0, thinking=True, infos=infos)
+    assert answers == ["```py\nx = 1\n```"] * 2
+    assert [(i["forced"], i["tokens"], i["forced_tokens"]) for i in infos] == [("stop", 900, 12), ("length", 900, 12)]
+    stop, length = [j["prompt"] for name, j in sent if name == "completion"]
+    assert stop == "<|im_start|>assistant\n<think>\nplan it\n</think>\n\n"
+    assert length == "<|im_start|>assistant\n<think>\nplan it" + ev.EARLY_STOP + "\n</think>\n\n"
+
+
+def test_thinking_off_never_forces_an_answer(monkeypatch):
+    import httpx
+    from stages import eval as ev
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+
+    urls = []
+    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: urls.append(url) or R())
+    infos = []
+    assert ev.generate("sys", ["a"], 4096, infos=infos)[0] == [""]
+    assert len(urls) == 1 and infos[0]["forced"] is None and infos[0]["finish"] == "length"

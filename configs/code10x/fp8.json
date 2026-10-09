@@ -9,7 +9,7 @@
     "livecodebench"
   ],
   "code_eval_max_tokens": 4096,
-  "lcb_since": "2026-05-01",
+  "lcb_since": "2025-01-01",
   "eval_candidates": {
     "fp8": "/mnt/nvme/models/gguf/Qwen3.6-35B-A3B-Q8_0.gguf"
   },

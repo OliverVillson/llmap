@@ -75,3 +75,14 @@ def test_unknown_language():
 def test_run_many_keeps_order():
     items = [("python", f"x = {i}", f"assert x == {i if i % 2 else -1}") for i in range(6)]
     assert [r.passed for r in sandbox.run_many(items, workers=3)] == [False, True] * 3
+
+
+ASM_OK = ".intel_syntax noprefix\n    .text\n    .globl add\nadd:\n    lea eax, [rdi + rsi]\n    ret\n"
+ASM_TESTS = "#include <assert.h>\nint add(int, int);\nint main(void) { assert(add(2, 3) == 5); return 0; }"
+
+
+def test_asm_links_against_c_tests():
+    need("c")
+    assert sandbox.run_tests("asm", ASM_OK, ASM_TESTS).passed
+    assert sandbox.run_tests("asm", ASM_OK.replace("lea eax, [rdi + rsi]", "mov eax, edi"), ASM_TESTS).reason == "test_failed"
+    assert sandbox.run_tests("asm", "add:\n    bogus eax\n", ASM_TESTS).reason == "compile_error"

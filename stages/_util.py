@@ -32,6 +32,18 @@ class Config:
     # Length limits for long-output tasks (code). None uses the env knob or built-in default:
     data_answer_max_tokens: int | None = None  # LOBBOT_DATA_ANSWER_MAX_TOKENS or 1536; eval follows it
     data_max_len: int | None = None  # vLLM context, LOBBOT_DATA_MAX_LEN or 8192
+    # Teacher answers with thinking on, and the thinking is kept in the training rows
+    # (the assistant message's reasoning_content), so REAP calibrates on it and heal
+    # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
+    # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50w95s-t).
+    data_thinking: bool = False
+    # Mugge-shaped heal data for code specs (stages/harness.py): this share of the train
+    # rows is asked the way Mugge's harness asks (context pack in, files out), and
+    # data_fix_rows fix rows are added: a failed draft and its error in, the teacher's
+    # passing fix out. Drafts are the teacher's own failed answers, topped up with
+    # extra answers sampled at temperature 1.0. 0 and 0 = plain rows only.
+    data_harness_share: float = 0.0
+    data_fix_rows: int = 0
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
@@ -61,6 +73,8 @@ class Config:
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"
     bit_ceiling: str = "q6_k"
+    # One llama.cpp type (e.g. "q8_0") for every non-expert tensor; "" keeps bits.STATIC.
+    static_type: str = ""
     # Eval
     judge_model: str = "gemini-3.8-flash"  # gemini-* needs GEMINI_API_KEY, claude-* ANTHROPIC_API_KEY
     laptop_bandwidth_gb_s: float = 120.0  # MacBook Air M4; M5 is ~153
@@ -73,6 +87,28 @@ class Config:
     code_eval_temperature: float = 0.2
     code_eval_limit: int | None = None  # problems per suite (quick runs); None = all
     code_eval_max_tokens: int = 4096
+    # Let the model think before answering (chat template enable_thinking). Thinking
+    # runs for thousands of tokens, so raise code_eval_max_tokens to ~24k-32k with it.
+    code_eval_thinking: bool = False
+    # Sampling temperature for one thinking answer per problem (greedy decoding loops
+    # when thinking). The Qwen3 cards say 0.6; Qwen3.8's says 1.0.
+    code_eval_thinking_temperature: float = 0.6
+    # Keep each answer's whole thinking in work/code_eval/<name>.jsonl and re-score it
+    # cut at these token budgets (stages/budget.py), so one long run also gives the
+    # scores at every shorter budget.
+    code_eval_budgets: list[int] = field(default_factory=list)
+    # After a greedy answer fails, ask once more with the failing output (Mugge's fix
+    # call) and report fix@1 next to pass@1: what the harness loop gets in one repair.
+    code_eval_fix: bool = False
+    # "plain": benchmark prompts as published. "harness": every problem is asked the way
+    # Mugge's harness asks (stages/harness.py: a ticket in, files out), fixes too.
+    code_eval_format: str = "plain"
+    # Route each token to this many experts instead of the model's own count (0 keeps
+    # it). A llama-server override at serve time, so a top-k test needs no rebuild.
+    eval_experts_used: int = 0
+    # llama-server KV cache type at eval ("q8_0" halves it, so more long thinking
+    # answers run at once); "" keeps llama.cpp's f16.
+    eval_kv_type: str = ""
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
     # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
     # eval-only job (pipeline.py --only eval) score an uncompressed reference.

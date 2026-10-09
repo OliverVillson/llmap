@@ -1,7 +1,8 @@
 /**
- * Harness-shaped prompts: one input, one output, the way llmap's specialists are trained.
+ * Harness-shaped prompts: one input, one output, the way llmap's specialists are trained
+ * (llmap's stages/harness.py builds the same prompts for training; keep them in sync).
  * A write call gets the context pack; a fix call gets the same pack plus the failing command's
- * trimmed output. Both answer `{ files: { path: content }, note }`.
+ * trimmed output. Both answer with the owned files as plain fenced files (files.ts).
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -10,8 +11,8 @@ import type { ChatMessage } from './inference.ts';
 
 export const SYSTEM = [
   'You are a coding specialist working on one ticket of a larger project.',
-  'Reply with one JSON object: {"files": {"<path>": "<full file content>"}, "note": "<one line>"}.',
-  'Write only the files the ticket owns, each in full. Do not change interfaces you only read.',
+  'Reply with each file you own in full: its path on one line, then its content in one fenced code block. You may end with one line "Note: <what you changed>".',
+  'Write only the files the ticket owns. Do not change interfaces you only read.',
   'No comments that mention AI, tickets or this process; write code the way the repo already does.',
 ].join('\n');
 

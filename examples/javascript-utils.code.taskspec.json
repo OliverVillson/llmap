@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "task_type": "code",
+  "language": "javascript",
+  "task_name": "javascript-utility-functions",
+  "description": "Write a small, self-contained JavaScript (Node 22) utility function from a short specification.",
+  "input_format": "A short spec naming the function, its parameters and its behaviour, including edge cases.",
+  "output_format": "JavaScript source defining the requested function (no imports, no exports).",
+  "eval_criteria": "The code runs under Node 22 and passes the example's tests.",
+  "seed_examples": [
+    {
+      "input": "Write `function chunk(arr, size)` that splits an array into consecutive chunks of `size` (the last may be shorter). Throw a RangeError if size < 1.",
+      "output": "function chunk(arr, size) {\n  if (size < 1) throw new RangeError('size must be >= 1');\n  const out = [];\n  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));\n  return out;\n}",
+      "tests": "const assert = require('assert');\nassert.deepStrictEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);\nassert.deepStrictEqual(chunk([], 3), []);\nassert.throws(() => chunk([1], 0), RangeError);"
+    },
+    {
+      "input": "Write `function camelToKebab(s)` that turns camelCase or PascalCase into kebab-case: `fooBarBaz` -> `foo-bar-baz`, `HTMLParser` -> `html-parser`. An empty string stays empty.",
+      "output": "function camelToKebab(s) {\n  return s\n    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')\n    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')\n    .toLowerCase();\n}",
+      "tests": "const assert = require('assert');\nassert.strictEqual(camelToKebab('fooBarBaz'), 'foo-bar-baz');\nassert.strictEqual(camelToKebab('HTMLParser'), 'html-parser');\nassert.strictEqual(camelToKebab(''), '');\nassert.strictEqual(camelToKebab('already'), 'already');"
+    },
+    {
+      "input": "Write `function groupBy(items, keyFn)` that returns a plain object mapping each key returned by keyFn to the array of items with that key, in input order.",
+      "output": "function groupBy(items, keyFn) {\n  const out = {};\n  for (const item of items) {\n    const k = keyFn(item);\n    (out[k] ||= []).push(item);\n  }\n  return out;\n}",
+      "tests": "const assert = require('assert');\nassert.deepStrictEqual(groupBy([1, 2, 3, 4], n => (n % 2 ? 'odd' : 'even')), { odd: [1, 3], even: [2, 4] });\nassert.deepStrictEqual(groupBy([], x => x), {});"
+    },
+    {
+      "input": "Write `function debounceCalls(times, wait)` that, given sorted call timestamps in ms, returns the timestamps at which a trailing-edge debounced function with delay `wait` would actually fire.",
+      "output": "function debounceCalls(times, wait) {\n  const fired = [];\n  for (let i = 0; i < times.length; i++) {\n    const next = times[i + 1];\n    if (next === undefined || next - times[i] >= wait) fired.push(times[i] + wait);\n  }\n  return fired;\n}",
+      "tests": "const assert = require('assert');\nassert.deepStrictEqual(debounceCalls([0, 50, 100, 400], 200), [300, 600]);\nassert.deepStrictEqual(debounceCalls([], 100), []);\nassert.deepStrictEqual(debounceCalls([0, 300], 100), [100, 400]);"
+    }
+  ],
+  "target": {
+    "max_size_gb": 7,
+    "min_tok_s": 40,
+    "laptop_ram_gb": 16
+  }
+}
