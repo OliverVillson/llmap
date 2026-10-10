@@ -2,7 +2,9 @@
 """Aider Polyglot: score a model dir with aider's own benchmark, and heal data in aider's format.
 
     python scripts/polyglot.py setup         # docker, pinned aider + polyglot-benchmark, the image
+    python scripts/polyglot.py selftest --out DIR      # no model: reference solutions through the tests
     python scripts/polyglot.py run --model-dir DIR --name NAME     # serve, benchmark, <run>/out/polyglot.json
+    python scripts/polyglot.py run --model-dir DIR --name NAME --sample-per-language 1   # 6 exercises
     python scripts/polyglot.py exercism      # training exercises: Exercism minus every Polyglot slug
     python scripts/polyglot.py run --model-dir TEACHER --name teacher-ex --out teacher-ex.json \
         --exercises $NVME/polyglot/exercism --log teacher-ex.requests.jsonl
@@ -16,8 +18,17 @@ a pinned aider inside aider's Docker image, which has every toolchain the tests 
 host network. Thinking, sampling (Qwen's thinking settings by default; Gemma 4 takes
 --temperature 1.0 --top-k 64 --reasoning-parser gemma4) and limits go in through aider's
 model settings; the results JSON is aider's --stats as fractions, per language too, with the
-GPU's busy share.
+GPU's busy share, and per exercise ("cases": {"<lang>/<exercise>": [passed by try 1, by try 2]})
+for comparing two runs exercise by exercise.
 A rerun resumes: aider keeps each finished exercise's .aider.results.json.
+--sample-per-language K runs the first K exercises (by name) of each language, a pre-flight
+check of serving and parsing in minutes, in its own run dir (runs/NAME-sampleK).
+
+`selftest` needs no model: the first N exercises of each language with their reference solution
+(Exercism's .meta example files) in place of the stub go through aider's benchmark with
+--no-aider, which runs each exercise's tests once as a real run does (same image, threads,
+caches and test timeout). A broken toolchain, no network for Rust crates or Gradle, or a test
+timeout too short for the machine fails it in minutes, and it warms the Gradle and cargo caches.
 
 Heal data: `exercism` builds a Polyglot-layout dir from the Exercism tracks at the commits
 Polyglot was copied from, without any slug Polyglot has in any language. A teacher `run` on
@@ -26,7 +37,8 @@ passing transcripts as chat rows for Config.data_extra_rows: a first-try pass as
 exchange, a second-try pass as the whole history (failed answer, test output, fix).
 
 Under $NVME/polyglot: aider/, polyglot-benchmark/, exercism-src/<lang>/, exercism/, gradle/
-(the Java tests' cache), runs/<name>/ (a job dir: work/ logs, bench/ aider's output, out/).
+and cargo/ (the Java and Rust tests' caches), runs/<name>/ (a job dir: work/ logs, bench/
+aider's output, out/).
 """
 
 from __future__ import annotations
@@ -88,6 +100,16 @@ MEMORY = "64g"  # the container's cap: 64 exercises building at once (Gradle, ru
 BOOT = ("import sys; sys.path.insert(0, '/aider/benchmark'); from aider import models; "
         "models.register_litellm_models(['/benchmarks/model-metadata.json']); "
         "import benchmark; sys.argv[0] = 'benchmark.py'; benchmark.app()")
+TEST_TIMEOUT = 180  # benchmark.py run_unit_tests: seconds per test run, fixed in aider
+# The selftest's benchmark.py, with each exercise's test run timed into .selftest.seconds.
+SELFTEST_BOOT = ("import sys, time; sys.path.insert(0, '/aider/benchmark'); import benchmark\n"
+                 "def timed(original, testdir, history, files, tests=benchmark.run_unit_tests):\n"
+                 "    start = time.time()\n"
+                 "    try:\n"
+                 "        return tests(original, testdir, history, files)\n"
+                 "    finally:\n"
+                 "        (testdir / '.selftest.seconds').write_text(str(round(time.time() - start, 1)))\n"
+                 "benchmark.run_unit_tests = timed; sys.argv[0] = 'benchmark.py'; benchmark.app()")
 # The harness's own words (aider benchmark/prompts.py): the first user message is the
 # exercise's docs, then ADDENDUM and the file list; the second try's ends in RETRY.
 ADDENDUM = "\n####\n\nUse the above instructions to modify the supplied files: "
@@ -179,30 +201,63 @@ def container(name: str) -> str:
     return "polyglot-" + re.sub(r"[^A-Za-z0-9_.-]", "-", name)
 
 
+def docker_run(name: str, run_dir: Path, exercises: Path, inner: str, env: dict[str, str], gradle: Path,
+               cargo: Path, prefix: tuple[str, ...]) -> list[str]:
+    """`inner` in aider's image, as benchmark/docker.sh starts it but on the host network:
+    run_dir at /benchmarks, the exercises read-only at /exercises, and the Gradle and cargo
+    caches kept on the host across runs."""
+    return [*prefix, "run", "--rm", "--name", container(name), "--network", "host",
+            "--memory", MEMORY, "--memory-swap", MEMORY,
+            "-v", f"{run_dir}:/benchmarks", "-v", f"{exercises}:/exercises:ro", "-v", f"{gradle}:/root/.gradle",
+            "-v", f"{cargo}:/root/.cargo/registry",
+            "-e", "AIDER_DOCKER=1", "-e", "AIDER_BENCHMARK_DIR=/benchmarks",
+            *(x for k, v in env.items() for x in ("-e", f"{k}={v}")),
+            IMAGE, "bash", "-c", inner]
+
+
 def docker_command(name: str, run_dir: Path, exercises: Path, api_base: str, edit_format: str = "diff",
                    threads: int = 64, num_tests: int = 0, owner: str = "0:0", gradle: Path = HOME / "gradle",
-                   prefix: tuple[str, ...] = ("docker",)) -> list[str]:
-    """aider's benchmark in its image, as benchmark/docker.sh starts it but on the host network,
-    so OPENAI_API_BASE reaches vLLM (or the proxy) on 127.0.0.1. run_dir is /benchmarks (aider
-    writes bench/ there), the exercises are read-only at /exercises, and the files aider wrote as
-    root are handed to `owner` at the end."""
+                   prefix: tuple[str, ...] = ("docker",), cargo: Path = HOME / "cargo") -> list[str]:
+    """aider's benchmark in its image (docker_run), so OPENAI_API_BASE reaches vLLM (or the
+    proxy) on 127.0.0.1. aider writes bench/ under run_dir, and the files it wrote as root are
+    handed to `owner` at the end."""
     bench = ["/benchmarks/bench", "--model", f"openai/{name}", "--edit-format", edit_format,
              "--threads", str(threads), "--exercises-dir", "/exercises",
              "--read-model-settings", "/benchmarks/model-settings.yml",
              *(["--num-tests", str(num_tests)] if num_tests > 0 else [])]
     inner = f"python3 -c \"{BOOT}\" {' '.join(bench)}; rc=$?; chown -R {owner} /benchmarks; exit $rc"
-    return [*prefix, "run", "--rm", "--name", container(name), "--network", "host",
-            "--memory", MEMORY, "--memory-swap", MEMORY,
-            "-v", f"{run_dir}:/benchmarks", "-v", f"{exercises}:/exercises:ro", "-v", f"{gradle}:/root/.gradle",
-            "-e", "AIDER_DOCKER=1", "-e", "AIDER_BENCHMARK_DIR=/benchmarks",
-            "-e", f"OPENAI_API_BASE={api_base}", "-e", "OPENAI_API_KEY=local",
-            IMAGE, "bash", "-c", inner]
+    return docker_run(name, run_dir, exercises, inner, {"OPENAI_API_BASE": api_base, "OPENAI_API_KEY": "local"},
+                      gradle, cargo, prefix)
+
+
+def selftest_command(out: Path, exercises: Path, threads: int = 64, owner: str = "0:0",
+                     gradle: Path = HOME / "gradle", cargo: Path = HOME / "cargo",
+                     prefix: tuple[str, ...] = ("docker",)) -> list[str]:
+    """aider's benchmark with --no-aider (docker_run): each exercise's files as they are, then
+    its tests, one try, into a fresh out/bench."""
+    bench = ["/benchmarks/bench", "--no-aider", "--tries", "1", "--threads", str(threads),
+             "--exercises-dir", "/exercises"]
+    inner = (f"rm -rf /benchmarks/bench; python3 -c \"{SELFTEST_BOOT}\" {' '.join(bench)}; rc=$?; "
+             f"chown -R {owner} /benchmarks; exit $rc")
+    return docker_run("selftest", out, exercises, inner, {"OPENAI_API_KEY": "local"}, gradle, cargo, prefix)
+
+
+def make_caches() -> None:
+    """The Gradle and cargo cache dirs, made here so docker does not make them as root."""
+    for d in (HOME / "gradle", HOME / "cargo"):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def passed(r: dict, tries: int) -> bool:
+    """aider's pass within `tries` tries: the last test run passed, and it was one of the first `tries`."""
+    o = r.get("tests_outcomes") or []
+    return bool(o and o[-1] and len(o) <= tries)
 
 
 def summarize(bench: Path) -> dict:
     """aider's --stats (benchmark.py summarize_results) for one run, rates as fractions, plus
-    pass rates per language. Rates are over the exercises that finished (n), as aider's are;
-    total counts every exercise in the run."""
+    pass rates per language and each exercise's pass by try 1 and 2 (cases). Rates are over
+    the exercises that finished (n), as aider's are; total counts every exercise in the run."""
     done = []
     for f in sorted(bench.glob("*/exercises/practice/*/.aider.results.json")):
         try:
@@ -210,15 +265,16 @@ def summarize(bench: Path) -> dict:
         except json.JSONDecodeError:  # being written
             continue
         if r:
-            done.append((f.relative_to(bench).parts[0], r))
+            lang, _, _, slug, _ = f.relative_to(bench).parts
+            done.append((lang, slug, r))
 
     def rate(rs: list[dict], tries: int) -> float | None:
-        ok = [bool(o and o[-1] and len(o) <= tries) for o in (r.get("tests_outcomes") or [] for r in rs)]
+        ok = [passed(r, tries) for r in rs]
         return round(sum(ok) / len(ok), 4) if ok else None
 
-    rs = [r for _, r in done]
+    rs = [r for _, _, r in done]
     total = lambda k: sum(r.get(k) or 0 for r in rs)  # noqa: E731
-    langs = {lang: [r for l2, r in done if l2 == lang] for lang in sorted({lang for lang, _ in done})}
+    langs = {lang: [r for l2, _, r in done if l2 == lang] for lang in sorted({lang for lang, _, _ in done})}
     return {
         "pass_rate_1": rate(rs, 1), "pass_rate_2": rate(rs, 2),
         "percent_cases_well_formed": round(1 - sum(bool(r.get("num_malformed_responses")) for r in rs) / len(rs), 4)
@@ -231,6 +287,7 @@ def summarize(bench: Path) -> dict:
         "error_outputs": total("num_error_outputs"), "malformed_responses": total("num_malformed_responses"),
         "prompt_tokens": total("prompt_tokens"), "completion_tokens": total("completion_tokens"),
         "seconds_per_case": round(total("duration") / len(rs), 1) if rs else None,
+        "cases": {f"{lang}/{slug}": [passed(r, 1), passed(r, 2)] for lang, slug, r in done},
     }
 
 
@@ -325,20 +382,70 @@ class LoggingProxy(ThreadingHTTPServer):
         self.client.close()
 
 
+def default_threads() -> int:
+    """Exercises at once: 4 per CPU, as each runs its test build on the CPUs, at most 64."""
+    return min(64, 4 * (os.cpu_count() or 16))
+
+
+def show_threads(threads: int) -> None:
+    print(f"[{STAGE}] {os.cpu_count()} CPUs, {threads} threads", flush=True)
+
+
+def follow(proc, bench: Path, total: int, label: str, check=lambda: None) -> None:
+    """Wait for proc, a progress line whenever another exercise finishes; check() may raise."""
+    shown = -1
+    while proc.poll() is None:
+        check()
+        done = sum(1 for _ in bench.glob("*/exercises/practice/*/.aider.results.json"))
+        if done != shown:
+            emit(STAGE, msg=f"{label}: {done}/{total} exercises", answered=done, total=total)
+            shown = done
+        time.sleep(10)
+
+
+def pick(root: Path, k: int, keep=lambda ex: True) -> list[Path]:
+    """The first k exercises (by name) of each language under root that keep() takes."""
+    return [ex for practice in sorted(root.glob("*/exercises/practice"))
+            for ex in [d for d in sorted(practice.iterdir()) if d.is_dir() and keep(d)][:k]]
+
+
+def case(ex: Path) -> str:
+    """<lang>/<exercise>, the key of summarize()'s cases."""
+    return f"{ex.parts[-4]}/{ex.name}"
+
+
+def copy_exercises(picked: list[Path], dest: Path, solve: bool = False) -> Path:
+    """A fresh dest in Polyglot's layout holding the picked exercises; with solve, each with its
+    reference solution (reference()) in place of the stub."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    for ex in picked:
+        to = dest / ex.parts[-4] / "exercises" / "practice" / ex.name
+        shutil.copytree(ex, to)  # copy2: gradlew stays executable
+        for f, src in (reference(ex) if solve else {}).items():
+            (to / f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, to / f)
+    return dest
+
+
 def run_bench(a) -> int:
-    run_dir = Path(a.dir or RUNS / a.name)
+    sample = f"-sample{a.sample_per_language}" if a.sample_per_language > 0 else ""
+    run_dir = Path(a.dir or RUNS / (a.name + sample))
     out = Path(a.out or run_dir / "out" / "polyglot.json")
     if out.exists() and not a.force:
         print(f"[{STAGE}] {out} exists; skipping {a.name} (--force runs it again)", flush=True)
         return 0
-    exercises = Path(a.exercises).resolve()
-    total = sum(1 for d in exercises.glob("*/exercises/practice/*") if d.is_dir())
-    if not total:
-        raise SystemExit(f"no exercises under {exercises}")
+    source = exercises = Path(a.exercises).resolve()
+    if not any(d.is_dir() for d in source.glob("*/exercises/practice/*")):
+        raise SystemExit(f"no exercises under {source}")
     if not ev.is_checkpoint(a.model_dir):
         raise SystemExit(f"{a.model_dir} is not a checkpoint dir (no config.json)")
     if not image_exists():
         raise SystemExit(f"no docker image {IMAGE}; run `python scripts/polyglot.py setup` first")
+    if sample:  # a copy, as aider reads /exercises in the container, where links out of it break
+        exercises = copy_exercises(pick(source, a.sample_per_language), (run_dir / "sample").resolve())
+    total = sum(1 for d in exercises.glob("*/exercises/practice/*") if d.is_dir())
     total = min(total, a.num_tests) if a.num_tests > 0 else total
 
     job = Job(run_dir)  # serve() reads its Config (a config.json there can add eval_vllm_args) and logs to work/
@@ -347,13 +454,19 @@ def run_bench(a) -> int:
     settings = model_settings(a.name, a.edit_format, a.temperature, a.top_p, a.top_k)
     (run_dir / "model-settings.yml").write_text(json.dumps(settings, indent=2))
     (run_dir / "model-metadata.json").write_text(json.dumps(model_metadata(a.name, ev.limits(job.config)[1]), indent=2))
-    (HOME / "gradle").mkdir(parents=True, exist_ok=True)
+    make_caches()
     subprocess.run([*docker(), "rm", "-f", container(a.name)], capture_output=True)  # left over from a stopped run
+    show_threads(a.threads)
 
     emit(STAGE, msg=f"{a.name}: serving {a.model_dir}")
     server = ev.serve(job, a.model_dir, a.name)
     end_gpu, proxy, start = ev.watch_gpu(), None, time.monotonic()
-    bench, log_path, shown = run_dir / "bench", job.path("work", "aider.log"), -1
+    bench, log_path = run_dir / "bench", job.path("work", "aider.log")
+
+    def vllm_up() -> None:
+        if server.poll() is not None:
+            raise RuntimeError(f"vLLM exited during the benchmark; see {job.path('work', f'vllm-{a.name}.log')}")
+
     try:
         if a.log:
             Path(a.log).parent.mkdir(parents=True, exist_ok=True)
@@ -363,14 +476,7 @@ def run_bench(a) -> int:
                              f"{os.getuid()}:{os.getgid()}", prefix=tuple(docker()))
         with open(log_path, "a") as log:
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-            while proc.poll() is None:
-                if server.poll() is not None:
-                    raise RuntimeError(f"vLLM exited during the benchmark; see {job.path('work', f'vllm-{a.name}.log')}")
-                done = sum(1 for _ in bench.glob("*/exercises/practice/*/.aider.results.json"))
-                if done != shown:
-                    emit(STAGE, msg=f"{a.name}: {done}/{total} exercises", answered=done, total=total)
-                    shown = done
-                time.sleep(10)
+            follow(proc, bench, total, a.name, vllm_up)
         if proc.returncode:
             tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-15:])
             raise RuntimeError(f"aider's benchmark exited with {proc.returncode}; see {log_path}:\n{tail}")
@@ -383,7 +489,7 @@ def run_bench(a) -> int:
         ev.stop(server)
 
     res = {"name": a.name, "model_dir": str(a.model_dir), "run_dir": str(run_dir.resolve()),
-           "exercises": str(exercises), "edit_format": a.edit_format,
+           "exercises": str(source), "sample_per_language": a.sample_per_language, "edit_format": a.edit_format,
            "sampling": {"temperature": a.temperature, "top_p": a.top_p, "top_k": a.top_k},
            "experts_used": a.experts_used, "reasoning_parser": a.reasoning_parser,
            **summarize(bench), "seconds": round(seconds, 1), "gpu": gpu}
@@ -392,6 +498,122 @@ def run_bench(a) -> int:
     emit(STAGE, "done", 100, f"{a.name}: pass_rate_2 {res['pass_rate_2']}, pass_rate_1 {res['pass_rate_1']} "
                              f"on {res['n']}/{res['total']} exercises; {out}")
     return 0
+
+
+# ---------- selftest ----------
+
+
+def reference(ex: Path) -> dict[str, Path]:
+    """{file in ex: the reference file that goes there}, from .meta/config.json: each example
+    file over the solution file of its name, else over the one solution file of its extension,
+    else beside that file under its own name (Java's helper classes); Rust's
+    .meta/Cargo-example.toml (the crates the reference uses) over Cargo.toml. {} when there is
+    no example, or one is missing or has no single place to go."""
+    try:
+        files = json.loads((ex / ".meta/config.json").read_text()).get("files") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    solution, example = files.get("solution") or [], files.get("example") or []
+    names = {Path(e).name for e in example}
+    placed = {}
+    for e in example:
+        same = [Path(s) for s in solution if Path(s).suffix == Path(e).suffix]
+        named = [s for s in same if s.name == Path(e).name]
+        if named:
+            to = named[0]
+        elif len(same) == 1:
+            to = same[0] if same[0].name not in names else same[0].parent / Path(e).name
+        else:
+            return {}
+        if not (ex / e).is_file() or str(to) in placed:
+            return {}
+        placed[str(to)] = ex / e
+    if placed and (ex / ".meta/Cargo-example.toml").is_file():
+        placed["Cargo.toml"] = ex / ".meta/Cargo-example.toml"
+    return placed
+
+
+def failure_output(d: Path, r: dict, lines: int = 30) -> str:
+    """The end of why an exercise did not pass: its test output, which benchmark.py appends to
+    the chat history, or the harness's exception."""
+    history = d / ".aider.chat.history.md"
+    if not r:
+        text = "no results; see selftest.log"
+    elif r.get("exception"):
+        text = r["exception"]
+    elif r.get("test_timeouts"):
+        text = f"the tests ran over {TEST_TIMEOUT} s"
+    else:
+        text = history.read_text(errors="replace") if history.is_file() else ""
+    return "\n".join([x for x in text.splitlines() if x.strip() != "```"][-lines:])
+
+
+def selftest_results(bench: Path, names: list[str]) -> tuple[dict, dict]:
+    """Per language {passed, failed, timed_out, seconds: its slowest test run}, and per exercise
+    that did not pass whether it timed out, its test run's seconds and the end of its output."""
+    per, failing = {}, {}
+    for name in names:
+        lang, slug = name.split("/")
+        d = bench / lang / "exercises" / "practice" / slug
+        try:
+            r = json.loads((d / ".aider.results.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            r = {}
+        try:
+            seconds = float((d / ".selftest.seconds").read_text())
+        except (OSError, ValueError):
+            seconds = None
+        timed_out = bool(r.get("test_timeouts"))
+        kind = "passed" if passed(r, 1) else "timed_out" if timed_out else "failed"
+        s = per.setdefault(lang, {"passed": 0, "failed": 0, "timed_out": 0, "seconds": 0.0})
+        s[kind] += 1
+        s["seconds"] = max(s["seconds"], seconds or 0.0)
+        if kind != "passed":
+            failing[name] = {"timed_out": timed_out, "seconds": seconds, "output": failure_output(d, r)}
+    return per, failing
+
+
+def selftest(a) -> int:
+    out, source = Path(a.out).resolve(), Path(a.exercises).resolve()
+    picked = pick(source, a.per_language, lambda ex: bool(reference(ex)))
+    if not picked:
+        raise SystemExit(f"no exercises with a reference solution under {source}")
+    if not image_exists():
+        raise SystemExit(f"no docker image {IMAGE}; run `python scripts/polyglot.py setup` first")
+    show_threads(a.threads)
+    exercises = copy_exercises(picked, out / "exercises", solve=True)
+    shutil.rmtree(out / "bench", ignore_errors=True)  # what a stopped run left as root, the container clears
+    make_caches()
+    names = [case(ex) for ex in picked]
+    cmd = selftest_command(out, exercises, a.threads, f"{os.getuid()}:{os.getgid()}", prefix=tuple(docker()))
+    subprocess.run([*docker(), "rm", "-f", container("selftest")], capture_output=True)
+    emit(STAGE, msg=f"selftest: {len(names)} reference solutions through their tests")
+    start = time.monotonic()
+    try:
+        with open(out / "selftest.log", "w") as log:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+            follow(proc, out / "bench", len(names), "selftest")
+    finally:
+        subprocess.run([*docker(), "rm", "-f", container("selftest")], capture_output=True)
+
+    per, failing = selftest_results(out / "bench", names)
+    ok = not failing and not proc.returncode
+    res = {"exercises": str(source), "exercises_per_language": a.per_language, "n": len(names),
+           "cpus": os.cpu_count(), "threads": a.threads, "test_timeout": TEST_TIMEOUT, "exit_code": proc.returncode,
+           "seconds": round(time.monotonic() - start, 1), "ok": ok, "per_language": per, "failing": failing}
+    (out / "selftest.json").write_text(json.dumps(res, indent=2) + "\n")
+    for lang, s in per.items():
+        print(f"[{STAGE}] {lang:10} {s['passed']:3} passed {s['failed']:3} failed {s['timed_out']:3} timed out; "
+              f"slowest test run {s['seconds']:.0f} s", flush=True)
+    for name, f in failing.items():
+        print(f"[{STAGE}] {'timed out' if f['timed_out'] else 'failed'}: {name}", flush=True)
+        for line in f["output"].splitlines()[-5:]:
+            print(f"[{STAGE}]     {line}", flush=True)
+    good = sum(s["passed"] for s in per.values())
+    emit(STAGE, "done" if ok else "error", 100,
+         f"selftest: {good}/{len(names)} reference solutions pass"
+         f"{'' if proc.returncode == 0 else f', benchmark.py exited with {proc.returncode}'}; {out / 'selftest.json'}")
+    return 0 if ok else 1
 
 
 # ---------- training exercises ----------
@@ -577,14 +799,22 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", help="install docker, clone the pinned repos, build aider's benchmark image")
+    threads = dict(type=int, default=default_threads(), help="exercises at once (default: 4 per CPU, at most 64)")
+    s = sub.add_parser("selftest", help="no model: reference solutions through each language's tests in aider's image")
+    s.add_argument("--out", required=True, help="selftest.json, selftest.log and the exercises as run go here")
+    s.add_argument("--per-language", type=int, default=3, help="the first N exercises (by name) of each language")
+    s.add_argument("--exercises", default=str(POLYGLOT), help="exercises in Polyglot's layout (default: Polyglot)")
+    s.add_argument("--threads", **threads)
     r = sub.add_parser("run", help="serve a model dir and run aider's benchmark against it")
     r.add_argument("--model-dir", required=True,
                    help="an HF checkpoint dir (BF16 or compressed-tensors), served with vLLM")
     r.add_argument("--name", required=True, type=name_arg, help="the run's name: served model name and run dir")
     r.add_argument("--exercises", default=str(POLYGLOT), help="exercises in Polyglot's layout (default: Polyglot)")
     r.add_argument("--edit-format", default="diff")
-    r.add_argument("--threads", type=int, default=64, help="exercises at once")
+    r.add_argument("--threads", **threads)
     r.add_argument("--num-tests", type=int, default=0, help="run only this many exercises, picked at random")
+    r.add_argument("--sample-per-language", type=int, default=0, metavar="K",
+                   help="run only the first K exercises (by name) of each language, in runs/NAME-sampleK")
     r.add_argument("--log", help="log every chat completion to this jsonl (a proxy between aider and vLLM)")
     r.add_argument("--experts-used", type=int, default=0, help="routed experts per token (0: the model's own)")
     r.add_argument("--reasoning-parser", default="qwen3", help="vLLM's --reasoning-parser: qwen3, gemma4, '' for none")
@@ -602,7 +832,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--out", required=True, help="rows jsonl; stats go next to it as .stats.json")
     w.add_argument("--max-chars", type=int, default=0, help="drop rows longer than this (0: keep all)")
     a = ap.parse_args(argv)
-    return {"setup": setup, "run": run_bench, "exercism": exercism, "rows": make_rows}[a.cmd](a) or 0
+    cmds = {"setup": setup, "selftest": selftest, "run": run_bench, "exercism": exercism, "rows": make_rows}
+    return cmds[a.cmd](a) or 0
 
 
 if __name__ == "__main__":
