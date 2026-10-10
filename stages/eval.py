@@ -1,8 +1,11 @@
 """Stage 5: evaluate teacher vs. candidates on the held-out set.
 
-Each candidate GGUF is served with llama-server on the VM GPU and answers the
-held-out inputs with the same system prompt the training data used. Every
-answer is scored two ways:
+Each candidate is served on the VM GPU and answers the held-out inputs with the
+same system prompt the training data used. A GGUF is served with llama-server
+(SLOTS answers at once); an HF checkpoint dir (one with a config.json: BF16, or
+llm-compressor's compressed-tensors NVFP4/W4A16) with vLLM's OpenAI server, run
+as a subprocess from its own venv, with VLLM_SEQS answers at once so the GPU
+stays busy through long thinking answers. Every answer is scored two ways:
   agreement  match with the teacher's reference answer (field-level for JSON
              outputs, token F1 otherwise). Needs no API key.
   judge      an LLM judge (Gemini by default, cfg.judge_model) scores each
@@ -13,13 +16,17 @@ answer is scored two ways:
              compiled and run against its tests (stages/sandbox.py). The mean
              pass@1 over suites then becomes `score` (score_method "pass@1"),
              with judge and agreement still reported next to it.
-Also records the decode speed measured on the VM. Writes out/eval.json, the
+Also records the decode speed measured on the VM; for code, the completion
+tokens per answer, the share of answers that hit the cap or needed a forced
+answer, and the output tokens/s of the whole eval; and the GPU's mean busy % and
+peak memory while each candidate ran (nvidia-smi). Writes out/eval.json, the
 contract the scoreboard screen reads, and work/code_eval/<candidate>.jsonl
 with every code answer and its test status.
 
-Config.eval_candidates replaces work/allocation.json with named GGUFs, so an
-eval-only job (pipeline.py --only eval) can score an uncompressed reference;
-without data/heldout.jsonl such a job is scored on code alone.
+Config.eval_candidates replaces work/allocation.json with named GGUFs or
+checkpoint dirs, so an eval-only job (pipeline.py --only eval) can score an
+uncompressed reference; without data/heldout.jsonl such a job is scored on code
+alone.
 """
 
 from __future__ import annotations
@@ -44,6 +51,9 @@ from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 STAGE = "eval"
 PORT = int(os.environ.get("LOBBOT_EVAL_PORT", "8091"))
 SLOTS = int(os.environ.get("LOBBOT_EVAL_SLOTS", 8))  # parallel requests; 2 on a 16 GB Mac
+# vLLM batches far more: its --max-num-seqs, and the requests kept in flight.
+VLLM_SEQS = int(os.environ.get("LOBBOT_VLLM_SEQS", 256))
+VLLM_GPU_UTIL = float(os.environ.get("LOBBOT_VLLM_GPU_UTIL", 0.9))
 # Must cover the longest teacher answer the data stage keeps
 # (LOBBOT_DATA_ANSWER_MAX_TOKENS), or long correct answers are judged as truncated.
 MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_MAX_TOKENS)))
@@ -56,6 +66,21 @@ CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 ANSWER_TOKENS = 4096
 # Qwen's wording for cutting thinking short (the Qwen3 model card's thinking budget).
 EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now."
+
+# The vLLM server serve() started last ({"name", "dir"}); empty while llama-server
+# serves. generate() and force_answer() speak to whichever runs.
+VLLM: dict[str, str] = {}
+# Requests in flight, shared by generate() calls running at once (code_eval's sample
+# passes): the rest wait here, not in the server's queue, where the wait would count
+# against their timeout and measured speed.
+_GATES = {"llama": threading.BoundedSemaphore(SLOTS), "vllm": threading.BoundedSemaphore(VLLM_SEQS)}
+_tokenizers: dict[str, object] = {}
+_tokenizer_lock = threading.Lock()
+
+
+def workers() -> int:
+    """Answers to keep in flight on the running server."""
+    return VLLM_SEQS if VLLM else SLOTS
 
 
 def limits(cfg) -> tuple[int, int]:
@@ -110,18 +135,68 @@ def server_args(cfg, gguf: str) -> list[str]:
     return args
 
 
-def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
+def is_checkpoint(path: str) -> bool:
+    """An HF checkpoint dir (BF16 safetensors, or compressed-tensors), served with
+    vLLM; anything else is a GGUF for llama-server."""
+    return (Path(path) / "config.json").is_file()
+
+
+def vllm_command(model_dir: str) -> tuple[list[str], dict]:
+    """(command that serves model_dir, its environment). The eval runs in the training
+    venv, which has no vllm, so this is the vLLM venv's (LOBBOT_VLLM_PY, see
+    setup_vm.sh): its `vllm` script, else its interpreter on the API server module,
+    with its bin first on PATH and no PYTHONPATH, so the training venv's packages
+    don't leak in. Without LOBBOT_VLLM_PY, vllm from PATH."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    py = os.environ.get("LOBBOT_VLLM_PY")
+    if not py:
+        return [shutil.which("vllm") or "vllm", "serve", model_dir], env
+    bin_dir = Path(py).parent
+    env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
+    if (bin_dir / "vllm").exists():
+        return [str(bin_dir / "vllm"), "serve", model_dir], env
+    return [py, "-m", "vllm.entrypoints.openai.api_server", "--model", model_dir], env
+
+
+def vllm_args(cfg, model_dir: str, name: str) -> list[str]:
+    """`vllm serve` flags after the model."""
+    args = ["--host", "127.0.0.1", "--port", str(PORT), "--served-model-name", name,
+            "--max-model-len", str(limits(cfg)[1]), "--max-num-seqs", str(VLLM_SEQS),
+            "--gpu-memory-utilization", str(VLLM_GPU_UTIL), "--enable-prefix-caching"]
+    if cfg.eval_reasoning_parser:
+        args += ["--reasoning-parser", cfg.eval_reasoning_parser]
+    if cfg.eval_experts_used:  # nested where the checkpoint keeps it: Qwen3.5/3.6 ship a text_config
+        hf = json.loads((Path(model_dir) / "config.json").read_text())
+        k = {"num_experts_per_tok": cfg.eval_experts_used}
+        nested = "num_experts_per_tok" not in hf and "num_experts_per_tok" in (hf.get("text_config") or {})
+        args += ["--hf-overrides", json.dumps({"text_config": k} if nested else k)]
+    return args + list(cfg.eval_vllm_args)
+
+
+def serve(job: Job, path: str, name: str) -> subprocess.Popen:
+    """Starts the server for one candidate, vLLM for a checkpoint dir and llama-server
+    for a GGUF, and waits until it is up; generate() then speaks to it."""
     import httpx
 
-    binary = Path(job.config.llama_cpp) / "build/bin/llama-server"
-    if not binary.exists() and shutil.which("llama-server"):
-        binary = Path(shutil.which("llama-server"))  # e.g. Homebrew's llama.cpp on a Mac
-    log_path = job.path("work", f"llama-server-{name}.log")
+    global VLLM
+    if is_checkpoint(path):
+        cmd, env = vllm_command(path)
+        cmd += vllm_args(job.config, path, name)
+        server, wait = "vllm", 1200  # a load takes minutes
+        VLLM = {"name": name, "dir": path}
+    else:
+        binary = Path(job.config.llama_cpp) / "build/bin/llama-server"
+        if not binary.exists() and shutil.which("llama-server"):
+            binary = Path(shutil.which("llama-server"))  # e.g. Homebrew's llama.cpp on a Mac
+        cmd, env = [str(binary), *server_args(job.config, path)], None
+        server, wait = "llama-server", 600
+        VLLM = {}
+    log_path = job.path("work", f"{server}-{name}.log")
     log = open(log_path, "w")
-    proc = subprocess.Popen([str(binary), *server_args(job.config, gguf)], stdout=log, stderr=subprocess.STDOUT)
-    for _ in range(600):
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+    for _ in range(wait):
         if proc.poll() is not None:
-            raise RuntimeError(f"llama-server exited for {name}:\n" + "\n".join(log_path.read_text().splitlines()[-20:]))
+            raise RuntimeError(f"{server} exited for {name}:\n" + "\n".join(log_path.read_text().splitlines()[-20:]))
         try:
             if httpx.get(f"http://127.0.0.1:{PORT}/health", timeout=2).status_code == 200:
                 return proc
@@ -129,13 +204,17 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
             pass
         time.sleep(1)
     proc.kill()
-    raise RuntimeError(f"llama-server did not become healthy for {name}; see {log_path}")
+    raise RuntimeError(f"{server} did not become healthy for {name}; see {log_path}")
 
 
-def split_reasoning(message: dict) -> tuple[str, str]:
+def split_reasoning(message: dict, cut: bool = False) -> tuple[str, str]:
     """(reasoning, answer) from a chat completion message. llama-server returns
-    the reasoning separately; when it does not, the tags are still in the content."""
-    content, reasoning = message.get("content") or "", message.get("reasoning_content") or ""
+    the reasoning separately, vLLM too (as reasoning_content or reasoning, by
+    version); when they do not, the tags are still in the content. cut: thinking
+    was on and the cap was hit, so untagged content with no reasoning beside it is
+    a thinking the prompt opened (vLLM's qwen3 parser leaves that in content)."""
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
     if "</think>" in content:
         head, content = content.rsplit("</think>", 1)
         reasoning = reasoning or head.replace("<think>", "", 1)
@@ -143,6 +222,8 @@ def split_reasoning(message: dict) -> tuple[str, str]:
         reasoning, content = reasoning or content.split("<think>", 1)[1], ""
     elif "</think>" in reasoning and not content.strip():  # answer left inside the reasoning
         reasoning, content = reasoning.rsplit("</think>", 1)
+    elif cut and not reasoning:
+        reasoning, content = content, ""
     return reasoning.strip(), content.strip()
 
 
@@ -150,12 +231,27 @@ def sampling_params(seed: int | None, thinking: bool) -> dict:
     return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
 
 
+def chat_template(model_dir: str, messages: list[dict]) -> str:
+    """messages in model_dir's chat template with thinking on, by its own tokenizer
+    (loaded once per dir): vLLM has no /apply-template."""
+    with _tokenizer_lock:  # one load per dir, and no fast tokenizer shared across threads
+        if model_dir not in _tokenizers:
+            from transformers import AutoTokenizer
+
+            _tokenizers[model_dir] = AutoTokenizer.from_pretrained(model_dir)
+        return _tokenizers[model_dir].apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                          enable_thinking=True)
+
+
 def thinking_prompt(messages: list[dict]) -> str:
     """The chat-template prompt up to and including the opened thinking."""
-    import httpx
+    if VLLM:
+        prompt = chat_template(VLLM["dir"], messages)
+    else:
+        import httpx
 
-    prompt = httpx.post(f"http://127.0.0.1:{PORT}/apply-template", timeout=60, json={
-        "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
+        prompt = httpx.post(f"http://127.0.0.1:{PORT}/apply-template", timeout=60, json={
+            "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
     if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
         prompt += "<think>\n"
     return prompt
@@ -170,6 +266,13 @@ def force_answer(messages: list[dict], reasoning: str, why: str, temperature: fl
     prompt = thinking_prompt(messages) + reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
     # An hour: with many answers at once, a long prompt to read in and up to
     # ANSWER_TOKENS to write can take well over the ~17 minutes this used to allow.
+    if VLLM:  # the rendered template already holds its special tokens
+        r = httpx.post(f"http://127.0.0.1:{PORT}/v1/completions", timeout=3600, json={
+            "model": VLLM["name"], "prompt": prompt, "max_tokens": ANSWER_TOKENS, "temperature": temperature,
+            "add_special_tokens": False, **sampling})
+        r.raise_for_status()
+        body = r.json()
+        return (body["choices"][0].get("text") or "").strip(), (body.get("usage") or {}).get("completion_tokens") or 0
     r = httpx.post(f"http://127.0.0.1:{PORT}/completion", timeout=3600, json={
         "prompt": prompt, "n_predict": ANSWER_TOKENS, "temperature": temperature, "cache_prompt": True, **sampling})
     r.raise_for_status()
@@ -181,7 +284,8 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
              temperature: float = 0.0, seed: int | None = None,
              thinking: bool = False, on_answer=None, infos: list | None = None,
              keep_reasoning: bool = False) -> tuple[list[str], float | None]:
-    """Answers plus the median decode speed (tok/s) the server reported.
+    """Answers plus the median decode speed (tok/s) the server reported (vLLM
+    reports none: there, completion tokens over each request's wall time).
 
     With thinking, a thinking that ends without an answer (out of max_tokens, or
     the model stopped inside it) is closed and the model is asked for the answer
@@ -194,22 +298,28 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
     url = f"http://127.0.0.1:{PORT}"
     speeds: list[float] = []
     sampling = sampling_params(seed, thinking)
+    gate = _GATES["vllm" if VLLM else "llama"]
 
     def one(text: str) -> tuple[str, dict]:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
         for attempt in range(2):
             try:
+                start = time.monotonic()
                 r = httpx.post(f"{url}/v1/chat/completions", timeout=max(600, max_tokens / 4), json={
+                    **({"model": VLLM["name"]} if VLLM else {}),
                     "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
                     "chat_template_kwargs": {"enable_thinking": thinking}, **sampling,
                 })
                 r.raise_for_status()
                 body = r.json()
                 tps = (body.get("timings") or {}).get("predicted_per_second")
+                if VLLM:
+                    tps = ((body.get("usage") or {}).get("completion_tokens") or 0) / max(time.monotonic() - start, 1e-3)
                 if tps:
                     speeds.append(float(tps))
                 choice = body["choices"][0]
-                reasoning, answer = split_reasoning(choice["message"])
+                reasoning, answer = split_reasoning(
+                    choice["message"], cut=bool(VLLM) and thinking and choice.get("finish_reason") == "length")
                 info = {"finish": choice.get("finish_reason"), "tokens": (body.get("usage") or {}).get("completion_tokens"),
                         "reasoning_chars": len(reasoning), "forced": None, **({"reasoning": reasoning} if keep_reasoning else {})}
                 if thinking and not answer:
@@ -230,12 +340,13 @@ def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS,
         return "", {}
 
     def counted(text: str) -> tuple[str, dict]:
-        got = one(text)
+        with gate:
+            got = one(text)
         if on_answer:
             on_answer()
         return got
 
-    with ThreadPoolExecutor(SLOTS) as ex:
+    with ThreadPoolExecutor(workers()) as ex:
         got = list(ex.map(counted, inputs))
     if infos is not None:
         infos.extend(i for _, i in got)
@@ -346,6 +457,38 @@ def stop(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def watch_gpu(every: float = 30.0):
+    """Samples nvidia-smi every `every` s in a background thread, to see whether the
+    server kept the GPU fed. Returns end(), which stops it and gives {busy_pct: mean
+    over samples and GPUs, mem_peak_mib: peak of the GPUs' total}; {} without
+    nvidia-smi or before the first sample."""
+    smi, busy, mem, done = shutil.which("nvidia-smi"), [], [], threading.Event()
+
+    def sample() -> None:
+        while not done.wait(every):
+            try:
+                out = subprocess.run([smi, "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                                     capture_output=True, text=True, timeout=20).stdout
+                gpus = [(float(u), float(m)) for u, m in (line.split(",") for line in out.splitlines() if line.strip())]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                continue
+            if gpus:
+                busy.append(statistics.mean(u for u, _ in gpus))
+                mem.append(sum(m for _, m in gpus))
+
+    thread = threading.Thread(target=sample, daemon=True)
+    if smi:
+        thread.start()
+
+    def end() -> dict:
+        done.set()
+        if smi:
+            thread.join()
+        return {"busy_pct": round(statistics.mean(busy), 1), "mem_peak_mib": round(max(mem))} if busy else {}
+
+    return end
+
+
 def code_problems(job: Job, held: list[dict]) -> list[dict]:
     """Every problem of the configured code suites."""
     cfg = job.config
@@ -384,10 +527,10 @@ SUITE_TIMEOUT = {"livecodebench": max(sandbox.TIMEOUT, 60.0)}
 
 def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> dict:
     """Answer every problem code_eval_samples times on the running server, run
-    the tests in the sandbox and return per-suite pass@k. Per-answer results go
-    to work/code_eval/<name>.jsonl. Held-out task rows are asked with the task's
-    own system prompt (the one the model was healed on), benchmarks with
-    codebench.SYSTEM."""
+    the tests in the sandbox and return per-suite pass@k and answer_stats().
+    Per-answer results go to work/code_eval/<name>.jsonl. Held-out task rows are
+    asked with the task's own system prompt (the one the model was healed on),
+    benchmarks with codebench.SYSTEM."""
     cfg = job.config
     n = max(cfg.code_eval_samples, max(cfg.code_eval_k))
     mugge = cfg.code_eval_format == "harness"
@@ -406,24 +549,38 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
             if done == total or done % max(1, total // 100) == 0:
                 emit(STAGE, msg=f"{name}: {done}/{total} code answers", answered=done, total=total)
 
-    emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
-    fixed: list = [None] * len(problems)
-    for i in range(n):
-        greedy = n == 1
-        # Greedy decoding loops when thinking, so thinking always samples (at the
-        # model card's temperature), seeded for repeatability.
-        temperature = (cfg.code_eval_temperature if not greedy
-                       else cfg.code_eval_thinking_temperature if cfg.code_eval_thinking else 0.0)
-        seed = i if cfg.code_eval_thinking or not greedy else None
+    greedy = n == 1
+    # Greedy decoding loops when thinking, so thinking always samples (at the
+    # model card's temperature), seeded for repeatability.
+    temperature = (cfg.code_eval_temperature if not greedy
+                   else cfg.code_eval_thinking_temperature if cfg.code_eval_thinking else 0.0)
+    seeds = [i if cfg.code_eval_thinking or not greedy else None for i in range(n)]
+    finished: list[float] = []  # when each pass got its last answer
+
+    def answer(i: int) -> tuple[list[str], list[dict]]:
+        """Sample pass i's answers and infos, in problem order."""
         answers, infos = [""] * len(problems), [{}] * len(problems)
         for (system, _), idx in groups.items():
             got_info: list[dict] = []
             got, tps = generate(system, [prompt(problems[j]) for j in idx], cfg.code_eval_max_tokens,
-                                temperature, seed, cfg.code_eval_thinking, answered, infos=got_info,
+                                temperature, seeds[i], cfg.code_eval_thinking, answered, infos=got_info,
                                 **({"keep_reasoning": True} if cfg.code_eval_budgets else {}))
-            speeds += [tps] if tps else []
+            speeds.extend([tps] if tps else [])
             for j, a, info in zip(idx, got, got_info or [{}] * len(idx)):
                 answers[j], infos[j] = a, info
+        finished.append(time.monotonic())
+        return answers, infos
+
+    def passes():
+        """Each pass's answers, in order. Sampled passes are answered at once, so one
+        pass's long tail doesn't idle the GPU; each is tested as soon as it is in."""
+        with ThreadPoolExecutor(n) as ex:
+            yield from ex.map(answer, range(n))
+
+    emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
+    fixed: list = [None] * len(problems)
+    start = time.monotonic()
+    for i, (answers, infos) in enumerate(passes()):
         ran: list = [None] * len(problems)
         for (_, timeout), idx in groups.items():
             items = []
@@ -445,7 +602,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 fix_text = ((lambda j: codebench.harness_fix_text(problems[j], code_of(problems[j], answers[j]), ran[j]))
                             if mugge else (lambda j: codebench.fix_prompt(problems[j], answers[j], ran[j])))
                 got, tps = generate(system, [fix_text(j) for j in sel],
-                                    cfg.code_eval_max_tokens, temperature, seed, cfg.code_eval_thinking, answered)
+                                    cfg.code_eval_max_tokens, temperature, seeds[i], cfg.code_eval_thinking, answered)
                 speeds += [tps] if tps else []
                 items = []
                 for j, a in zip(sel, got):
@@ -473,7 +630,23 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
         if broken:
             emit(STAGE, msg=f"{suite}: {broken} answers could not run ({', '.join(k for k in v['status'] if k in ('missing_toolchain', 'unsupported_language'))}); check the VM toolchains")
     return {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), **fix, "samples_per_problem": n,
-            "tok_s_vm": round(statistics.median(speeds), 1) if speeds else None}
+            "tok_s_vm": round(statistics.median(speeds), 1) if speeds else None,
+            **answer_stats(rows, max(finished, default=start) - start)}
+
+
+def answer_stats(rows: list[dict], seconds: float) -> dict:
+    """How long the code answers ran: completion tokens per answer (thinking in, a
+    forced answer not), the shares that hit the cap and that needed a forced answer,
+    and output tokens/s of the whole eval: every token written (forced answers in,
+    fix turns not) over the wall time of answering."""
+    tokens = [r["tokens"] for r in rows if r.get("tokens") is not None]
+    written = sum(tokens) + sum(r.get("forced_tokens") or 0 for r in rows)
+    share = lambda hit: round(sum(map(hit, rows)) / len(rows), 4) if rows else None
+    return {"tokens_mean": round(statistics.mean(tokens)) if tokens else None,
+            "tokens_median": round(statistics.median(tokens)) if tokens else None,
+            "hit_cap_share": share(lambda r: r.get("finish") == "length"),
+            "forced_share": share(lambda r: bool(r.get("forced"))),
+            "tok_s_total": round(written / seconds, 1) if seconds > 0 else None, "answer_s": round(seconds, 1)}
 
 
 def load_code_ref(job: Job) -> dict:
@@ -499,7 +672,10 @@ def candidates_to_eval(job: Job) -> dict[str, dict]:
             p = Path(path)
             if not p.exists() and not DRY_RUN:
                 raise FileNotFoundError(f"eval candidate {name}: {p} not found")
-            parts = sorted(p.parent.glob(p.name.replace("-00001-of-", "-*-of-"))) if "-00001-of-" in p.name else [p]
+            if p.is_dir():  # a checkpoint for vLLM
+                parts = list(p.glob("*.safetensors"))
+            else:
+                parts = sorted(p.parent.glob(p.name.replace("-00001-of-", "-*-of-"))) if "-00001-of-" in p.name else [p]
             size = sum(f.stat().st_size for f in parts if f.exists())
             out[name] = {"path": str(p), "size_gb": round(size / 1e9, 2), "tok_s_est": None}
         return out
@@ -552,7 +728,7 @@ def run_stage(job: Job) -> None:
                 code = {"suites": suites, "mean_pass@1": codebench.mean_pass1(suites), "samples_per_problem": 1,
                         **({"mean_fix@1": codebench.mean_fix1(suites)} if cfg.code_eval_fix else {})}
             results[name] = {"agreement": 0.85 - 0.07 * i if inputs else None, "judge": None, "tok_s_vm": None,
-                             "code": code, "samples": []}
+                             "code": code, "samples": [], "gpu": {}}
     else:
         if use_judge:
             emit(STAGE, pct=5, msg=f"judging teacher references on {len(inputs)} held-out inputs")
@@ -561,6 +737,7 @@ def run_stage(job: Job) -> None:
         for i, (name, c) in enumerate(cands.items()):
             emit(STAGE, pct=10 + 85 * i / n, msg=f"running {name}")
             proc = serve(job, c["path"], name)
+            end_watch = watch_gpu()  # from here on: the load is not the eval
             agree = score = tps = code = None
             answers: list[str] = []
             try:
@@ -570,6 +747,7 @@ def run_stage(job: Job) -> None:
                     emit(STAGE, pct=10 + 85 * (i + 0.3) / n, msg=f"{name}: answering {len(problems)} code problems")
                     code = code_eval(job, name, problems, system)
             finally:
+                gpu = end_watch()
                 stop(proc)
             tps = tps or (code or {}).get("tok_s_vm")
             if inputs:
@@ -580,7 +758,7 @@ def run_stage(job: Job) -> None:
                 per = ", ".join(f"{k} {v['pass@1']:.0%}" for k, v in code["suites"].items() if "pass@1" in v)
                 emit(STAGE, pct=10 + 85 * (i + 0.9) / n, msg=f"{name}: pass@1 {per}")
             results[name] = {
-                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code,
+                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code, "gpu": gpu,
                 "samples": [{"input": a, "output": b, "reference": r} for a, b, r in list(zip(inputs, answers, refs))[:3]],
             }
 
@@ -600,7 +778,7 @@ def run_stage(job: Job) -> None:
         candidates.append({
             "name": name, "size_gb": c["size_gb"], "score": score,
             "agreement": r["agreement"], "judge_score": r["judge"], "code": r["code"],
-            "tok_s_est": tok_s_est, "tok_s_vm": r["tok_s_vm"],
+            "tok_s_est": tok_s_est, "tok_s_vm": r["tok_s_vm"], "gpu": r["gpu"],
             "meets_target": c["size_gb"] <= spec.target.max_size_gb and (tok_s_est or 0) >= spec.target.min_tok_s,
         })
     ref = load_code_ref(job) if coded else {}
