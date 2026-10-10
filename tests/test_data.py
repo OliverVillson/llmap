@@ -281,6 +281,55 @@ def test_tokenize_trains_thinking_turns_on_the_thinking():
     assert _prompt(off).endswith("<think>\n\n</think>\n\n") and _target(off) == "x = 1<|im_end|>"
 
 
+class GemmaCharTok(CharTok):
+    """Gemma 4's chat format: thinking on puts <|think|> in the system turn and leaves
+    the thought channel to the model; thinking off closes an empty one; a model turn's
+    reasoning_content is rendered as its thought channel."""
+    chat_template = "gemma-ish <|turn>"
+    eos_token = "<eos>"
+
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False):
+        empty = "" if enable_thinking else "<|channel>thought\n<channel|>"
+        text = "<bos><|turn>system\n" + ("<|think|>\n" if enable_thinking else "") + msgs[0]["content"] + "<turn|>\n"
+        for m in msgs[1:]:
+            if m["role"] == "user":
+                text += f"<|turn>user\n{m['content']}<turn|>\n"
+            else:
+                thought = m.get("reasoning_content")
+                channel = f"<|channel>thought\n{thought}\n<channel|>" if thought else empty
+                text += f"<|turn>model\n{channel}{m['content']}<turn|>\n"
+        return text + ("<|turn>model\n" + empty if add_generation_prompt else "")
+
+
+def test_tokenize_trains_gemma4_thinking_in_its_thought_channel():
+    from stages.taskdata import tokenize_example
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "add"},
+            {"role": "assistant", "content": "x = 1", "reasoning_content": "plan it"}]
+    ex = tokenize_example(GemmaCharTok(), msgs, 10_000)
+    assert _prompt(ex).endswith("<|think|>\nsys<turn|>\n<|turn>user\nadd<turn|>\n<|turn>model\n")
+    assert _target(ex) == "<|channel>thought\nplan it\n<channel|>x = 1<turn|>"
+    # the row is the conversation as Gemma's template renders it with the thinking
+    assert _prompt(ex) + _target(ex) + "\n" == GemmaCharTok().apply_chat_template(msgs, enable_thinking=True)
+
+    off = tokenize_example(GemmaCharTok(), [*msgs[:2], {"role": "assistant", "content": "x = 1"}], 10_000)
+    assert _prompt(off).endswith("<|turn>model\n<|channel>thought\n<channel|>") and _target(off) == "x = 1<turn|>"
+
+
+def test_split_think_reads_qwen_tags_and_gemma4_thought_channel():
+    from stages.data import clean, split_think
+    from stages.taskdata import GEMMA4_THINK, QWEN_THINK, think_tags
+
+    assert split_think("<think>\nplan it\n</think>\n\nx = 1") == ("plan it", "\n\nx = 1")
+    assert split_think("plan it\n</think>\n\nx = 1") == ("plan it", "\n\nx = 1")  # template opened it
+    assert split_think("<|channel>thought\nplan it\n<channel|>x = 1") == ("plan it", "x = 1")
+    assert split_think("<|channel>thought\nplan it, never closed") == ("", "<|channel>thought\nplan it, never closed")
+    assert clean("<|channel>thought\nplan it<channel|>x = 1") == "x = 1"
+    assert think_tags(GemmaCharTok.chat_template) == GEMMA4_THINK and think_tags(None) == QWEN_THINK
+    # a prompt is told by its last turn, whatever its messages quote
+    assert think_tags("<|im_start|>user\nwhat is <|turn>?<|im_end|>\n<|im_start|>assistant\n") == QWEN_THINK
+
+
 # --------------------------------------------------------------------------- contest rows
 
 ADD_STDIN = "a, b = map(int, input().split())\nprint(a + b)"

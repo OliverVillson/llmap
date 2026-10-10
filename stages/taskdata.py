@@ -46,6 +46,22 @@ def to_messages(row: dict) -> list[dict] | None:
     return None
 
 
+# How a generation marks its thinking: (opening, closing). Qwen wraps it in
+# <think> tags. Gemma 4 (turns in <|turn>...<turn|>) writes it in a thought
+# channel, which the model opens itself after the <|think|> switch its template
+# puts in the system turn when enable_thinking is on; vLLM's "gemma4" reasoning
+# parser splits it off.
+QWEN_THINK = ("<think>\n", "\n</think>\n\n")
+GEMMA4_THINK = ("<|channel>thought\n", "\n<channel|>")
+
+
+def think_tags(template: str | None) -> tuple[str, str]:
+    """The thinking markers of a chat template, or of a prompt rendered with one
+    (by its last turn marker: a message may quote the other format)."""
+    t = template or ""
+    return GEMMA4_THINK if t.rfind("<|turn>") > t.rfind("<|im_start|>") else QWEN_THINK
+
+
 def _template(tok, msgs, thinking: bool = False, **kw):
     try:
         return tok.apply_chat_template(msgs, tokenize=False, enable_thinking=thinking, **kw)
@@ -62,7 +78,9 @@ def tokenize_example(tok, msgs: list[dict], max_len: int) -> dict:
 
     An answer with reasoning_content (data_thinking) is trained as a thinking
     turn: the prompt is rendered with thinking on and the target is the thinking,
-    </think>, then the answer, so the model learns to think and to close it."""
+    </think>, then the answer, so the model learns to think and to close it.
+    Gemma 4's target is its thought channel (<|channel>thought, the thinking,
+    <channel|>) and the answer."""
     answer = msgs[-1]["content"]
     reasoning = (msgs[-1].get("reasoning_content") or "").strip()
     if tok.chat_template:
@@ -75,9 +93,12 @@ def tokenize_example(tok, msgs: list[dict], max_len: int) -> dict:
         prompt = "".join(m["content"] + "\n" for m in msgs[:-1])
         suffix = tok.eos_token or ""
     if reasoning:
-        if not prompt.rstrip().endswith("<think>"):  # templates that leave opening it to the model
-            prompt += "<think>\n"
-        answer = f"{reasoning}\n</think>\n\n{answer}"
+        opening, closing = think_tags(tok.chat_template)
+        if opening == GEMMA4_THINK[0]:  # trained to open it, as the model does at inference
+            reasoning = opening + reasoning
+        elif not prompt.rstrip().endswith("<think>"):  # templates that leave opening it to the model
+            prompt += opening
+        answer = reasoning + closing + answer
     p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
     a_ids = tok(answer + suffix, add_special_tokens=False)["input_ids"]
     ids = (p_ids + a_ids)[:max_len]
