@@ -55,6 +55,10 @@ class Config:
     data_contest_before: str = "2024-10-01"  # only problems released before this date
     data_contest_samples: int = 2  # teacher answers per problem; the shortest passing one is kept
     data_contest_harness_share: float = 0.0  # share asked as a Mugge ticket instead of a plain prompt
+    # A .jsonl of ready chat rows added to train as they are, for code specs (train only, no
+    # teacher): e.g. aider transcripts from scripts/polyglot.py rows. A relative path is
+    # resolved in the job dir.
+    data_extra_rows: str = ""
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.

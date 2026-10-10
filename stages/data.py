@@ -11,7 +11,8 @@ when it builds and passes those tests in stages/sandbox.py. Seeds must pass thei
 tests first. Code specs can add contest rows (Config.data_contest_rows): LiveCodeBench
 problems released before data_contest_before, so older than the ones the eval scores
 (lcb_since), each answered data_contest_samples times by the teacher; the shortest answer
-that passes every test becomes a train row (never held out). Writes:
+that passes every test becomes a train row (never held out). Code specs can also add ready
+rows from a file (Config.data_extra_rows), train only. Writes:
   data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included
   data/heldout.jsonl  held-out inputs with teacher reference answers (inputs written
                       by Gemini when Config.testgen_model and GEMINI_API_KEY are set;
@@ -395,8 +396,9 @@ def run_stage(job: Job) -> None:
     if spec.is_code:
         stats.update(task_type="code", language=spec.language)
         check_seeds(spec)
-    # contest problems load (and their date guard runs) before the teacher does
+    # contest problems load (and their date guard runs) before the teacher does, extra rows too
     contest = contest_problems(cfg) if spec.is_code and cfg.data_contest_rows > 0 else []
+    extra = extra_rows(job, stats) if spec.is_code and cfg.data_extra_rows else []
 
     if DRY_RUN:
         teacher = DryRunTeacher(spec, rng)
@@ -535,16 +537,17 @@ def run_stage(job: Job) -> None:
         train = harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats)
     if contest:  # train only: the held-out set stays the task's own
         train += contest_rows(cfg, teacher, rng, contest, stats)
+    train += extra  # train only, like contest rows
     if not think:  # the human seeds have no thinking, and every row of a thinking model thinks
         train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
     if think:
         stats["thinking_chars_median"] = statistics.median(
-            len(r["messages"][2]["reasoning_content"]) for r in train) if train else 0
+            len(r["messages"][-1].get("reasoning_content", "")) for r in train) if train else 0
     rng.shuffle(train)
     write_jsonl(job.path("data", "train.jsonl"), train)
     write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
-    job.path("data", "calib.txt").write_text(
-        "\n\n".join(r["messages"][1]["content"] + "\n" + _with_thinking(r["messages"][2]) for r in train[:1000])
+    job.path("data", "calib.txt").write_text(  # the last exchange: extra rows can be whole chats
+        "\n\n".join(r["messages"][-2]["content"] + "\n" + _with_thinking(r["messages"][-1]) for r in train[:1000])
     )
     stats.update(train=len(train), heldout=len(heldout), elapsed_s=round(time.monotonic() - t0, 1))
     job.path("data", "stats.json").write_text(json.dumps(stats, indent=2))
@@ -703,6 +706,19 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
     print(f"[data] contest: {len(out)} rows ({n_ticket} as tickets) from {len(asks)} LiveCodeBench problems "
           f"released before {cfg.data_contest_before}, {len(best)} solved, dropped {drops}", flush=True)
     return out
+
+
+def extra_rows(job: Job, stats: dict) -> list[dict]:
+    """The ready chat rows of Config.data_extra_rows, as they are: each a {"messages": [...]}
+    ending in the assistant's answer, e.g. teacher transcripts in aider's format."""
+    path = job.root / job.config.data_extra_rows  # an absolute path stays as is
+    rows = read_jsonl(path)
+    for i, r in enumerate(rows, 1):
+        if (r.get("messages") or [{}])[-1].get("role") != "assistant":
+            raise ValueError(f"{path} line {i}: not a chat row ending in an assistant message")
+    stats["extra_rows"] = len(rows)
+    print(f"[data] {len(rows)} extra rows from {path}", flush=True)
+    return rows
 
 
 def _chat_row(msgs: list[dict], answer: str, reasoning: str = "") -> dict:

@@ -484,3 +484,32 @@ def test_dry_run_adds_contest_rows(tmp_path):
         items.append(("python", *codebench.assemble(prob, ans["content"], code), codebench.time_limit(prob)))
     assert forms == {True, False}
     assert all(res.passed for res in sandbox.run_many(items))
+
+
+def test_dry_run_adds_extra_rows(tmp_path):
+    """data_extra_rows: ready chat rows (whole aider chats here) go into train and calib.txt as
+    they are, never into heldout, and are counted; a relative path is the job's. A file with a
+    row that does not end in an answer stops the stage before any teacher work."""
+    job = code_job(tmp_path, "python")
+    chat = [{"role": "system", "content": "Act as an expert software developer."},
+            {"role": "user", "content": "Change get_factorial() to use math.factorial"},
+            {"role": "assistant", "content": "mathweb/flask/app.py ..."}]
+    extra = [{"messages": [*chat, {"role": "user", "content": f"aider exercise {i}"},
+                           {"role": "assistant", "content": f"edit {i}", "reasoning_content": f"plan {i}"}]}
+             for i in range(5)]
+    (job / "aider-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in extra))
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "data_thinking": True, "data_extra_rows": "aider-rows.jsonl"}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    assert sorted(json.dumps(r) for r in train if len(r["messages"]) == 5) == sorted(json.dumps(r) for r in extra)
+    assert "aider exercise" not in (job / "data/heldout.jsonl").read_text()
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["extra_rows"] == 5 and stats["train"] == len(train) and stats["thinking_chars_median"] > 0
+    assert "aider exercise 3\n<think>\nplan 3\n</think>\n\nedit 3" in (job / "data/calib.txt").read_text()
+
+    (job / "aider-rows.jsonl").write_text(json.dumps({"messages": chat[:2]}) + "\n")
+    (job / ".done/data").unlink()
+    p = run_data(job)
+    assert p.returncode != 0 and "line 1: not a chat row ending in an assistant message" in p.stdout + p.stderr

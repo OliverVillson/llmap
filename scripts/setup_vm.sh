@@ -131,3 +131,8 @@ uv pip install -q --python "$NVME/venv-train/bin/python" "llmcompressor==0.14.0"
 
 say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"
+
+say "Aider Polyglot: docker, the pinned aider and polyglot-benchmark, aider's benchmark image"
+# scripts/polyglot.py setup is idempotent; the image build takes ~15 minutes the first time.
+NVME="$NVME" "$NVME/venv-train/bin/python" "$REPO/scripts/polyglot.py" setup \
+  || echo 'WARNING: Polyglot setup failed; re-run `python scripts/polyglot.py setup` before `polyglot.py run`'
