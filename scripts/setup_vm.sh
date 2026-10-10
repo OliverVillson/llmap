@@ -60,7 +60,7 @@ fi
 
 say "vLLM venv (data stage)"
 uv venv -q --python 3.12 "$NVME/venv-vllm"
-uv pip install -q --python "$NVME/venv-vllm/bin/python" vllm pyyaml httpx
+uv pip install -q --python "$NVME/venv-vllm/bin/python" "vllm==0.31.0" pyyaml httpx  # the version exp04 was checked against
 uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 
 say "Training venv (reap, heal, quantize, eval, package, API)"

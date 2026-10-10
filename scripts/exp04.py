@@ -84,6 +84,12 @@ SHARE = 0.90  # Oliver's bar: 90% of the best full model's Polyglot score
 BUDGET_GB = 9.8
 MAX_GB = 9.95
 CHOICE = LOGS / "builds.json"
+# Guards against a run that looks fine but isn't. A full model under these on Polyglot is
+# broken (reasoning parser, chat template, edit format), not weak: the third-party anchor
+# for Qwen3.6 is 62%. Fewer transcript rows than MIN_ROWS means the logging or the row
+# parser failed. Either stops the run; EXP04_ACCEPT=1 goes on anyway.
+MIN_FULL_PASS, MIN_FORMED, MIN_ROWS = 0.15, 0.70, 60
+ACCEPT = os.environ.get("EXP04_ACCEPT") == "1"
 
 
 # ---------- bases, builds and results ----------
@@ -120,6 +126,11 @@ def builds() -> list[str]:
     full = {k: poly_score(f"{k}-full") for k in WANTED}
     if any(v is None for v in full.values()):
         raise RuntimeError("every full model needs a Polyglot score before the builds are picked")
+    bad = {k: why for k in WANTED if (why := suspect(f"{k}-full"))}
+    if bad and not ACCEPT:
+        raise RuntimeError("these full-model Polyglot runs look broken, not weak: "
+                           + "; ".join(f"{LABELS[k]} {why}" for k, why in bad.items())
+                           + f". Send Claude the step logs and {POLY}; EXP04_ACCEPT=1 builds anyway.")
     out = []
     qwen_shape = [k for k in ("ornith", "qwen") if k in WANTED]
     if len(qwen_shape) == 2:
@@ -130,6 +141,17 @@ def builds() -> list[str]:
     LOGS.mkdir(exist_ok=True)
     write(CHOICE, {"builds": out, "full": full, "bar": round(SHARE * max(full.values()), 4)})
     return out
+
+
+def suspect(name: str) -> str:
+    """Why a Polyglot result looks broken rather than weak, or ""."""
+    r = poly(name) or {}
+    why = []
+    if (r.get("pass_rate_2") or 0) < MIN_FULL_PASS:
+        why.append(f"passed {r.get('pass_rate_2') or 0:.0%}")
+    if (r.get("percent_cases_well_formed") or 0) < MIN_FORMED:
+        why.append(f"{r.get('percent_cases_well_formed') or 0:.0%} well-formed edits")
+    return " and ".join(why)
 
 
 def bar() -> float | None:
@@ -307,28 +329,41 @@ def run_full(key: str) -> Callable[[Step], None]:
 
 
 def run_build(slot: int) -> Callable[[Step], None]:
-    """The slot-th build: transcripts, the pipeline, then Polyglot on the 4-bit model."""
+    """The slot-th build: transcripts, the pipeline, then Polyglot on the 4-bit model. A
+    failed build is skipped, so the other one still runs; a re-run retries it."""
     def run(step: Step) -> None:
         b = builds()
         if slot >= len(b):
             raise Skip("only one build in this run")
-        key, name = b[slot], build_name(b[slot])
-        if not rows_file(key).exists():
-            log = LOGS / "transcripts" / f"{key}.requests.jsonl"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            polyglot(step, base_dir(key), f"{key}-exercism", key, f"--exercises {EXERCISM} --log {log}")
-            # rows heal would cut short are dropped: ~3 characters a token in code and its thinking
-            max_chars = 3 * read(CONFIGS / "build.json")["heal_max_len"]
-            sh(step, f"python scripts/polyglot.py rows --log {log} --results {POLY / (key + '-exercism.json')} "
-                     f"--out {rows_file(key)} --max-chars {max_chars}")
-        if not (job(name) / "config.json").exists():
-            make_job(name, build_config(key))
-        pipeline(step, name)
-        polyglot(step, model_dir(name), name, key)
-        score, line = poly_score(name), bar()
-        above(f"    {LABELS[key]} 4-bit: Aider Polyglot {score:.1%} against the {line:.1%} bar "
-              f"({'met' if score >= line else 'missed'}); LiveCodeBench {lcb(name) or 0:.0%}")
+        try:
+            build(step, b[slot])
+        except Exception as e:  # noqa: BLE001
+            raise Skip(f"{LABELS[b[slot]]} failed (re-run to retry): {e}") from e
     return run
+
+
+def build(step: Step, key: str) -> None:
+    """Transcripts, the pipeline, then Polyglot on the 4-bit model, for one base."""
+    name = build_name(key)
+    if not rows_file(key).exists():
+        log = LOGS / "transcripts" / f"{key}.requests.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        polyglot(step, base_dir(key), f"{key}-exercism", key, f"--exercises {EXERCISM} --log {log}")
+        # rows heal would cut short are dropped: ~3 characters a token in code and its thinking
+        max_chars = 3 * read(CONFIGS / "build.json")["heal_max_len"]
+        sh(step, f"python scripts/polyglot.py rows --log {log} --results {POLY / (key + '-exercism.json')} "
+                 f"--out {rows_file(key)} --max-chars {max_chars}")
+    n = sum(1 for line in open(rows_file(key)) if line.strip())
+    if n < MIN_ROWS and not ACCEPT:
+        raise RuntimeError(f"the Aider transcripts gave {n} training rows (expected well over {MIN_ROWS}); "
+                           f"see the rows counts in the step log. EXP04_ACCEPT=1 builds anyway.")
+    if not (job(name) / "config.json").exists():
+        make_job(name, build_config(key))
+    pipeline(step, name)
+    polyglot(step, model_dir(name), name, key)
+    score, line = poly_score(name), bar()
+    above(f"    {LABELS[key]} 4-bit: Aider Polyglot {score:.1%} against the {line:.1%} bar "
+          f"({'met' if score >= line else 'missed'}); LiveCodeBench {lcb(name) or 0:.0%}")
 
 
 def build_done(slot: int) -> Callable[[], bool]:

@@ -55,7 +55,8 @@ def exp04(tmp_path, monkeypatch):
 
 def score(m, name, rate, **extra):
     m.POLY.mkdir(parents=True, exist_ok=True)
-    (m.POLY / f"{name}.json").write_text(json.dumps({"pass_rate_2": rate, "pass_rate_1": rate / 2, **extra}))
+    (m.POLY / f"{name}.json").write_text(json.dumps({"pass_rate_2": rate, "pass_rate_1": rate / 2,
+                                                     "percent_cases_well_formed": 0.95, **extra}))
 
 
 def test_build_configs_are_valid(exp04):
@@ -104,6 +105,33 @@ def test_a_subset_of_bases(tmp_path, monkeypatch, bases, built, n_steps):
         score(m, f"{key}-full", 0.6)
     assert m.builds() == built and len(m.steps()) == n_steps
     assert m.build_done(1)() is (len(built) == 1)  # an unused second build slot counts as done
+
+
+@pytest.mark.parametrize("gemma", [{"rate": 0.04}, {"rate": 0.5, "percent_cases_well_formed": 0.3}])
+def test_a_broken_full_model_run_stops_the_builds(tmp_path, monkeypatch, gemma):
+    m = load(tmp_path, monkeypatch)
+    score(m, "qwen-full", 0.6)
+    score(m, "ornith-full", 0.6)
+    rate = gemma.pop("rate")
+    score(m, "gemma-full", rate, **gemma)
+    with pytest.raises(RuntimeError, match="Gemma 4 26B-A4B"):
+        m.builds()
+    assert not m.CHOICE.exists()
+    monkeypatch.setenv("EXP04_ACCEPT", "1")
+    m = load(tmp_path, monkeypatch)
+    assert m.builds() == ["ornith", "gemma"]
+
+
+def test_a_failed_build_does_not_block_the_other(exp04, monkeypatch):
+    m = exp04
+    for key in ("qwen", "ornith", "gemma"):
+        score(m, f"{key}-full", 0.6)
+    m.rows_file("ornith").parent.mkdir(parents=True, exist_ok=True)
+    m.rows_file("ornith").write_text('{"messages": []}\n' * 10)  # too few rows: logging broke
+    monkeypatch.setattr(m, "sh", lambda step, cmd: pytest.fail(f"ran {cmd}"))
+    with pytest.raises(m.Skip, match="Ornith-1.5 failed .* 10 training rows"):
+        m.run_build(0)(None)
+    assert not m.build_done(0)()
 
 
 def test_full_plan_and_summary(exp04, capsys):
