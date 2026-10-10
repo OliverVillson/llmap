@@ -11,17 +11,23 @@ experts are 4-bit (vLLM's MoE kernels go no lower) and fewer experts are kept th
 r50w95s's 128: about 104 of 256, int4 experts, FP8 DeltaNet / attention / output
 head, BF16 embeddings and router. Plan: /mnt/project-files/plan/next-model.md.
 
+Two bases with the same architecture (plan/moe-bases.md): Qwen3.6-35B-A3B, and
+Ornith-1.5-35B-A3B, which is stronger at agent coding but publishes no LiveCodeBench
+score. Both full models are scored, and r59-t is built from Ornith unless it trails
+Qwen3.6 by more than 2 points. EXP04_BASE=qwen or EXP04_BASE=ornith runs only that one.
+
 Steps:
   1. VM setup (scripts/setup_vm.sh), with the code suites re-fetched when they
      predate the per-case time limit
-  2. the base model download
+  2. the base model downloads
   3. smoke test (scripts/exp04_smoke.py): a 4-layer copy of the base with random
      weights goes through the real quantize stage and is served by vLLM, once with
      FP8 DeltaNet / attention and, if that fails, with them in BF16. That picks the
      format, and the format and the 10 GB budget pick the expert count
-  4. the full model scored on vLLM: LiveCodeBench (2025-01..04, thinking on, 32k,
-     4 answers per problem; pass@1 is their mean), then the other code suites once
-     each with one fix turn. These are the 100% marks
+  4. each full model scored on vLLM: LiveCodeBench (2025-01..04, thinking on, 32k,
+     4 answers per problem; pass@1 is their mean). That picks the base. Then the
+     picked base on the other code suites once each, with one fix turn. These are
+     the 100% marks
   5. r59-t: contest + Python thinking data, REAP to the smoke test's expert count,
      heal capped at 45 min, int4 + FP8 quantize with a size check, LiveCodeBench x4
   6. r59-t on the other suites (one fix turn), and in Mugge's format
@@ -53,8 +59,14 @@ NVME = Path(os.environ.get("NVME", "/mnt/nvme"))
 J = Path(os.environ.get("LOBBOT_JOBS", NVME / "jobs"))
 LOGS = Path(os.environ.get("EXP04_LOGS", Path.home() / "exp04-logs"))
 BUCKET = "bucket://mugge-library"
-TEACHER = "Qwen/Qwen3.6-35B-A3B"
-TEACHER_DIR = NVME / "models" / TEACHER.split("/")[-1]
+BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B"}
+LABELS = {"qwen": "Qwen3.6", "ornith": "Ornith-1.5"}
+ONLY = os.environ.get("EXP04_BASE", "")
+if ONLY and ONLY not in BASES:
+    sys.exit(f"EXP04_BASE must be one of {', '.join(BASES)}")
+WANTED = [ONLY] if ONLY else list(BASES)
+ORNITH_MARGIN = 0.02  # Ornith is built unless it trails Qwen3.6 by more than this on LiveCodeBench
+CHOICE = LOGS / "base.json"
 TASKSPEC = "examples/python-utils.code.taskspec.json"
 SMOKE = NVME / "exp04-smoke"
 CONFIGS = REPO / "configs" / "exp04"
@@ -90,14 +102,38 @@ def config(base: str, **over) -> dict:
     return {**read(CONFIGS / f"{base}.json"), **over}
 
 
+def base_dir(key: str) -> Path:
+    return NVME / "models" / BASES[key].split("/")[-1]
+
+
+def ref_job(key: str) -> str:
+    return "ref" if key == "qwen" else f"ref-{key}"
+
+
+def chosen() -> str:
+    """The base r59-t is built from, decided once from the full models' LiveCodeBench scores."""
+    if ONLY:
+        return ONLY
+    if CHOICE.exists():
+        return read(CHOICE)["base"]
+    q, o = lcb("ref"), lcb("ref-ornith")
+    if q is None or o is None:
+        raise RuntimeError("both full models need a LiveCodeBench score before the base is picked")
+    key = "ornith" if o >= q - ORNITH_MARGIN else "qwen"
+    LOGS.mkdir(exist_ok=True)
+    write(CHOICE, {"base": key, "qwen": q, "ornith": o})
+    return key
+
+
 def smoke() -> dict:
     """The smoke test's verdict: {"fp8_attention", "experts", "size_gb_est", ...}."""
     return read(SMOKE / "result.json")
 
 
 def r59_config() -> dict:
-    s = smoke()
-    return config("r59-t", reap_sparsity=round(1 - s["experts"] / 256, 6), quant_fp8_attention=s["fp8_attention"])
+    s, key = smoke(), chosen()
+    return config("r59-t", teacher=BASES[key], code_eval_ref=f"exp04-{ref_job(key)}",
+                  reap_sparsity=round(1 - s["experts"] / 256, 6), quant_fp8_attention=s["fp8_attention"])
 
 
 def model_dir(name: str = "r59-t") -> Path:
@@ -157,7 +193,7 @@ def run_setup(step: Step) -> None:
     if (NVME / "codebench" / "livecodebench.jsonl").exists() and not lcb_current():
         (NVME / "codebench" / "livecodebench.jsonl").rename(NVME / "codebench" / "livecodebench-old.jsonl")
         above("    re-fetching the code suites (older LiveCodeBench rows have no per-case time limit)")
-    sh(step, f"NVME={NVME} TEACHER={TEACHER} STUDENT= bash scripts/setup_vm.sh")
+    sh(step, f"NVME={NVME} TEACHER={BASES[WANTED[0]]} STUDENT= bash scripts/setup_vm.sh")
 
 
 def setup_done() -> bool:
@@ -169,20 +205,27 @@ def downloading() -> bool:
     return subprocess.run(["pgrep", "-f", "hf download"], stdout=subprocess.DEVNULL).returncode == 0
 
 
+DONE_MARK = "EXP04_DOWNLOADS_DONE"
+
+
 def download_done() -> bool:
     log = NVME / "download.log"
-    return (log.exists() and "DOWNLOADS_DONE" in log.read_text(errors="replace")
-            and (TEACHER_DIR / "config.json").exists())
+    return (log.exists() and DONE_MARK in log.read_text(errors="replace")
+            and all((base_dir(k) / "config.json").exists() for k in WANTED))
 
 
 def run_download(step: Step) -> None:
+    """setup_vm.sh starts the first base's download; this waits for it, then fetches every
+    base (hf download skips the files already there), so a half-finished download resumes."""
     log = NVME / "download.log"
-    if not (TEACHER_DIR / "config.json").exists() and not downloading():
-        # A VM set up for another experiment has a finished download.log but not this model.
-        if log.exists():
-            log.rename(log.with_name(f"download-{int(time.time())}.log"))
-        sh(step, f"export PATH=$HOME/.local/bin:$PATH && nohup bash -c 'uv tool run --from huggingface_hub hf download {TEACHER} "
-                 f"--local-dir {TEACHER_DIR} && echo DOWNLOADS_DONE' > {log} 2>&1 &")
+    while downloading():
+        time.sleep(5)
+    if log.exists():
+        log.rename(log.with_name(f"download-{int(time.time())}.log"))
+    fetch = " && ".join(f"uv tool run --from huggingface_hub hf download {BASES[k]} --local-dir {base_dir(k)}"
+                        for k in WANTED)
+    sh(step, f"export PATH=$HOME/.local/bin:$PATH && nohup bash -c '{fetch} && echo {DONE_MARK}' > {log} 2>&1 &")
+    time.sleep(10)
     while not download_done():
         if not downloading():
             time.sleep(10)
@@ -192,12 +235,12 @@ def run_download(step: Step) -> None:
 
 
 def download_progress() -> float:
-    got = sum(f.stat().st_size for f in TEACHER_DIR.rglob("*") if f.is_file()) if TEACHER_DIR.exists() else 0
-    return min(0.99, got / 70e9)
+    got = sum(f.stat().st_size for k in WANTED if base_dir(k).exists() for f in base_dir(k).rglob("*") if f.is_file())
+    return min(0.99, got / (70e9 * len(WANTED)))
 
 
 def run_smoke(step: Step) -> None:
-    sh(step, f"python scripts/exp04_smoke.py --teacher {TEACHER_DIR} --out {SMOKE} --budget-gb {BUDGET_GB}")
+    sh(step, f"python scripts/exp04_smoke.py --teacher {base_dir(WANTED[0])} --out {SMOKE} --budget-gb {BUDGET_GB}")
     s = smoke()
     above(f"    vLLM serves int4 experts with {'FP8' if s['fp8_attention'] else 'BF16'} DeltaNet and attention: "
           f"keeping {s['experts']} of 256 experts, {s['size_gb_est']:.2f} GB estimated")
@@ -205,19 +248,26 @@ def run_smoke(step: Step) -> None:
         above("    vLLM did not load the unquantized pruned model, so the before-quantizing score is skipped")
 
 
-def run_ref(step: Step) -> None:
-    eval_only("ref", {"ref": str(TEACHER_DIR)}, code_eval_ref="")
-    pipeline(step, "ref", "--only eval")
-    score = lcb("ref")
-    if score is None:
-        raise RuntimeError("the full model has no LiveCodeBench score; see the eval log")
-    above(f"    full model LiveCodeBench pass@1 (mean of 4): {score:.1%}; the bar is {BAR:.0%}")
-    if score < 0.55:
-        above("    far below the model card's 80%: the eval may be broken. The run goes on; send Claude the summary.")
+def run_ref(key: str) -> Callable[[Step], None]:
+    def run(step: Step) -> None:
+        name = ref_job(key)
+        eval_only(name, {name: str(base_dir(key))}, code_eval_ref="")
+        pipeline(step, name, "--only eval")
+        score = lcb(name)
+        if score is None:
+            raise RuntimeError(f"{LABELS[key]} has no LiveCodeBench score; see the eval log")
+        above(f"    {LABELS[key]} LiveCodeBench pass@1 (mean of 4): {score:.1%}; the bar is {BAR:.0%}")
+        if key == "qwen" and score < 0.55:
+            above("    far below the model card's 80%: the eval may be broken. The run goes on; send Claude the summary.")
+        if key == WANTED[-1]:
+            k = chosen()
+            above(f"    r59-t will be built from {LABELS[k]}" + ("" if ONLY else f" (Ornith is picked unless it trails "
+                                                                    f"Qwen3.6 by more than {ORNITH_MARGIN:.0%})"))
+    return run
 
 
 def run_ref_suites(step: Step) -> None:
-    eval_only("ref-suites", {"ref": str(TEACHER_DIR)}, "eval-suites", code_eval_ref="")
+    eval_only("ref-suites", {"ref": str(base_dir(chosen()))}, "eval-suites", code_eval_ref="")
     pipeline(step, "ref-suites", "--only eval")
 
 
@@ -317,8 +367,8 @@ def steps() -> list[Step]:
         Step("VM setup", {"": 40}, run_setup, setup_done),
         Step("base model download", {"": 15}, run_download, download_done, download_progress),
         Step("smoke test: vLLM and the 4-bit format", {"": 25}, run_smoke, (SMOKE / "result.json").exists),
-        Step("full model, LiveCodeBench x4", {"eval": 40}, run_ref, done("ref")),
-        Step("full model, other suites", {"eval": 20}, run_ref_suites, done("ref-suites")),
+        *[Step(f"{LABELS[k]} full model, LiveCodeBench x4", {"eval": 40}, run_ref(k), done(ref_job(k))) for k in WANTED],
+        Step("picked full model, other suites", {"eval": 20}, run_ref_suites, done("ref-suites")),
         Step("r59-t build and LiveCodeBench x4",
              {"data": 25, "reap": 10, "heal": 45, "quantize": 20, "eval": 25, "package": 1}, run_build, done("r59-t", "package")),
         Step("r59-t, other suites", {"eval": 15}, run_suites, done("r59-t-suites")),
@@ -335,7 +385,8 @@ def steps() -> list[Step]:
 
 SHORT = {"livecodebench": "LCB", "multipl-e-py": "py", "multipl-e-js": "js", "multipl-e-ts": "ts",
          "multipl-e-cpp": "cpp", "c-set": "C"}
-ROWS = [("full model", "ref", "ref-suites"), ("r59-t", "r59-t", "r59-t-suites"), ("r59-t Mugge format", None, "r59-t-mugge"),
+ROWS = [("Qwen3.6 full", "ref", None), ("Ornith-1.5 full", "ref-ornith", None), ("picked full, suites", None, "ref-suites"),
+        ("r59-t", "r59-t", "r59-t-suites"), ("r59-t Mugge format", None, "r59-t-mugge"),
         ("r59-t before quant", "r59-t-bf16", None), ("r59-t 6 experts", "r59-t-k6", None)]
 
 
@@ -348,7 +399,8 @@ def summary() -> str:
     suites, size, the share of answers that hit the 32k cap, GPU busy and speed."""
     head = ["model", "size", "LCB", "pick", "of ref"] + list(SHORT.values())[1:] + ["+1 fix", "capped", "GPU", "tok/s"]
     table = [head]
-    ref = lcb("ref")
+    key = read(CHOICE)["base"] if CHOICE.exists() else ONLY or "qwen"
+    ref = lcb(ref_job(key))
     for label, lcb_job, suites_job in ROWS:
         reps = [eval_json(n) for n in (lcb_job, suites_job) if n]
         if not any(reps):
@@ -372,7 +424,7 @@ def summary() -> str:
     r = lcb("r59-t")
     if r is not None:
         size = ((eval_json("r59-t") or {}).get("candidates") or [{}])[0].get("size_gb")
-        out.append(f"\nThe bar: under 10 GB ({'yes' if size and size < 10 else 'no'}, {size} GB), "
+        out.append(f"\nr59-t is built from {LABELS[key]}. The bar: under 10 GB ({'yes' if size and size < 10 else 'no'}, {size} GB), "
                    f"LiveCodeBench above {BAR:.0%} ({'yes' if r > BAR else 'no'}, {r:.1%}).")
     if BENCH.exists():
         b = read(BENCH)

@@ -8,7 +8,7 @@
   "data_max_len": 20480,
   "data_harness_share": 0.5,
   "data_fix_rows": 300,
-  "data_contest_rows": 700,
+  "data_contest_rows": 450,
   "data_contest_samples": 2,
   "data_contest_before": "2024-10-01",
   "data_contest_harness_share": 0.3,
@@ -16,9 +16,11 @@
   "reap_calib_samples": 256,
   "reap_max_seq": 8192,
   "heal_max_minutes": 45,
-  "heal_max_len": 16384,
+  "heal_max_len": 18432,
   "quant_format": "w4a16",
-  "code_eval_suites": ["livecodebench"],
+  "code_eval_suites": [
+    "livecodebench"
+  ],
   "code_eval_samples": 4,
   "code_eval_thinking": true,
   "code_eval_max_tokens": 32768,
