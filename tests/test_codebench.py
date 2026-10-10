@@ -112,6 +112,30 @@ def test_livecodebench_functional_tests():
            "                return [seen[target - x], i]\n            seen[x] = i\n```")
     assert run(p, ans).passed  # List comes from the LiveCodeBench prelude
     assert not run(p, ans.replace("[seen[target - x], i]", "[i]")).passed
+    demo = ans.replace("```python\n", "```python\nimport sys\n") .replace(
+        "\n```", "\n\nif __name__ == '__main__':\n    print(Solution().twoSum(*eval(sys.stdin.read())))\n```")
+    assert run(p, demo).passed  # the answer's own main block is dropped; the tests are the entry point
+
+
+@needs("python3")
+def test_livecodebench_limits_each_case_not_the_whole_problem(monkeypatch):
+    """Each case gets CASE_TIMEOUT, as in LiveCodeBench's runner: three cases of ~0.6 s
+    pass under a 1 s limit even though together they take longer; a stuck case fails
+    at its own limit, and an answer's `except Exception` cannot swallow it."""
+    monkeypatch.setattr(cb, "CASE_TIMEOUT", 1.0)
+    slow = "```python\nimport time\ntime.sleep(0.6)\nprint(int(input()) * 2)\n```"
+    p = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "Double it.",
+         "tests": [{"input": f"{i}\n", "output": f"{2 * i}\n"} for i in range(3)]}
+    assert cb.time_limit(p) == 13.0
+    assert sandbox.run_many([("python", *cb.assemble(p, slow), cb.time_limit(p))], timeout=1.5)[0].passed
+    stuck = "```python\ntry:\n    while True:\n        pass\nexcept Exception:\n    print(0)\n```"
+    r = sandbox.run_many([("python", *cb.assemble(p, stuck), cb.time_limit(p))])[0]
+    assert not r.passed and "case 0: over the 1 s time limit" in r.output
+    f = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
+         "tests": fc.functional_tests("f", [{"input": "1", "output": "1"}])}
+    spin = "```python\nclass Solution:\n    def f(self, x):\n        while True:\n            pass\n```"
+    r = sandbox.run_many([("python", *cb.assemble(f, spin), cb.time_limit(f))])[0]
+    assert not r.passed and "over the 1 s time limit" in r.output
 
 
 def test_decode_cases_refuses_pickled_objects():
@@ -137,7 +161,7 @@ def test_lcb_row_shapes():
     assert r["tests"] == [{"input": "1", "output": "1"}] and r["date"] == "2026-06-01"
     r = fc.lcb_row({**base, "starter_code": "class Solution:\n    def f(self, x):", "metadata": '{"func_name": "f"}',
                     "public_test_cases": json.dumps([{"input": "1", "output": "1", "testtype": "functional"}])}, 50)
-    assert isinstance(r["tests"], str) and "starter code" in r["prompt"]
+    assert r["tests"] == {"func": "f", "cases": [["1", "1"]]} and "starter code" in r["prompt"]
 
 
 def test_load_suite_filters_by_date_and_limit(tmp_path):

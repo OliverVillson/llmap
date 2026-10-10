@@ -16,7 +16,7 @@ CASES = json.loads((ROOT / "mugge/test/fixtures/files-cases.json").read_text())
 
 @pytest.mark.parametrize("case", CASES["parse"], ids=[c["why"] for c in CASES["parse"]])
 def test_parse_files_matches_the_engine(case):
-    assert harness.parse_files(case["answer"]) == (case["files"], case["note"])
+    assert harness.parse_files(case["answer"], case.get("owns")) == (case["files"], case["note"])
 
 
 def test_render_files_matches_the_engine_and_parses_back():

@@ -105,13 +105,14 @@ def run_tests(language: str, code: str, tests: str, timeout: float = TIMEOUT) ->
         return Result(rc == 0, "" if rc == 0 else "test_failed", out)
 
 
-def run_many(items: list[tuple[str, str, str]], workers: int | None = None,
+def run_many(items: list[tuple], workers: int | None = None,
              timeout: float = TIMEOUT) -> list[Result]:
-    """run_tests over (language, code, tests) triples in parallel; results keep input order."""
+    """run_tests over (language, code, tests) triples in parallel; results keep input order.
+    An item may add a fourth element, its own time limit, which wins over timeout when set."""
     if not items:
         return []
     with ThreadPoolExecutor(max_workers=workers or WORKERS) as ex:
-        return list(ex.map(lambda it: run_tests(*it, timeout=timeout), items))
+        return list(ex.map(lambda it: run_tests(*it[:3], timeout=(it[3] if len(it) > 3 and it[3] else timeout)), items))
 
 
 # --------------------------------------------------------------------------- process isolation

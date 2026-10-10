@@ -128,7 +128,7 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
             items = []
             for j in idx:
                 code, tests = codebench.assemble(problems[j], redone[j], code_of(problems[j], redone[j]))
-                items.append((problems[j]["language"], code, tests))
+                items.append((problems[j]["language"], code, tests, codebench.time_limit(problems[j])))
             for j, res in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 results[j] = res
         write_jsonl(job.path("work", "code_eval", f"{name}-{b}.jsonl"),

@@ -377,7 +377,8 @@ def prompting(cfg, task_system: str):
     return system_of, prompt, code_of
 
 
-# LiveCodeBench runs every test case in one process, so it gets a longer budget.
+# LiveCodeBench runs every test case in one process, so it gets a longer budget. Problems
+# fetched with their cases as data get CASE_TIMEOUT per case instead (codebench.time_limit).
 SUITE_TIMEOUT = {"livecodebench": max(sandbox.TIMEOUT, 60.0)}
 
 
@@ -428,7 +429,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
             items = []
             for j in idx:
                 code, tests = codebench.assemble(problems[j], answers[j], code_of(problems[j], answers[j]))
-                items.append((problems[j]["language"], code, tests))
+                items.append((problems[j]["language"], code, tests, codebench.time_limit(problems[j])))
             for j, r in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 ran[j] = r
         fix_answers = [""] * len(problems)
@@ -450,7 +451,7 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 for j, a in zip(sel, got):
                     fix_answers[j] = a
                     code, tests = codebench.assemble(problems[j], a, code_of(problems[j], a))
-                    items.append((problems[j]["language"], code, tests))
+                    items.append((problems[j]["language"], code, tests, codebench.time_limit(problems[j])))
                 for j, r in zip(sel, sandbox.run_many(items, timeout=timeout)):
                     fixed[j] = r
         for j, (p, a, r) in enumerate(zip(problems, answers, ran)):

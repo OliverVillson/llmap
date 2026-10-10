@@ -9,7 +9,7 @@ const cases = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures/files-case
 describe('coder answer format', () => {
   for (const c of cases.parse) {
     test(`parse: ${c.why}`, () => {
-      expect(parseFiles(c.answer)).toEqual({ files: c.files, note: c.note });
+      expect(parseFiles(c.answer, c.owns)).toEqual({ files: c.files, note: c.note });
     });
   }
   test('render matches the shared cases and parses back', () => {

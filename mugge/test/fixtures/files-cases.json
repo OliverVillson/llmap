@@ -40,6 +40,79 @@
         "empty.txt": ""
       },
       "note": ""
+    },
+    {
+      "why": "a path in the fence's info string",
+      "answer": "```python src/a.py\nx = 1\n```",
+      "files": {
+        "src/a.py": "x = 1\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a File: label before the block",
+      "answer": "File: src/a.py\n```python\nx = 1\n```",
+      "files": {
+        "src/a.py": "x = 1\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a ticket that owns one file takes its last unlabelled block",
+      "owns": [
+        "src/a.py"
+      ],
+      "answer": "The bug was an off-by-one. Old:\n```python\nx = 1\n```\nHere is the fix:\n```python\nx = 2\n```\nNote: fixed x",
+      "files": {
+        "src/a.py": "x = 2\n"
+      },
+      "note": "fixed x"
+    },
+    {
+      "why": "the line before a block names an owned file",
+      "owns": [
+        "src/a.ts",
+        "src/b.ts"
+      ],
+      "answer": "Updated `src/b.ts`:\n```ts\nb\n```\nAnd the new a.ts:\n```ts\na\n```",
+      "files": {
+        "src/b.ts": "b\n",
+        "src/a.ts": "a\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a block's first line names an owned file",
+      "owns": [
+        "lib/x.c",
+        "lib/y.c"
+      ],
+      "answer": "```c\n// lib/y.c\nint y;\n```",
+      "files": {
+        "lib/y.c": "// lib/y.c\nint y;\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a bare file name moves to the owned path",
+      "owns": [
+        "src/a.py"
+      ],
+      "answer": "a.py\n```python\nx = 1\n```",
+      "files": {
+        "src/a.py": "x = 1\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a file name inside a longer word does not count",
+      "owns": [
+        "a.py",
+        "b.py"
+      ],
+      "answer": "Changes to data.py:\n```python\nz = 1\n```",
+      "files": {},
+      "note": ""
     }
   ],
   "render": [

@@ -569,7 +569,7 @@ def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) 
     drops, fixes = {}, []
     for (s, _, _), conv, g in zip(pool, convs, gens):
         reasoning, text = split_think(g.text) if think else ("", g.text)
-        files, note = harness.parse_files(text)
+        files, note = harness.parse_files(text, [src])
         why = ("truncated" if not g.finished else "no_thinking_end" if think and not reasoning
                else "no_file" if not files.get(src, "").strip() else "")
         if why:
