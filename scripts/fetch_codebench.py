@@ -76,7 +76,8 @@ def functional_tests(func: str, cases: list[dict]) -> dict:
 
 
 def lcb_row(r: dict, max_cases: int) -> dict | None:
-    cases = decode_cases(r["public_test_cases"]) + decode_cases(r["private_test_cases"])
+    public = decode_cases(r["public_test_cases"])
+    cases = public + decode_cases(r["private_test_cases"])
     if not cases:
         return None
     cases = cases[:max_cases]
@@ -90,7 +91,8 @@ def lcb_row(r: dict, max_cases: int) -> dict | None:
     else:
         tests = [{"input": c["input"], "output": c["output"]} for c in cases]
     return {"id": f"{r['platform']}/{r['question_id']}", "language": "python", "prompt": prompt, "stub": "",
-            "entry": "", "tests": tests, "date": str(r["contest_date"])[:10], "difficulty": r.get("difficulty")}
+            "entry": "", "tests": tests, "date": str(r["contest_date"])[:10], "difficulty": r.get("difficulty"),
+            "public": min(len(public), len(cases))}  # the first cases are the examples in the problem text
 
 
 def fetch_livecodebench(out: Path, max_cases: int) -> None:

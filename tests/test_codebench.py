@@ -158,7 +158,7 @@ def test_lcb_row_shapes():
     base = {"question_content": "Q", "platform": "atcoder", "question_id": "abc1", "contest_date": "2026-06-01T00:00:00",
             "starter_code": "", "metadata": "{}", "private_test_cases": "[]"}
     r = fc.lcb_row({**base, "public_test_cases": json.dumps([{"input": "1", "output": "1", "testtype": "stdin"}])}, 50)
-    assert r["tests"] == [{"input": "1", "output": "1"}] and r["date"] == "2026-06-01"
+    assert r["tests"] == [{"input": "1", "output": "1"}] and r["date"] == "2026-06-01" and r["public"] == 1
     r = fc.lcb_row({**base, "starter_code": "class Solution:\n    def f(self, x):", "metadata": '{"func_name": "f"}',
                     "public_test_cases": json.dumps([{"input": "1", "output": "1", "testtype": "functional"}])}, 50)
     assert r["tests"] == {"func": "f", "cases": [["1", "1"]]} and "starter code" in r["prompt"]

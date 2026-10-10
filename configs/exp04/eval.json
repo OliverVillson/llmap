@@ -1,0 +1,9 @@
+{
+  "teacher": "Qwen/Qwen3.6-35B-A3B",
+  "code_eval_suites": ["livecodebench"],
+  "code_eval_samples": 4,
+  "code_eval_thinking": true,
+  "code_eval_max_tokens": 32768,
+  "lcb_since": "2025-01-01",
+  "code_eval_ref": "exp04-ref"
+}
