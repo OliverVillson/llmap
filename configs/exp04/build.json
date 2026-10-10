@@ -13,7 +13,7 @@
   "data_contest_harness_share": 0.3,
   "reap_calib_samples": 256,
   "reap_max_seq": 8192,
-  "heal_max_minutes": 45,
+  "heal_max_minutes": 90,
   "heal_max_len": 18432,
   "quant_format": "w4a16",
   "code_eval_suites": [
