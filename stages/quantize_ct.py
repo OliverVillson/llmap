@@ -1,11 +1,16 @@
 """Stage 4, vLLM path (Config.quant_format "w4a16"): the healed model as a
 compressed-tensors checkpoint that vLLM serves on a GPU, which llama.cpp cannot
 keep busy. llm-compressor quantizes it in one pass; the scheme (stages/w4a16.py):
-  routed and shared experts   W4A16 int4, group 128, by GPTQ (Marlin MoE kernels)
-  attention, DeltaNet's in_proj_qkv, in_proj_z and out_proj, lm_head
+  routed (and shared) experts W4A16 int4, group 128 (Gemma 4: 64), by GPTQ
+                              (Marlin MoE kernels)
+  Qwen3.6: attention, DeltaNet's in_proj_qkv, in_proj_z and out_proj, lm_head
+  Gemma 4: attention, the dense MLP beside the experts
                               FP8_DYNAMIC, round to nearest (BF16 with
                               quant_fp8_attention off)
   everything else             BF16
+Gemma 4 is quantized and saved as its text decoder alone (Gemma4ForCausalLM, as
+heal saves it; a released multimodal checkpoint is cut to it), so its vision and
+audio towers do not count against the size.
 GPTQ calibrates on quant_calib_samples rows of data/train.jsonl, rendered the
 way heal trains on them (chat template, thinking included), and every expert
 sees every calibration token (moe_calibrate_all_experts), so experts the router
@@ -48,34 +53,68 @@ def calibration_set(job: Job, tok):
     return Dataset.from_dict({"input_ids": ids, "attention_mask": [[1] * len(x) for x in ids]})
 
 
-def recipe(fp8: bool) -> list:
+def recipe(hf: dict, fp8: bool) -> list:
+    """FP8 first, so GPTQ fits the experts to the outputs of the FP8 layers they
+    will see in vLLM; then W4A16 (int4, symmetric) at the model's group size."""
+    from compressed_tensors.quantization import preset_name_to_scheme
     from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
 
-    # W4A16: int4, symmetric, group 128. FP8 goes first, so GPTQ fits the experts
-    # to the outputs of the FP8 attention they will see in vLLM.
-    gptq = GPTQModifier(targets=w4a16.INT4_TARGETS, scheme="W4A16")
-    return ([QuantizationModifier(targets=w4a16.FP8_TARGETS, scheme="FP8_DYNAMIC")] if fp8 else []) + [gptq]
+    int4, f8 = w4a16.targets(hf, fp8)
+    scheme = preset_name_to_scheme("W4A16", int4)
+    weights = scheme.weights.model_copy(update={"group_size": w4a16.group_size(hf)})
+    gptq = GPTQModifier(config_groups={"group_0": scheme.model_copy(update={"weights": weights})})
+    return ([QuantizationModifier(targets=f8, scheme="FP8_DYNAMIC")] if f8 else []) + [gptq]
+
+
+def load_text_model(healed: Path):
+    """The healed model's text decoder in BF16, on the CPU (oneshot moves one decoder
+    layer at a time to the GPU). Heal saves Qwen3.6 and Gemma 4 text only already
+    (Gemma4ForCausalLM, see sft.load_causal_lm); a Gemma 4 checkpoint as released is
+    multimodal (Gemma4ForConditionalGeneration), and only its text decoder is loaded."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    hf = AutoConfig.from_pretrained(str(healed))
+    if hf.model_type != "gemma4":
+        return AutoModelForCausalLM.from_pretrained(str(healed), dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(str(healed), config=hf.text_config, dtype=torch.bfloat16,
+                                                 key_mapping={r"^model\.language_model\.": "model."})
+    model._weight_conversions = None  # else save_pretrained maps the tensors back to model.language_model.*
+    return model
+
+
+def keep_model_config(saved: Path, model) -> None:
+    """llm-compressor rewrites config.json from the healed one when it can (for
+    vLLM's sake); for Gemma 4 that is the multimodal config, whose towers were not
+    saved. Keep the saved model's own config, with the quantization config."""
+    p = saved / "config.json"
+    cfg = json.loads(p.read_text())
+    if cfg.get("model_type") != model.config.model_type:
+        own = model.config.to_dict() | {"architectures": [type(model).__name__]}
+        p.write_text(json.dumps(own | {"quantization_config": cfg["quantization_config"]}, indent=2) + "\n")
 
 
 def quantize(job: Job, healed: Path, out: Path) -> None:
-    import torch
     from llmcompressor import oneshot
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     from stages import moe_utils as mu
 
     cfg = job.config
+    hf = json.loads((healed / "config.json").read_text())
     tok = AutoTokenizer.from_pretrained(str(healed))
     data = calibration_set(job, tok)
-    # Loaded on the CPU: oneshot moves one decoder layer at a time to the GPU.
-    model = AutoModelForCausalLM.from_pretrained(str(healed), dtype=torch.bfloat16)
+    model = load_text_model(healed)
     emit(STAGE, pct=10, msg=f"GPTQ on {len(data)} rows, {sum(map(len, data['input_ids']))} tokens")
-    oneshot(model=model, dataset=data, recipe=recipe(cfg.quant_fp8_attention), max_seq_length=cfg.quant_calib_len,
-            num_calibration_samples=len(data), moe_calibrate_all_experts=True)
+    # processor: else oneshot loads one from the model dir (Gemma 4's wants torchvision)
+    oneshot(model=model, processor=tok, dataset=data, recipe=recipe(hf, cfg.quant_fp8_attention),
+            max_seq_length=cfg.quant_calib_len, num_calibration_samples=len(data), moe_calibrate_all_experts=True)
     emit(STAGE, pct=90, msg="saving compressed-tensors checkpoint")
     tmp = out.with_name(out.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     model.save_pretrained(tmp, save_compressed=True, max_shard_size="5GB")
+    if hf.get("model_type") == "gemma4":
+        keep_model_config(tmp, model)
     tok.save_pretrained(tmp)
     mu.fix_saved_config(tmp)
     shutil.rmtree(out, ignore_errors=True)
