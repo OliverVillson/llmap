@@ -767,3 +767,18 @@ def test_selftest_fails_when_the_benchmark_does(tmp_path, monkeypatch):
     assert json.loads((out / "selftest.json").read_text())["exit_code"] == 2
     with pytest.raises(SystemExit, match="no exercises with a reference solution"):
         pg.main(["selftest", "--out", str(out), "--exercises", str(tmp_path / "none")])
+
+
+def test_image_pins_jest_29(tmp_path, monkeypatch):
+    """Jest 30 dropped toThrowError, which two of Polyglot's JS tests call."""
+    monkeypatch.setattr(pg, "HOME", tmp_path)
+    monkeypatch.setattr(pg, "AIDER", tmp_path / "aider")
+    (tmp_path / "aider" / "benchmark").mkdir(parents=True)
+    src = "    npm install \\\n    jest \\\n    @types/jest@29.5.12 \\\n    babel-jest@29.6.4 \\\n"
+    (tmp_path / "aider" / "benchmark" / "Dockerfile").write_text(src)
+    text = pg.dockerfile().read_text()
+    assert "    jest@29.7.0 \\\n" in text and "    jest \\\n" not in text and "babel-jest@29.6.4" in text
+    assert pg.IMAGE.endswith("-jest29")
+    (tmp_path / "aider" / "benchmark" / "Dockerfile").write_text("    npm install jest\n")
+    with pytest.raises(SystemExit):
+        pg.dockerfile()

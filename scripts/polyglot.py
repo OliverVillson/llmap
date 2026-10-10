@@ -80,7 +80,11 @@ POLYGLOT_COMMIT = "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f"  # 2024-12-22
 TRACKS = {"python": "7bec634f5c51cce82d233ad88f7ae81a3e98242a", "go": "26635e19868f0b4fbed09a986b824cd67efdbc2e",
           "java": "1123e5b3dddeb9e57b802835285a886b4428bfcc", "javascript": "dbfbeae34dd4fce7fad7afd740d075d33cc51b21",
           "rust": "6c321382019fa969401b8e923a5e12ff69065561", "cpp": "acc32555eab077cf786f892b6ab27a22184d81c7"}
-IMAGE = f"aider-benchmark:{AIDER_COMMIT[:12]}"
+# aider's Dockerfile installs jest unpinned. Jest 30 dropped toThrowError, which Polyglot's own
+# affine-cipher and resistor-color-trio tests call, so the image pins the Jest its babel-jest
+# and @types/jest (29.x) were written for.
+JEST = "jest@29.7.0"
+IMAGE = f"aider-benchmark:{AIDER_COMMIT[:12]}-jest29"
 # benchmark.py run_unit_tests: the test files' extension picks the command, which needs these.
 TEST_EXTS = {".py", ".rs", ".go", ".js", ".cpp", ".java"}
 BUILD = {"go": "go.mod", "java": "gradlew", "javascript": "package.json", "rust": "Cargo.toml", "cpp": "CMakeLists.txt"}
@@ -159,12 +163,22 @@ def image_exists() -> bool:
     return subprocess.run([*docker(), "image", "inspect", IMAGE], capture_output=True).returncode == 0
 
 
+def dockerfile() -> Path:
+    """aider's benchmark Dockerfile with Jest pinned (see JEST), written beside the clone."""
+    text = (AIDER / "benchmark" / "Dockerfile").read_text()
+    if text.count("    jest \\\n") != 1:
+        raise SystemExit("aider's benchmark/Dockerfile no longer installs jest as expected; update JEST pinning")
+    out = HOME / "Dockerfile.benchmark"
+    out.write_text(text.replace("    jest \\\n", f"    {JEST} \\\n"))
+    return out
+
+
 def setup(a) -> None:
     install_docker()
     clone("https://github.com/Aider-AI/aider", AIDER, AIDER_COMMIT)
     clone("https://github.com/Aider-AI/polyglot-benchmark", POLYGLOT, POLYGLOT_COMMIT)
     if not image_exists():  # benchmark/docker_build.sh, tagged with the pin
-        run([*docker(), "build", "--file", "benchmark/Dockerfile", "-t", IMAGE, "."], STAGE, cwd=AIDER)
+        run([*docker(), "build", "--file", str(dockerfile()), "-t", IMAGE, "."], STAGE, cwd=AIDER)
     emit(STAGE, "done", 100, f"aider {AIDER_COMMIT[:7]}, polyglot-benchmark {POLYGLOT_COMMIT[:7]}, image {IMAGE}")
 
 

@@ -391,7 +391,13 @@ SELFTEST = LOGS / "selftest"
 
 def setup_done() -> bool:
     return ((REPO / ".env.vm").exists() and (NVME / "venv-vllm/bin/python").exists() and lcb_current()
-            and (EXERCISM / ".done").exists() and (SELFTEST / "selftest.json").exists())
+            and (EXERCISM / ".done").exists() and selftest_ok(SELFTEST) and selftest_ok(Path(f"{SELFTEST}-train")))
+
+
+def selftest_ok(out: Path) -> bool:
+    """The no-model test run passed (selftest.json is written either way; ok says which)."""
+    f = out / "selftest.json"
+    return f.exists() and (ACCEPT or bool(json.loads(f.read_text()).get("ok")))
 
 
 def downloading() -> bool:

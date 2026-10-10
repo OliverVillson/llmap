@@ -292,3 +292,13 @@ def test_smoke_tiny_gemma4_is_saved_as_reap_saves_it(tmp_path):
     model = AutoModelForCausalLM.from_pretrained(tiny, dtype=torch.float32)
     assert model.model.layers[5].self_attn.head_dim == 64 and model.model.layers[5].self_attn.v_proj is None
     assert model.model.layers[0].experts.gate_up_proj.shape[0] == 4
+
+
+def test_failed_selftest_reruns_setup(exp04):
+    """selftest.json is written even when the reference solutions fail; setup isn't done until both pass."""
+    for out, ok in ((exp04.SELFTEST, True), (Path(f"{exp04.SELFTEST}-train"), False)):
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "selftest.json").write_text(json.dumps({"ok": ok}))
+    assert exp04.selftest_ok(exp04.SELFTEST)
+    assert not exp04.selftest_ok(Path(f"{exp04.SELFTEST}-train"))
+    assert not exp04.selftest_ok(exp04.LOGS / "missing")
