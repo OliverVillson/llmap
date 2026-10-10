@@ -47,6 +47,7 @@ from pathlib import Path
 from common.progress import emit
 from stages import codebench, data, harness, sandbox
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
+from stages.taskdata import think_tags
 
 STAGE = "eval"
 PORT = int(os.environ.get("LOBBOT_EVAL_PORT", "8091"))
@@ -167,8 +168,10 @@ def vllm_args(cfg, model_dir: str, name: str) -> list[str]:
         args += ["--reasoning-parser", cfg.eval_reasoning_parser]
     if cfg.eval_experts_used:  # nested where the checkpoint keeps it: Qwen3.5/3.6 ship a text_config
         hf = json.loads((Path(model_dir) / "config.json").read_text())
-        k = {"num_experts_per_tok": cfg.eval_experts_used}
-        nested = "num_experts_per_tok" not in hf and "num_experts_per_tok" in (hf.get("text_config") or {})
+        text = hf.get("text_config") or {}
+        key = "top_k_experts" if "top_k_experts" in {*hf, *text} else "num_experts_per_tok"  # Gemma 4's name
+        k = {key: cfg.eval_experts_used}
+        nested = key not in hf and key in text
         args += ["--hf-overrides", json.dumps({"text_config": k} if nested else k)]
     return args + list(cfg.eval_vllm_args)
 
@@ -244,7 +247,8 @@ def chat_template(model_dir: str, messages: list[dict]) -> str:
 
 
 def thinking_prompt(messages: list[dict]) -> str:
-    """The chat-template prompt up to and including the opened thinking."""
+    """The chat-template prompt up to and including the opened thinking (<think>,
+    or Gemma 4's thought channel)."""
     if VLLM:
         prompt = chat_template(VLLM["dir"], messages)
     else:
@@ -252,8 +256,9 @@ def thinking_prompt(messages: list[dict]) -> str:
 
         prompt = httpx.post(f"http://127.0.0.1:{PORT}/apply-template", timeout=60, json={
             "messages": messages, "chat_template_kwargs": {"enable_thinking": True}}).json()["prompt"]
-    if not prompt.rstrip().endswith("<think>"):  # templates that let the model open it
-        prompt += "<think>\n"
+    opening = think_tags(prompt)[0]
+    if not prompt.rstrip().endswith(opening.strip()):  # templates that let the model open it
+        prompt += opening
     return prompt
 
 
@@ -263,7 +268,8 @@ def force_answer(messages: list[dict], reasoning: str, why: str, temperature: fl
     and has the model answer on top of it: (answer, tokens)."""
     import httpx
 
-    prompt = thinking_prompt(messages) + reasoning + (EARLY_STOP if why == "length" else "") + "\n</think>\n\n"
+    prompt = thinking_prompt(messages)
+    prompt += reasoning + (EARLY_STOP if why == "length" else "") + think_tags(prompt)[1]
     # An hour: with many answers at once, a long prompt to read in and up to
     # ANSWER_TOKENS to write can take well over the ~17 minutes this used to allow.
     if VLLM:  # the rendered template already holds its special tokens

@@ -71,6 +71,14 @@ def test_vllm_args(tmp_path, monkeypatch):
     nested = str(checkpoint(tmp_path / "nested", text_config={"num_experts_per_tok": 8}))
     args = ev.vllm_args(cfg, nested, "cand")
     assert json.loads(args[args.index("--hf-overrides") + 1]) == {"text_config": {"num_experts_per_tok": 6}}
+    # Gemma 4 calls it top_k_experts: the shipped multimodal config and a pruned text-only one
+    cfg.eval_reasoning_parser = "gemma4"
+    shipped = checkpoint(tmp_path / "gemma", text_config={"top_k_experts": 8})
+    pruned = checkpoint(tmp_path / "gemma-text", top_k_experts=8)
+    for path, want in ((shipped, {"text_config": {"top_k_experts": 6}}), (pruned, {"top_k_experts": 6})):
+        args = ev.vllm_args(cfg, str(path), "cand")
+        assert json.loads(args[args.index("--hf-overrides") + 1]) == want
+        assert args[args.index("--reasoning-parser") + 1] == "gemma4"
 
 
 def test_vllm_command_runs_from_the_vllm_venv(tmp_path, monkeypatch):
@@ -185,6 +193,30 @@ def test_force_answer_on_vllm_uses_the_checkpoint_tokenizer(tmp_path, monkeypatc
                               f"<|im_start|>user\nb{opened}\n</think>\n\n"]
     assert all(j["model"] == "cand" and j["max_tokens"] == ev.ANSWER_TOKENS and j["temperature"] == 0.6
                and j["seed"] == 0 and j["top_k"] == 20 and not j["add_special_tokens"] for j in forced.values())
+
+
+def test_force_answer_reopens_gemma4_thought_channel(tmp_path, monkeypatch):
+    """Gemma 4's template leaves the thought channel to the model, so a forced answer
+    opens it in the prompt, puts back the thinking vLLM's gemma4 parser split off,
+    and closes it with <channel|>."""
+    class Tok:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt, enable_thinking):
+            return (f"<bos><|turn>system\n<|think|>\n{messages[0]['content']}<turn|>\n"
+                    f"<|turn>user\n{messages[1]['content']}<turn|>\n<|turn>model\n")
+
+    monkeypatch.setattr(ev, "_tokenizers", {str(tmp_path): Tok()})
+    monkeypatch.setattr(ev, "VLLM", {"name": "cand", "dir": str(tmp_path)})
+    sent = []
+
+    def post(url, timeout, json):
+        sent.append(json)
+        return R({"choices": [{"text": "x = 1"}], "usage": {"completion_tokens": 3}})
+
+    monkeypatch.setattr(httpx, "post", post)
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "a"}]
+    assert ev.force_answer(msgs, "plan it", "length", 1.0, {}) == ("x = 1", 3)
+    assert sent[0]["prompt"] == ("<bos><|turn>system\n<|think|>\nsys<turn|>\n<|turn>user\na<turn|>\n<|turn>model\n"
+                                 f"<|channel>thought\nplan it{ev.EARLY_STOP}\n<channel|>")
 
 
 def fake_tests(monkeypatch):

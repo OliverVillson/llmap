@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from common.progress import emit
 from stages import codebench, harness, sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
+from stages.taskdata import GEMMA4_THINK, think_tags
 
 STAGE = "data"
 N_SCENARIOS = int(os.environ.get("LOBBOT_DATA_SCENARIOS", 40))
@@ -170,17 +171,21 @@ def answer_messages(spec, shots, text: str) -> list[dict]:
 
 # --------------------------------------------------------------------------- parsing & filters
 
-_THINK = re.compile(r"<think>.*?</think>\s*", re.S)
+_THINK = re.compile(r"(<think>.*?</think>|<\|channel>.*?<channel\|>)\s*", re.S)
 _FENCE = re.compile(r"^```[\w-]*\s*\n?|\n?```\s*$")
 
 
 def split_think(text: str) -> tuple[str, str]:
     """(thinking, answer) from a raw generation. The thinking ends at the last
-    </think>; templates that open <think> in the prompt leave only the closing tag."""
-    if "</think>" not in text:
-        return "", text
-    head, tail = text.rsplit("</think>", 1)
-    return head.replace("<think>", "", 1).strip(), tail
+    </think>; templates that open <think> in the prompt leave only the closing tag.
+    Gemma 4 thinks in a thought channel: <|channel>thought, the thinking, <channel|>."""
+    if "</think>" in text:
+        head, tail = text.rsplit("</think>", 1)
+        return head.replace("<think>", "", 1).strip(), tail
+    if "<channel|>" in text:
+        head, tail = text.rsplit("<channel|>", 1)
+        return head.split("<|channel>", 1)[-1].strip().removeprefix("thought\n").strip(), tail
+    return "", text
 
 
 def clean(text: str) -> str:
@@ -284,10 +289,15 @@ class Teacher:
         self.llm = LLM(model=model_path, max_model_len=max_len, gpu_memory_utilization=GPU_UTIL,
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
+        # Gemma 4's thought channel opens and closes with special tokens, which the
+        # decoded text drops unless told to keep them; split_think needs them.
+        template = getattr(self.llm.get_tokenizer(), "chat_template", None)
+        self.keep_special = isinstance(template, str) and think_tags(template) == GEMMA4_THINK
 
     def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
-                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}))
+                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}),
+                                 **({"skip_special_tokens": False} if thinking and self.keep_special else {}))
         try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
             res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
         except TypeError:
@@ -720,7 +730,8 @@ def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
 
 def _row(sys: str, inp: str, out: str, reasoning: str = "") -> dict:
     """A chat row. The teacher's thinking, when kept, goes in reasoning_content (the
-    field Qwen's chat templates render inside <think>); taskdata trains on it."""
+    field Qwen's chat templates render inside <think>, Gemma 4's in its thought
+    channel); taskdata trains on it."""
     return {"messages": [
         {"role": "system", "content": sys},
         {"role": "user", "content": inp},

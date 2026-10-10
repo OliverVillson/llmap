@@ -118,7 +118,9 @@ class Config:
     # answers run at once); "" keeps llama.cpp's f16. vLLM: --kv-cache-dtype in eval_vllm_args.
     eval_kv_type: str = ""
     # vLLM serves the candidates that are HF checkpoint dirs: its --reasoning-parser
-    # ("" = none; the <think> tags then stay in the content and are split off there),
+    # ("" = none; the <think> tags then stay in the content and are split off there;
+    # "gemma4" for Gemma 4, whose thought channel needs it: without it vLLM drops the
+    # channel's special tokens and the thinking runs into the answer),
     # and extra `vllm serve` args, e.g. ["--speculative-config", "{...}"].
     eval_reasoning_parser: str = "qwen3"
     eval_vllm_args: list[str] = field(default_factory=list)

@@ -35,12 +35,27 @@ def log(msg: str) -> None:
 
 
 def load_causal_lm(path: str):
-    """bf16 on GPU, fp32 on CPU; works with transformers 4.x and 5.x."""
+    """bf16 on GPU, fp32 on CPU; works with transformers 4.x and 5.x.
+
+    A Gemma 4 MoE checkpoint (Gemma4ForConditionalGeneration, e.g.
+    gemma-4-26B-A4B-it) loads as its text decoder alone, Gemma4ForCausalLM, as
+    AutoModelForCausalLM does for Qwen3.6: REAP and heal only touch the text
+    model, and the vision tower would add size. It saves as a plain text
+    checkpoint (model.* tensors, gemma4_text config), which transformers reloads
+    as is and vLLM serves as Gemma4ForCausalLM. Dense Gemma 4 students (E4B)
+    keep their multimodal wrapper."""
     import transformers
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM
     kw = {"device_map": "auto"} if torch.cuda.is_available() else {}
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    cfg = AutoConfig.from_pretrained(path)
+    if cfg.model_type == "gemma4" and getattr(cfg.text_config, "enable_moe_block", False):
+        from transformers import Gemma4ForCausalLM
+        model = Gemma4ForCausalLM.from_pretrained(path, config=cfg.text_config, **{key: dtype}, **kw,
+                                                  key_mapping={r"^model\.language_model\.": "model."})
+        model._weight_conversions = None  # else save_pretrained maps the tensors back to model.language_model.*
+        return model
     return AutoModelForCausalLM.from_pretrained(path, **{key: dtype}, **kw)
 
 
@@ -63,8 +78,9 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
         # fused experts (transformers 5.x): LoRA on the stacked expert weights
         extra["target_parameters"] = ["experts.gate_up_proj", "experts.down_proj"]
     # "gate" also matches Qwen3.5/3.6's shared_expert_gate (suffix match), so
-    # the shared expert's sigmoid gate is trained along with the router
-    modules_to_save = ["gate"] if (blocks and train_router) else None
+    # the shared expert's sigmoid gate is trained along with the router; "router"
+    # is Gemma 4's (its projection, input scale and per-expert scale)
+    modules_to_save = ["gate", "router"] if (blocks and train_router) else None
     cfg = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=0.0, target_modules=targets,
                      modules_to_save=modules_to_save, task_type="CAUSAL_LM", **extra)
     try:
