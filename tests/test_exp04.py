@@ -81,6 +81,7 @@ def test_build_configs_are_valid(exp04):
         cfg = job.config
         assert cfg.teacher == m.BASES[key] and cfg.reap_sparsity == round(1 - kept / total, 6)
         assert cfg.heal_max_minutes == 90
+        assert cfg.data_extra_weight == 2 and cfg.calib_extra_share == 0.5
         assert cfg.quant_format == "w4a16" and cfg.quant_fp8_attention and cfg.code_eval_thinking
         assert cfg.eval_reasoning_parser == m.PARSER[key] and cfg.data_extra_rows == str(m.rows_file(key))
         assert cfg.code_eval_samples == 1 and cfg.lcb_since > cfg.data_contest_before
