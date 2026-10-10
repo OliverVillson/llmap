@@ -124,5 +124,10 @@ ENV
 [ -f "$NVME/codebench/livecodebench.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
   python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" || echo 'WARNING: code suites not downloaded; code eval will fail'
 
+say "llm-compressor in the training venv (quant_format w4a16: int4 experts, FP8 attention, for vLLM)"
+# 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: inside this venv's
+# ranges (transformers>=5.5, torch>=2.7), so it shares the venv; newer releases are moved back.
+uv pip install -q --python "$NVME/venv-train/bin/python" "llmcompressor==0.14.0"
+
 say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"
