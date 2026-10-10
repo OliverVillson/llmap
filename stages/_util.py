@@ -76,6 +76,12 @@ class Config:
     student_epochs: float = 2.0
     student_lr: float | None = None  # dense student LoRA lr; None uses LOBBOT_STUDENT_LR or 1e-4
     student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)
+    # Quantize: "gguf" = llama.cpp mixed-bit GGUF (below); "w4a16" = compressed-tensors
+    # for vLLM on a GPU (stages/quantize_ct.py): int4 experts, FP8 attention, BF16 rest.
+    quant_format: str = "gguf"
+    quant_calib_samples: int = 128  # w4a16: train.jsonl rows GPTQ calibrates on
+    quant_calib_len: int = 2048  # w4a16: tokens per calibration row
+    quant_fp8_attention: bool = True  # w4a16: False keeps attention, DeltaNet and lm_head BF16
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"
