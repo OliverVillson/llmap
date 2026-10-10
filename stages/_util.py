@@ -104,14 +104,22 @@ class Config:
     # Mugge's harness asks (stages/harness.py: a ticket in, files out), fixes too.
     code_eval_format: str = "plain"
     # Route each token to this many experts instead of the model's own count (0 keeps
-    # it). A llama-server override at serve time, so a top-k test needs no rebuild.
+    # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
+    # so a top-k test needs no rebuild.
     eval_experts_used: int = 0
     # llama-server KV cache type at eval ("q8_0" halves it, so more long thinking
-    # answers run at once); "" keeps llama.cpp's f16.
+    # answers run at once); "" keeps llama.cpp's f16. vLLM: --kv-cache-dtype in eval_vllm_args.
     eval_kv_type: str = ""
+    # vLLM serves the candidates that are HF checkpoint dirs: its --reasoning-parser
+    # ("" = none; the <think> tags then stay in the content and are split off there),
+    # and extra `vllm serve` args, e.g. ["--speculative-config", "{...}"].
+    eval_reasoning_parser: str = "qwen3"
+    eval_vllm_args: list[str] = field(default_factory=list)
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
-    # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
-    # eval-only job (pipeline.py --only eval) score an uncompressed reference.
+    # Models to evaluate instead of work/allocation.json: {name: path}, a GGUF (served
+    # with llama-server) or an HF checkpoint dir with a config.json (BF16 or
+    # compressed-tensors, served with vLLM). Lets an eval-only job (pipeline.py
+    # --only eval) score an uncompressed reference.
     eval_candidates: dict[str, str] = field(default_factory=dict)
     # Reference job for code scores: its out/eval.json's pass@1 is the 100% mark
     # (experiment 01's `ref`). Relative paths resolve against this job's parent dir.
