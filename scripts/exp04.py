@@ -392,11 +392,11 @@ def steps() -> list[Step]:
         Step("base model downloads", {"": 25}, run_download, download_done, download_progress),
         *[Step(f"smoke test: {SHAPE[k]} architecture on vLLM", {"": 20}, run_smoke(k),
                (SMOKE / SHAPE[k] / "result.json").exists) for k in smoke_keys()],
-        *[Step(f"{LABELS[k]} full model, Aider Polyglot", {"": 40}, run_full(k), (POLY / f"{k}-full.json").exists)
+        *[Step(f"{LABELS[k]} full, Polyglot", {"": 40}, run_full(k), (POLY / f"{k}-full.json").exists)
           for k in WANTED],
-        *[Step(f"build {i + 1}: transcripts, compress, Polyglot", {**BUILD_MINUTES, "": 35}, run_build(i), build_done(i))
+        *[Step(f"build {i + 1}: heal data, compress, score", {**BUILD_MINUTES, "": 35}, run_build(i), build_done(i))
           for i in range(n_builds)],
-        Step("better build before quantizing, Polyglot", {"": 40}, run_before_quant, side_done("bf16")),
+        Step("better build unquantized, Polyglot", {"": 40}, run_before_quant, side_done("bf16")),
         Step("better build with 6 experts, Polyglot", {"": 35}, run_k6, side_done("w4-k6")),
         Step("throughput at 1, 32, 128 at once", {"": 15}, run_bench, BENCH.exists),
         Step("upload to the bucket", {"": 20}, run_upload, (LOGS / ".uploaded").exists),
