@@ -68,7 +68,7 @@ EXERCISM = NVME / "exercism-train"  # Exercism practice exercises outside Polygl
 POLY = LOGS / "polyglot"  # one results JSON per Polyglot run
 CONFIGS = REPO / "configs" / "exp04"
 
-BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B", "gemma": "google/gemma-4-26B-A4B-it"}
+BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B-A3B", "gemma": "google/gemma-4-26B-A4B-it"}
 LABELS = {"qwen": "Qwen3.6", "ornith": "Ornith-1.5", "gemma": "Gemma 4 26B-A4B"}
 SHAPE = {"qwen": "qwen", "ornith": "qwen", "gemma": "gemma"}  # architecture, for the smoke test
 PARSER = {"qwen": "qwen3", "ornith": "qwen3", "gemma": "gemma4"}  # vLLM reasoning parser
