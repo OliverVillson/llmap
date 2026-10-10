@@ -33,6 +33,9 @@ sys.path.insert(0, str(ROOT))
 from stages import w4a16  # noqa: E402
 
 TASKSPEC = ROOT / "examples" / "python-utils.code.taskspec.json"
+# Expert counts go in steps of 2: at 9.8 GB that keeps 106 of Qwen3.6's 256 (104 in
+# steps of 8) and 70 of Gemma 4's 128 (64), about 0.13 and 0.19 GB per 2 experts.
+STEP = 2
 
 
 def tiny_layers(hf: dict) -> int:
@@ -133,7 +136,7 @@ def decide(hf: dict, budget_gb: float, try_format) -> dict:
     experts that fit the budget. try_format(fp8, k, errors) -> bool."""
     errors: dict = {}
     for fp8 in (True, False):
-        k = w4a16.max_experts(hf, budget_gb, fp8)
+        k = w4a16.max_experts(hf, budget_gb, fp8, STEP)
         if try_format(fp8, k, errors):
             return {"fp8_attention": fp8, "experts": k, "size_gb_est": round(w4a16.size_gb(hf, k, fp8), 2),
                     "errors": errors}

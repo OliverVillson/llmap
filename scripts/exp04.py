@@ -13,9 +13,9 @@ and the output head FP8, embeddings and routers BF16, and fewer experts are kept
 Plan: /mnt/project-files/plan/next-model.md.
 
 Three bases (plan/moe-bases.md):
-  qwen    Qwen3.6-35B-A3B     256 experts, ~104 kept
+  qwen    Qwen3.6-35B-A3B     256 experts, ~106 kept
   ornith  Ornith-1.5-35B-A3B  the same architecture, stronger at agent coding
-  gemma   Gemma 4 26B-A4B     128 experts, ~72 kept (less pruning, ~4B active)
+  gemma   Gemma 4 26B-A4B     128 experts, ~70 kept (less pruning, ~4B active)
 Two are built: the better of qwen and ornith on full-model Polyglot (ornith unless it
 trails by more than 2 points; they share a shape, so pruning should cost both the
 same), and gemma. EXP04_BASES=qwen,gemma (say) runs a subset.
@@ -317,8 +317,10 @@ def run_build(slot: int) -> Callable[[Step], None]:
             log = LOGS / "transcripts" / f"{key}.requests.jsonl"
             log.parent.mkdir(parents=True, exist_ok=True)
             polyglot(step, base_dir(key), f"{key}-exercism", key, f"--exercises {EXERCISM} --log {log}")
+            # rows heal would cut short are dropped: ~3 characters a token in code and its thinking
+            max_chars = 3 * read(CONFIGS / "build.json")["heal_max_len"]
             sh(step, f"python scripts/polyglot.py rows --log {log} --results {POLY / (key + '-exercism.json')} "
-                     f"--out {rows_file(key)}")
+                     f"--out {rows_file(key)} --max-chars {max_chars}")
         if not (job(name) / "config.json").exists():
             make_job(name, build_config(key))
         pipeline(step, name)

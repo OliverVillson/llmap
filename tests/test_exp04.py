@@ -41,7 +41,7 @@ def load(tmp_path, monkeypatch, bases=None):
     for key, cfg in (("qwen", QWEN36), ("ornith", QWEN36), ("gemma", GEMMA4)):
         m.base_dir(key).mkdir(parents=True, exist_ok=True)
         (m.base_dir(key) / "config.json").write_text(json.dumps(cfg))
-    for shape, experts, fp8 in (("qwen", 104, True), ("gemma", 72, True)):
+    for shape, experts, fp8 in (("qwen", 106, True), ("gemma", 70, True)):
         (m.SMOKE / shape).mkdir(parents=True, exist_ok=True)
         (m.SMOKE / shape / "result.json").write_text(json.dumps({"fp8_attention": fp8, "experts": experts,
                                                                  "size_gb_est": 9.6, "bf16_loads": True}))
@@ -65,7 +65,7 @@ def test_build_configs_are_valid(exp04):
     for key, rate in (("qwen", 0.60), ("ornith", 0.62), ("gemma", 0.55)):
         score(m, f"{key}-full", rate)
     assert m.builds() == ["ornith", "gemma"]
-    for key, kept, total in (("ornith", 104, 256), ("gemma", 72, 128)):
+    for key, kept, total in (("ornith", 106, 256), ("gemma", 70, 128)):
         d = m.make_job(m.build_name(key), m.build_config(key))
         job = Job(d)
         assert job.spec.target.max_size_gb == m.MAX_GB
@@ -133,22 +133,22 @@ def test_smoke_falls_back_to_bf16_deltanet_with_fewer_experts():
 
     out = smoke.decide(QWEN36, 9.8, fp8_refused)
     (k_fp8, k_bf16) = (k for _, k in tried)
-    assert out["fp8_attention"] is False and out["experts"] == k_bf16 < k_fp8 == 104
+    assert out["fp8_attention"] is False and out["experts"] == k_bf16 == 78 < k_fp8 == 106
     assert out["size_gb_est"] <= 9.8 and out["errors"] == {"fp8": "refused"}
-    assert smoke.decide(QWEN36, 9.8, lambda fp8, k, e: True)["experts"] == 104
+    assert smoke.decide(QWEN36, 9.8, lambda fp8, k, e: True)["experts"] == 106
     with pytest.raises(SystemExit):
         smoke.decide(QWEN36, 9.8, lambda fp8, k, e: False)
 
 
 def test_smoke_sizes_gemma4():
     """Gemma 4's experts take int4 group 64 (704 is no multiple of 128), its tied
-    embeddings stay BF16: 64 experts fit 9.8 GB with FP8 attention and dense MLP."""
+    embeddings stay BF16: 70 experts fit 9.8 GB with FP8 attention and dense MLP."""
     import exp04_smoke as smoke
 
     assert smoke.decide(GEMMA4_26B, 9.8, lambda fp8, k, e: True) == {
-        "fp8_attention": True, "experts": 64, "size_gb_est": 9.2, "errors": {}}
+        "fp8_attention": True, "experts": 70, "size_gb_est": 9.77, "errors": {}}
     bf16 = smoke.decide(GEMMA4_26B, 9.8, lambda fp8, k, e: not fp8)
-    assert bf16["fp8_attention"] is False and bf16["experts"] == 48 and bf16["size_gb_est"] <= 9.8
+    assert bf16["fp8_attention"] is False and bf16["experts"] == 52 and bf16["size_gb_est"] <= 9.8
     # the tiny copy ends just past the first full-attention layer
     assert smoke.tiny_layers(GEMMA4_26B) == 6 and smoke.tiny_layers(QWEN36) == 4
 
