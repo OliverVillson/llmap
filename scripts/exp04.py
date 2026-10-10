@@ -1,52 +1,55 @@
 #!/usr/bin/env python3
-"""Experiment 04 on the B200 in one command: r59-t, the next Mugge model.
+"""Experiment 04 on the B200 in one command: the next Mugge model, scored on Aider Polyglot.
 
     python3 scripts/exp04.py          # everything; re-run after a stop and finished steps are skipped
     python3 scripts/exp04.py --list   # the steps and their time guesses
     python3 scripts/exp04.py summary  # the results table
 
-The bar (Oliver, 2026-10-10): a file under 10 GB, above 65% on LiveCodeBench with
-thinking on, and a build faster than r50w95s-t's. Served by vLLM on the GPU, so the
-experts are 4-bit (vLLM's MoE kernels go no lower) and fewer experts are kept than
-r50w95s's 128: about 104 of 256, int4 experts, FP8 DeltaNet / attention / output
-head, BF16 embeddings and router. Plan: /mnt/project-files/plan/next-model.md.
+The bar (Oliver, 2026-10-10): a model file under 10 GB, served by vLLM on the GPU, a
+faster build than r50w95s-t's, and an Aider Polyglot score (pass rate after the second
+attempt) of at least 90% of the best full model's, both measured here. vLLM's MoE
+kernels go no lower than 4 bits, so experts are int4, attention / DeltaNet / dense MLP
+and the output head FP8, embeddings and routers BF16, and fewer experts are kept.
+Plan: /mnt/project-files/plan/next-model.md.
 
-Two bases with the same architecture (plan/moe-bases.md): Qwen3.6-35B-A3B, and
-Ornith-1.5-35B-A3B, which is stronger at agent coding but publishes no LiveCodeBench
-score. Both full models are scored, and r59-t is built from Ornith unless it trails
-Qwen3.6 by more than 2 points. EXP04_BASE=qwen or EXP04_BASE=ornith runs only that one.
+Three bases (plan/moe-bases.md):
+  qwen    Qwen3.6-35B-A3B     256 experts, ~104 kept
+  ornith  Ornith-1.5-35B-A3B  the same architecture, stronger at agent coding
+  gemma   Gemma 4 26B-A4B     128 experts, ~72 kept (less pruning, ~4B active)
+Two are built: the better of qwen and ornith on full-model Polyglot (ornith unless it
+trails by more than 2 points; they share a shape, so pruning should cost both the
+same), and gemma. EXP04_BASES=qwen,gemma (say) runs a subset.
 
 Steps:
-  1. VM setup (scripts/setup_vm.sh), with the code suites re-fetched when they
-     predate the per-case time limit
+  1. VM setup (scripts/setup_vm.sh), Aider's benchmark image and the Exercism
+     training exercises (scripts/polyglot.py), with the code suites re-fetched
+     when they predate the per-case time limit
   2. the base model downloads
-  3. smoke test (scripts/exp04_smoke.py): a 4-layer copy of the base with random
-     weights goes through the real quantize stage and is served by vLLM, once with
-     FP8 DeltaNet / attention and, if that fails, with them in BF16. That picks the
-     format, and the format and the 10 GB budget pick the expert count
-  4. each full model scored on vLLM: LiveCodeBench (2025-01..04, thinking on, 32k,
-     4 answers per problem; pass@1 is their mean). That picks the base. Then the
-     picked base on the other code suites once each, with one fix turn. These are
-     the 100% marks
-  5. r59-t: contest + Python thinking data, REAP to the smoke test's expert count,
-     heal capped at 45 min, int4 + FP8 quantize with a size check, LiveCodeBench x4
-  6. r59-t on the other suites (one fix turn), and in Mugge's format
-  7. side scores on LiveCodeBench x4: r59-t before quantizing (pruning loss vs
-     4-bit loss), and with 6 experts per token instead of 8 (speed)
-  8. throughput: 1, 32 and 128 requests at once
-  9. a GGUF for the Mac from the same healed model (EXP04_GGUF=0 leaves it out)
- 10. the model, the GGUF and the job results to the bucket
+  3. smoke tests (scripts/exp04_smoke.py), one per architecture: a few layers of
+     the base with random weights go through the real quantize stage and vLLM,
+     with FP8 attention first and BF16 if vLLM refuses it. That picks the format,
+     and the format and the 10 GB budget pick the expert count
+  4. Aider Polyglot on each full model (thinking on, diff edits, 64 at once).
+     This sets the bar and picks qwen or ornith
+  5. per build: the base works Exercism exercises Polyglot doesn't use, through
+     Aider, logged; its passing transcripts (fix turns too) join the heal data. Then
+     data, REAP to the smoke test's expert count, heal capped at 45 min, int4 +
+     FP8 quantize with a size check, one LiveCodeBench pass as a reasoning floor,
+     and Aider Polyglot on the 4-bit model
+  6. side scores on the better build: before quantizing (pruning loss vs 4-bit
+     loss), and 6 experts per token instead of 8
+  7. throughput of the better build at 1, 32 and 128 requests at once
+  8. the models and the job results to the bucket
 
-Runs with the system python3 (stdlib only); each step sources .env.vm. Logs are in
-~/exp04-logs. The upload needs an evroc login first; without one it is skipped and
-a re-run picks it up.
+Runs with the system python3 (stdlib only); each step sources .env.vm. Logs and the
+Polyglot results are in ~/exp04-logs. The upload needs an evroc login first; without
+one it is skipped and a re-run picks it up.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -59,35 +62,83 @@ NVME = Path(os.environ.get("NVME", "/mnt/nvme"))
 J = Path(os.environ.get("LOBBOT_JOBS", NVME / "jobs"))
 LOGS = Path(os.environ.get("EXP04_LOGS", Path.home() / "exp04-logs"))
 BUCKET = "bucket://mugge-library"
-BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B"}
-LABELS = {"qwen": "Qwen3.6", "ornith": "Ornith-1.5"}
-ONLY = os.environ.get("EXP04_BASE", "")
-if ONLY and ONLY not in BASES:
-    sys.exit(f"EXP04_BASE must be one of {', '.join(BASES)}")
-WANTED = [ONLY] if ONLY else list(BASES)
-ORNITH_MARGIN = 0.02  # Ornith is built unless it trails Qwen3.6 by more than this on LiveCodeBench
-CHOICE = LOGS / "base.json"
 TASKSPEC = "examples/python-utils.code.taskspec.json"
 SMOKE = NVME / "exp04-smoke"
+EXERCISM = NVME / "exercism-train"  # Exercism practice exercises outside Polyglot
+POLY = LOGS / "polyglot"  # one results JSON per Polyglot run
 CONFIGS = REPO / "configs" / "exp04"
-# Oliver's bar is 10 GB. The expert count is chosen so the estimate fits BUDGET_GB;
-# the quantize stage refuses a file over MAX_GB.
+
+BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B", "gemma": "google/gemma-4-26B-A4B-it"}
+LABELS = {"qwen": "Qwen3.6", "ornith": "Ornith-1.5", "gemma": "Gemma 4 26B-A4B"}
+SHAPE = {"qwen": "qwen", "ornith": "qwen", "gemma": "gemma"}  # architecture, for the smoke test
+PARSER = {"qwen": "qwen3", "ornith": "qwen3", "gemma": "gemma4"}  # vLLM reasoning parser
+WANTED = [k for k in os.environ.get("EXP04_BASES", ",".join(BASES)).split(",") if k]
+if not WANTED or set(WANTED) - set(BASES):
+    sys.exit(f"EXP04_BASES takes a comma list of {', '.join(BASES)}")
+ORNITH_MARGIN = 0.02  # ornith is built unless it trails qwen by more than this on Polyglot
+SHARE = 0.90  # Oliver's bar: 90% of the best full model's Polyglot score
+# 10 GB is the bar. The expert count is the most whose estimate fits BUDGET_GB; the
+# quantize stage refuses a file over MAX_GB.
 BUDGET_GB = 9.8
 MAX_GB = 9.95
-BAR = 0.65
-SUITES = ["multipl-e-py", "multipl-e-js", "multipl-e-ts", "multipl-e-cpp", "c-set"]
-WITH_GGUF = os.environ.get("EXP04_GGUF", "1") == "1"
+CHOICE = LOGS / "builds.json"
 
 
-# ---------- jobs ----------
+# ---------- bases, builds and results ----------
+
+
+def base_dir(key: str) -> Path:
+    return NVME / "models" / BASES[key].split("/")[-1]
 
 
 def job(name: str) -> Path:
     return J / f"exp04-{name}"
 
 
+def poly(name: str) -> dict | None:
+    p = POLY / f"{name}.json"
+    return read(p) if p.exists() else None
+
+
+def poly_score(name: str) -> float | None:
+    r = poly(name)
+    return r.get("pass_rate_2") if r else None
+
+
+def smoke(key: str) -> dict:
+    """The smoke test's verdict for key's architecture: {"fp8_attention", "experts", "size_gb_est", ...}."""
+    return read(SMOKE / SHAPE[key] / "result.json")
+
+
+def builds() -> list[str]:
+    """The bases to compress: the better of qwen and ornith on full-model Polyglot, and
+    gemma. Decided once, after the full models are scored."""
+    if CHOICE.exists():
+        return read(CHOICE)["builds"]
+    full = {k: poly_score(f"{k}-full") for k in WANTED}
+    if any(v is None for v in full.values()):
+        raise RuntimeError("every full model needs a Polyglot score before the builds are picked")
+    out = []
+    qwen_shape = [k for k in ("ornith", "qwen") if k in WANTED]
+    if len(qwen_shape) == 2:
+        out.append("ornith" if full["ornith"] >= full["qwen"] - ORNITH_MARGIN else "qwen")
+    else:
+        out += qwen_shape
+    out += [k for k in WANTED if k == "gemma"]
+    LOGS.mkdir(exist_ok=True)
+    write(CHOICE, {"builds": out, "full": full, "bar": round(SHARE * max(full.values()), 4)})
+    return out
+
+
+def bar() -> float | None:
+    return read(CHOICE)["bar"] if CHOICE.exists() else None
+
+
+def build_name(key: str) -> str:
+    return f"{key}-w4"
+
+
 def make_job(name: str, cfg: dict, max_size_gb: float = MAX_GB) -> Path:
-    """A job from configs/exp04/<base>.json plus cfg; the size target goes in its taskspec."""
     d = job(name)
     for sub in (".done", "work", "out"):
         (d / sub).mkdir(parents=True, exist_ok=True)
@@ -98,45 +149,21 @@ def make_job(name: str, cfg: dict, max_size_gb: float = MAX_GB) -> Path:
     return d
 
 
-def config(base: str, **over) -> dict:
-    return {**read(CONFIGS / f"{base}.json"), **over}
+def build_config(key: str) -> dict:
+    """configs/exp04/build.json for one base: its own teacher, transcripts, expert count and format."""
+    s, n = smoke(key), n_experts(key)
+    return {**read(CONFIGS / "build.json"), "teacher": BASES[key], "data_extra_rows": str(rows_file(key)),
+            "reap_sparsity": round(1 - s["experts"] / n, 6), "quant_fp8_attention": s["fp8_attention"],
+            "eval_reasoning_parser": PARSER[key]}
 
 
-def base_dir(key: str) -> Path:
-    return NVME / "models" / BASES[key].split("/")[-1]
+def n_experts(key: str) -> int:
+    cfg = read(base_dir(key) / "config.json")
+    t = cfg.get("text_config") or cfg
+    return t.get("num_experts") or t["num_local_experts"]
 
 
-def ref_job(key: str) -> str:
-    return "ref" if key == "qwen" else f"ref-{key}"
-
-
-def chosen() -> str:
-    """The base r59-t is built from, decided once from the full models' LiveCodeBench scores."""
-    if ONLY:
-        return ONLY
-    if CHOICE.exists():
-        return read(CHOICE)["base"]
-    q, o = lcb("ref"), lcb("ref-ornith")
-    if q is None or o is None:
-        raise RuntimeError("both full models need a LiveCodeBench score before the base is picked")
-    key = "ornith" if o >= q - ORNITH_MARGIN else "qwen"
-    LOGS.mkdir(exist_ok=True)
-    write(CHOICE, {"base": key, "qwen": q, "ornith": o})
-    return key
-
-
-def smoke() -> dict:
-    """The smoke test's verdict: {"fp8_attention", "experts", "size_gb_est", ...}."""
-    return read(SMOKE / "result.json")
-
-
-def r59_config() -> dict:
-    s, key = smoke(), chosen()
-    return config("r59-t", teacher=BASES[key], code_eval_ref=f"exp04-{ref_job(key)}",
-                  reap_sparsity=round(1 - s["experts"] / 256, 6), quant_fp8_attention=s["fp8_attention"])
-
-
-def model_dir(name: str = "r59-t") -> Path:
+def model_dir(name: str) -> Path:
     """The vLLM directory the quantize stage registered for a job."""
     alloc = read(job(name) / "work" / "allocation.json")
     for c in alloc["candidates"].values():
@@ -145,33 +172,38 @@ def model_dir(name: str = "r59-t") -> Path:
     raise RuntimeError(f"{job(name)} has no vLLM candidate in work/allocation.json")
 
 
-def eval_only(name: str, candidates: dict[str, str], base: str = "eval", **over) -> Path:
-    return make_job(name, config(base, eval_candidates=candidates, **over))
-
-
-def eval_json(name: str) -> dict | None:
-    p = job(name) / "out" / "eval.json"
-    return read(p) if p.exists() else None
-
-
-def suite(name: str, key: str = "livecodebench") -> dict:
-    rep = eval_json(name)
-    if not rep or not rep.get("candidates"):
-        return {}
-    c = rep["candidates"][0]
-    return ((c.get("code") or {}).get("suites") or {}).get(key) or {}
-
-
 def lcb(name: str) -> float | None:
-    return suite(name).get("pass@1")
+    p = job(name) / "out" / "eval.json"
+    if not p.exists():
+        return None
+    c = (read(p).get("candidates") or [{}])[0]
+    return (((c.get("code") or {}).get("suites") or {}).get("livecodebench") or {}).get("pass@1")
 
 
-def done(name: str, stage: str = "eval") -> Callable[[], bool]:
-    return lambda: (job(name) / ".done" / stage).exists()
+def best_build() -> str:
+    """The build with the higher Polyglot score."""
+    scored = [(poly_score(build_name(k)) or -1, k) for k in builds()]
+    if not scored or max(scored)[0] < 0:
+        raise Skip("no build has a Polyglot score yet")
+    return max(scored)[1]
+
+
+# ---------- commands ----------
+
+
+def polyglot(step: Step, model: Path, name: str, key: str, *extra: str) -> None:
+    """Aider Polyglot (or, with --exercises, another exercises dir) on a model served by vLLM."""
+    POLY.mkdir(parents=True, exist_ok=True)
+    sh(step, f"python scripts/polyglot.py run --model-dir {model} --name {name} --out {POLY / (name + '.json')} "
+             f"--reasoning-parser {PARSER[key]} {' '.join(extra)}".rstrip())
 
 
 def pipeline(step: Step, name: str, extra: str = "") -> None:
     sh(step, f"python pipeline.py --job {job(name)} {extra}".rstrip())
+
+
+def rows_file(key: str) -> Path:
+    return LOGS / "transcripts" / f"{key}.rows.jsonl"
 
 
 # ---------- the steps ----------
@@ -194,11 +226,12 @@ def run_setup(step: Step) -> None:
         (NVME / "codebench" / "livecodebench.jsonl").rename(NVME / "codebench" / "livecodebench-old.jsonl")
         above("    re-fetching the code suites (older LiveCodeBench rows have no per-case time limit)")
     sh(step, f"NVME={NVME} TEACHER={BASES[WANTED[0]]} STUDENT= bash scripts/setup_vm.sh")
+    sh(step, f"python scripts/polyglot.py setup && python scripts/polyglot.py exercism --out {EXERCISM}")
 
 
 def setup_done() -> bool:
-    return ((REPO / ".env.vm").exists() and (NVME / "venv-vllm/bin/python").exists()
-            and (NVME / "llama.cpp/build/bin/llama-server").exists() and lcb_current())
+    return ((REPO / ".env.vm").exists() and (NVME / "venv-vllm/bin/python").exists() and lcb_current()
+            and (EXERCISM / ".done").exists())
 
 
 def downloading() -> bool:
@@ -235,197 +268,184 @@ def run_download(step: Step) -> None:
 
 
 def download_progress() -> float:
+    sizes = {"qwen": 70e9, "ornith": 72e9, "gemma": 52e9}
     got = sum(f.stat().st_size for k in WANTED if base_dir(k).exists() for f in base_dir(k).rglob("*") if f.is_file())
-    return min(0.99, got / (70e9 * len(WANTED)))
+    return min(0.99, got / sum(sizes[k] for k in WANTED))
 
 
-def run_smoke(step: Step) -> None:
-    sh(step, f"python scripts/exp04_smoke.py --teacher {base_dir(WANTED[0])} --out {SMOKE} --budget-gb {BUDGET_GB}")
-    s = smoke()
-    above(f"    vLLM serves int4 experts with {'FP8' if s['fp8_attention'] else 'BF16'} DeltaNet and attention: "
-          f"keeping {s['experts']} of 256 experts, {s['size_gb_est']:.2f} GB estimated")
-    if not s.get("bf16_loads", True):
-        above("    vLLM did not load the unquantized pruned model, so the before-quantizing score is skipped")
-
-
-def run_ref(key: str) -> Callable[[Step], None]:
+def run_smoke(key: str) -> Callable[[Step], None]:
     def run(step: Step) -> None:
-        name = ref_job(key)
-        eval_only(name, {name: str(base_dir(key))}, code_eval_ref="")
-        pipeline(step, name, "--only eval")
-        score = lcb(name)
-        if score is None:
-            raise RuntimeError(f"{LABELS[key]} has no LiveCodeBench score; see the eval log")
-        above(f"    {LABELS[key]} LiveCodeBench pass@1 (mean of 4): {score:.1%}; the bar is {BAR:.0%}")
-        if key == "qwen" and score < 0.55:
-            above("    far below the model card's 80%: the eval may be broken. The run goes on; send Claude the summary.")
-        if key == WANTED[-1]:
-            k = chosen()
-            above(f"    r59-t will be built from {LABELS[k]}" + ("" if ONLY else f" (Ornith is picked unless it trails "
-                                                                    f"Qwen3.6 by more than {ORNITH_MARGIN:.0%})"))
+        out = SMOKE / SHAPE[key]
+        sh(step, f"python scripts/exp04_smoke.py --teacher {base_dir(key)} --out {out} --budget-gb {BUDGET_GB}")
+        s = smoke(key)
+        above(f"    {SHAPE[key]} architecture: int4 experts with {'FP8' if s['fp8_attention'] else 'BF16'} attention, "
+              f"keeping {s['experts']} of {n_experts(key)} experts, {s['size_gb_est']:.2f} GB estimated")
     return run
 
 
-def run_ref_suites(step: Step) -> None:
-    eval_only("ref-suites", {"ref": str(base_dir(chosen()))}, "eval-suites", code_eval_ref="")
-    pipeline(step, "ref-suites", "--only eval")
+def smoke_keys() -> list[str]:
+    """One base per architecture."""
+    seen: dict[str, str] = {}
+    for k in WANTED:
+        seen.setdefault(SHAPE[k], k)
+    return list(seen.values())
 
 
-def run_build(step: Step) -> None:
-    if not (job("r59-t") / "config.json").exists():
-        make_job("r59-t", r59_config())
-    pipeline(step, "r59-t")
-    stats = job("r59-t") / "data" / "stats.json"
-    if stats.exists():
-        s = read(stats)
-        c = s.get("contest") or {}
-        above(f"    data: {s.get('rows', s.get('answered'))} rows, {c.get('rows_kept', '?')} contest rows, "
-              f"{s.get('fix_rows', '?')} fix rows")
-    score = lcb("r59-t")
-    if score is not None:
-        above(f"    r59-t LiveCodeBench pass@1: {score:.1%} ({'above' if score > BAR else 'below'} the {BAR:.0%} bar)")
+def run_full(key: str) -> Callable[[Step], None]:
+    def run(step: Step) -> None:
+        polyglot(step, base_dir(key), f"{key}-full", key)
+        above(f"    {LABELS[key]} full model, Aider Polyglot: {poly_score(f'{key}-full'):.1%}")
+        if all(poly(f"{k}-full") for k in WANTED):
+            b = builds()
+            above(f"    bar: {bar():.1%} (90% of the best full model); building {', '.join(LABELS[k] for k in b)}")
+    return run
 
 
-def run_suites(step: Step) -> None:
-    eval_only("r59-t-suites", {"r59-t": str(model_dir())}, "eval-suites")
-    pipeline(step, "r59-t-suites", "--only eval")
+def run_build(slot: int) -> Callable[[Step], None]:
+    """The slot-th build: transcripts, the pipeline, then Polyglot on the 4-bit model."""
+    def run(step: Step) -> None:
+        b = builds()
+        if slot >= len(b):
+            raise Skip("only one build in this run")
+        key, name = b[slot], build_name(b[slot])
+        if not rows_file(key).exists():
+            log = LOGS / "transcripts" / f"{key}.requests.jsonl"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            polyglot(step, base_dir(key), f"{key}-exercism", key, f"--exercises {EXERCISM} --log {log}")
+            sh(step, f"python scripts/polyglot.py rows --log {log} --results {POLY / (key + '-exercism.json')} "
+                     f"--out {rows_file(key)}")
+        if not (job(name) / "config.json").exists():
+            make_job(name, build_config(key))
+        pipeline(step, name)
+        polyglot(step, model_dir(name), name, key)
+        score, line = poly_score(name), bar()
+        above(f"    {LABELS[key]} 4-bit: Aider Polyglot {score:.1%} against the {line:.1%} bar "
+              f"({'met' if score >= line else 'missed'}); LiveCodeBench {lcb(name) or 0:.0%}")
+    return run
 
 
-def run_mugge(step: Step) -> None:
-    eval_only("r59-t-mugge", {"r59-t": str(model_dir())}, "eval-suites", code_eval_format="harness", code_eval_ref="",
-              code_eval_suites=SUITES + ["livecodebench"])
-    pipeline(step, "r59-t-mugge", "--only eval")
+def build_done(slot: int) -> Callable[[], bool]:
+    def done() -> bool:
+        if not CHOICE.exists():
+            return False
+        b = builds()
+        return slot >= len(b) or poly(build_name(b[slot])) is not None
+    return done
 
 
-def run_bf16(step: Step) -> None:
-    if not smoke().get("bf16_loads", True):
+def run_before_quant(step: Step) -> None:
+    key = best_build()
+    if not smoke(key).get("bf16_loads", True):
         raise Skip("vLLM did not load the unquantized pruned model in the smoke test")
-    eval_only("r59-t-bf16", {"r59-t-bf16": str(job("r59-t") / "work" / "healed")})
-    pipeline(step, "r59-t-bf16", "--only eval")
+    polyglot(step, job(build_name(key)) / "work" / "healed", f"{key}-bf16", key)
 
 
 def run_k6(step: Step) -> None:
-    eval_only("r59-t-k6", {"r59-t-k6": str(model_dir())}, eval_experts_used=6)
-    pipeline(step, "r59-t-k6", "--only eval")
+    key = best_build()
+    polyglot(step, model_dir(build_name(key)), f"{key}-w4-k6", key, "--experts-used 6")
+
+
+def side_done(suffix: str) -> Callable[[], bool]:
+    return lambda: any(poly(f"{k}-{suffix}") for k in BASES)
 
 
 BENCH = LOGS / "throughput.json"
 
 
 def run_bench(step: Step) -> None:
-    sh(step, f"$LOBBOT_VLLM_PY scripts/bench_vllm.py --model {model_dir()} --out {BENCH} --concurrency 1 32 128")
-
-
-def run_gguf(step: Step) -> None:
-    """The existing llama.cpp path (2-8 bit by saliency, 8-bit rest) on r59-t's healed model."""
-    src, d = job("r59-t"), job("r59-t-gguf")
-    if not (src / ".done" / "heal").exists():
-        raise Skip("r59-t has not healed")
-    make_job("r59-t-gguf", {**r59_config(), "quant_format": "gguf"}, max_size_gb=9.5)
-    for sub in ("data", ".done"):
-        shutil.copytree(src / sub, d / sub, dirs_exist_ok=True)
-    for f in ("eval", "quantize", "package"):
-        (d / ".done" / f).unlink(missing_ok=True)
-    for f in ("layer_importance.json", "reap_saliency.json"):
-        if (src / "work" / f).exists():
-            shutil.copy(src / "work" / f, d / "work" / f)
-    if not (d / "work" / "healed").exists():
-        (d / "work" / "healed").symlink_to(src / "work" / "healed")
-    pipeline(step, "r59-t-gguf", "--only quantize")
-
-
-def gguf_file() -> Path:
-    return job("r59-t-gguf") / "work" / "candidates" / "lobbot-moe.gguf"
+    sh(step, f"$LOBBOT_VLLM_PY scripts/bench_vllm.py --model {model_dir(build_name(best_build()))} --out {BENCH} "
+             f"--concurrency 1 32 128")
 
 
 def run_upload(step: Step) -> None:
-    """Every job file under 200 MB (configs, data, scores), the vLLM model as one tar, and the GGUF."""
+    """Every job file under 200 MB (configs, data, scores), the logs and Polyglot results,
+    and each 4-bit model as one tar."""
     if not evroc_ok():
         raise Skip("no evroc login. Log in (runbook step D) and re-run to upload.")
     tar = NVME / "exp04-jobs.tar"
-    sh(step, f"mkdir -p {J}/_logs_exp04 && cp {LOGS}/*.log {LOGS}/*.json {J}/_logs_exp04/ 2>/dev/null; cd {J.parent} && "
-             f"find {J.name} -path '*exp04-*' -type f -size -200M -print0 | tar cf {tar} --null -T -")
+    sh(step, f"rm -rf {J}/_logs_exp04 && cp -r {LOGS} {J}/_logs_exp04 && cd {J.parent} && "
+             f"find {J.name} \\( -path '*exp04-*' -o -path '*_logs_exp04*' \\) -type f -size -200M -print0 "
+             f"| tar cf {tar} --null -T -")
     up = [(tar, "exp04/exp04-jobs.tar")]
-    try:
-        m = model_dir()
-        mtar = NVME / "qwen36-r59-t-w4a16.tar"
+    for key in builds():
+        try:
+            m = model_dir(build_name(key))
+        except (FileNotFoundError, RuntimeError):
+            continue
+        mtar = NVME / f"{key}-w4.tar"
         if not mtar.exists():
             sh(step, f"tar cf {mtar}.part -C {m.parent} {m.name} && mv {mtar}.part {mtar}")
-        up.append((mtar, "models/qwen36-r59-t-w4a16.tar"))
-    except (FileNotFoundError, RuntimeError):
-        above("    no r59-t model to upload")
-    if gguf_file().exists():
-        up.append((gguf_file(), "gguf/qwen36-r59-t.gguf"))
-    for src, key in up:
+        up.append((mtar, f"models/exp04-{key}-w4.tar"))
+    for src, dst in up:
         sh(step, f"evroc storage bucket get-s3-credentials >/dev/null && "
-                 f"evroc storage bucket copy --from {src} --to {BUCKET}/{key}")
+                 f"evroc storage bucket copy --from {src} --to {BUCKET}/{dst}")
     (LOGS / ".uploaded").write_text(time.strftime("%F %T"))
 
 
+BUILD_MINUTES = {"polyglot": 40, "data": 15, "reap": 10, "heal": 45, "quantize": 20, "eval": 10, "package": 1}
+
+
 def steps() -> list[Step]:
+    n_builds = min(2, len({SHAPE[k] for k in WANTED}))
     return [
-        Step("VM setup", {"": 40}, run_setup, setup_done),
-        Step("base model download", {"": 15}, run_download, download_done, download_progress),
-        Step("smoke test: vLLM and the 4-bit format", {"": 25}, run_smoke, (SMOKE / "result.json").exists),
-        *[Step(f"{LABELS[k]} full model, LiveCodeBench x4", {"eval": 40}, run_ref(k), done(ref_job(k))) for k in WANTED],
-        Step("picked full model, other suites", {"eval": 20}, run_ref_suites, done("ref-suites")),
-        Step("r59-t build and LiveCodeBench x4",
-             {"data": 25, "reap": 10, "heal": 45, "quantize": 20, "eval": 25, "package": 1}, run_build, done("r59-t", "package")),
-        Step("r59-t, other suites", {"eval": 15}, run_suites, done("r59-t-suites")),
-        Step("r59-t in Mugge's format", {"eval": 20}, run_mugge, done("r59-t-mugge")),
-        Step("r59-t before quantizing", {"eval": 25}, run_bf16, done("r59-t-bf16")),
-        Step("r59-t with 6 experts per token", {"eval": 20}, run_k6, done("r59-t-k6")),
+        Step("VM setup and Aider's benchmark", {"": 50}, run_setup, setup_done),
+        Step("base model downloads", {"": 25}, run_download, download_done, download_progress),
+        *[Step(f"smoke test: {SHAPE[k]} architecture on vLLM", {"": 20}, run_smoke(k),
+               (SMOKE / SHAPE[k] / "result.json").exists) for k in smoke_keys()],
+        *[Step(f"{LABELS[k]} full model, Aider Polyglot", {"": 40}, run_full(k), (POLY / f"{k}-full.json").exists)
+          for k in WANTED],
+        *[Step(f"build {i + 1}: transcripts, compress, Polyglot", {**BUILD_MINUTES, "": 35}, run_build(i), build_done(i))
+          for i in range(n_builds)],
+        Step("better build before quantizing, Polyglot", {"": 40}, run_before_quant, side_done("bf16")),
+        Step("better build with 6 experts, Polyglot", {"": 35}, run_k6, side_done("w4-k6")),
         Step("throughput at 1, 32, 128 at once", {"": 15}, run_bench, BENCH.exists),
-        *([Step("GGUF for the Mac", {"quantize": 20}, run_gguf, gguf_file().exists)] if WITH_GGUF else []),
         Step("upload to the bucket", {"": 20}, run_upload, (LOGS / ".uploaded").exists),
     ]
 
 
 # ---------- summary ----------
 
-SHORT = {"livecodebench": "LCB", "multipl-e-py": "py", "multipl-e-js": "js", "multipl-e-ts": "ts",
-         "multipl-e-cpp": "cpp", "c-set": "C"}
-ROWS = [("Qwen3.6 full", "ref", None), ("Ornith-1.5 full", "ref-ornith", None), ("picked full, suites", None, "ref-suites"),
-        ("r59-t", "r59-t", "r59-t-suites"), ("r59-t Mugge format", None, "r59-t-mugge"),
-        ("r59-t before quant", "r59-t-bf16", None), ("r59-t 6 experts", "r59-t-k6", None)]
-
 
 def pct(x: float | None) -> str:
-    return f"{x:.0%}" if x is not None else "–"
+    return f"{x:.1%}" if x is not None else "–"
 
 
 def summary() -> str:
-    """LiveCodeBench pass@1 (mean of 4) and best-of-4 picked by the examples, the other
-    suites, size, the share of answers that hit the 32k cap, GPU busy and speed."""
-    head = ["model", "size", "LCB", "pick", "of ref"] + list(SHORT.values())[1:] + ["+1 fix", "capped", "GPU", "tok/s"]
+    """Aider Polyglot after 1 and 2 attempts, well-formed edits and per language, for every
+    run, with the bar; then size, LiveCodeBench floor, GPU busy and throughput."""
+    langs = ["cpp", "go", "java", "javascript", "python", "rust"]
+    head = ["run", "size", "pass 2", "pass 1", "formed", *langs, "LCB", "GPU"]
     table = [head]
-    key = read(CHOICE)["base"] if CHOICE.exists() else ONLY or "qwen"
-    ref = lcb(ref_job(key))
-    for label, lcb_job, suites_job in ROWS:
-        reps = [eval_json(n) for n in (lcb_job, suites_job) if n]
-        if not any(reps):
-            table.append([label, "not run"] + [""] * (len(head) - 2))
+    names = [f"{k}-full" for k in WANTED] + [build_name(k) for k in BASES] + \
+            [f"{k}-bf16" for k in BASES] + [f"{k}-w4-k6" for k in BASES]
+    for name in names:
+        r = poly(name)
+        if not r:
             continue
-        main = next(r for r in reps if r)["candidates"][0]
-        code = main.get("code") or {}
-        lc = suite(lcb_job) if lcb_job else {}
-        rest = [suite(suites_job, k).get("pass@1") if suites_job else None for k in list(SHORT)[1:]]
-        fix = ((eval_json(suites_job) or {}).get("candidates") or [{}])[0].get("code", {}).get("mean_fix@1") if suites_job else None
-        gpu = main.get("gpu") or {}
-        table.append([label, f"{main.get('size_gb', 0):.1f} GB" if main.get("size_gb") else "",
-                      pct(lc.get("pass@1")), pct(lc.get("pick@examples")),
-                      pct(lc["pass@1"] / ref) if lc.get("pass@1") is not None and ref else "",
-                      *[pct(x) for x in rest], pct(fix), pct(code.get("hit_cap_share")),
-                      f"{gpu['busy_pct']:.0f}%" if gpu.get("busy_pct") is not None else "",
-                      f"{code['tok_s_total']:.0f}" if code.get("tok_s_total") else ""])
+        size = ""
+        if name.endswith("-w4"):
+            alloc = job(name) / "work" / "allocation.json"
+            if alloc.exists():
+                size = f"{next(iter(read(alloc)['candidates'].values()))['size_gb']:.2f} GB"
+        per = r.get("per_language") or {}
+        gpu = r.get("gpu") or {}
+        table.append([name, size, pct(r.get("pass_rate_2")), pct(r.get("pass_rate_1")),
+                      pct(r.get("percent_cases_well_formed")),
+                      *[pct((per.get(lang) or {}).get("pass_rate_2")) for lang in langs],
+                      pct(lcb(name)) if name.endswith("-w4") else "",
+                      f"{gpu['busy_pct']:.0f}%" if gpu.get("busy_pct") is not None else ""])
+    if len(table) == 1:
+        return "No Aider Polyglot results yet."
     widths = [max(len(r[i]) for r in table) for i in range(len(head))]
     out = ["\n".join("  ".join(x.ljust(widths[i]) if i == 0 else x.rjust(widths[i]) for i, x in enumerate(r)).rstrip()
                      for r in table)]
-    r = lcb("r59-t")
-    if r is not None:
-        size = ((eval_json("r59-t") or {}).get("candidates") or [{}])[0].get("size_gb")
-        out.append(f"\nr59-t is built from {LABELS[key]}. The bar: under 10 GB ({'yes' if size and size < 10 else 'no'}, {size} GB), "
-                   f"LiveCodeBench above {BAR:.0%} ({'yes' if r > BAR else 'no'}, {r:.1%}).")
+    if CHOICE.exists():
+        c = read(CHOICE)
+        out.append(f"\nThe bar: Aider Polyglot {c['bar']:.1%} (90% of the best full model), under 10 GB.")
+        for key in c["builds"]:
+            s = poly_score(build_name(key))
+            if s is not None:
+                out.append(f"  {LABELS[key]} 4-bit: {s:.1%}, {'meets' if s >= c['bar'] else 'misses'} the bar")
     if BENCH.exists():
         b = read(BENCH)
         out.append("Throughput (output tok/s): " + ", ".join(f"{k} at once {v['output_tok_s']:.0f}" for k, v in b.items()))

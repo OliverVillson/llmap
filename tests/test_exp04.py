@@ -1,5 +1,5 @@
-"""exp04's runner and smoke test logic, without a GPU: the job configs are valid,
-the base is picked by the rule, and the smoke test falls back to BF16 DeltaNet."""
+"""exp04's runner and smoke test logic, without a GPU: the build configs are valid,
+the builds and the bar follow the rule, and the smoke test falls back to BF16 DeltaNet."""
 
 import importlib
 import json
@@ -18,49 +18,97 @@ QWEN36 = {"text_config": {
     "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "attn_output_gate": True,
     "linear_num_key_heads": 16, "linear_key_head_dim": 128, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4, "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 10}}
+GEMMA4 = {"text_config": {"num_experts": 128, "top_k_experts": 8}}
+
+
+def load(tmp_path, monkeypatch, bases=None):
+    monkeypatch.setenv("NVME", str(tmp_path))
+    monkeypatch.setenv("LOBBOT_JOBS", str(tmp_path / "jobs"))
+    monkeypatch.setenv("EXP04_LOGS", str(tmp_path / "logs"))
+    if bases:
+        monkeypatch.setenv("EXP04_BASES", bases)
+    else:
+        monkeypatch.delenv("EXP04_BASES", raising=False)
+    sys.modules.pop("exp04", None)
+    m = importlib.import_module("exp04")
+    for key, cfg in (("qwen", QWEN36), ("ornith", QWEN36), ("gemma", GEMMA4)):
+        m.base_dir(key).mkdir(parents=True, exist_ok=True)
+        (m.base_dir(key) / "config.json").write_text(json.dumps(cfg))
+    for shape, experts, fp8 in (("qwen", 104, True), ("gemma", 72, True)):
+        (m.SMOKE / shape).mkdir(parents=True, exist_ok=True)
+        (m.SMOKE / shape / "result.json").write_text(json.dumps({"fp8_attention": fp8, "experts": experts,
+                                                                 "size_gb_est": 9.6, "bf16_loads": True}))
+    return m
 
 
 @pytest.fixture
 def exp04(tmp_path, monkeypatch):
-    monkeypatch.setenv("NVME", str(tmp_path))
-    monkeypatch.setenv("LOBBOT_JOBS", str(tmp_path / "jobs"))
-    monkeypatch.setenv("EXP04_LOGS", str(tmp_path / "logs"))
-    monkeypatch.delenv("EXP04_BASE", raising=False)
-    sys.modules.pop("exp04", None)
-    return importlib.import_module("exp04")
+    return load(tmp_path, monkeypatch)
 
 
-def score(m, name, lcb):
-    d = m.job(name) / "out"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "eval.json").write_text(json.dumps({"candidates": [{"code": {"suites": {"livecodebench": {"pass@1": lcb}}}}]}))
+def score(m, name, rate, **extra):
+    m.POLY.mkdir(parents=True, exist_ok=True)
+    (m.POLY / f"{name}.json").write_text(json.dumps({"pass_rate_2": rate, "pass_rate_1": rate / 2, **extra}))
 
 
-def test_job_configs_are_valid(exp04):
+def test_build_configs_are_valid(exp04):
     from stages._util import Job
 
     m = exp04
-    (m.SMOKE).mkdir(parents=True)
-    (m.SMOKE / "result.json").write_text(json.dumps({"fp8_attention": True, "experts": 104, "size_gb_est": 9.6}))
-    score(m, "ref", 0.70)
-    score(m, "ref-ornith", 0.69)
-    for d in (m.make_job("r59-t", m.r59_config()), m.eval_only("ref", {"ref": "/x"}, code_eval_ref=""),
-              m.eval_only("r59-t-suites", {"r59-t": "/x"}, "eval-suites")):
+    for key, rate in (("qwen", 0.60), ("ornith", 0.62), ("gemma", 0.55)):
+        score(m, f"{key}-full", rate)
+    assert m.builds() == ["ornith", "gemma"]
+    for key, kept, total in (("ornith", 104, 256), ("gemma", 72, 128)):
+        d = m.make_job(m.build_name(key), m.build_config(key))
         job = Job(d)
-        assert job.spec.target.max_size_gb == m.MAX_GB and job.config.code_eval_thinking
-    cfg = Job(m.job("r59-t")).config
-    assert cfg.teacher == "ornith-ai/Ornith-1.5-35B" and cfg.code_eval_ref == "exp04-ref-ornith"
-    assert cfg.reap_sparsity == round(1 - 104 / 256, 6) and cfg.quant_format == "w4a16" and cfg.quant_fp8_attention
-    assert cfg.code_eval_samples == 4 and cfg.lcb_since > cfg.data_contest_before
+        assert job.spec.target.max_size_gb == m.MAX_GB
+        cfg = job.config
+        assert cfg.teacher == m.BASES[key] and cfg.reap_sparsity == round(1 - kept / total, 6)
+        assert cfg.quant_format == "w4a16" and cfg.quant_fp8_attention and cfg.code_eval_thinking
+        assert cfg.eval_reasoning_parser == m.PARSER[key] and cfg.data_extra_rows == str(m.rows_file(key))
+        assert cfg.code_eval_samples == 1 and cfg.lcb_since > cfg.data_contest_before
 
 
-@pytest.mark.parametrize("qwen, ornith, picked", [(0.70, 0.69, "ornith"), (0.70, 0.67, "qwen"), (0.66, 0.72, "ornith")])
+@pytest.mark.parametrize("qwen, ornith, picked", [(0.60, 0.59, "ornith"), (0.60, 0.57, "qwen"), (0.55, 0.62, "ornith")])
 def test_ornith_is_built_unless_it_trails_by_more_than_two_points(exp04, qwen, ornith, picked):
-    score(exp04, "ref", qwen)
-    score(exp04, "ref-ornith", ornith)
-    assert exp04.chosen() == picked
-    score(exp04, "ref-ornith", 0.0)  # decided once: a later score does not flip it
-    assert exp04.chosen() == picked
+    m = exp04
+    score(m, "qwen-full", qwen)
+    score(m, "ornith-full", ornith)
+    score(m, "gemma-full", 0.50)
+    assert m.builds() == [picked, "gemma"]
+    assert m.bar() == round(0.9 * max(qwen, ornith), 4)
+    score(m, "ornith-full", 0.0)  # decided once: a later score does not flip it
+    assert m.builds() == [picked, "gemma"]
+
+
+def test_builds_wait_for_every_full_score(exp04):
+    score(exp04, "qwen-full", 0.6)
+    with pytest.raises(RuntimeError):
+        exp04.builds()
+
+
+@pytest.mark.parametrize("bases, built, n_steps", [("qwen,gemma", ["qwen", "gemma"], 12),
+                                                    ("ornith", ["ornith"], 9), ("gemma", ["gemma"], 9)])
+def test_a_subset_of_bases(tmp_path, monkeypatch, bases, built, n_steps):
+    m = load(tmp_path, monkeypatch, bases)
+    for key in m.WANTED:
+        score(m, f"{key}-full", 0.6)
+    assert m.builds() == built and len(m.steps()) == n_steps
+    assert m.build_done(1)() is (len(built) == 1)  # an unused second build slot counts as done
+
+
+def test_full_plan_and_summary(exp04, capsys):
+    m = exp04
+    assert len(m.steps()) == 13 and m.run_plan(m.steps(), m.summary, m.LOGS, ["x", "--list"]) == 0
+    assert "Aider Polyglot" in capsys.readouterr().out
+    assert m.summary() == "No Aider Polyglot results yet."
+    for key, rate in (("qwen", 0.60), ("ornith", 0.62), ("gemma", 0.55)):
+        score(m, f"{key}-full", rate, per_language={"rust": {"pass_rate_2": rate}})
+    m.builds()
+    score(m, "ornith-w4", 0.58, gpu={"busy_pct": 91.0})
+    assert m.best_build() == "ornith"
+    out = m.summary()
+    assert "ornith-w4" in out and "55.8%" in out and "meets the bar" in out and "91%" in out
 
 
 def test_smoke_falls_back_to_bf16_deltanet_with_fewer_experts():

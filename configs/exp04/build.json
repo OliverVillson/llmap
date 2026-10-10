@@ -1,5 +1,4 @@
 {
-  "teacher": "Qwen/Qwen3.6-35B-A3B",
   "dense_fallback": false,
   "n_generate": 600,
   "n_heldout": 50,
@@ -8,11 +7,10 @@
   "data_max_len": 20480,
   "data_harness_share": 0.5,
   "data_fix_rows": 300,
-  "data_contest_rows": 450,
+  "data_contest_rows": 150,
   "data_contest_samples": 2,
   "data_contest_before": "2024-10-01",
   "data_contest_harness_share": 0.3,
-  "reap_sparsity": 0.59375,
   "reap_calib_samples": 256,
   "reap_max_seq": 8192,
   "heal_max_minutes": 45,
@@ -21,9 +19,8 @@
   "code_eval_suites": [
     "livecodebench"
   ],
-  "code_eval_samples": 4,
+  "code_eval_samples": 1,
   "code_eval_thinking": true,
   "code_eval_max_tokens": 32768,
-  "lcb_since": "2025-01-01",
-  "code_eval_ref": "exp04-ref"
+  "lcb_since": "2025-01-01"
 }
