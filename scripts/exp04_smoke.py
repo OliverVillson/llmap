@@ -3,14 +3,16 @@ Run in the training venv (scripts/exp04.py does), before any long step:
 
     python scripts/exp04_smoke.py --teacher /mnt/nvme/models/Qwen3.6-35B-A3B --out /mnt/nvme/exp04-smoke --budget-gb 9.8
 
-A copy of the base cut to 4 layers (3 DeltaNet, 1 full attention), with the expert
-count the budget allows and random weights, is saved the way REAP saves a pruned
-model, quantized by the real quantize stage (quant_format "w4a16") and served by
-vLLM through the eval stage's own serve() and generate(). Random weights answer
-nonsense; what counts is that vLLM loads the checkpoint and answers at all. With
-FP8 DeltaNet and attention first; if vLLM refuses that, again with them in BF16,
-which costs bytes and so experts. The unquantized copy is served too, for the
-before-quantizing score. Writes <out>/result.json:
+A copy of the base cut just past its first full-attention layer (Qwen3.6: 3 DeltaNet
+layers and 1 full, 4 in all; Gemma 4: 5 sliding-window layers and 1 full, 6), with
+the expert count the budget allows and random weights, is saved the way REAP saves
+a pruned model, quantized by the real quantize stage (quant_format "w4a16") and
+served by vLLM through the eval stage's own serve() and generate(). Random weights
+answer nonsense; what counts is that vLLM loads the checkpoint and answers at all.
+With the FP8 layers (attention, and DeltaNet or Gemma's dense MLP) first; if vLLM
+refuses that, again with them in BF16, which costs bytes and so experts. The
+unquantized copy is served too, for the before-quantizing score. Writes
+<out>/result.json:
   {"fp8_attention": bool, "experts": K, "size_gb_est": GB of the full-depth model,
    "bf16_loads": bool, "errors": {try: message}}
 """
@@ -31,12 +33,17 @@ sys.path.insert(0, str(ROOT))
 from stages import w4a16  # noqa: E402
 
 TASKSPEC = ROOT / "examples" / "python-utils.code.taskspec.json"
-LAYERS = 4  # Qwen3.6 repeats 3 DeltaNet layers and 1 full-attention layer
+
+
+def tiny_layers(hf: dict) -> int:
+    """Layers up to and including the first full-attention one, so the tiny copy has
+    every kind of layer the base has: 4 for Qwen3.6, 6 for Gemma 4."""
+    return w4a16.layer_types(w4a16.text_config(hf)).index("full_attention") + 1
 
 
 def build_tiny(teacher: Path, out: Path, k: int) -> Path:
-    """The base's architecture at LAYERS layers and k experts, random BF16 weights,
-    saved as the pipeline saves a pruned model (same class, fix_saved_config)."""
+    """The base's architecture cut to tiny_layers layers with k experts, random BF16
+    weights, saved as the pipeline saves a pruned model (same class, fix_saved_config)."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -44,11 +51,17 @@ def build_tiny(teacher: Path, out: Path, k: int) -> Path:
 
     if (out / "config.json").exists():
         return out
+    n = tiny_layers(json.loads((teacher / "config.json").read_text()))
     cfg = AutoConfig.from_pretrained(teacher)
+    if cfg.model_type == "gemma4":  # REAP keeps Gemma 4's text decoder alone (sft.load_causal_lm)
+        cfg = cfg.text_config
     t = getattr(cfg, "text_config", cfg)
-    t.num_hidden_layers = LAYERS
+    per_layer = t.to_dict().get("per_layer_config")  # Gemma 4: the full layers' head size and KV heads
+    t.num_hidden_layers = n
     if getattr(t, "layer_types", None):
-        t.layer_types = list(t.layer_types)[:LAYERS]
+        t.layer_types = list(t.layer_types)[:n]
+    if per_layer:
+        t.per_layer_config = {int(i): o for i, o in per_layer.items() if int(i) < n}
     if getattr(t, "mtp_num_hidden_layers", None):
         t.mtp_num_hidden_layers = 0
     mu.set_config_experts(cfg, k)

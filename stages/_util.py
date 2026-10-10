@@ -89,7 +89,7 @@ class Config:
     quant_format: str = "gguf"
     quant_calib_samples: int = 128  # w4a16: train.jsonl rows GPTQ calibrates on
     quant_calib_len: int = 2048  # w4a16: tokens per calibration row
-    quant_fp8_attention: bool = True  # w4a16: False keeps attention, DeltaNet and lm_head BF16
+    quant_fp8_attention: bool = True  # w4a16: False keeps attention, DeltaNet, lm_head, Gemma's MLP BF16
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"

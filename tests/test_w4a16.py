@@ -1,5 +1,5 @@
 """The vLLM 4-bit path: the size model (stages/w4a16.py, no torch) and the real
-quantize stage (stages/quantize_ct.py) on a tiny random Qwen3.6-shaped model."""
+quantize stage (stages/quantize_ct.py) on tiny random Qwen3.6 and Gemma 4 MoE models."""
 import json
 import math
 import os
@@ -54,6 +54,49 @@ def test_bf16_attention_costs_its_bytes():
     assert w4a16.max_experts(QWEN36, 9.8, fp8=False) < 104
     with pytest.raises(ValueError):
         w4a16.max_experts(QWEN36, 2.0)
+
+
+# Gemma 4 26B-A4B's config.json as released: multimodal, text decoder in text_config.
+GEMMA4_26B = {"model_type": "gemma4", "tie_word_embeddings": True, "vision_config": {"hidden_size": 1152},
+              "text_config": dict(
+    model_type="gemma4_text", hidden_size=2816, num_hidden_layers=30, num_attention_heads=16, num_key_value_heads=8,
+    head_dim=256, global_head_dim=512, num_global_key_value_heads=2, attention_k_eq_v=True, enable_moe_block=True,
+    num_experts=128, top_k_experts=8, moe_intermediate_size=704, intermediate_size=2112, vocab_size=262144,
+    hidden_size_per_layer_input=0, tie_word_embeddings=True,
+    layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 5)}
+
+
+def test_gemma4_experts_take_group_64_and_64_fit_under_9_8_gb():
+    # vLLM's int4 MoE kernels take whole groups of the expert width: 704 = 5.5 x 128
+    assert w4a16.group_size(GEMMA4_26B) == 64 and w4a16.group_size(QWEN36) == 128
+    p = w4a16.part_bytes(GEMMA4_26B, 72)
+    # 72 x 30 x 3 x 2816 x 704 weights at 4.25 bits, tied embeddings in BF16 and no lm_head
+    assert p["routed_experts"] / 1e9 == pytest.approx(72 * 30 * 3 * 2816 * 704 * 4.25 / 8 / 1e9, abs=0.001)
+    assert p["lm_head"] == 0 and p["embeddings"] == 2 * 262144 * 2816
+    # attention: 25 sliding layers (q 16x256, k and v 8x256, o) and 5 full ones (q 16x512, k 2x512 doubling as v)
+    rows = 25 * (4096 + 2 * 2048 + 2816) + 5 * (8192 + 1024 + 2816)
+    weights = 25 * (2 * 4096 + 2 * 2048) * 2816 + 5 * (2 * 8192 + 1024) * 2816
+    assert p["attention"] == weights + 2 * rows  # FP8 bytes plus a BF16 scale per output row
+    assert p["dense_mlp"] == 30 * (3 * 2112 * 2816 + 2 * (2 * 2112 + 2816))
+    assert [round(w4a16.size_gb(GEMMA4_26B, k), 2) for k in (64, 72, 80, 128)] == [9.20, 9.96, 10.72, 15.28]
+    assert w4a16.max_experts(GEMMA4_26B, 9.8) == 64 and w4a16.max_experts(GEMMA4_26B, 9.8, step=2) == 70
+    assert w4a16.max_experts(GEMMA4_26B, 10.0) == 72 and w4a16.max_experts(GEMMA4_26B, 9.8, fp8=False) == 48
+    # tied embeddings are read whole for every token, as the LM head
+    assert w4a16.bytes_per_token_gb(GEMMA4_26B, 72) == pytest.approx(
+        (sum(p.values()) - p["routed_experts"] * (1 - 8 / 72)) / 1e9)
+    assert w4a16.targets(GEMMA4_26B) == (w4a16.GEMMA4_INT4_TARGETS, w4a16.GEMMA4_FP8_TARGETS)
+    assert w4a16.targets(QWEN36, fp8=False) == (w4a16.INT4_TARGETS, [])
+
+
+def test_gemma4_size_model_reads_every_config_layout():
+    t = GEMMA4_26B["text_config"]
+    # as transformers >= 5.15 saves it (text only): per_layer_config instead of global_*, no layer_types needed
+    flat = ("global_head_dim", "num_global_key_value_heads", "layer_types")
+    saved = {k: v for k, v in t.items() if k not in flat} | {
+        "per_layer_config": {f"{i:02d}": {"head_dim": 512, "num_key_value_heads": 2} for i in range(5, 30, 6)}}
+    assert w4a16.layer_types(saved) == t["layer_types"]
+    assert w4a16.size_gb(saved, 72) == w4a16.size_gb(t, 72) == w4a16.size_gb(GEMMA4_26B, 72)
+    assert w4a16.n_experts(GEMMA4_26B) == 128 and w4a16.top_k(GEMMA4_26B) == 8 and w4a16.top_k(QWEN36) == 8
 
 
 def test_size_check_uses_the_saved_files(tmp_path):
@@ -264,3 +307,151 @@ def test_calibration_rows_include_the_thinking(quantized):
     assert len(data) == 4 and all(len(ids) <= 160 for ids in data["input_ids"])
     text = tok.decode(data["input_ids"][0])
     assert "<|im_start|>assistant\n<think>\nOrder 10" in text and "</think>" in text
+
+
+# --- the real stage on a tiny Gemma 4 MoE ---
+
+GEMMA_TYPES = ["sliding_attention", "full_attention"]  # 26B-A4B repeats 5 sliding-window layers and 1 full
+
+
+def tiny_gemma4(out: Path, layout: str):
+    """Gemma 4's tokenizer specials and template (tests/test_gemma4_moe.py) and a
+    random Gemma 4 MoE: a sliding-window layer and a full-attention one with wider
+    heads and K reused as V, each with a dense MLP beside 4 fused experts, top-2,
+    tied embeddings. The expert width 192 is no multiple of 128 (26B-A4B's 704 is
+    not either), so the experts take int4 group 64. layout "text" is how REAP and
+    heal save it (Gemma4ForCausalLM); "multimodal" is how it ships, with a vision
+    tower, whose config also names its dtype, so llm-compressor rewrites the saved
+    config.json from this one."""
+    import torch
+    from test_gemma4_moe import build_tokenizer
+    from transformers import Gemma4Config, Gemma4ForCausalLM, Gemma4ForConditionalGeneration
+
+    tok = build_tokenizer(out)
+    text = dict(vocab_size=384, hidden_size=256, num_hidden_layers=2, layer_types=GEMMA_TYPES,
+                num_attention_heads=2, num_key_value_heads=1, head_dim=128, global_head_dim=256,
+                num_global_key_value_heads=1, attention_k_eq_v=True, intermediate_size=128, enable_moe_block=True,
+                num_experts=4, top_k_experts=2, moe_intermediate_size=192, hidden_size_per_layer_input=0,
+                sliding_window=64, tie_word_embeddings=True, pad_token_id=tok.pad_token_id,
+                bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id)
+    vision = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+                  num_key_value_heads=2, head_dim=16, position_embedding_size=64)
+    cfg = Gemma4Config(text_config=text, vision_config=vision)
+    torch.manual_seed(0)
+    if layout == "text":
+        Gemma4ForCausalLM(cfg.text_config).to(torch.bfloat16).save_pretrained(out)
+        return
+    Gemma4ForConditionalGeneration(cfg).to(torch.bfloat16).save_pretrained(out)
+    p = out / "config.json"
+    hf = json.loads(p.read_text())
+    hf["text_config"]["dtype"] = "bfloat16"
+    p.write_text(json.dumps(hf))
+
+
+@pytest.fixture(scope="module", params=["text", "multimodal"])
+def quantized_gemma(request, tmp_path_factory):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers", minversion="5.15")
+    pytest.importorskip("llmcompressor")
+    job = make_job(tmp_path_factory.mktemp(f"w4a16-gemma-{request.param}"), max_size_gb=1.0)
+    tiny_gemma4(job / "work/healed", request.param)
+    p = subprocess.run([sys.executable, "-m", "stages.quantize", "--job", str(job)], cwd=ROOT,
+                       env={**os.environ, "LOBBOT_DRY_RUN": ""}, capture_output=True, text=True)
+    events = [e for e in map(parse, p.stdout.splitlines()) if e]
+    assert p.returncode == 0 and events[-1]["status"] == "done", p.stdout[-3000:] + p.stderr[-3000:]
+    return job
+
+
+def test_gemma4_stage_saves_the_text_decoder(quantized_gemma):
+    from test_gemma4_moe import TEMPLATE
+    from transformers import AutoConfig, AutoTokenizer
+
+    c = json.loads((quantized_gemma / "work/allocation.json").read_text())["candidates"]["lobbot-moe"]
+    out = Path(c["path"])
+    hf = json.loads((quantized_gemma / "work/healed/config.json").read_text())
+    assert c["num_experts"] == 4 and w4a16.is_gemma4(hf)
+    t = tensors(out)
+    sizes = {"F8_E4M3": 1, "BF16": 2, "I32": 4, "I64": 8}
+    assert sum(sizes[d] * math.prod(s) for d, s in t.values()) == sum(w4a16.part_bytes(hf, 4).values())
+    # Gemma4ForCausalLM's own names: no towers, no multimodal prefix, no lm_head (tied)
+    assert not [k for k in t if not k.startswith("model.") or "language_model" in k or "vision" in k]
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["model_type"] == "gemma4_text" and cfg["architectures"] == ["Gemma4ForCausalLM"]
+    assert cfg["quantization_config"]["quant_method"] == "compressed-tensors" and "vision_config" not in cfg
+    loaded = AutoConfig.from_pretrained(out)
+    assert loaded.model_type == "gemma4_text" and loaded.per_layer_config[1].head_dim == 256
+    assert loaded.num_experts == 4 and loaded.top_k_experts == 2
+    assert AutoTokenizer.from_pretrained(out).chat_template == TEMPLATE
+
+
+def test_gemma4_quantization_config(quantized_gemma):
+    q = json.loads((quantized_gemma / "work/candidates/lobbot-moe/config.json").read_text())["quantization_config"]
+    assert q["format"] == "mixed-precision"
+    groups = {tuple(g["targets"]): g for g in q["config_groups"].values()}
+    int4, fp8 = groups[tuple(w4a16.GEMMA4_INT4_TARGETS)], groups[tuple(w4a16.GEMMA4_FP8_TARGETS)]
+    w = int4["weights"]
+    assert (w["type"], w["num_bits"], w["strategy"], w["group_size"], w["symmetric"]) == ("int", 4, "group", 64, True)
+    assert int4["format"] == "pack-quantized" and int4["input_activations"] is None
+    w, a = fp8["weights"], fp8["input_activations"]
+    assert (w["type"], w["num_bits"], w["strategy"]) == ("float", 8, "channel")
+    assert (a["type"], a["strategy"], a["dynamic"]) == ("float", "token", True)
+    for i in range(2):
+        assert f"model.layers.{i}.router.proj" in q["ignore"]
+    assert not [m for m in q["ignore"] if "language_model" in m or "vision" in m or "_proj" in m and "router" not in m]
+
+
+def test_gemma4_every_module_gets_its_format(quantized_gemma):
+    t = tensors(quantized_gemma / "work/candidates/lobbot-moe")
+    for i, kind in enumerate(GEMMA_TYPES):
+        pre, full = f"model.layers.{i}.", kind == "full_attention"
+        for j in range(4):
+            for proj, (rows, cols) in (("gate_proj", (192, 256)), ("up_proj", (192, 256)), ("down_proj", (256, 192))):
+                assert t[f"{pre}experts.{j}.{proj}.weight_packed"] == ("I32", [rows, cols // 8])
+                assert t[f"{pre}experts.{j}.{proj}.weight_scale"] == ("BF16", [rows, cols // 64])
+        fp8 = [f"self_attn.{p}_proj" for p in ("q", "k", "o") + (() if full else ("v",))]
+        fp8 += [f"mlp.{p}_proj" for p in ("gate", "up", "down")]
+        for m in fp8:
+            assert t[f"{pre}{m}.weight"][0] == "F8_E4M3" and t[f"{pre}{m}.weight_scale"][0] == "BF16"
+        assert (f"{pre}self_attn.v_proj.weight" in t) == (not full)  # the full layer reuses K as V
+        assert t[f"{pre}self_attn.q_proj.weight"][1] == [2 * (256 if full else 128), 256]
+        bf16 = ["router.proj.weight", "router.scale", "router.per_expert_scale", "layer_scalar",
+                "self_attn.q_norm.weight", "self_attn.k_norm.weight"]
+        bf16 += [f"{n}.weight" for n in ("input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
+                                         "post_feedforward_layernorm", "post_feedforward_layernorm_1",
+                                         "post_feedforward_layernorm_2", "pre_feedforward_layernorm_2")]
+        for m in bf16:
+            assert t[pre + m][0] == "BF16", pre + m
+    assert t["model.embed_tokens.weight"][0] == "BF16" and t["model.norm.weight"][0] == "BF16"
+
+
+def test_gemma4_weights_stay_the_healed_ones(quantized_gemma):
+    import torch
+    from compressed_tensors.compressors import unpack_from_int32
+    from safetensors.torch import load_file
+
+    healed = load_file(next((quantized_gemma / "work/healed").glob("*.safetensors")))
+    healed = {k.replace("model.language_model.", "model."): v for k, v in healed.items()}
+    q = load_file(next((quantized_gemma / "work/candidates/lobbot-moe").glob("*.safetensors")))
+    for k in ("model.embed_tokens.weight", "model.layers.0.router.proj.weight", "model.layers.0.router.scale",
+              "model.layers.1.self_attn.k_norm.weight", "model.layers.1.post_feedforward_layernorm_2.weight"):
+        assert torch.equal(q[k], healed[k]), k
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    for k in ("model.layers.1.self_attn.k_proj", "model.layers.0.self_attn.v_proj", "model.layers.1.mlp.down_proj"):
+        assert rel(q[k + ".weight"].float() * q[k + ".weight_scale"].float(), healed[k + ".weight"]) < 0.05, k
+    gate_up, down = healed["model.layers.1.experts.gate_up_proj"], healed["model.layers.1.experts.down_proj"]
+    for k, ref in (("model.layers.1.experts.2.down_proj", down[2]),  # gate rows first in gate_up_proj
+                   ("model.layers.1.experts.3.gate_proj", gate_up[3, :192]),
+                   ("model.layers.1.experts.3.up_proj", gate_up[3, 192:])):
+        w = unpack_from_int32(q[k + ".weight_packed"], 4, torch.Size(q[k + ".weight_shape"].tolist())).float()
+        assert rel(w * q[k + ".weight_scale"].float().repeat_interleave(64, dim=1), ref) < 0.3, k
+
+
+def test_gemma4_calibration_rows_think_in_the_thought_channel(quantized_gemma):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(str(quantized_gemma / "work/healed"))
+    text = tok.decode(quantize_ct.calibration_set(Job(quantized_gemma), tok)["input_ids"][0])
+    assert "<|think|>" in text and "<|turn>model\n<|channel>thought\nOrder 10" in text and "<channel|>" in text

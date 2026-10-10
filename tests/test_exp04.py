@@ -19,6 +19,13 @@ QWEN36 = {"text_config": {
     "linear_num_key_heads": 16, "linear_key_head_dim": 128, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4, "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 10}}
 GEMMA4 = {"text_config": {"num_experts": 128, "top_k_experts": 8}}
+# Gemma 4 26B-A4B's config.json as released (multimodal; the size model reads text_config)
+GEMMA4_26B = {"model_type": "gemma4", "text_config": {
+    "model_type": "gemma4_text", "hidden_size": 2816, "num_hidden_layers": 30, "num_attention_heads": 16,
+    "num_key_value_heads": 8, "head_dim": 256, "global_head_dim": 512, "num_global_key_value_heads": 2,
+    "attention_k_eq_v": True, "enable_moe_block": True, "num_experts": 128, "top_k_experts": 8,
+    "moe_intermediate_size": 704, "intermediate_size": 2112, "vocab_size": 262144, "hidden_size_per_layer_input": 0,
+    "tie_word_embeddings": True, "layer_types": (["sliding_attention"] * 5 + ["full_attention"]) * 5}}
 
 
 def load(tmp_path, monkeypatch, bases=None):
@@ -131,3 +138,43 @@ def test_smoke_falls_back_to_bf16_deltanet_with_fewer_experts():
     assert smoke.decide(QWEN36, 9.8, lambda fp8, k, e: True)["experts"] == 104
     with pytest.raises(SystemExit):
         smoke.decide(QWEN36, 9.8, lambda fp8, k, e: False)
+
+
+def test_smoke_sizes_gemma4():
+    """Gemma 4's experts take int4 group 64 (704 is no multiple of 128), its tied
+    embeddings stay BF16: 64 experts fit 9.8 GB with FP8 attention and dense MLP."""
+    import exp04_smoke as smoke
+
+    assert smoke.decide(GEMMA4_26B, 9.8, lambda fp8, k, e: True) == {
+        "fp8_attention": True, "experts": 64, "size_gb_est": 9.2, "errors": {}}
+    bf16 = smoke.decide(GEMMA4_26B, 9.8, lambda fp8, k, e: not fp8)
+    assert bf16["fp8_attention"] is False and bf16["experts"] == 48 and bf16["size_gb_est"] <= 9.8
+    # the tiny copy ends just past the first full-attention layer
+    assert smoke.tiny_layers(GEMMA4_26B) == 6 and smoke.tiny_layers(QWEN36) == 4
+
+
+def test_smoke_tiny_gemma4_is_saved_as_reap_saves_it(tmp_path):
+    """Released multimodal, cut to 6 layers and k experts, saved text only
+    (Gemma4ForCausalLM) with the full-attention layer's wider heads."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers", minversion="5.15")
+    import exp04_smoke as smoke
+    from test_gemma4_moe import build_tokenizer
+    from transformers import AutoModelForCausalLM, Gemma4Config, Gemma4ForConditionalGeneration
+
+    teacher = tmp_path / "teacher"
+    build_tokenizer(teacher)
+    text = dict(vocab_size=384, hidden_size=64, intermediate_size=48, num_hidden_layers=12, num_attention_heads=2,
+                num_key_value_heads=1, head_dim=32, global_head_dim=64, num_global_key_value_heads=1,
+                attention_k_eq_v=True, hidden_size_per_layer_input=0, enable_moe_block=True, num_experts=8,
+                top_k_experts=2, moe_intermediate_size=32)
+    vision = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+                  num_key_value_heads=2, head_dim=16)
+    Gemma4ForConditionalGeneration(Gemma4Config(text_config=text, vision_config=vision)).save_pretrained(teacher)
+    tiny = smoke.build_tiny(teacher, tmp_path / "tiny", 4)
+    cfg = json.loads((tiny / "config.json").read_text())
+    assert cfg["model_type"] == "gemma4_text" and cfg["architectures"] == ["Gemma4ForCausalLM"]
+    assert cfg["num_hidden_layers"] == 6 and cfg["layer_types"][-1] == "full_attention" and cfg["num_experts"] == 4
+    model = AutoModelForCausalLM.from_pretrained(tiny, dtype=torch.float32)
+    assert model.model.layers[5].self_attn.head_dim == 64 and model.model.layers[5].self_attn.v_proj is None
+    assert model.model.layers[0].experts.gate_up_proj.shape[0] == 4
