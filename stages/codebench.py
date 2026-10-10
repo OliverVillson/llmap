@@ -7,9 +7,11 @@ Every suite is a JSONL file of problems in one shape:
             full problem statement)
   stub      code the answer completes (MultiPL-E prompt); "" for none
   entry     name of the function the tests call ("" for stdin programs)
-  tests     test code appended to the answer (a string), or a list of
-            {"input", "output"} stdin/stdout cases (Python only; assemble()
-            turns them into a test harness, since the sandbox runs answer + tests)
+  tests     test code appended to the answer (a string), a list of
+            {"input", "output"} stdin/stdout cases, or {"func", "cases"} for a
+            LeetCode-style Solution method (both Python only; assemble() turns them
+            into a test harness with a time limit per case, since the sandbox runs
+            answer + tests)
   date      optional ISO date the problem was published (LiveCodeBench)
 
 Suites (Config.code_eval_suites):
@@ -30,6 +32,7 @@ with n samples per problem of which c pass, pass@k = 1 - C(n-c, k) / C(n, k).
 from __future__ import annotations
 
 import json
+import os
 import re
 from math import comb
 from pathlib import Path
@@ -42,6 +45,9 @@ ALIASES = {"py": "python", "js": "javascript", "ts": "typescript", "c++": "cpp",
 FENCE = {"python": "python", "javascript": "javascript", "typescript": "typescript", "c": "c", "cpp": "cpp", "asm": "asm"}
 SYSTEM = ("You are an expert programmer. Answer with one complete, correct code block "
           "and nothing else: no explanation, no example usage, no tests.")
+# Seconds each LiveCodeBench test case may run, as in LiveCodeBench's own runner; a
+# problem's cases share one process, so its time limit is this times the cases.
+CASE_TIMEOUT = float(os.environ.get("LOBBOT_LCB_CASE_TIMEOUT", 6))
 # Imports LiveCodeBench prepends for LeetCode-style answers, which assume them.
 PY_PRELUDE = ("from typing import *\nfrom collections import *\nfrom functools import *\n"
               "from itertools import *\nfrom heapq import *\nfrom bisect import *\n"
@@ -142,8 +148,8 @@ def harness_code(p: dict, answer: str) -> str:
     """The owned file out of a harness-format answer; a lone fenced block also counts."""
     from stages import harness, sandbox
 
-    files, _ = harness.parse_files(answer)
     src = sandbox.layout(p["language"])[0]
+    files, _ = harness.parse_files(answer, [src])
     if src in files:
         return files[src]
     return next(iter(files.values())) if len(files) == 1 else extract_code(answer)
@@ -189,6 +195,26 @@ def add_fix_scores(suites: dict, problems: list[dict], first: list, fixed: list)
         s["fixed"] = sum(bool(fixed[j] and fixed[j].passed) for j in idx)
 
 
+def examples_only(p: dict) -> dict:
+    """The problem with only the example cases its text shows (LiveCodeBench's public
+    tests, the first p["public"] cases), as a coder can check before handing in."""
+    k, tests = p["public"], p["tests"]
+    return {**p, "tests": {**tests, "cases": tests["cases"][:k]} if isinstance(tests, dict) else tests[:k]}
+
+
+def add_pick_scores(suites: dict, problems: list[dict], results: list[list], examples: list[list]) -> None:
+    """pick@examples per suite: of a problem's samples, the first that passes the examples
+    in its text is handed in (the first sample when none does), as Mugge's loop would.
+    Only problems with example cases count. results and examples hold one entry per sample."""
+    picked: dict[str, list[bool]] = {}
+    for p, rs, ex in zip(problems, results, examples):
+        if p.get("public") and len(ex) == len(rs):
+            picked.setdefault(p["suite"], []).append(rs[next((i for i, ok in enumerate(ex) if ok), 0)].passed)
+    for name, got in picked.items():
+        if "pass@1" in suites.get(name, {}):
+            suites[name]["pick@examples"] = round(sum(got) / len(got), 4)
+
+
 def mean_fix1(suites: dict) -> float | None:
     vals = [s["fix@1"] for s in suites.values() if "fix@1" in s]
     return round(sum(vals) / len(vals), 4) if vals else None
@@ -216,7 +242,7 @@ def assemble(p: dict, answer: str, code: str | None = None) -> tuple[str, str]:
     lang = p["language"]
     code = extract_code(answer) if code is None else code
     tests = p["tests"]
-    if isinstance(tests, str) and (lang == "python" or re.search(r"\bmain\s*\(", tests)):
+    if isinstance(tests, dict) or isinstance(tests, str) and (lang == "python" or re.search(r"\bmain\s*\(", tests)):
         code = _strip_main(code, lang)  # the tests are the entry point (stdin programs keep theirs)
     stub, entry = p.get("stub") or "", p.get("entry") or ""
     if stub:
@@ -231,19 +257,61 @@ def assemble(p: dict, answer: str, code: str | None = None) -> tuple[str, str]:
             pre = [l for l in stub.splitlines() if _PREAMBLE.match(l) and l.strip() not in code]
             if pre:
                 code = "\n".join(pre) + "\n" + code
-    if p.get("suite") == "livecodebench" and lang == "python" and isinstance(tests, str):
+    if p.get("suite") == "livecodebench" and lang == "python" and not isinstance(tests, list):
         code = PY_PRELUDE + code
+    if isinstance(tests, dict):
+        return code, functional_harness(tests["func"], tests["cases"])
     if not isinstance(tests, str):
         return stdio_harness(code, tests), ""
     return code, tests
 
 
+def time_limit(p: dict) -> float | None:
+    """The sandbox time limit for a problem whose cases run in one harness: CASE_TIMEOUT
+    per case plus start-up; None for any other problem (the suite's limit applies)."""
+    tests = p.get("tests")
+    cases = tests if isinstance(tests, list) else tests.get("cases") if isinstance(tests, dict) else None
+    return CASE_TIMEOUT * len(cases) + 10 if cases else None
+
+
+# Per-case limit for the harnesses below: an itimer raises _CaseTimeout, a BaseException,
+# so an answer's own `except Exception` cannot swallow it.
+_LIMIT = (
+    "import signal as _signal\n"
+    "class _CaseTimeout(BaseException):\n"
+    "    pass\n"
+    "def _alarm(*_):\n"
+    "    raise _CaseTimeout()\n"
+    "_signal.signal(_signal.SIGALRM, _alarm)\n")
+
+
+def functional_harness(func: str, cases: list) -> str:
+    """Tests for a LeetCode-style answer: Solution().func(*args) per case, each within
+    CASE_TIMEOUT seconds. A case's input is one JSON value per line."""
+    return (
+        "import json as _json\n" + _LIMIT +
+        f"_cases = _json.loads({json.dumps(cases)!r})\n"
+        "_f = getattr(Solution(), " + repr(func) + ")\n"
+        "for _i, (_inp, _out) in enumerate(_cases):\n"
+        f"    _signal.setitimer(_signal.ITIMER_REAL, {CASE_TIMEOUT})\n"
+        "    try:\n"
+        "        _got = _f(*[_json.loads(_l) for _l in _inp.split('\\n') if _l.strip()])\n"
+        "    except _CaseTimeout:\n"
+        f"        raise SystemExit(f'case {{_i}}: over the {CASE_TIMEOUT:g} s time limit')\n"
+        "    finally:\n"
+        "        _signal.setitimer(_signal.ITIMER_REAL, 0)\n"
+        "    _got = list(_got) if isinstance(_got, tuple) else _got\n"
+        "    _want = _json.loads(_out)\n"
+        "    assert _got == _want, f'case {_i}: expected {_want!r}, got {_got!r}'\n")
+
+
 def stdio_harness(code: str, cases: list[dict]) -> str:
     """A Python program that runs `code` once per case with that case's stdin and
-    fails unless its stdout matches (trailing whitespace ignored per line)."""
+    fails unless its stdout matches (trailing whitespace ignored per line) within
+    CASE_TIMEOUT seconds."""
     data = json.dumps([[c["input"], c["output"]] for c in cases])
     return (
-        "import io as _io, json as _json, sys as _sys\n"
+        "import io as _io, json as _json, sys as _sys\n" + _LIMIT +
         f"_SRC = {code!r}\n"
         f"_CASES = _json.loads({data!r})\n"
         "_norm = lambda s: [l.rstrip() for l in s.strip().splitlines()]\n"
@@ -253,12 +321,16 @@ def stdio_harness(code: str, cases: list[dict]) -> str:
         "    _buf = _io.BytesIO()\n"
         "    _out = _io.TextIOWrapper(_buf, encoding='utf-8', write_through=True)\n"
         "    _sys.stdout = _out\n"
+        f"    _signal.setitimer(_signal.ITIMER_REAL, {CASE_TIMEOUT})\n"
         "    try:\n"
         "        exec(compile(_SRC, 'answer.py', 'exec'), {'__name__': '__main__'})\n"
         "    except SystemExit as _e:\n"
         "        if _e.code not in (None, 0):\n"
         "            raise\n"
+        "    except _CaseTimeout:\n"
+        f"        raise SystemExit(f'case {{_i}}: over the {CASE_TIMEOUT:g} s time limit')\n"
         "    finally:\n"
+        "        _signal.setitimer(_signal.ITIMER_REAL, 0)\n"
         "        _out.flush()\n"
         "        _sys.stdout = _real_out\n"
         "    _got = _buf.getvalue().decode('utf-8', 'replace')\n"

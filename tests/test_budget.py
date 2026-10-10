@@ -47,7 +47,7 @@ def test_rescore_cuts_thinking_and_retests(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "force_answer", force)
     monkeypatch.setattr(budget.codebench, "assemble", lambda p, a, code=None: (a, ""))
     monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
-        sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, _ in items])
+        sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, *_ in items])
     out = budget.rescore(job, "m", rows, probs, [10])["10"]
     assert out["how"] == {"same": 2, "cut": 1, "truncated": 1} and out["errors"] == 0
     assert seen["cut"] == (" ".join(["w"] * 10), "length", 0.6)
@@ -83,7 +83,7 @@ def test_rescore_retries_once_then_scores_a_lost_answer_as_failed(tmp_path, monk
     monkeypatch.setattr(ev, "force_answer", force)
     monkeypatch.setattr(budget.codebench, "assemble", lambda p, a, code=None: (a, ""))
     monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
-        sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, _ in items])
+        sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed") for _, code, *_ in items])
     out = budget.rescore(job, "m", rows, probs, [10])["10"]
     assert out["errors"] == 2 and len(calls) == 4  # two tries each
     assert out["suites"]["livecodebench"]["pass@1"] == 0.0

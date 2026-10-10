@@ -2,7 +2,8 @@
 
 REAP (Router-weighted Expert Activation Pruning) scores every expert by
     S_j = mean over tokens routed to j of  g_j(x) * ||f_j(x)||_2
-where g_j is the renormalised router weight and f_j the expert output, then
+where g_j is the renormalised router weight as the block applies it (Gemma 4's
+includes its per-expert scale) and f_j the expert output, then
 drops the lowest-scoring experts in every layer. The same number is dropped
 in each layer so the expert count stays uniform (llama.cpp needs that).
 Experts the task never routes to score 0 and go first, which is what
@@ -45,7 +46,7 @@ class SaliencyCollector:
             E, dev = mu.num_experts(blk), mu.gate_weight(blk).device
             self.sum[li] = torch.zeros(E, dtype=torch.float64, device=dev)
             self.freq[li] = torch.zeros(E, dtype=torch.float64, device=dev)
-            self.handles.append(blk.register_forward_hook(self._hook(li, blk)))
+            self.handles.append(mu.moe_module(blk).register_forward_hook(self._hook(li, blk)))
 
     def _hook(self, li, blk):
         import torch
@@ -54,8 +55,7 @@ class SaliencyCollector:
 
         @torch.no_grad()
         def hook(_mod, args, _out):
-            x = args[0].reshape(-1, args[0].shape[-1])
-            w, idx = mu.route(blk, self.config, x)
+            x, w, idx = mu.routed(blk, self.config, args)
             for j in torch.unique(idx).tolist():
                 tok_pos, slot = torch.where(idx == j)
                 out = mu.expert_forward(blk, self.config, j, x[tok_pos])
@@ -82,15 +82,14 @@ def choose_keep(saliency: list[float], freq: list[float], n_keep: int) -> list[i
 
 def calib_sequences(job: Job, tok) -> list[list[int]]:
     """Token ids REAP calibrates on: the task's own train.jsonl (reap_calib
-    "task"), or a general-text file (reap_calib "general", see Config)."""
-    from stages.taskdata import load_examples, to_messages, tokenize_example
+    "task", calib_extra_share of it extra rows), or a general-text file
+    (reap_calib "general", see Config)."""
+    from stages.taskdata import calib_examples, to_messages, tokenize_example
 
     cfg = job.config
     if cfg.reap_calib == "task":
-        examples = load_examples(job.path("data", "train.jsonl"))
-        random.Random(0).shuffle(examples)
-        return [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"]
-                for ex in examples[: cfg.reap_calib_samples]]
+        examples = calib_examples(job.path("data", "train.jsonl"), cfg.reap_calib_samples, cfg.calib_extra_share)
+        return [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"] for ex in examples]
     if cfg.reap_calib != "general":
         raise ValueError(f'reap_calib must be "task" or "general", not {cfg.reap_calib!r}')
     if not cfg.reap_calib_path:
@@ -121,7 +120,8 @@ def calib_sequences(job: Job, tok) -> list[list[int]]:
 def layer_importance(model, batches) -> list[float]:
     """Relative contribution of each MoE block: mean ||moe_out|| / ||moe_in||
     over calibration tokens. Layers whose experts move the residual stream
-    more are treated as more sensitive to quantization. Dense layers get the
+    more are treated as more sensitive to quantization (Gemma 4: its routed
+    experts' input and output, before the post-norm). Dense layers get the
     mean score so the list has one entry per decoder layer."""
     import torch
 
@@ -140,7 +140,7 @@ def layer_importance(model, batches) -> list[float]:
             counts[li] += r.numel()
         return fn
 
-    handles = [b.register_forward_hook(hook(li)) for li, b in blocks]
+    handles = [mu.moe_module(b).register_forward_hook(hook(li)) for li, b in blocks]
     try:
         with torch.no_grad():
             for ids in batches:

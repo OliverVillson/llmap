@@ -12,6 +12,9 @@ The dense student, if present, gets a plain imatrix Q4_K_M. Writes:
   work/allocation.json   bit widths, size and speed per candidate
 Every intermediate (bf16 GGUF, imatrix) is reused if present, so a rerun after
 a crash only redoes the step that failed.
+
+Config.quant_format "w4a16" takes the vLLM path instead (stages/quantize_ct.py):
+a compressed-tensors checkpoint with int4 experts and FP8 attention, for a GPU.
 """
 
 from __future__ import annotations
@@ -194,6 +197,11 @@ def layer_importance(job: Job, n_layers: int) -> list[float] | None:
 
 
 def run_stage(job: Job) -> None:
+    if job.config.quant_format == "w4a16":
+        from stages import quantize_ct
+        return quantize_ct.run_stage(job)
+    if job.config.quant_format != "gguf":
+        raise ValueError(f'quant_format must be "gguf" or "w4a16", not {job.config.quant_format!r}')
     cfg, spec = job.config, job.spec
     cand_dir = job.path("work", "candidates")
     cand_dir.mkdir(exist_ok=True)

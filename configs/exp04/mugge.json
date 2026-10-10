@@ -1,0 +1,8 @@
+{
+  "code_eval_suites": ["multipl-e-py", "multipl-e-js", "multipl-e-ts", "multipl-e-cpp", "c-set"],
+  "code_eval_samples": 1,
+  "code_eval_fix": true,
+  "code_eval_format": "harness",
+  "code_eval_thinking": true,
+  "code_eval_max_tokens": 32768
+}

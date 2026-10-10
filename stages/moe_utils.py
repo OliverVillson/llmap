@@ -9,10 +9,20 @@ Shared experts (Qwen2-MoE, Qwen3.5/3.6: `shared_expert` plus a sigmoid
 `shared_expert_gate`) run on every token and are never scored or pruned; only
 the routed experts behind `gate` are.
 
+Gemma 4 26B-A4B (Gemma4TextDecoderLayer) has no MoE module: each decoder layer
+runs a dense MLP (`mlp`) and, beside it, `router` and fused `experts`
+(gate_up_proj [E, 2I, H], down_proj [E, H, I]) inline, so the layer is the block
+here. The router reads the post-attention residual (RMS-normed, times a learned
+`scale` and 1/sqrt(H)) and takes the softmax over all experts, the top-k
+renormalised to sum to 1, times a learned `per_expert_scale`; the experts read
+pre_feedforward_layernorm_2 of the same residual. The layer adds the post-normed
+outputs of both. Like a shared expert, the dense MLP is never scored or pruned.
+
 Qwen3.6-35B-A3B ships as a multimodal checkpoint (Qwen3_5MoeForConditionalGeneration).
 AutoModelForCausalLM loads only its text decoder (Qwen3_5MoeForCausalLM; the
-vision tower and the MTP head are skipped), which is what the pipeline wants.
-fix_saved_config makes such a text-only save consistent."""
+vision tower and the MTP head are skipped), which is what the pipeline wants;
+sft.load_causal_lm does the same for Gemma 4's MoE checkpoints. fix_saved_config
+makes such a text-only save consistent."""
 from __future__ import annotations
 
 import torch
@@ -32,18 +42,27 @@ def decoder_layers(model):
 
 
 def find_moe_blocks(model) -> list[tuple[int, nn.Module]]:
-    """(decoder layer index, moe block) for every sparse layer."""
+    """(decoder layer index, moe block) for every sparse layer. A Gemma 4 block
+    is the decoder layer itself."""
     layers = decoder_layers(model)
     out = []
     for i, layer in enumerate(layers):
         mlp = getattr(layer, "mlp", None) or getattr(layer, "block_sparse_moe", None)
         if mlp is not None and hasattr(mlp, "experts") and hasattr(mlp, "gate"):
             out.append((i, mlp))
+        elif hasattr(layer, "experts") and hasattr(layer, "router"):  # Gemma 4
+            out.append((i, layer))
     return out
 
 
+def _router(block) -> nn.Module:
+    """`gate` (an nn.Linear or a router module), or Gemma 4's `router`."""
+    return block.router if hasattr(block, "router") else block.gate
+
+
 def gate_weight(block) -> torch.Tensor:
-    return block.gate.weight  # [E, H] for both nn.Linear and router modules
+    gate = _router(block)
+    return getattr(gate, "proj", gate).weight  # [E, H]: nn.Linear, router modules, Gemma 4's router.proj
 
 
 def num_experts(block) -> int:
@@ -51,7 +70,9 @@ def num_experts(block) -> int:
 
 
 def top_k(block, config) -> int:
-    for obj, name in ((block, "top_k"), (block.gate, "top_k"), (config, "num_experts_per_tok")):
+    gate = _router(block)
+    for obj, name in ((block, "top_k"), (gate, "top_k"), (config, "num_experts_per_tok"),
+                      (getattr(gate, "config", config), "top_k_experts")):  # Gemma 4: its router's text config
         v = getattr(obj, name, None)
         if isinstance(v, int):
             return v
@@ -59,15 +80,18 @@ def top_k(block, config) -> int:
 
 
 def route(block, config, x: torch.Tensor):
-    """The routing the block itself uses. x: [N, H]. Returns
-    (weights [N, k], indices [N, k]). Router modules (5.x) are called as is,
-    since their renormalisation differs by model (Qwen3.5/3.6 always
-    renormalises the top-k, Qwen3-MoE only with norm_topk_prob); a plain
-    nn.Linear gate (4.x) gets the HF softmax, top-k and optional renormalisation."""
-    gate = block.gate
+    """The routing the block itself uses. x: [N, H], the router's input (for
+    Gemma 4 the post-attention residual). Returns (weights [N, k], indices
+    [N, k]), the weights the block puts on the expert outputs. Router modules
+    (5.x) are called as is, since their renormalisation differs by model
+    (Qwen3.5/3.6 always renormalises the top-k, Qwen3-MoE only with
+    norm_topk_prob, Gemma 4 renormalises and then applies per_expert_scale); a
+    plain nn.Linear gate (4.x) gets the HF softmax, top-k and optional
+    renormalisation."""
+    gate = _router(block)
     if not isinstance(gate, nn.Linear):
         out = gate(x)
-        if isinstance(out, tuple) and len(out) == 3:  # (logits, top-k weights, top-k indices)
+        if isinstance(out, tuple) and len(out) == 3:  # (logits or probs, top-k weights, top-k indices)
             return out[1], out[2]
     logits = F.linear(x, gate_weight(block))
     probs = F.softmax(logits, dim=-1, dtype=torch.float)
@@ -75,6 +99,26 @@ def route(block, config, x: torch.Tensor):
     if getattr(config, "norm_topk_prob", False):
         w = w / w.sum(dim=-1, keepdim=True)
     return w, idx
+
+
+def moe_module(block) -> nn.Module:
+    """Where a forward hook sees the routed experts at work: the module's forward
+    args start with the experts' input and it returns their weighted sum. The
+    block itself, or Gemma 4's experts (its decoder layer also runs attention and
+    the dense MLP)."""
+    return block.experts if hasattr(block, "router") else block
+
+
+def routed(block, config, args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(x [N, H], weights [N, k], indices [N, k]) from the forward args of
+    moe_module(block): the experts' input and the routing applied to it. Gemma 4's
+    layer routes the residual and hands its experts a normed copy plus that
+    routing (args x, indices, weights); other blocks are routed here as they
+    route themselves."""
+    x = args[0].reshape(-1, args[0].shape[-1])
+    if hasattr(block, "router"):
+        return x, args[2], args[1]
+    return (x, *route(block, config, x))
 
 
 def _act(experts, config):
@@ -86,7 +130,8 @@ def _act(experts, config):
 
 
 def expert_forward(block, config, j: int, x: torch.Tensor) -> torch.Tensor:
-    """Output of expert j on tokens x [n, H] -> [n, H] (without gate weight)."""
+    """Output of expert j on tokens x [n, H] -> [n, H] (without gate weight). x
+    is the experts' input (see routed)."""
     experts = block.experts
     if isinstance(experts, nn.ModuleList):
         return experts[j](x)
@@ -110,14 +155,13 @@ def prune_block(block, keep: list[int]) -> None:
     n = len(keep)
 
     # router
-    gate = block.gate
+    gate = _router(block)
     if isinstance(gate, nn.Linear):
-        new = nn.Linear(gate.in_features, n, bias=gate.bias is not None,
-                        device=gate.weight.device, dtype=gate.weight.dtype)
-        new.weight.copy_(gate.weight[keep_t])
-        if gate.bias is not None:
-            new.bias.copy_(gate.bias[keep_t])
-        block.gate = new
+        block.gate = _keep_rows(gate, keep_t)
+    elif hasattr(gate, "per_expert_scale"):  # Gemma 4: router.scale is per hidden dim and stays
+        gate.proj = _keep_rows(gate.proj, keep_t)
+        s = gate.per_expert_scale
+        gate.per_expert_scale = nn.Parameter(s.data[keep_t.to(s.device)].clone(), requires_grad=s.requires_grad)
     else:
         for name, p in list(gate.named_parameters(recurse=False)):
             if p.shape[0] == E:
@@ -142,6 +186,15 @@ def prune_block(block, keep: list[int]) -> None:
         for attr in ("num_experts", "num_local_experts"):
             if isinstance(getattr(experts, attr, None), int):
                 setattr(experts, attr, n)
+
+
+def _keep_rows(lin: nn.Linear, rows: torch.Tensor) -> nn.Linear:
+    new = nn.Linear(lin.in_features, len(rows), bias=lin.bias is not None,
+                    device=lin.weight.device, dtype=lin.weight.dtype)
+    new.weight.copy_(lin.weight[rows])
+    if lin.bias is not None:
+        new.bias.copy_(lin.bias[rows])
+    return new
 
 
 def set_config_experts(config, n: int) -> None:

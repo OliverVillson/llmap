@@ -37,6 +37,10 @@ class Config:
     # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
     # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50w95s-t).
     data_thinking: bool = False
+    # Sampling for thinking answers: the temperature here, top_k in the data stage and
+    # the eval. The Qwen3 cards say 0.6 and 20; Gemma 4's says 1.0 and 64.
+    data_thinking_temperature: float = 0.6
+    thinking_top_k: int = 20
     # Mugge-shaped heal data for code specs (stages/harness.py): this share of the train
     # rows is asked the way Mugge's harness asks (context pack in, files out), and
     # data_fix_rows fix rows are added: a failed draft and its error in, the teacher's
@@ -44,6 +48,25 @@ class Config:
     # extra answers sampled at temperature 1.0. 0 and 0 = plain rows only.
     data_harness_share: float = 0.0
     data_fix_rows: int = 0
+    # Contest rows for code specs: LiveCodeBench problems (code_eval_dir) older than the
+    # eval's, answered by the teacher (thinking per data_thinking) and kept when they pass
+    # their tests. Train only, never held out; must not overlap the eval (lcb_since).
+    data_contest_rows: int = 0  # contest rows to add; 0 = off
+    data_contest_before: str = "2024-10-01"  # only problems released before this date
+    data_contest_samples: int = 2  # teacher answers per problem; the shortest passing one is kept
+    data_contest_harness_share: float = 0.0  # share asked as a Mugge ticket instead of a plain prompt
+    # A .jsonl of ready chat rows added to train as they are, for code specs (train only, no
+    # teacher): e.g. aider transcripts from scripts/polyglot.py rows. A relative path is
+    # resolved in the job dir. The data stage marks them in train.jsonl with "meta": {"extra": true}
+    # (training ignores meta).
+    data_extra_rows: str = ""
+    # Each extra row appears this many times in train, so heal sees it that often per epoch.
+    data_extra_weight: int = 1
+    # Share of the calibration samples drawn from the extra rows, for REAP (reap_calib "task",
+    # reap_calib_samples) and w4a16 GPTQ (quant_calib_samples): each distinct row at most once,
+    # taken from each language (meta.language) in turn; the rest are the other train rows.
+    # 0 = train rows as they come, copies included.
+    calib_extra_share: float = 0.0
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
@@ -69,6 +92,12 @@ class Config:
     student_epochs: float = 2.0
     student_lr: float | None = None  # dense student LoRA lr; None uses LOBBOT_STUDENT_LR or 1e-4
     student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)
+    # Quantize: "gguf" = llama.cpp mixed-bit GGUF (below); "w4a16" = compressed-tensors
+    # for vLLM on a GPU (stages/quantize_ct.py): int4 experts, FP8 attention, BF16 rest.
+    quant_format: str = "gguf"
+    quant_calib_samples: int = 128  # w4a16: train.jsonl rows GPTQ calibrates on (see calib_extra_share)
+    quant_calib_len: int = 2048  # w4a16: tokens per calibration row
+    quant_fp8_attention: bool = True  # w4a16: False keeps attention, DeltaNet, lm_head, Gemma's MLP BF16
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"
@@ -104,14 +133,24 @@ class Config:
     # Mugge's harness asks (stages/harness.py: a ticket in, files out), fixes too.
     code_eval_format: str = "plain"
     # Route each token to this many experts instead of the model's own count (0 keeps
-    # it). A llama-server override at serve time, so a top-k test needs no rebuild.
+    # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
+    # so a top-k test needs no rebuild.
     eval_experts_used: int = 0
     # llama-server KV cache type at eval ("q8_0" halves it, so more long thinking
-    # answers run at once); "" keeps llama.cpp's f16.
+    # answers run at once); "" keeps llama.cpp's f16. vLLM: --kv-cache-dtype in eval_vllm_args.
     eval_kv_type: str = ""
+    # vLLM serves the candidates that are HF checkpoint dirs: its --reasoning-parser
+    # ("" = none; the <think> tags then stay in the content and are split off there;
+    # "gemma4" for Gemma 4, whose thought channel needs it: without it vLLM drops the
+    # channel's special tokens and the thinking runs into the answer),
+    # and extra `vllm serve` args, e.g. ["--speculative-config", "{...}"].
+    eval_reasoning_parser: str = "qwen3"
+    eval_vllm_args: list[str] = field(default_factory=list)
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
-    # Models to evaluate instead of work/allocation.json: {name: gguf path}. Lets an
-    # eval-only job (pipeline.py --only eval) score an uncompressed reference.
+    # Models to evaluate instead of work/allocation.json: {name: path}, a GGUF (served
+    # with llama-server) or an HF checkpoint dir with a config.json (BF16 or
+    # compressed-tensors, served with vLLM). Lets an eval-only job (pipeline.py
+    # --only eval) score an uncompressed reference.
     eval_candidates: dict[str, str] = field(default_factory=dict)
     # Reference job for code scores: its out/eval.json's pass@1 is the 100% mark
     # (experiment 01's `ref`). Relative paths resolve against this job's parent dir.

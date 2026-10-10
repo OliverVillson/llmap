@@ -1,4 +1,6 @@
 import json
+import shutil
+from pathlib import Path
 
 from stages.eval import agreement
 from stages.package import modelfile, template_family
@@ -81,3 +83,24 @@ def test_eval_cap_follows_per_job_data_cap(monkeypatch):
     assert data.answer_max_tokens(cfg) == 6000 and data.max_model_len(cfg) == 16384
     assert ev.limits(cfg) == (6000, 6000 + 4096)
     assert ev.limits(Config())[0] == max(2048, data.ANSWER_MAX_TOKENS)  # no override: env knob / default
+
+
+def test_package_links_a_vllm_checkpoint_dir(tmp_path):
+    """A vLLM checkpoint winner is hard-linked into out/model/, not copied."""
+    from stages import package
+    from stages._util import Job
+
+    src = tmp_path / "work" / "candidates" / "r59-t"
+    src.mkdir(parents=True)
+    (src / "config.json").write_text("{}")
+    (src / "model.safetensors").write_bytes(b"w" * 10)
+    (tmp_path / "out").mkdir()
+    shutil.copy(Path(__file__).resolve().parents[1] / "examples" / "python-utils.code.taskspec.json",
+                tmp_path / "taskspec.json")
+    (tmp_path / "out" / "eval.json").write_text(json.dumps({"winner": "r59-t"}))
+    (tmp_path / "work" / "allocation.json").write_text(json.dumps({"candidates": {"r59-t": {"path": str(src)}}}))
+    job = Job(tmp_path)
+    package.run_stage(job)
+    out = tmp_path / "out" / "model" / "model.safetensors"
+    assert out.read_bytes() == b"w" * 10 and out.stat().st_ino == (src / "model.safetensors").stat().st_ino
+    assert job.is_done("package") and not (tmp_path / "out" / "model.gguf").exists()

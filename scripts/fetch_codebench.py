@@ -69,21 +69,15 @@ def decode_cases(s: str) -> list[dict]:
         return json.loads(raw)
 
 
-def functional_tests(func: str, cases: list[dict]) -> str:
-    data = json.dumps([[c["input"], c["output"]] for c in cases])
-    return (
-        "import json as _json\n"
-        f"_cases = _json.loads({data!r})\n"
-        "_f = getattr(Solution(), " + repr(func) + ")\n"
-        "for _i, (_inp, _out) in enumerate(_cases):\n"
-        "    _got = _f(*[_json.loads(_l) for _l in _inp.split('\\n') if _l.strip()])\n"
-        "    _got = list(_got) if isinstance(_got, tuple) else _got\n"
-        "    _want = _json.loads(_out)\n"
-        "    assert _got == _want, f'case {_i}: expected {_want!r}, got {_got!r}'\n")
+def functional_tests(func: str, cases: list[dict]) -> dict:
+    """A LeetCode-style problem's tests as data; stages/codebench.py builds the harness,
+    with its time limit per case, at eval time."""
+    return {"func": func, "cases": [[c["input"], c["output"]] for c in cases]}
 
 
 def lcb_row(r: dict, max_cases: int) -> dict | None:
-    cases = decode_cases(r["public_test_cases"]) + decode_cases(r["private_test_cases"])
+    public = decode_cases(r["public_test_cases"])
+    cases = public + decode_cases(r["private_test_cases"])
     if not cases:
         return None
     cases = cases[:max_cases]
@@ -97,7 +91,8 @@ def lcb_row(r: dict, max_cases: int) -> dict | None:
     else:
         tests = [{"input": c["input"], "output": c["output"]} for c in cases]
     return {"id": f"{r['platform']}/{r['question_id']}", "language": "python", "prompt": prompt, "stub": "",
-            "entry": "", "tests": tests, "date": str(r["contest_date"])[:10], "difficulty": r.get("difficulty")}
+            "entry": "", "tests": tests, "date": str(r["contest_date"])[:10], "difficulty": r.get("difficulty"),
+            "public": min(len(public), len(cases))}  # the first cases are the examples in the problem text
 
 
 def fetch_livecodebench(out: Path, max_cases: int) -> None:

@@ -8,8 +8,14 @@ then drops bad answers (empty, truncated, invalid JSON when the output format
 is JSON) and splits off a held-out set. Code TaskSpecs (task_type "code") differ:
 the teacher writes each new input together with its tests, and an answer is kept only
 when it builds and passes those tests in stages/sandbox.py. Seeds must pass their own
-tests first. Writes:
-  data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included
+tests first. Code specs can add contest rows (Config.data_contest_rows): LiveCodeBench
+problems released before data_contest_before, so older than the ones the eval scores
+(lcb_since), each answered data_contest_samples times by the teacher; the shortest answer
+that passes every test becomes a train row (never held out). Code specs can also add ready
+rows from a file (Config.data_extra_rows), train only, data_extra_weight times each and marked
+"meta": {"extra": true} so calibration can pick them (Config.calib_extra_share). Writes:
+  data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included;
+                      every row shuffled, then the extra rows' further copies
   data/heldout.jsonl  held-out inputs with teacher reference answers (inputs written
                       by Gemini when Config.testgen_model and GEMINI_API_KEY are set;
                       code specs: always teacher inputs, rows add "tests" and "language")
@@ -39,8 +45,9 @@ import zlib
 from dataclasses import dataclass
 
 from common.progress import emit
-from stages import harness, sandbox, testgen
+from stages import codebench, harness, sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
+from stages.taskdata import GEMMA4_THINK, think_tags
 
 STAGE = "data"
 N_SCENARIOS = int(os.environ.get("LOBBOT_DATA_SCENARIOS", 40))
@@ -55,6 +62,10 @@ ATTN_BACKEND = os.environ.get("LOBBOT_DATA_ATTN_BACKEND", "FLASH_ATTN")
 # FlashInfer's top-p/top-k sampler is JIT-built the same way during warmup.
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 OVERSHOOT = 1.3      # extra inputs requested to cover dedupe and answer filtering
+CONTEST_OVERSHOOT = 1.5  # contest problems asked per wanted row; the teacher solves maybe 60-80%
+# Contest answers go to vLLM in chunks this big, not BATCH: each chunk waits for its slowest
+# answer, and with long thinking answers small chunks leave the GPU mostly idle at their end.
+CONTEST_BATCH = 2048
 MAX_ROUNDS = 6
 MAX_INPUT_CHARS = 6000  # keeps every answer prompt well inside MAX_MODEL_LEN
 FEWSHOT = 6          # seed examples shown to the teacher when answering
@@ -163,17 +174,21 @@ def answer_messages(spec, shots, text: str) -> list[dict]:
 
 # --------------------------------------------------------------------------- parsing & filters
 
-_THINK = re.compile(r"<think>.*?</think>\s*", re.S)
+_THINK = re.compile(r"(<think>.*?</think>|<\|channel>.*?<channel\|>)\s*", re.S)
 _FENCE = re.compile(r"^```[\w-]*\s*\n?|\n?```\s*$")
 
 
 def split_think(text: str) -> tuple[str, str]:
     """(thinking, answer) from a raw generation. The thinking ends at the last
-    </think>; templates that open <think> in the prompt leave only the closing tag."""
-    if "</think>" not in text:
-        return "", text
-    head, tail = text.rsplit("</think>", 1)
-    return head.replace("<think>", "", 1).strip(), tail
+    </think>; templates that open <think> in the prompt leave only the closing tag.
+    Gemma 4 thinks in a thought channel: <|channel>thought, the thinking, <channel|>."""
+    if "</think>" in text:
+        head, tail = text.rsplit("</think>", 1)
+        return head.replace("<think>", "", 1).strip(), tail
+    if "<channel|>" in text:
+        head, tail = text.rsplit("<channel|>", 1)
+        return head.split("<|channel>", 1)[-1].strip().removeprefix("thought\n").strip(), tail
+    return "", text
 
 
 def clean(text: str) -> str:
@@ -270,17 +285,22 @@ class Gen:
 
 
 class Teacher:
-    def __init__(self, model_path: str, max_len: int = MAX_MODEL_LEN):
+    def __init__(self, model_path: str, max_len: int = MAX_MODEL_LEN, top_k: int = 20):
         from vllm import LLM, SamplingParams
 
-        self.SamplingParams = SamplingParams
+        self.SamplingParams, self.top_k = SamplingParams, top_k
         self.llm = LLM(model=model_path, max_model_len=max_len, gpu_memory_utilization=GPU_UTIL,
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
+        # Gemma 4's thought channel opens and closes with special tokens, which the
+        # decoded text drops unless told to keep them; split_think needs them.
+        template = getattr(self.llm.get_tokenizer(), "chat_template", None)
+        self.keep_special = isinstance(template, str) and think_tags(template) == GEMMA4_THINK
 
     def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
-                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}))
+                                 max_tokens=max_tokens, **({"top_k": self.top_k} if thinking else {}),
+                                 **({"skip_special_tokens": False} if thinking and self.keep_special else {}))
         try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
             res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
         except TypeError:
@@ -288,10 +308,11 @@ class Teacher:
         return [Gen(r.outputs[0].text, r.outputs[0].finish_reason != "length") for r in res]
 
 
-def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label, thinking: bool = False) -> list[Gen]:
+def chat_batched(teacher, convs, temperature, max_tokens, lo, hi, label, thinking: bool = False,
+                 batch: int = BATCH) -> list[Gen]:
     out: list[Gen] = []
-    for i in range(0, len(convs), BATCH):
-        out += teacher.chat(convs[i:i + BATCH], temperature, max_tokens, thinking)
+    for i in range(0, len(convs), batch):
+        out += teacher.chat(convs[i:i + batch], temperature, max_tokens, thinking)
         emit(STAGE, pct=lo + (hi - lo) * len(out) / len(convs), msg=f"{label} {len(out)}/{len(convs)}")
     return out
 
@@ -313,6 +334,8 @@ class DryRunTeacher:
         prompt = conv[-1]["content"]
         if "real-world scenarios" in prompt:
             return Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True)
+        if conv[0]["content"] == codebench.SYSTEM or prompt.startswith("Ticket: livecodebench-"):
+            return self._contest(prompt)
         if self.spec.is_code:
             return self._code(prompt)
         if "NEW, realistic inputs" in prompt:
@@ -345,6 +368,22 @@ class DryRunTeacher:
             return Gen(next(e for e in seeds if e is not own).output, True)
         return Gen(f"Here is the code:\n```\n{own.output}\n```", True)
 
+    def _contest(self, prompt: str) -> Gen:
+        """LiveCodeBench problems (contest_rows). The dry-run ones (tests/test_data.py) all add
+        two integers, read from stdin or passed to a Solution method; answers are right, some
+        with an extra comment line, wrong (they subtract) or truncated."""
+        m = re.search(r"def (\w+)\(self", prompt)
+        r = self.rng.random()
+        op = "-" if r < 0.15 else "+"
+        code = (f"class Solution:\n    def {m.group(1)}(self, a, b):\n        return a {op} b" if m
+                else f"a, b = map(int, input().split())\nprint(a {op} b)")
+        if r > 0.7:
+            code = "# add the two numbers\n" + code
+        if prompt.startswith("Ticket: "):
+            src = re.search(r"^Files you own \(write each in full\): (\S+)", prompt, re.M).group(1)
+            return Gen(harness.render_files({src: code}, "adds them"), not 0.15 <= r < 0.25)
+        return Gen(f"Here it is:\n```python\n{code}\n```", not 0.15 <= r < 0.25)
+
 
 # --------------------------------------------------------------------------- stage
 
@@ -359,13 +398,16 @@ def run_stage(job: Job) -> None:
     if spec.is_code:
         stats.update(task_type="code", language=spec.language)
         check_seeds(spec)
+    # contest problems load (and their date guard runs) before the teacher does, extra rows too
+    contest = contest_problems(cfg) if spec.is_code and cfg.data_contest_rows > 0 else []
+    extra = extra_rows(job, stats) if spec.is_code and cfg.data_extra_rows else []
 
     if DRY_RUN:
         teacher = DryRunTeacher(spec, rng)
     else:
         model = job.model_path(cfg.teacher)
         emit(STAGE, pct=1, msg=f"loading teacher {model}")
-        teacher = Teacher(model, max_model_len(cfg))
+        teacher = Teacher(model, max_model_len(cfg), cfg.thinking_top_k)
     stats["load_s"] = round(time.monotonic() - t0, 1)
     emit(STAGE, pct=10, msg="teacher loaded")
 
@@ -444,7 +486,7 @@ def run_stage(job: Job) -> None:
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
     think = cfg.data_thinking
     # Thinking samples at Qwen's recommended 0.6; greedy-ish decoding makes it loop.
-    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 45, 95,
+    gens = chat_batched(teacher, convs, cfg.data_thinking_temperature if think else 0.3, answer_max_tokens(cfg), 45, 95,
                         "teacher answering" + (" (thinking)" if think else ""), think)
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
@@ -495,16 +537,21 @@ def run_stage(job: Job) -> None:
     if spec.is_code and (cfg.data_harness_share > 0 or cfg.data_fix_rows > 0):
         held = {r["messages"][1]["content"] for r in heldout}
         train = harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats)
+    if contest:  # train only: the held-out set stays the task's own
+        train += contest_rows(cfg, teacher, rng, contest, stats)
+    train += extra  # train only, like contest rows
     if not think:  # the human seeds have no thinking, and every row of a thinking model thinks
         train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
     if think:
         stats["thinking_chars_median"] = statistics.median(
-            len(r["messages"][2]["reasoning_content"]) for r in train) if train else 0
+            len(r["messages"][-1].get("reasoning_content", "")) for r in train) if train else 0
     rng.shuffle(train)
+    calib = train[:1000]  # without the copies below
+    train += extra * (cfg.data_extra_weight - 1)  # last, so a prefix of train.jsonl reads each row once
     write_jsonl(job.path("data", "train.jsonl"), train)
     write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
-    job.path("data", "calib.txt").write_text(
-        "\n\n".join(r["messages"][1]["content"] + "\n" + _with_thinking(r["messages"][2]) for r in train[:1000])
+    job.path("data", "calib.txt").write_text(  # the last exchange: extra rows can be whole chats
+        "\n\n".join(r["messages"][-2]["content"] + "\n" + _with_thinking(r["messages"][-1]) for r in calib)
     )
     stats.update(train=len(train), heldout=len(heldout), elapsed_s=round(time.monotonic() - t0, 1))
     job.path("data", "stats.json").write_text(json.dumps(stats, indent=2))
@@ -564,12 +611,12 @@ def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) 
         cmd = cmds[0] if r.reason == "compile_error" and len(cmds) > 1 else cmds[-1]
         out_text = harness.tail(r.output, 2000) or ("(timed out)" if r.reason == "timeout" else "(no output)")
         convs.append(harness.fix_messages(task_ticket(spec, s, a), cmd, out_text))
-    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 96, 98,
+    gens = chat_batched(teacher, convs, cfg.data_thinking_temperature if think else 0.3, answer_max_tokens(cfg), 96, 98,
                         "teacher fixing drafts" + (" (thinking)" if think else ""), think)
     drops, fixes = {}, []
     for (s, _, _), conv, g in zip(pool, convs, gens):
         reasoning, text = split_think(g.text) if think else ("", g.text)
-        files, note = harness.parse_files(text)
+        files, note = harness.parse_files(text, [src])
         why = ("truncated" if not g.finished else "no_thinking_end" if think and not reasoning
                else "no_file" if not files.get(src, "").strip() else "")
         if why:
@@ -587,6 +634,99 @@ def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) 
     stats.update(fix_pool=len(pool), fix_rows=n_fix, fix_dropped=drops)
     print(f"[data] harness: {n_write} write rows, {n_fix} fix rows from {len(pool)} drafts, dropped {drops}", flush=True)
     return out
+
+
+def contest_problems(cfg) -> list[dict]:
+    """LiveCodeBench problems (every release, from code_eval_dir) released before
+    data_contest_before. The eval scores the ones released on or after lcb_since and the
+    undated ones, so a cut-off after lcb_since is refused and both are dropped here."""
+    before, since = cfg.data_contest_before, cfg.lcb_since
+    if before > since:
+        raise ValueError(f"data_contest_before {before} is after lcb_since {since}: contest rows would "
+                         "train on LiveCodeBench problems the eval scores")
+    rows = codebench.load_suite("livecodebench", cfg.code_eval_dir)
+    # long statements are dropped like long task inputs, so every prompt fits the teacher's context
+    out = [p for p in rows if p.get("date") and p["date"][:10] < before and p["date"][:10] < since
+           and len(p["prompt"]) <= MAX_INPUT_CHARS]
+    if not out:
+        raise RuntimeError(f"no LiveCodeBench problems released before {before} in {cfg.code_eval_dir}")
+    return out
+
+
+def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
+    """Up to data_contest_rows train rows from contest problems (contest_problems), so heal and
+    REAP calibration see contest reasoning. Each problem is asked data_contest_samples times,
+    as a plain prompt or, with probability data_contest_harness_share, as a Mugge ticket, and
+    keeps its shortest answer (thinking plus code) that passes every test. The row's answer is
+    that code rendered canonically (one fenced block, or the ticket's file), not the teacher's
+    prose; its thinking goes in reasoning_content."""
+    think, n = cfg.data_thinking, max(1, cfg.data_contest_samples)
+    n_avail = len(problems)
+    rng.shuffle(problems)
+    asks = []  # (problem, messages, asked as a ticket)
+    for p in problems[:int(cfg.data_contest_rows * CONTEST_OVERSHOOT)]:
+        mugge = rng.random() < cfg.data_contest_harness_share
+        msgs = (harness.write_messages(codebench.ticket(p)) if mugge else
+                [{"role": "system", "content": codebench.SYSTEM},
+                 {"role": "user", "content": codebench.build_prompt(p)}])
+        asks.append((p, msgs, mugge))
+    gens = chat_batched(teacher, [m for _, m, _ in asks for _ in range(n)], cfg.data_thinking_temperature if think else 0.3,
+                        answer_max_tokens(cfg), 98, 99, "teacher answering contest problems"
+                        + (" (thinking)" if think else ""), think, batch=CONTEST_BATCH)
+    drops, cands, items = {}, [], []  # cands: (problem index, code, note, thinking) for the sandbox
+    for k, g in enumerate(gens):
+        p, _, mugge = asks[k // n]
+        reasoning, text = split_think(g.text) if think else ("", g.text)
+        code = codebench.harness_code(p, text) if mugge else codebench.extract_code(text)
+        why = ("truncated" if not g.finished else "no_thinking_end" if think and not reasoning
+               else "empty" if not code.strip() else "")
+        if why:
+            drops[why] = drops.get(why, 0) + 1
+            continue
+        note = harness.parse_files(text, [sandbox.layout(p["language"])[0]])[1] if mugge else ""
+        cands.append((k // n, code, note, reasoning))
+        items.append((p["language"], *codebench.assemble(p, text, code), codebench.time_limit(p)))
+    emit(STAGE, pct=99, msg=f"running tests for {len(items)} contest answers")
+    best: dict[int, tuple] = {}  # problem index -> (code, note, thinking) of its shortest passing answer
+    for (i, code, note, reasoning), r in zip(cands, sandbox.run_many(items)):
+        if not r.passed:
+            drops[r.reason] = drops.get(r.reason, 0) + 1
+        elif i not in best or len(code) + len(reasoning) < len(best[i][0]) + len(best[i][2]):
+            best[i] = (code, note, reasoning)
+    out, n_ticket = [], 0
+    for i in sorted(best)[:cfg.data_contest_rows]:
+        (p, msgs, mugge), (code, note, reasoning) = asks[i], best[i]
+        lang = p["language"]
+        answer = (harness.render_files({sandbox.layout(lang)[0]: code}, note) if mugge
+                  else f"```{codebench.FENCE[lang]}\n{code.rstrip()}\n```")
+        out.append(_chat_row(msgs, answer, reasoning))
+        n_ticket += mugge
+    stats.update(contest_available=n_avail, contest_problems=len(asks), contest_answers=len(gens),
+                 contest_passed_any=len(best), contest_rows=len(out), contest_ticket_rows=n_ticket,
+                 contest_dropped=drops)
+    if think:
+        stats["contest_thinking_chars_median"] = statistics.median(
+            len(r["messages"][-1].get("reasoning_content", "")) for r in out) if out else 0
+    print(f"[data] contest: {len(out)} rows ({n_ticket} as tickets) from {len(asks)} LiveCodeBench problems "
+          f"released before {cfg.data_contest_before}, {len(best)} solved, dropped {drops}", flush=True)
+    return out
+
+
+def extra_rows(job: Job, stats: dict) -> list[dict]:
+    """The ready chat rows of Config.data_extra_rows, as they are but marked "meta": {"extra": true}
+    (beside any meta they bring, e.g. their language): each a {"messages": [...]} ending in the
+    assistant's answer, e.g. teacher transcripts in aider's format."""
+    cfg = job.config
+    if cfg.data_extra_weight < 1:
+        raise ValueError(f"data_extra_weight must be 1 or more, not {cfg.data_extra_weight}")
+    path = job.root / cfg.data_extra_rows  # an absolute path stays as is
+    rows = read_jsonl(path)
+    for i, r in enumerate(rows, 1):
+        if (r.get("messages") or [{}])[-1].get("role") != "assistant":
+            raise ValueError(f"{path} line {i}: not a chat row ending in an assistant message")
+    stats.update(extra_rows=len(rows), extra_weight=cfg.data_extra_weight)
+    print(f"[data] {len(rows)} extra rows from {path}, {cfg.data_extra_weight}x in train", flush=True)
+    return [{**r, "meta": {**(r.get("meta") or {}), "extra": True}} for r in rows]
 
 
 def _chat_row(msgs: list[dict], answer: str, reasoning: str = "") -> dict:
@@ -614,7 +754,8 @@ def _heldout_row(spec, r: dict, tests_of: dict[str, str]) -> dict:
 
 def _row(sys: str, inp: str, out: str, reasoning: str = "") -> dict:
     """A chat row. The teacher's thinking, when kept, goes in reasoning_content (the
-    field Qwen's chat templates render inside <think>); taskdata trains on it."""
+    field Qwen's chat templates render inside <think>, Gemma 4's in its thought
+    channel); taskdata trains on it."""
     return {"messages": [
         {"role": "system", "content": sys},
         {"role": "user", "content": inp},

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -110,7 +111,7 @@ def test_gemini_written_heldout(job, monkeypatch):
     fake = [f"gemini test input number {i} with enough words" for i in range(25)]
     monkeypatch.setenv("GEMINI_API_KEY", "g-key")
     monkeypatch.setattr(data, "DRY_RUN", False)
-    monkeypatch.setattr(data, "Teacher", lambda path, max_len=None: data.DryRunTeacher(j.spec, random.Random(0)))
+    monkeypatch.setattr(data, "Teacher", lambda path, max_len=None, top_k=20: data.DryRunTeacher(j.spec, random.Random(0)))
     monkeypatch.setattr(testgen, "held_out_inputs", lambda spec, cfg, n, seen, *a, **k: fake[:n])
     data.run_stage(j)
     held, train = read(job / "data/heldout.jsonl"), read(job / "data/train.jsonl")
@@ -279,3 +280,286 @@ def test_tokenize_trains_thinking_turns_on_the_thinking():
 
     off = tokenize_example(CharTok(), [*msgs[:2], {"role": "assistant", "content": "x = 1"}], 10_000)
     assert _prompt(off).endswith("<think>\n\n</think>\n\n") and _target(off) == "x = 1<|im_end|>"
+
+
+class GemmaCharTok(CharTok):
+    """Gemma 4's chat format: thinking on puts <|think|> in the system turn and leaves
+    the thought channel to the model; thinking off closes an empty one; a model turn's
+    reasoning_content is rendered as its thought channel."""
+    chat_template = "gemma-ish <|turn>"
+    eos_token = "<eos>"
+
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False):
+        empty = "" if enable_thinking else "<|channel>thought\n<channel|>"
+        text = "<bos><|turn>system\n" + ("<|think|>\n" if enable_thinking else "") + msgs[0]["content"] + "<turn|>\n"
+        for m in msgs[1:]:
+            if m["role"] == "user":
+                text += f"<|turn>user\n{m['content']}<turn|>\n"
+            else:
+                thought = m.get("reasoning_content")
+                channel = f"<|channel>thought\n{thought}\n<channel|>" if thought else empty
+                text += f"<|turn>model\n{channel}{m['content']}<turn|>\n"
+        return text + ("<|turn>model\n" + empty if add_generation_prompt else "")
+
+
+def test_tokenize_trains_gemma4_thinking_in_its_thought_channel():
+    from stages.taskdata import tokenize_example
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "add"},
+            {"role": "assistant", "content": "x = 1", "reasoning_content": "plan it"}]
+    ex = tokenize_example(GemmaCharTok(), msgs, 10_000)
+    assert _prompt(ex).endswith("<|think|>\nsys<turn|>\n<|turn>user\nadd<turn|>\n<|turn>model\n")
+    assert _target(ex) == "<|channel>thought\nplan it\n<channel|>x = 1<turn|>"
+    # the row is the conversation as Gemma's template renders it with the thinking
+    assert _prompt(ex) + _target(ex) + "\n" == GemmaCharTok().apply_chat_template(msgs, enable_thinking=True)
+
+    off = tokenize_example(GemmaCharTok(), [*msgs[:2], {"role": "assistant", "content": "x = 1"}], 10_000)
+    assert _prompt(off).endswith("<|turn>model\n<|channel>thought\n<channel|>") and _target(off) == "x = 1<turn|>"
+
+
+def test_split_think_reads_qwen_tags_and_gemma4_thought_channel():
+    from stages.data import clean, split_think
+    from stages.taskdata import GEMMA4_THINK, QWEN_THINK, think_tags
+
+    assert split_think("<think>\nplan it\n</think>\n\nx = 1") == ("plan it", "\n\nx = 1")
+    assert split_think("plan it\n</think>\n\nx = 1") == ("plan it", "\n\nx = 1")  # template opened it
+    assert split_think("<|channel>thought\nplan it\n<channel|>x = 1") == ("plan it", "x = 1")
+    assert split_think("<|channel>thought\nplan it, never closed") == ("", "<|channel>thought\nplan it, never closed")
+    assert clean("<|channel>thought\nplan it<channel|>x = 1") == "x = 1"
+    assert think_tags(GemmaCharTok.chat_template) == GEMMA4_THINK and think_tags(None) == QWEN_THINK
+    # a prompt is told by its last turn, whatever its messages quote
+    assert think_tags("<|im_start|>user\nwhat is <|turn>?<|im_end|>\n<|im_start|>assistant\n") == QWEN_THINK
+
+
+# --------------------------------------------------------------------------- contest rows
+
+ADD_STDIN = "a, b = map(int, input().split())\nprint(a + b)"
+ADD_FUNC = "class Solution:\n    def add(self, a, b):\n        return a + b"
+
+
+def lcb_problem(name, date, functional):
+    """A tiny LiveCodeBench row in scripts/fetch_codebench.py's shape: add two integers,
+    read from stdin or passed to Solution.add (the problems DryRunTeacher can solve)."""
+    row = {"id": f"atcoder/{name.replace(' ', '_')}", "language": "python", "stub": "", "entry": "", "date": date,
+           "prompt": f"{name}: read A and B and print A + B.",
+           "tests": [{"input": "1 2\n", "output": "3\n"}, {"input": "10 -3\n", "output": "7\n"}]}
+    if functional:
+        row.update(id=f"leetcode/{name.replace(' ', '-')}",
+                   tests={"func": "add", "cases": [["1\n2", "3"], ["-4\n9", "5"]]},
+                   prompt=f"{name}: return a + b.\n\nUse this starter code:\n```python\nclass Solution:\n"
+                          "    def add(self, a: int, b: int) -> int:\n        \n```")
+    return row
+
+
+def write_lcb(d, old=12):
+    """old problems released before 2024-10-01; recent ones on or after it (some on or
+    after lcb_since 2025-01-01), and one undated, which the eval also scores."""
+    d.mkdir(exist_ok=True)
+    rows = [lcb_problem(f"Old problem {i}", f"2024-0{1 + i % 9}-15", i % 2) for i in range(old)]
+    rows += [lcb_problem(f"Recent problem {i}", date, i % 2)
+             for i, date in enumerate(["2024-10-01", "2024-12-31", "2025-01-01", "2025-06-01"])]
+    rows.append(lcb_problem("Recent problem undated", None, 0))
+    (d / "livecodebench.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return d
+
+
+def test_contest_problems_date_guard(tmp_path):
+    """Only problems released before data_contest_before; undated ones never; a cut-off after
+    the eval's lcb_since is refused."""
+    from stages import data
+    from stages._util import Config
+
+    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01")
+    got = data.contest_problems(cfg)
+    assert len(got) == 12 and all(p["prompt"].startswith("Old problem") for p in got)
+    cfg.data_contest_before = "2025-01-01"  # the latest allowed: everything before the eval's problems
+    assert sorted({p["date"] for p in data.contest_problems(cfg)})[-2:] == ["2024-10-01", "2024-12-31"]
+    cfg.data_contest_before = "2025-01-02"
+    with pytest.raises(ValueError, match="after lcb_since"):
+        data.contest_problems(cfg)
+
+
+def test_contest_cutoff_after_the_eval_stops_the_stage_early(tmp_path, monkeypatch):
+    from stages import data
+    from stages._util import Job
+
+    job = code_job(tmp_path, "python")
+    (job / "config.json").write_text(json.dumps({
+        "n_generate": 120, "n_heldout": 10, "code_eval_dir": str(write_lcb(tmp_path / "bench")),
+        "data_contest_rows": 5, "data_contest_before": "2025-03-01", "lcb_since": "2025-01-01"}))
+    monkeypatch.setattr(data, "DRY_RUN", False)
+    monkeypatch.setattr(data, "Teacher", lambda *a, **k: pytest.fail("teacher loaded before the date check"))
+    with pytest.raises(ValueError, match="after lcb_since"):
+        data.run_stage(Job(job))
+
+
+class ScriptedTeacher:
+    """Asked the same problem five times, answers: wrong code, right code cut off, right
+    code whose thinking never closed, right code after long thinking, right code after short
+    thinking. Plain answers wrap the code in prose; tickets answer with the file."""
+
+    def __init__(self):
+        self.asked: dict[str, int] = {}
+
+    def chat(self, convs, temperature, max_tokens, thinking=False):
+        from stages import harness
+        from stages.data import Gen
+
+        out = []
+        for conv in convs:
+            prompt = conv[-1]["content"]
+            k = self.asked[prompt] = self.asked.get(prompt, -1) + 1
+            right = ADD_FUNC if "def add(self" in prompt else ADD_STDIN
+            code, think, finished = [(right.replace("+", "-"), "short", True), (right, "s", False), (right, None, True),
+                                     (right, "long " * 40, True), (right, "short", True)][k]
+            body = (harness.render_files({"prog.py": code}, "adds them") if prompt.startswith("Ticket: ")
+                    else f"Sure:\n```python\n{code}\n```\nThis adds them.")
+            out.append(Gen(body if think is None else f"{think}\n</think>\n\n{body}", finished))
+        return out
+
+
+def test_contest_rows_keep_the_shortest_passing_answer(tmp_path):
+    import random
+
+    from stages import codebench, data, harness
+    from stages._util import Config
+
+    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01", data_thinking=True,
+                 data_contest_rows=8, data_contest_samples=5, data_contest_harness_share=0.5)
+    stats: dict = {}
+    rows = data.contest_rows(cfg, ScriptedTeacher(), random.Random(0), data.contest_problems(cfg), stats)
+    assert len(rows) == 8  # 12 asked (1.5x), all solved, stopped at data_contest_rows
+    tickets = [r for r in rows if r["messages"][0]["content"] == harness.SYSTEM]
+    assert 0 < len(tickets) < 8
+    for r in rows:
+        sys_msg, user, ans = r["messages"]
+        right = ADD_FUNC if "def add(self" in user["content"] else ADD_STDIN
+        assert ans["reasoning_content"] == "short"  # the shortest passing answer, not the first
+        if r in tickets:
+            assert user["content"].startswith("Ticket: livecodebench-")
+            assert ans["content"] == harness.render_files({"prog.py": right}, "adds them")
+        else:
+            assert sys_msg["content"] == codebench.SYSTEM and "Old problem" in user["content"]
+            assert ans["content"] == f"```python\n{right}\n```"  # the code only, without the prose
+    assert stats == {"contest_available": 12, "contest_problems": 12, "contest_answers": 60, "contest_passed_any": 12,
+                     "contest_rows": 8, "contest_ticket_rows": len(tickets), "contest_thinking_chars_median": 5,
+                     "contest_dropped": {"test_failed": 12, "truncated": 12, "no_thinking_end": 12}}
+
+
+def test_dry_run_adds_contest_rows(tmp_path):
+    """Contest rows land in train and calib.txt with the teacher's thinking and code that
+    passes; recent problems appear nowhere and contest problems are never held out."""
+    from stages import codebench, harness, sandbox
+
+    job = code_job(tmp_path, "python")
+    bench = write_lcb(tmp_path / "bench", old=20)
+    (job / "config.json").write_text(json.dumps({
+        "n_generate": 120, "n_heldout": 10, "data_thinking": True, "code_eval_dir": str(bench),
+        "lcb_since": "2025-01-01", "data_contest_rows": 10, "data_contest_harness_share": 0.5}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    contest = [r for r in train if "Old problem" in r["messages"][1]["content"]]
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert len(contest) == 10 == stats["contest_rows"] and stats["train"] == len(train)
+    assert stats["contest_problems"] == 15 and stats["contest_answers"] == 30 and stats["contest_dropped"]
+    assert stats["contest_thinking_chars_median"] == len("Let me work this out first.")
+    calib, held = (job / "data/calib.txt").read_text(), (job / "data/heldout.jsonl").read_text()
+    assert "Recent problem" not in json.dumps(train) + held + calib and "Old problem" not in held
+    assert "Old problem" in calib and "[data] contest: 10 rows" in p.stdout
+
+    probs = codebench.load_suite("livecodebench", bench)
+    items, forms = [], set()
+    for r in contest:
+        user, ans = r["messages"][1]["content"], r["messages"][2]
+        assert ans["reasoning_content"] == "Let me work this out first." and "</think>" not in ans["content"]
+        prob = next(q for q in probs if q["prompt"].rstrip() in user)
+        if user.startswith("Ticket: "):
+            files, note = harness.parse_files(ans["content"], ["prog.py"])
+            assert list(files) == ["prog.py"] and ans["content"] == harness.render_files(files, note)
+            code = files["prog.py"]
+        else:
+            assert ans["content"].startswith("```python\n") and ans["content"].endswith("\n```")
+            code = codebench.extract_code(ans["content"])
+        forms.add(user.startswith("Ticket: "))
+        items.append(("python", *codebench.assemble(prob, ans["content"], code), codebench.time_limit(prob)))
+    assert forms == {True, False}
+    assert all(res.passed for res in sandbox.run_many(items))
+
+
+def aider_rows(n, chat=(), langs=("python",)):
+    """n extra rows as scripts/polyglot.py rows writes them: a chat, an exercise and the answer."""
+    return [{"messages": [*chat, {"role": "user", "content": f"aider exercise {i}"},
+                          {"role": "assistant", "content": f"edit {i}", "reasoning_content": f"plan {i}"}],
+             "meta": {"source": "aider", "language": langs[i % len(langs)], "exercise": f"ex{i}"}}
+            for i in range(n)]
+
+
+def test_dry_run_adds_extra_rows(tmp_path):
+    """data_extra_rows: ready chat rows (whole aider chats here) go into train and calib.txt as
+    they are, marked as extra beside their own meta, never into heldout, and are counted; a
+    relative path is the job's. A file with a row that does not end in an answer stops the stage
+    before any teacher work."""
+    from stages.taskdata import is_extra, load_examples
+
+    job = code_job(tmp_path, "python")
+    chat = [{"role": "system", "content": "Act as an expert software developer."},
+            {"role": "user", "content": "Change get_factorial() to use math.factorial"},
+            {"role": "assistant", "content": "mathweb/flask/app.py ..."}]
+    extra = aider_rows(5, chat)
+    del extra[0]["meta"]  # a rows file from before rows carried meta
+    (job / "aider-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in extra))
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "data_thinking": True, "data_extra_rows": "aider-rows.jsonl"}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    marked = [{**r, "meta": {**r.get("meta", {}), "extra": True}} for r in extra]
+    assert sorted(json.dumps(r) for r in train if len(r["messages"]) == 5) == sorted(json.dumps(r) for r in marked)
+    assert [r for r in train if "meta" in r] == [r for r in train if len(r["messages"]) == 5]
+    examples = load_examples(job / "data/train.jsonl")  # what heal and calibration read
+    assert sum(map(is_extra, examples)) == 5 and all(set(ex) <= {"messages", "meta"} for ex in examples)
+    assert "aider exercise" not in (job / "data/heldout.jsonl").read_text()
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["extra_rows"] == 5 and stats["extra_weight"] == 1 and stats["train"] == len(train)
+    assert stats["thinking_chars_median"] > 0
+    assert "aider exercise 3\n<think>\nplan 3\n</think>\n\nedit 3" in (job / "data/calib.txt").read_text()
+
+    (job / "aider-rows.jsonl").write_text(json.dumps({"messages": chat[:2]}) + "\n")
+    (job / ".done/data").unlink()
+    p = run_data(job)
+    assert p.returncode != 0 and "line 1: not a chat row ending in an assistant message" in p.stdout + p.stderr
+
+
+def test_dry_run_weights_extra_rows(tmp_path):
+    """data_extra_weight 3: every extra row is in train three times (the copies after the shuffled
+    rows), in calib.txt once, never held out; calibration (calib_extra_share) picks each once."""
+    from stages.taskdata import calib_examples, is_extra
+
+    job = code_job(tmp_path, "python")
+    extra = aider_rows(12, langs=("go", "python", "rust"))
+    (job / "aider-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in extra))
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "data_extra_rows": "aider-rows.jsonl", "data_extra_weight": 3}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    n_once = len(train) - 2 * len(extra)
+    copies = Counter(json.dumps(r) for r in train if "meta" in r)
+    assert len(copies) == 12 and set(copies.values()) == {3}
+    assert all("meta" in r for r in train[n_once:]) and sum("meta" in r for r in train[:n_once]) == 12
+    assert "aider exercise" not in (job / "data/heldout.jsonl").read_text()
+    calib = (job / "data/calib.txt").read_text()
+    assert all(calib.count(f"aider exercise {i}\n") == 1 for i in range(12))
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["extra_rows"] == 12 and stats["extra_weight"] == 3 and stats["train"] == len(train)
+
+    picked = calib_examples(job / "data/train.jsonl", 20, 0.45)
+    ex = [e for e in picked if is_extra(e)]
+    assert len(picked) == 20 and len(ex) == 9 and len({json.dumps(e["messages"]) for e in ex}) == 9
+    assert Counter(e["meta"]["language"] for e in ex) == {"go": 3, "python": 3, "rust": 3}
+
+    (job / "config.json").write_text(json.dumps({**cfg, "data_extra_rows": "aider-rows.jsonl", "data_extra_weight": 0}))
+    (job / ".done/data").unlink()
+    p = run_data(job)
+    assert p.returncode != 0 and "data_extra_weight must be 1 or more" in p.stdout + p.stderr

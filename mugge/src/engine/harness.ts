@@ -80,7 +80,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
         r.promptTokens += c.promptTokens;
         r.completionTokens += c.completionTokens;
         r.inferenceMs += c.ms;
-        out = parseFiles(c.value);
+        out = parseFiles(c.value, ticket.owns);
         ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, ms: c.ms, note: String(out?.note ?? '').slice(0, 200) });
       } catch (e) {
         failed = { command: '(model call)', output: String((e as Error).message ?? e) };

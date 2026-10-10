@@ -1,0 +1,28 @@
+{
+  "dense_fallback": false,
+  "n_generate": 600,
+  "n_heldout": 50,
+  "data_thinking": true,
+  "data_answer_max_tokens": 16384,
+  "data_max_len": 20480,
+  "data_harness_share": 0.5,
+  "data_fix_rows": 300,
+  "data_contest_rows": 150,
+  "data_contest_samples": 2,
+  "data_contest_before": "2024-10-01",
+  "data_contest_harness_share": 0.3,
+  "data_extra_weight": 2,
+  "reap_calib_samples": 256,
+  "reap_max_seq": 8192,
+  "calib_extra_share": 0.5,
+  "heal_max_minutes": 90,
+  "heal_max_len": 18432,
+  "quant_format": "w4a16",
+  "code_eval_suites": [
+    "livecodebench"
+  ],
+  "code_eval_samples": 1,
+  "code_eval_thinking": true,
+  "code_eval_max_tokens": 32768,
+  "lcb_since": "2025-01-01"
+}

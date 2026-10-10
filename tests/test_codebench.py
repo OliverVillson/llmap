@@ -112,6 +112,30 @@ def test_livecodebench_functional_tests():
            "                return [seen[target - x], i]\n            seen[x] = i\n```")
     assert run(p, ans).passed  # List comes from the LiveCodeBench prelude
     assert not run(p, ans.replace("[seen[target - x], i]", "[i]")).passed
+    demo = ans.replace("```python\n", "```python\nimport sys\n") .replace(
+        "\n```", "\n\nif __name__ == '__main__':\n    print(Solution().twoSum(*eval(sys.stdin.read())))\n```")
+    assert run(p, demo).passed  # the answer's own main block is dropped; the tests are the entry point
+
+
+@needs("python3")
+def test_livecodebench_limits_each_case_not_the_whole_problem(monkeypatch):
+    """Each case gets CASE_TIMEOUT, as in LiveCodeBench's runner: three cases of ~0.6 s
+    pass under a 1 s limit even though together they take longer; a stuck case fails
+    at its own limit, and an answer's `except Exception` cannot swallow it."""
+    monkeypatch.setattr(cb, "CASE_TIMEOUT", 1.0)
+    slow = "```python\nimport time\ntime.sleep(0.6)\nprint(int(input()) * 2)\n```"
+    p = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "Double it.",
+         "tests": [{"input": f"{i}\n", "output": f"{2 * i}\n"} for i in range(3)]}
+    assert cb.time_limit(p) == 13.0
+    assert sandbox.run_many([("python", *cb.assemble(p, slow), cb.time_limit(p))], timeout=1.5)[0].passed
+    stuck = "```python\ntry:\n    while True:\n        pass\nexcept Exception:\n    print(0)\n```"
+    r = sandbox.run_many([("python", *cb.assemble(p, stuck), cb.time_limit(p))])[0]
+    assert not r.passed and "case 0: over the 1 s time limit" in r.output
+    f = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
+         "tests": fc.functional_tests("f", [{"input": "1", "output": "1"}])}
+    spin = "```python\nclass Solution:\n    def f(self, x):\n        while True:\n            pass\n```"
+    r = sandbox.run_many([("python", *cb.assemble(f, spin), cb.time_limit(f))])[0]
+    assert not r.passed and "over the 1 s time limit" in r.output
 
 
 def test_decode_cases_refuses_pickled_objects():
@@ -134,10 +158,10 @@ def test_lcb_row_shapes():
     base = {"question_content": "Q", "platform": "atcoder", "question_id": "abc1", "contest_date": "2026-06-01T00:00:00",
             "starter_code": "", "metadata": "{}", "private_test_cases": "[]"}
     r = fc.lcb_row({**base, "public_test_cases": json.dumps([{"input": "1", "output": "1", "testtype": "stdin"}])}, 50)
-    assert r["tests"] == [{"input": "1", "output": "1"}] and r["date"] == "2026-06-01"
+    assert r["tests"] == [{"input": "1", "output": "1"}] and r["date"] == "2026-06-01" and r["public"] == 1
     r = fc.lcb_row({**base, "starter_code": "class Solution:\n    def f(self, x):", "metadata": '{"func_name": "f"}',
                     "public_test_cases": json.dumps([{"input": "1", "output": "1", "testtype": "functional"}])}, 50)
-    assert isinstance(r["tests"], str) and "starter code" in r["prompt"]
+    assert r["tests"] == {"func": "f", "cases": [["1", "1"]]} and "starter code" in r["prompt"]
 
 
 def test_load_suite_filters_by_date_and_limit(tmp_path):
@@ -292,8 +316,8 @@ def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monke
 
 
 def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch):
-    """Thinking loops under greedy decoding, so a single-sample thinking eval
-    samples at 0.6 with a fixed seed and passes thinking through."""
+    """Thinking loops under greedy decoding, so a thinking eval samples at 0.6 with
+    a fixed seed per sample, one sample or several, and passes thinking through."""
     from stages import eval as ev
     from stages._util import Job
 
@@ -314,6 +338,28 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     assert calls == [(24576, 0.6, 0, True)]
     # Progress for the Mac runner's bar: 0 of 1 before answering, 1 of 1 after.
     assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
+    calls.clear()
+    job.config.code_eval_samples = 2
+    ev.code_eval(job, "cand", probs, "task system")
+    assert sorted(calls) == [(24576, 0.6, 0, True), (24576, 0.6, 1, True)]
+
+
+def test_examples_only_and_pick_at_examples():
+    """A sample that passes the examples shown in the problem is the one handed in;
+    with none, the first sample is."""
+    R = sandbox.Result
+    stdio = {"suite": "livecodebench", "language": "python", "public": 1,
+             "tests": [{"input": "1", "output": "1"}, {"input": "2", "output": "2"}]}
+    func = {**stdio, "tests": {"func": "f", "cases": [["1", "1"], ["2", "2"]]}}
+    assert cb.examples_only(stdio)["tests"] == [{"input": "1", "output": "1"}]
+    assert cb.examples_only(func)["tests"] == {"func": "f", "cases": [["1", "1"]]}
+    probs = [stdio, func, {**stdio, "public": 0}]
+    results = [[R(False, "test_failed"), R(True, "")], [R(False, "test_failed"), R(True, "")],
+               [R(True, ""), R(True, "")]]
+    examples = [[False, True], [False, False], []]
+    suites = {"livecodebench": {"pass@1": 0.5}}
+    cb.add_pick_scores(suites, probs, results, examples)
+    assert suites["livecodebench"]["pick@examples"] == 0.5  # 1 of the 2 problems with examples
 
 
 def test_generate_sends_thinking_flag(monkeypatch):
