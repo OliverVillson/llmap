@@ -186,19 +186,25 @@ def test_prune_keeps_the_kept_experts_and_reloads(teacher, tmp_path):
 
 @pytest.fixture(scope="module")
 def reaped(teacher, tmp_path_factory):
-    """The real reap stage on a tiny Gemma 4 thinking job: 8 -> 5 experts per layer."""
+    """The real reap stage on a tiny Gemma 4 thinking job: 8 -> 5 experts per layer. Two of
+    its rows are extra rows (data_extra_rows, marked by the data stage), in train twice."""
     from stages import reap
     from stages._util import Job
 
     root = tmp_path_factory.mktemp("job")
     (root / "config.json").write_text(json.dumps({
-        "teacher": str(teacher), "reap_sparsity": 0.375, "reap_calib_samples": 12, "reap_max_seq": 128}))
+        "teacher": str(teacher), "reap_sparsity": 0.375, "reap_calib_samples": 12, "reap_max_seq": 128,
+        "calib_extra_share": 0.25}))
     job = Job(root)
     rows = [{"messages": [{"role": "system", "content": "Write Python."},
                           {"role": "user", "content": f"Add {i} and {i + 1}."},
                           {"role": "assistant", "content": f"print({i} + {i + 1})",
                            "reasoning_content": f"{i} plus {i + 1} is {2 * i + 1}."}]} for i in range(12)]
-    job.path("data", "train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    extra = [{"messages": [{"role": "user", "content": f"Fix ex{i}.py: the tests fail."},
+                           {"role": "assistant", "content": f"ex{i}.py\n<<<<<<< SEARCH",
+                            "reasoning_content": "A fix."}],
+              "meta": {"source": "aider", "language": "python", "exercise": f"ex{i}", "extra": True}} for i in range(2)]
+    job.path("data", "train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows + extra * 2))
     reap.run_stage(job)
     return job
 
@@ -211,6 +217,7 @@ def test_reap_stage_prunes_gemma4(reaped, teacher):
     assert (cfg["architectures"], cfg["model_type"], cfg["num_experts"]) == (["Gemma4ForCausalLM"], "gemma4_text", 5)
     sal = json.loads(reaped.path("work", "reap_saliency.json").read_text())
     assert (sal["num_experts_orig"], sal["num_experts_kept"], len(sal["layers"])) == (E, 5, 6)
+    assert sal["calib_samples"] == 12  # both extra rows once, ten task rows
     assert all(len(L["kept"]) == 5 and sum(L["freq"]) > 0 for L in sal["layers"])
     imp = json.loads(reaped.path("work", "layer_importance.json").read_text())
     assert len(imp) == 6 and all(v > 0 for v in imp)

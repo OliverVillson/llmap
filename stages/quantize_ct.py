@@ -11,8 +11,9 @@ keep busy. llm-compressor quantizes it in one pass; the scheme (stages/w4a16.py)
 Gemma 4 is quantized and saved as its text decoder alone (Gemma4ForCausalLM, as
 heal saves it; a released multimodal checkpoint is cut to it), so its vision and
 audio towers do not count against the size.
-GPTQ calibrates on quant_calib_samples rows of data/train.jsonl, rendered the
-way heal trains on them (chat template, thinking included), and every expert
+GPTQ calibrates on quant_calib_samples rows of data/train.jsonl (calib_extra_share
+of them extra rows, see Config), rendered the way heal trains on them (chat
+template, thinking included), and every expert
 sees every calibration token (moe_calibrate_all_experts), so experts the router
 rarely picks still get a full Hessian. Writes:
   work/candidates/lobbot-moe/   safetensors, config.json with the quantization
@@ -26,7 +27,6 @@ quantized on this path.
 from __future__ import annotations
 
 import json
-import random
 import shutil
 from pathlib import Path
 
@@ -40,16 +40,15 @@ NAME = "lobbot-moe"
 
 
 def calibration_set(job: Job, tok):
-    """quant_calib_samples train rows as token ids, as heal trains on them."""
+    """quant_calib_samples train rows (calib_extra_share of them extra rows) as token
+    ids, as heal trains on them."""
     from datasets import Dataset
 
-    from stages.taskdata import load_examples, tokenize_example
+    from stages.taskdata import calib_examples, tokenize_example
 
     cfg = job.config
-    examples = load_examples(job.path("data", "train.jsonl"))
-    random.Random(0).shuffle(examples)
-    ids = [tokenize_example(tok, ex["messages"], cfg.quant_calib_len)["input_ids"]
-           for ex in examples[: cfg.quant_calib_samples]]
+    examples = calib_examples(job.path("data", "train.jsonl"), cfg.quant_calib_samples, cfg.calib_extra_share)
+    ids = [tokenize_example(tok, ex["messages"], cfg.quant_calib_len)["input_ids"] for ex in examples]
     return Dataset.from_dict({"input_ids": ids, "attention_mask": [[1] * len(x) for x in ids]})
 
 

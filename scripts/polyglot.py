@@ -511,7 +511,8 @@ def rows_from_run(bench: Path, log: Path, max_chars: int = 0) -> tuple[list[dict
     passing try (its whole history: aider's prompt, any format or lint retries, and on a second
     try the failed answer and the test output) with the answer as the assistant message. Dropped:
     exercises that never passed, tries not in the log, answers cut at max_tokens (finish
-    "length"), thinking that never closed, empty answers, and rows over max_chars (0: no cap)."""
+    "length"), thinking that never closed, empty answers, and rows over max_chars (0: no cap).
+    Each row's "meta" names its source, language and exercise; training ignores it."""
     index = exercise_index(bench)
     last: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
     entries = read_jsonl(log)
@@ -541,7 +542,8 @@ def rows_from_run(bench: Path, log: Path, max_chars: int = 0) -> tuple[list[dict
         if why:
             s["dropped"][why] += 1
             continue
-        kept.append(_chat_row(msgs, content, reasoning))
+        kept.append({**_chat_row(msgs, content, reasoning),
+                     "meta": {"source": "aider", "language": lang, "exercise": slug}})
         s["kept"] += 1
         s["first_try" if attempt == 1 else "fix"] += 1
     for s in per.values():

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -486,30 +487,79 @@ def test_dry_run_adds_contest_rows(tmp_path):
     assert all(res.passed for res in sandbox.run_many(items))
 
 
+def aider_rows(n, chat=(), langs=("python",)):
+    """n extra rows as scripts/polyglot.py rows writes them: a chat, an exercise and the answer."""
+    return [{"messages": [*chat, {"role": "user", "content": f"aider exercise {i}"},
+                          {"role": "assistant", "content": f"edit {i}", "reasoning_content": f"plan {i}"}],
+             "meta": {"source": "aider", "language": langs[i % len(langs)], "exercise": f"ex{i}"}}
+            for i in range(n)]
+
+
 def test_dry_run_adds_extra_rows(tmp_path):
     """data_extra_rows: ready chat rows (whole aider chats here) go into train and calib.txt as
-    they are, never into heldout, and are counted; a relative path is the job's. A file with a
-    row that does not end in an answer stops the stage before any teacher work."""
+    they are, marked as extra beside their own meta, never into heldout, and are counted; a
+    relative path is the job's. A file with a row that does not end in an answer stops the stage
+    before any teacher work."""
+    from stages.taskdata import is_extra, load_examples
+
     job = code_job(tmp_path, "python")
     chat = [{"role": "system", "content": "Act as an expert software developer."},
             {"role": "user", "content": "Change get_factorial() to use math.factorial"},
             {"role": "assistant", "content": "mathweb/flask/app.py ..."}]
-    extra = [{"messages": [*chat, {"role": "user", "content": f"aider exercise {i}"},
-                           {"role": "assistant", "content": f"edit {i}", "reasoning_content": f"plan {i}"}]}
-             for i in range(5)]
+    extra = aider_rows(5, chat)
+    del extra[0]["meta"]  # a rows file from before rows carried meta
     (job / "aider-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in extra))
     cfg = json.loads((job / "config.json").read_text())
     (job / "config.json").write_text(json.dumps({**cfg, "data_thinking": True, "data_extra_rows": "aider-rows.jsonl"}))
     p = run_data(job)
     assert p.returncode == 0, p.stdout + p.stderr
     train = read(job / "data/train.jsonl")
-    assert sorted(json.dumps(r) for r in train if len(r["messages"]) == 5) == sorted(json.dumps(r) for r in extra)
+    marked = [{**r, "meta": {**r.get("meta", {}), "extra": True}} for r in extra]
+    assert sorted(json.dumps(r) for r in train if len(r["messages"]) == 5) == sorted(json.dumps(r) for r in marked)
+    assert [r for r in train if "meta" in r] == [r for r in train if len(r["messages"]) == 5]
+    examples = load_examples(job / "data/train.jsonl")  # what heal and calibration read
+    assert sum(map(is_extra, examples)) == 5 and all(set(ex) <= {"messages", "meta"} for ex in examples)
     assert "aider exercise" not in (job / "data/heldout.jsonl").read_text()
     stats = json.loads((job / "data/stats.json").read_text())
-    assert stats["extra_rows"] == 5 and stats["train"] == len(train) and stats["thinking_chars_median"] > 0
+    assert stats["extra_rows"] == 5 and stats["extra_weight"] == 1 and stats["train"] == len(train)
+    assert stats["thinking_chars_median"] > 0
     assert "aider exercise 3\n<think>\nplan 3\n</think>\n\nedit 3" in (job / "data/calib.txt").read_text()
 
     (job / "aider-rows.jsonl").write_text(json.dumps({"messages": chat[:2]}) + "\n")
     (job / ".done/data").unlink()
     p = run_data(job)
     assert p.returncode != 0 and "line 1: not a chat row ending in an assistant message" in p.stdout + p.stderr
+
+
+def test_dry_run_weights_extra_rows(tmp_path):
+    """data_extra_weight 3: every extra row is in train three times (the copies after the shuffled
+    rows), in calib.txt once, never held out; calibration (calib_extra_share) picks each once."""
+    from stages.taskdata import calib_examples, is_extra
+
+    job = code_job(tmp_path, "python")
+    extra = aider_rows(12, langs=("go", "python", "rust"))
+    (job / "aider-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in extra))
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "data_extra_rows": "aider-rows.jsonl", "data_extra_weight": 3}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    n_once = len(train) - 2 * len(extra)
+    copies = Counter(json.dumps(r) for r in train if "meta" in r)
+    assert len(copies) == 12 and set(copies.values()) == {3}
+    assert all("meta" in r for r in train[n_once:]) and sum("meta" in r for r in train[:n_once]) == 12
+    assert "aider exercise" not in (job / "data/heldout.jsonl").read_text()
+    calib = (job / "data/calib.txt").read_text()
+    assert all(calib.count(f"aider exercise {i}\n") == 1 for i in range(12))
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["extra_rows"] == 12 and stats["extra_weight"] == 3 and stats["train"] == len(train)
+
+    picked = calib_examples(job / "data/train.jsonl", 20, 0.45)
+    ex = [e for e in picked if is_extra(e)]
+    assert len(picked) == 20 and len(ex) == 9 and len({json.dumps(e["messages"]) for e in ex}) == 9
+    assert Counter(e["meta"]["language"] for e in ex) == {"go": 3, "python": 3, "rust": 3}
+
+    (job / "config.json").write_text(json.dumps({**cfg, "data_extra_rows": "aider-rows.jsonl", "data_extra_weight": 0}))
+    (job / ".done/data").unlink()
+    p = run_data(job)
+    assert p.returncode != 0 and "data_extra_weight must be 1 or more" in p.stdout + p.stderr

@@ -12,8 +12,10 @@ tests first. Code specs can add contest rows (Config.data_contest_rows): LiveCod
 problems released before data_contest_before, so older than the ones the eval scores
 (lcb_since), each answered data_contest_samples times by the teacher; the shortest answer
 that passes every test becomes a train row (never held out). Code specs can also add ready
-rows from a file (Config.data_extra_rows), train only. Writes:
-  data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included
+rows from a file (Config.data_extra_rows), train only, data_extra_weight times each and marked
+"meta": {"extra": true} so calibration can pick them (Config.calib_extra_share). Writes:
+  data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included;
+                      every row shuffled, then the extra rows' further copies
   data/heldout.jsonl  held-out inputs with teacher reference answers (inputs written
                       by Gemini when Config.testgen_model and GEMINI_API_KEY are set;
                       code specs: always teacher inputs, rows add "tests" and "language")
@@ -544,10 +546,12 @@ def run_stage(job: Job) -> None:
         stats["thinking_chars_median"] = statistics.median(
             len(r["messages"][-1].get("reasoning_content", "")) for r in train) if train else 0
     rng.shuffle(train)
+    calib = train[:1000]  # without the copies below
+    train += extra * (cfg.data_extra_weight - 1)  # last, so a prefix of train.jsonl reads each row once
     write_jsonl(job.path("data", "train.jsonl"), train)
     write_jsonl(job.path("data", "heldout.jsonl"), [_heldout_row(spec, r, tests_of) for r in heldout])
     job.path("data", "calib.txt").write_text(  # the last exchange: extra rows can be whole chats
-        "\n\n".join(r["messages"][-2]["content"] + "\n" + _with_thinking(r["messages"][-1]) for r in train[:1000])
+        "\n\n".join(r["messages"][-2]["content"] + "\n" + _with_thinking(r["messages"][-1]) for r in calib)
     )
     stats.update(train=len(train), heldout=len(heldout), elapsed_s=round(time.monotonic() - t0, 1))
     job.path("data", "stats.json").write_text(json.dumps(stats, indent=2))
@@ -709,16 +713,20 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
 
 
 def extra_rows(job: Job, stats: dict) -> list[dict]:
-    """The ready chat rows of Config.data_extra_rows, as they are: each a {"messages": [...]}
-    ending in the assistant's answer, e.g. teacher transcripts in aider's format."""
-    path = job.root / job.config.data_extra_rows  # an absolute path stays as is
+    """The ready chat rows of Config.data_extra_rows, as they are but marked "meta": {"extra": true}
+    (beside any meta they bring, e.g. their language): each a {"messages": [...]} ending in the
+    assistant's answer, e.g. teacher transcripts in aider's format."""
+    cfg = job.config
+    if cfg.data_extra_weight < 1:
+        raise ValueError(f"data_extra_weight must be 1 or more, not {cfg.data_extra_weight}")
+    path = job.root / cfg.data_extra_rows  # an absolute path stays as is
     rows = read_jsonl(path)
     for i, r in enumerate(rows, 1):
         if (r.get("messages") or [{}])[-1].get("role") != "assistant":
             raise ValueError(f"{path} line {i}: not a chat row ending in an assistant message")
-    stats["extra_rows"] = len(rows)
-    print(f"[data] {len(rows)} extra rows from {path}", flush=True)
-    return rows
+    stats.update(extra_rows=len(rows), extra_weight=cfg.data_extra_weight)
+    print(f"[data] {len(rows)} extra rows from {path}, {cfg.data_extra_weight}x in train", flush=True)
+    return [{**r, "meta": {**(r.get("meta") or {}), "extra": True}} for r in rows]
 
 
 def _chat_row(msgs: list[dict], answer: str, reasoning: str = "") -> dict:
