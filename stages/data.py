@@ -282,10 +282,10 @@ class Gen:
 
 
 class Teacher:
-    def __init__(self, model_path: str, max_len: int = MAX_MODEL_LEN):
+    def __init__(self, model_path: str, max_len: int = MAX_MODEL_LEN, top_k: int = 20):
         from vllm import LLM, SamplingParams
 
-        self.SamplingParams = SamplingParams
+        self.SamplingParams, self.top_k = SamplingParams, top_k
         self.llm = LLM(model=model_path, max_model_len=max_len, gpu_memory_utilization=GPU_UTIL,
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
@@ -296,7 +296,7 @@ class Teacher:
 
     def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
-                                 max_tokens=max_tokens, **({"top_k": 20} if thinking else {}),
+                                 max_tokens=max_tokens, **({"top_k": self.top_k} if thinking else {}),
                                  **({"skip_special_tokens": False} if thinking and self.keep_special else {}))
         try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
             res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
@@ -403,7 +403,7 @@ def run_stage(job: Job) -> None:
     else:
         model = job.model_path(cfg.teacher)
         emit(STAGE, pct=1, msg=f"loading teacher {model}")
-        teacher = Teacher(model, max_model_len(cfg))
+        teacher = Teacher(model, max_model_len(cfg), cfg.thinking_top_k)
     stats["load_s"] = round(time.monotonic() - t0, 1)
     emit(STAGE, pct=10, msg="teacher loaded")
 
@@ -482,7 +482,7 @@ def run_stage(job: Job) -> None:
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
     think = cfg.data_thinking
     # Thinking samples at Qwen's recommended 0.6; greedy-ish decoding makes it loop.
-    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 45, 95,
+    gens = chat_batched(teacher, convs, cfg.data_thinking_temperature if think else 0.3, answer_max_tokens(cfg), 45, 95,
                         "teacher answering" + (" (thinking)" if think else ""), think)
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
@@ -604,7 +604,7 @@ def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) 
         cmd = cmds[0] if r.reason == "compile_error" and len(cmds) > 1 else cmds[-1]
         out_text = harness.tail(r.output, 2000) or ("(timed out)" if r.reason == "timeout" else "(no output)")
         convs.append(harness.fix_messages(task_ticket(spec, s, a), cmd, out_text))
-    gens = chat_batched(teacher, convs, 0.6 if think else 0.3, answer_max_tokens(cfg), 96, 98,
+    gens = chat_batched(teacher, convs, cfg.data_thinking_temperature if think else 0.3, answer_max_tokens(cfg), 96, 98,
                         "teacher fixing drafts" + (" (thinking)" if think else ""), think)
     drops, fixes = {}, []
     for (s, _, _), conv, g in zip(pool, convs, gens):
@@ -663,7 +663,7 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
                 [{"role": "system", "content": codebench.SYSTEM},
                  {"role": "user", "content": codebench.build_prompt(p)}])
         asks.append((p, msgs, mugge))
-    gens = chat_batched(teacher, [m for _, m, _ in asks for _ in range(n)], 0.6 if think else 0.3,
+    gens = chat_batched(teacher, [m for _, m, _ in asks for _ in range(n)], cfg.data_thinking_temperature if think else 0.3,
                         answer_max_tokens(cfg), 98, 99, "teacher answering contest problems"
                         + (" (thinking)" if think else ""), think, batch=CONTEST_BATCH)
     drops, cands, items = {}, [], []  # cands: (problem index, code, note, thinking) for the sandbox

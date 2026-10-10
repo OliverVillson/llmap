@@ -37,6 +37,10 @@ class Config:
     # teaches the model to think. Makes a thinking model: raise data_answer_max_tokens,
     # data_max_len, heal_max_len and reap_max_seq to fit the thinking (see r50w95s-t).
     data_thinking: bool = False
+    # Sampling for thinking answers: the temperature here, top_k in the data stage and
+    # the eval. The Qwen3 cards say 0.6 and 20; Gemma 4's says 1.0 and 64.
+    data_thinking_temperature: float = 0.6
+    thinking_top_k: int = 20
     # Mugge-shaped heal data for code specs (stages/harness.py): this share of the train
     # rows is asked the way Mugge's harness asks (context pack in, files out), and
     # data_fix_rows fix rows are added: a failed draft and its error in, the teacher's

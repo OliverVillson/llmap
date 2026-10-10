@@ -71,6 +71,7 @@ EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the s
 # The vLLM server serve() started last ({"name", "dir"}); empty while llama-server
 # serves. generate() and force_answer() speak to whichever runs.
 VLLM: dict[str, str] = {}
+THINK_TOP_K = 20  # top_k for thinking answers; serve() takes the job's thinking_top_k
 # Requests in flight, shared by generate() calls running at once (code_eval's sample
 # passes): the rest wait here, not in the server's queue, where the wait would count
 # against their timeout and measured speed.
@@ -181,7 +182,8 @@ def serve(job: Job, path: str, name: str) -> subprocess.Popen:
     for a GGUF, and waits until it is up; generate() then speaks to it."""
     import httpx
 
-    global VLLM
+    global VLLM, THINK_TOP_K
+    THINK_TOP_K = job.config.thinking_top_k
     if is_checkpoint(path):
         cmd, env = vllm_command(path)
         cmd += vllm_args(job.config, path, name)
@@ -231,7 +233,7 @@ def split_reasoning(message: dict, cut: bool = False) -> tuple[str, str]:
 
 
 def sampling_params(seed: int | None, thinking: bool) -> dict:
-    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": 20} if thinking else {})}
+    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": THINK_TOP_K} if thinking else {})}
 
 
 def chat_template(model_dir: str, messages: list[dict]) -> str:

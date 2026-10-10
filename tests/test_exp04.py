@@ -67,6 +67,8 @@ def test_build_configs_are_valid(exp04):
         assert cfg.quant_format == "w4a16" and cfg.quant_fp8_attention and cfg.code_eval_thinking
         assert cfg.eval_reasoning_parser == m.PARSER[key] and cfg.data_extra_rows == str(m.rows_file(key))
         assert cfg.code_eval_samples == 1 and cfg.lcb_since > cfg.data_contest_before
+        assert (cfg.data_thinking_temperature, cfg.thinking_top_k) == ((1.0, 64) if key == "gemma" else (0.6, 20))
+        assert cfg.code_eval_thinking_temperature == cfg.data_thinking_temperature
 
 
 @pytest.mark.parametrize("qwen, ornith, picked", [(0.60, 0.59, "ornith"), (0.60, 0.57, "qwen"), (0.55, 0.62, "ornith")])
@@ -100,7 +102,7 @@ def test_a_subset_of_bases(tmp_path, monkeypatch, bases, built, n_steps):
 def test_full_plan_and_summary(exp04, capsys):
     m = exp04
     assert len(m.steps()) == 13 and m.run_plan(m.steps(), m.summary, m.LOGS, ["x", "--list"]) == 0
-    assert "Aider Polyglot" in capsys.readouterr().out
+    assert "Gemma 4 26B-A4B full, Polyglot" in capsys.readouterr().out
     assert m.summary() == "No Aider Polyglot results yet."
     for key, rate in (("qwen", 0.60), ("ornith", 0.62), ("gemma", 0.55)):
         score(m, f"{key}-full", rate, per_language={"rust": {"pass_rate_2": rate}})

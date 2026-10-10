@@ -72,6 +72,8 @@ BASES = {"qwen": "Qwen/Qwen3.6-35B-A3B", "ornith": "ornith-ai/Ornith-1.5-35B", "
 LABELS = {"qwen": "Qwen3.6", "ornith": "Ornith-1.5", "gemma": "Gemma 4 26B-A4B"}
 SHAPE = {"qwen": "qwen", "ornith": "qwen", "gemma": "gemma"}  # architecture, for the smoke test
 PARSER = {"qwen": "qwen3", "ornith": "qwen3", "gemma": "gemma4"}  # vLLM reasoning parser
+# Thinking sampling from each model card: Qwen3.6 (and Ornith) 0.6 / top_p 0.95 / top_k 20, Gemma 4 1.0 / 0.95 / 64
+SAMPLING = {"qwen": (0.6, 20), "ornith": (0.6, 20), "gemma": (1.0, 64)}
 WANTED = [k for k in os.environ.get("EXP04_BASES", ",".join(BASES)).split(",") if k]
 if not WANTED or set(WANTED) - set(BASES):
     sys.exit(f"EXP04_BASES takes a comma list of {', '.join(BASES)}")
@@ -154,7 +156,8 @@ def build_config(key: str) -> dict:
     s, n = smoke(key), n_experts(key)
     return {**read(CONFIGS / "build.json"), "teacher": BASES[key], "data_extra_rows": str(rows_file(key)),
             "reap_sparsity": round(1 - s["experts"] / n, 6), "quant_fp8_attention": s["fp8_attention"],
-            "eval_reasoning_parser": PARSER[key]}
+            "eval_reasoning_parser": PARSER[key], "data_thinking_temperature": SAMPLING[key][0],
+            "code_eval_thinking_temperature": SAMPLING[key][0], "thinking_top_k": SAMPLING[key][1]}
 
 
 def n_experts(key: str) -> int:
@@ -194,8 +197,10 @@ def best_build() -> str:
 def polyglot(step: Step, model: Path, name: str, key: str, *extra: str) -> None:
     """Aider Polyglot (or, with --exercises, another exercises dir) on a model served by vLLM."""
     POLY.mkdir(parents=True, exist_ok=True)
+    temp, top_k = SAMPLING[key]
     sh(step, f"python scripts/polyglot.py run --model-dir {model} --name {name} --out {POLY / (name + '.json')} "
-             f"--reasoning-parser {PARSER[key]} {' '.join(extra)}".rstrip())
+             f"--reasoning-parser {PARSER[key]} --temperature {temp} --top-p 0.95 --top-k {top_k} "
+             f"{' '.join(extra)}".rstrip())
 
 
 def pipeline(step: Step, name: str, extra: str = "") -> None:
