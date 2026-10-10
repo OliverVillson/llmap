@@ -44,6 +44,13 @@ class Config:
     # extra answers sampled at temperature 1.0. 0 and 0 = plain rows only.
     data_harness_share: float = 0.0
     data_fix_rows: int = 0
+    # Contest rows for code specs: LiveCodeBench problems (code_eval_dir) older than the
+    # eval's, answered by the teacher (thinking per data_thinking) and kept when they pass
+    # their tests. Train only, never held out; must not overlap the eval (lcb_since).
+    data_contest_rows: int = 0  # contest rows to add; 0 = off
+    data_contest_before: str = "2024-10-01"  # only problems released before this date
+    data_contest_samples: int = 2  # teacher answers per problem; the shortest passing one is kept
+    data_contest_harness_share: float = 0.0  # share asked as a Mugge ticket instead of a plain prompt
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.

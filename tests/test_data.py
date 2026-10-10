@@ -279,3 +279,159 @@ def test_tokenize_trains_thinking_turns_on_the_thinking():
 
     off = tokenize_example(CharTok(), [*msgs[:2], {"role": "assistant", "content": "x = 1"}], 10_000)
     assert _prompt(off).endswith("<think>\n\n</think>\n\n") and _target(off) == "x = 1<|im_end|>"
+
+
+# --------------------------------------------------------------------------- contest rows
+
+ADD_STDIN = "a, b = map(int, input().split())\nprint(a + b)"
+ADD_FUNC = "class Solution:\n    def add(self, a, b):\n        return a + b"
+
+
+def lcb_problem(name, date, functional):
+    """A tiny LiveCodeBench row in scripts/fetch_codebench.py's shape: add two integers,
+    read from stdin or passed to Solution.add (the problems DryRunTeacher can solve)."""
+    row = {"id": f"atcoder/{name.replace(' ', '_')}", "language": "python", "stub": "", "entry": "", "date": date,
+           "prompt": f"{name}: read A and B and print A + B.",
+           "tests": [{"input": "1 2\n", "output": "3\n"}, {"input": "10 -3\n", "output": "7\n"}]}
+    if functional:
+        row.update(id=f"leetcode/{name.replace(' ', '-')}",
+                   tests={"func": "add", "cases": [["1\n2", "3"], ["-4\n9", "5"]]},
+                   prompt=f"{name}: return a + b.\n\nUse this starter code:\n```python\nclass Solution:\n"
+                          "    def add(self, a: int, b: int) -> int:\n        \n```")
+    return row
+
+
+def write_lcb(d, old=12):
+    """old problems released before 2024-10-01; recent ones on or after it (some on or
+    after lcb_since 2025-01-01), and one undated, which the eval also scores."""
+    d.mkdir(exist_ok=True)
+    rows = [lcb_problem(f"Old problem {i}", f"2024-0{1 + i % 9}-15", i % 2) for i in range(old)]
+    rows += [lcb_problem(f"Recent problem {i}", date, i % 2)
+             for i, date in enumerate(["2024-10-01", "2024-12-31", "2025-01-01", "2025-06-01"])]
+    rows.append(lcb_problem("Recent problem undated", None, 0))
+    (d / "livecodebench.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return d
+
+
+def test_contest_problems_date_guard(tmp_path):
+    """Only problems released before data_contest_before; undated ones never; a cut-off after
+    the eval's lcb_since is refused."""
+    from stages import data
+    from stages._util import Config
+
+    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01")
+    got = data.contest_problems(cfg)
+    assert len(got) == 12 and all(p["prompt"].startswith("Old problem") for p in got)
+    cfg.data_contest_before = "2025-01-01"  # the latest allowed: everything before the eval's problems
+    assert sorted({p["date"] for p in data.contest_problems(cfg)})[-2:] == ["2024-10-01", "2024-12-31"]
+    cfg.data_contest_before = "2025-01-02"
+    with pytest.raises(ValueError, match="after lcb_since"):
+        data.contest_problems(cfg)
+
+
+def test_contest_cutoff_after_the_eval_stops_the_stage_early(tmp_path, monkeypatch):
+    from stages import data
+    from stages._util import Job
+
+    job = code_job(tmp_path, "python")
+    (job / "config.json").write_text(json.dumps({
+        "n_generate": 120, "n_heldout": 10, "code_eval_dir": str(write_lcb(tmp_path / "bench")),
+        "data_contest_rows": 5, "data_contest_before": "2025-03-01", "lcb_since": "2025-01-01"}))
+    monkeypatch.setattr(data, "DRY_RUN", False)
+    monkeypatch.setattr(data, "Teacher", lambda *a, **k: pytest.fail("teacher loaded before the date check"))
+    with pytest.raises(ValueError, match="after lcb_since"):
+        data.run_stage(Job(job))
+
+
+class ScriptedTeacher:
+    """Asked the same problem five times, answers: wrong code, right code cut off, right
+    code whose thinking never closed, right code after long thinking, right code after short
+    thinking. Plain answers wrap the code in prose; tickets answer with the file."""
+
+    def __init__(self):
+        self.asked: dict[str, int] = {}
+
+    def chat(self, convs, temperature, max_tokens, thinking=False):
+        from stages import harness
+        from stages.data import Gen
+
+        out = []
+        for conv in convs:
+            prompt = conv[-1]["content"]
+            k = self.asked[prompt] = self.asked.get(prompt, -1) + 1
+            right = ADD_FUNC if "def add(self" in prompt else ADD_STDIN
+            code, think, finished = [(right.replace("+", "-"), "short", True), (right, "s", False), (right, None, True),
+                                     (right, "long " * 40, True), (right, "short", True)][k]
+            body = (harness.render_files({"prog.py": code}, "adds them") if prompt.startswith("Ticket: ")
+                    else f"Sure:\n```python\n{code}\n```\nThis adds them.")
+            out.append(Gen(body if think is None else f"{think}\n</think>\n\n{body}", finished))
+        return out
+
+
+def test_contest_rows_keep_the_shortest_passing_answer(tmp_path):
+    import random
+
+    from stages import codebench, data, harness
+    from stages._util import Config
+
+    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01", data_thinking=True,
+                 data_contest_rows=8, data_contest_samples=5, data_contest_harness_share=0.5)
+    stats: dict = {}
+    rows = data.contest_rows(cfg, ScriptedTeacher(), random.Random(0), data.contest_problems(cfg), stats)
+    assert len(rows) == 8  # 12 asked (1.5x), all solved, stopped at data_contest_rows
+    tickets = [r for r in rows if r["messages"][0]["content"] == harness.SYSTEM]
+    assert 0 < len(tickets) < 8
+    for r in rows:
+        sys_msg, user, ans = r["messages"]
+        right = ADD_FUNC if "def add(self" in user["content"] else ADD_STDIN
+        assert ans["reasoning_content"] == "short"  # the shortest passing answer, not the first
+        if r in tickets:
+            assert user["content"].startswith("Ticket: livecodebench-")
+            assert ans["content"] == harness.render_files({"prog.py": right}, "adds them")
+        else:
+            assert sys_msg["content"] == codebench.SYSTEM and "Old problem" in user["content"]
+            assert ans["content"] == f"```python\n{right}\n```"  # the code only, without the prose
+    assert stats == {"contest_available": 12, "contest_problems": 12, "contest_answers": 60, "contest_passed_any": 12,
+                     "contest_rows": 8, "contest_ticket_rows": len(tickets), "contest_thinking_chars_median": 5,
+                     "contest_dropped": {"test_failed": 12, "truncated": 12, "no_thinking_end": 12}}
+
+
+def test_dry_run_adds_contest_rows(tmp_path):
+    """Contest rows land in train and calib.txt with the teacher's thinking and code that
+    passes; recent problems appear nowhere and contest problems are never held out."""
+    from stages import codebench, harness, sandbox
+
+    job = code_job(tmp_path, "python")
+    bench = write_lcb(tmp_path / "bench", old=20)
+    (job / "config.json").write_text(json.dumps({
+        "n_generate": 120, "n_heldout": 10, "data_thinking": True, "code_eval_dir": str(bench),
+        "lcb_since": "2025-01-01", "data_contest_rows": 10, "data_contest_harness_share": 0.5}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    contest = [r for r in train if "Old problem" in r["messages"][1]["content"]]
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert len(contest) == 10 == stats["contest_rows"] and stats["train"] == len(train)
+    assert stats["contest_problems"] == 15 and stats["contest_answers"] == 30 and stats["contest_dropped"]
+    assert stats["contest_thinking_chars_median"] == len("Let me work this out first.")
+    calib, held = (job / "data/calib.txt").read_text(), (job / "data/heldout.jsonl").read_text()
+    assert "Recent problem" not in json.dumps(train) + held + calib and "Old problem" not in held
+    assert "Old problem" in calib and "[data] contest: 10 rows" in p.stdout
+
+    probs = codebench.load_suite("livecodebench", bench)
+    items, forms = [], set()
+    for r in contest:
+        user, ans = r["messages"][1]["content"], r["messages"][2]
+        assert ans["reasoning_content"] == "Let me work this out first." and "</think>" not in ans["content"]
+        prob = next(q for q in probs if q["prompt"].rstrip() in user)
+        if user.startswith("Ticket: "):
+            files, note = harness.parse_files(ans["content"], ["prog.py"])
+            assert list(files) == ["prog.py"] and ans["content"] == harness.render_files(files, note)
+            code = files["prog.py"]
+        else:
+            assert ans["content"].startswith("```python\n") and ans["content"].endswith("\n```")
+            code = codebench.extract_code(ans["content"])
+        forms.add(user.startswith("Ticket: "))
+        items.append(("python", *codebench.assemble(prob, ans["content"], code), codebench.time_limit(prob)))
+    assert forms == {True, False}
+    assert all(res.passed for res in sandbox.run_many(items))
