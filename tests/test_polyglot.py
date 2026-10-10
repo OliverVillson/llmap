@@ -1,10 +1,14 @@
 """scripts/polyglot.py on fakes: no docker, GPU or vLLM. The logging proxy against a fake
 upstream, the training exercises' slug exclusion, aider's results and a logged run turned into
-chat rows, the container command and the run's wiring."""
+chat rows, the container command and the run's wiring, a sample run, and the selftest's
+reference solutions, command and report."""
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -217,6 +221,25 @@ def test_summarize_matches_aiders_stats(tmp_path):
     assert pg.summarize(tmp_path / "none")["pass_rate_2"] is None
 
 
+def test_summarize_cases_pair_two_runs_by_exercise(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    results(a, "python", "leap", tests_outcomes=[True])
+    results(a, "python", "bob", tests_outcomes=[False, True])
+    results(a, "go", "leap", tests_outcomes=[False, False])
+    results(a, "rust", "crash", exception="Traceback ...")
+    results(a, "rust", "late", tests_outcomes=[False, False, True])  # passed on a try past the two that count
+    (a / "java/exercises/practice/unfinished").mkdir(parents=True)
+    s = pg.summarize(a)
+    assert s["cases"] == {"go/leap": [False, False], "python/bob": [False, True], "python/leap": [True, True],
+                          "rust/crash": [False, False], "rust/late": [False, False]}
+    assert [sum(c[i] for c in s["cases"].values()) / s["n"] for i in (0, 1)] == [s["pass_rate_1"], s["pass_rate_2"]]
+    results(b, "python", "leap", tests_outcomes=[False, True])
+    results(b, "go", "leap", tests_outcomes=[True])
+    ca, cb = s["cases"], pg.summarize(b)["cases"]
+    assert {k: (ca[k][1], cb[k][1]) for k in ca.keys() & cb.keys()} == {"python/leap": (True, True),
+                                                                        "go/leap": (False, True)}
+
+
 # ---------- a logged run into rows ----------
 
 SYSTEM = "Act as an expert software developer."
@@ -336,7 +359,8 @@ def test_docker_command_and_model_settings(tmp_path):
     assert cmd[:6] == ["sudo", "docker", "run", "--rm", "--name", "polyglot-qwen36"]
     assert cmd[cmd.index("--network") + 1] == "host" and cmd[-4:-2] == [pg.IMAGE, "bash"]
     mounts = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-v"]
-    assert mounts == [f"{tmp_path}/run:/benchmarks", f"{tmp_path}/ex:/exercises:ro", f"{tmp_path}/gradle:/root/.gradle"]
+    assert mounts == [f"{tmp_path}/run:/benchmarks", f"{tmp_path}/ex:/exercises:ro", f"{tmp_path}/gradle:/root/.gradle",
+                      f"{pg.HOME}/cargo:/root/.cargo/registry"]
     env = dict(cmd[i + 1].split("=", 1) for i, x in enumerate(cmd) if x == "-e")
     assert env["OPENAI_API_BASE"] == "http://127.0.0.1:8092/v1" and env["AIDER_DOCKER"] == "1"
     assert env["AIDER_BENCHMARK_DIR"] == "/benchmarks"
@@ -397,6 +421,7 @@ def fake_bench(monkeypatch, server_exits=False):
     monkeypatch.setattr(pg.ev, "watch_gpu", lambda: lambda: {"busy_pct": 91.5, "mem_peak_mib": 150000})
     monkeypatch.setattr(pg, "image_exists", lambda: True)
     monkeypatch.setattr(pg, "docker", lambda: ["docker"])
+    monkeypatch.setattr(pg, "make_caches", lambda: None)  # not under $NVME
     monkeypatch.setattr(pg.subprocess, "Popen", Container)
     monkeypatch.setattr(pg.subprocess, "run", lambda cmd, **k: calls["run"].append(cmd))  # docker rm -f
     monkeypatch.setattr(pg.time, "sleep", lambda s: None)
@@ -472,3 +497,273 @@ def test_run_stops_when_vllm_dies(tmp_path, monkeypatch):
         pg.main(["run", "--model-dir", str(model), "--name", "cand", "--exercises", str(ex), "--dir", str(tmp_path / "run")])
     assert calls["run"][-1] == ["docker", "rm", "-f", "polyglot-cand"]  # the container goes too
     assert not (tmp_path / "run/out/polyglot.json").exists()  # a rerun resumes
+
+
+def test_threads_default_to_four_per_cpu(tmp_path, monkeypatch, capsys):
+    for cpus, threads in [(2, 8), (16, 64), (96, 64), (None, 64)]:
+        monkeypatch.setattr(pg.os, "cpu_count", lambda c=cpus: c)
+        assert pg.default_threads() == threads
+    calls = fake_bench(monkeypatch)
+    monkeypatch.setattr(pg.os, "cpu_count", lambda: 3)
+    model, ex = model_and_exercises(tmp_path)
+    assert pg.main(["run", "--model-dir", str(model), "--name", "cand", "--exercises", str(ex),
+                    "--dir", str(tmp_path / "run")]) == 0
+    assert "--threads 12 " in calls["docker"][0][-1]
+    assert "3 CPUs, 12 threads" in capsys.readouterr().out
+
+
+def test_sample_runs_the_first_exercises_of_each_language(tmp_path, monkeypatch, capsys):
+    calls = fake_bench(monkeypatch)  # the container finishes python/a and go/b
+    monkeypatch.setattr(pg, "RUNS", tmp_path / "runs")
+    model, ex = model_and_exercises(tmp_path)  # python a, b, c
+    for slug in ("z", "b"):
+        exercise(ex, "go", slug, docs="x")
+    assert pg.main(["run", "--model-dir", str(model), "--name", "cand", "--exercises", str(ex),
+                    "--sample-per-language", "1"]) == 0
+    run_dir = tmp_path / "runs/cand-sample1"  # apart from the full run's runs/cand
+    (cmd,) = calls["docker"]
+    mounted = next(m for m in cmd if m.endswith(":/exercises:ro")).removesuffix(":/exercises:ro")
+    assert mounted == str((run_dir / "sample").resolve())  # copies: links out of the mount would break
+    assert sorted(str(d.relative_to(mounted)) for d in Path(mounted).glob("*/exercises/practice/*")) == [
+        "go/exercises/practice/b", "python/exercises/practice/a"]
+    assert (Path(mounted) / "go/exercises/practice/b/.docs/instructions.md").read_text() == "x"
+    assert '"answered": 2, "total": 2' in capsys.readouterr().out
+    res = json.loads((run_dir / "out/polyglot.json").read_text())
+    assert (res["exercises"], res["sample_per_language"]) == (str(ex.resolve()), 1)
+    assert (res["n"], res["total"], res["pass_rate_2"]) == (2, 2, 0.5)
+    assert res["cases"] == {"go/b": [False, False], "python/a": [True, True]}
+    assert (run_dir / "model-settings.yml").exists() and calls["serve"][0][2] == "cand"  # served as itself
+
+
+# ---------- the selftest ----------
+
+
+def with_examples(ex: Path, *files: str) -> Path:
+    """ex with these example files (its reference solution), listed in .meta/config.json."""
+    cfg = json.loads((ex / ".meta/config.json").read_text())
+    cfg["files"]["example"] = list(files)
+    (ex / ".meta/config.json").write_text(json.dumps(cfg))
+    for f in files:
+        (ex / f).parent.mkdir(parents=True, exist_ok=True)
+        (ex / f).write_text(f"// {f}\n")
+    return ex
+
+
+def java_bowling(root: Path) -> Path:
+    """Java's layout: the reference's main class and a helper class under .meta/src/reference."""
+    ex = exercise(root, "java", "bowling", solution=["src/main/java/BowlingGame.java"],
+                  tests=["src/test/java/BowlingGameTest.java"])
+    return with_examples(ex, ".meta/src/reference/java/BowlingGame.java", ".meta/src/reference/java/Frame.java")
+
+
+def test_reference_solution_goes_where_the_stub_is(tmp_path):
+    py = with_examples(exercise(tmp_path, "python", "leap"), ".meta/example.py")
+    assert pg.reference(py) == {"leap.py": py / ".meta/example.py"}
+    rs = with_examples(exercise(tmp_path, "rust", "alphametics", solution=["src/lib.rs", "Cargo.toml"],
+                                tests=["tests/alphametics.rs"]), ".meta/example.rs")
+    assert pg.reference(rs) == {"src/lib.rs": rs / ".meta/example.rs"}
+    (rs / ".meta/Cargo-example.toml").write_text('[dependencies]\nitertools = "0.5"\n')  # the crates it uses
+    assert pg.reference(rs)["Cargo.toml"] == rs / ".meta/Cargo-example.toml"
+    java = java_bowling(tmp_path)
+    ref = java / ".meta/src/reference/java"
+    assert pg.reference(java) == {"src/main/java/BowlingGame.java": ref / "BowlingGame.java",
+                                  "src/main/java/Frame.java": ref / "Frame.java"}
+    cpp = with_examples(exercise(tmp_path, "cpp", "meetup", solution=["meetup.cpp", "meetup.h"]), ".meta/example.h")
+    assert pg.reference(cpp) == {"meetup.h": cpp / ".meta/example.h"}  # header only: the .cpp stub stays
+    with_examples(cpp, ".meta/example.cpp", ".meta/example.h")
+    assert set(pg.reference(cpp)) == {"meetup.cpp", "meetup.h"}
+    two = with_examples(exercise(tmp_path, "python", "two", solution=["a.py", "b.py"]), ".meta/example.py")
+    assert pg.reference(two) == {}  # which stub it replaces is anyone's guess
+    assert pg.reference(exercise(tmp_path, "python", "nofile")) == {}  # example listed, not there
+    assert pg.reference(tmp_path / "nothing") == {}
+
+
+def test_pick_and_copy_exercises(tmp_path):
+    src = tmp_path / "src"
+    for lang, slugs in {"python": ["leap", "anagram", "bob"], "go": ["z", "y"]}.items():
+        for slug in slugs:
+            exercise(src, lang, slug)
+    (src / "counts.json").write_text("{}")
+    assert [pg.case(e) for e in pg.pick(src, 2)] == ["go/y", "go/z", "python/anagram", "python/bob"]
+    assert [pg.case(e) for e in pg.pick(src, 1, lambda e: e.name != "anagram")] == ["go/y", "python/bob"]
+
+    java, leap = java_bowling(src), with_examples(src / "python/exercises/practice/leap", ".meta/example.py")
+    (java / "gradlew").write_text("#!/bin/sh\n")
+    (java / "gradlew").chmod(0o755)
+    dest = tmp_path / "out"
+    assert pg.copy_exercises([java, leap], dest, solve=True) == dest
+    got = dest / "java/exercises/practice/bowling"
+    assert (got / "src/main/java/BowlingGame.java").read_text() == "// .meta/src/reference/java/BowlingGame.java\n"
+    assert (got / "src/main/java/Frame.java").exists() and os.access(got / "gradlew", os.X_OK)
+    assert (got / "src/test/java/BowlingGameTest.java").read_text() == "stub\n"
+    assert (dest / "python/exercises/practice/leap/leap.py").read_text() == "// .meta/example.py\n"
+    assert (java / "src/main/java/BowlingGame.java").read_text() == "stub\n"  # the source as it was
+    pg.copy_exercises([leap], dest)  # a fresh dest; without solve the stub stays
+    assert [str(d.relative_to(dest)) for d in dest.glob("*/exercises/practice/*")] == ["python/exercises/practice/leap"]
+    assert (dest / "python/exercises/practice/leap/leap.py").read_text() == "stub\n"
+
+
+def test_selftest_command_runs_aiders_benchmark_without_a_model(tmp_path):
+    out = tmp_path / "out"
+    cmd = pg.selftest_command(out, out / "exercises", 12, "1000:1000", prefix=("sudo", "docker"))
+    assert cmd[:6] == ["sudo", "docker", "run", "--rm", "--name", "polyglot-selftest"]
+    assert cmd[cmd.index("--network") + 1] == "host" and cmd[cmd.index("--memory") + 1] == pg.MEMORY
+    mounts = lambda c: [c[i + 1] for i, x in enumerate(c) if x == "-v"]  # noqa: E731
+    run = pg.docker_command("q", tmp_path / "run", tmp_path / "ex", "http://x/v1")
+    assert mounts(cmd) == [f"{out}:/benchmarks", f"{out}/exercises:/exercises:ro", *mounts(run)[2:]]  # run's caches
+    env = dict(cmd[i + 1].split("=", 1) for i, x in enumerate(cmd) if x == "-e")
+    assert env["AIDER_DOCKER"] == "1" and env["AIDER_BENCHMARK_DIR"] == "/benchmarks" and "OPENAI_API_BASE" not in env
+    inner = cmd[-1]
+    assert inner.startswith("rm -rf /benchmarks/bench; ") and inner.endswith("chown -R 1000:1000 /benchmarks; exit $rc")
+    # bash hands python3 the multi-line boot and benchmark.py's arguments intact (rm, chown and python3 stubbed)
+    argv = tmp_path / "argv"
+    stubs = f"rm() {{ :; }}; chown() {{ :; }}; python3() {{ printf '%s\\0' \"$@\" > {argv}; }}; "
+    assert subprocess.run(["bash", "-c", stubs + inner]).returncode == 0
+    assert argv.read_text().split("\0")[:-1] == ["-c", pg.SELFTEST_BOOT, "/benchmarks/bench", "--no-aider",
+                                                  "--tries", "1", "--threads", "12", "--exercises-dir", "/exercises"]
+
+
+def test_selftest_boot_times_each_test_run(tmp_path):
+    fake = tmp_path / "fake"  # benchmark.py's shape: app() calls run_unit_tests through the module
+    fake.mkdir()
+    (fake / "benchmark.py").write_text(textwrap.dedent("""\
+        import subprocess, sys
+        from pathlib import Path
+
+        def run_unit_tests(original_dname, testdir, history_fname, test_files):
+            if testdir.name == "slow":
+                raise subprocess.TimeoutExpired("pytest", 180)
+            return "errors" if testdir.name == "bad" else None
+
+        def app():
+            for name in ("ok", "bad", "slow"):
+                d = Path(sys.argv[1]) / name
+                d.mkdir()
+                try:
+                    print(name, run_unit_tests(None, d, None, []))
+                except subprocess.TimeoutExpired:
+                    print(name, "timed out")
+            print(sys.argv[0])
+        """))
+    bench = tmp_path / "bench"
+    bench.mkdir()
+    r = subprocess.run([sys.executable, "-c", pg.SELFTEST_BOOT, str(bench)], cwd=tmp_path, capture_output=True,
+                       text=True, env={**os.environ, "PYTHONPATH": str(fake)})
+    assert r.stdout.splitlines() == ["ok None", "bad errors", "slow timed out", "benchmark.py"], r.stderr
+    assert all(float((bench / n / ".selftest.seconds").read_text()) >= 0 for n in ("ok", "bad", "slow"))
+
+
+PASS = ({"tests_outcomes": [True], "test_timeouts": 0}, "", 1.5)
+
+
+def fake_selftest(monkeypatch, outcomes: dict, returncode: int = 0) -> dict:
+    """docker as a fake: the container copies /exercises to /benchmarks/bench, as aider does, and
+    leaves each exercise's results, test output and seconds as outcomes[lang] says (None: nothing)."""
+    calls = {"docker": [], "run": []}
+
+    class Container:
+        def __init__(self, cmd, stdout=None, stderr=None):
+            calls["docker"].append(cmd)
+            vols = {c: h for h, c, *_ in (cmd[i + 1].split(":") for i, x in enumerate(cmd) if x == "-v")}
+            for ex in Path(vols["/exercises"]).glob("*/exercises/practice/*"):
+                d = Path(vols["/benchmarks"]) / "bench" / ex.relative_to(vols["/exercises"])
+                shutil.copytree(ex, d)
+                if outcomes[ex.parts[-4]] is None:
+                    continue
+                r, output, seconds = outcomes[ex.parts[-4]]
+                (d / ".aider.results.json").write_text(json.dumps(r))
+                (d / ".aider.chat.history.md").write_text(f"\n# aider chat started at x\n\n```\n{output}\n```")
+                if seconds is not None:
+                    (d / ".selftest.seconds").write_text(str(seconds))
+            self.returncode, self.polls = returncode, 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else self.returncode
+
+    monkeypatch.setattr(pg, "image_exists", lambda: True)
+    monkeypatch.setattr(pg, "docker", lambda: ["docker"])
+    monkeypatch.setattr(pg, "make_caches", lambda: None)
+    monkeypatch.setattr(pg.subprocess, "Popen", Container)
+    monkeypatch.setattr(pg.subprocess, "run", lambda cmd, **k: calls["run"].append(cmd))  # docker rm -f
+    monkeypatch.setattr(pg.time, "sleep", lambda s: None)
+    return calls
+
+
+def solvable(tmp_path) -> Path:
+    """Exercises with their reference solutions; python/anagram has none."""
+    ex = tmp_path / "ex"
+    for slug in ("leap", "bob"):
+        with_examples(exercise(ex, "python", slug), ".meta/example.py")
+    exercise(ex, "python", "anagram")
+    with_examples(exercise(ex, "rust", "acronym", solution=["src/lib.rs", "Cargo.toml"], tests=["tests/a.rs"]),
+                  ".meta/example.rs")
+    java_bowling(ex)
+    with_examples(exercise(ex, "go", "leap"), ".meta/example.go")
+    with_examples(exercise(ex, "cpp", "bob"), ".meta/example.cpp")
+    return ex
+
+
+def test_selftest_reports_each_language_and_fails_on_any_failure(tmp_path, monkeypatch, capsys):
+    calls = fake_selftest(monkeypatch, {
+        "python": PASS,
+        "rust": ({"tests_outcomes": [False], "test_timeouts": 0},
+                 "error[E0432]: unresolved import `itertools`\nerror: could not compile `acronym`", 3.0),
+        "java": ({"tests_outcomes": [False], "test_timeouts": 1}, "", 180.2),
+        "go": ({"exception": "Traceback (most recent call last):\nValueError: boom"}, "", None),
+        "cpp": None})  # the container died before it
+    ex, out = solvable(tmp_path), tmp_path / "selftest"
+    assert pg.main(["selftest", "--out", str(out), "--exercises", str(ex), "--per-language", "2",
+                    "--threads", "5"]) == 1
+    (cmd,) = calls["docker"]
+    assert "--no-aider --tries 1 --threads 5 --exercises-dir /exercises" in cmd[-1]
+    assert f"{out}/exercises:/exercises:ro" in cmd
+    assert calls["run"][-1] == ["docker", "rm", "-f", "polyglot-selftest"]
+    # what ran: the first two of each language with a reference solution, the reference in place
+    assert (out / "exercises/python/exercises/practice/leap/leap.py").read_text() == "// .meta/example.py\n"
+    assert not (out / "exercises/python/exercises/practice/anagram").exists()
+
+    res = json.loads((out / "selftest.json").read_text())
+    assert res["per_language"] == {
+        "cpp": {"passed": 0, "failed": 1, "timed_out": 0, "seconds": 0.0},
+        "go": {"passed": 0, "failed": 1, "timed_out": 0, "seconds": 0.0},
+        "java": {"passed": 0, "failed": 0, "timed_out": 1, "seconds": 180.2},
+        "python": {"passed": 2, "failed": 0, "timed_out": 0, "seconds": 1.5},
+        "rust": {"passed": 0, "failed": 1, "timed_out": 0, "seconds": 3.0}}
+    f = res["failing"]
+    assert set(f) == {"cpp/bob", "go/leap", "java/bowling", "rust/acronym"}
+    assert f["rust/acronym"] == {"timed_out": False, "seconds": 3.0, "output": "\n# aider chat started at x\n\n"
+                                 "error[E0432]: unresolved import `itertools`\nerror: could not compile `acronym`"}
+    assert f["java/bowling"] == {"timed_out": True, "seconds": 180.2, "output": "the tests ran over 180 s"}
+    assert f["go/leap"]["output"].endswith("ValueError: boom") and f["go/leap"]["seconds"] is None
+    assert f["cpp/bob"]["output"] == "no results; see selftest.log"
+    assert (res["n"], res["exercises_per_language"], res["threads"], res["ok"]) == (6, 2, 5, False)
+    assert res["exercises"] == str(ex.resolve()) and res["test_timeout"] == 180 and res["exit_code"] == 0
+    printed = capsys.readouterr().out
+    assert "python       2 passed   0 failed   0 timed out; slowest test run 2 s" in printed
+    assert "timed out: java/bowling" in printed and "failed: rust/acronym" in printed
+    assert "error: could not compile `acronym`" in printed  # the end of the output, on the console too
+    assert '"status": "error"' in printed
+
+
+def test_selftest_passes_when_every_reference_passes(tmp_path, monkeypatch, capsys):
+    fake_selftest(monkeypatch, dict.fromkeys(("python", "rust", "java", "go", "cpp"), PASS))
+    ex, out = solvable(tmp_path), tmp_path / "selftest"
+    (out / "bench/python/exercises/practice/old").mkdir(parents=True)  # a previous selftest's
+    monkeypatch.setattr(pg.os, "cpu_count", lambda: 2)
+    assert pg.main(["selftest", "--out", str(out), "--exercises", str(ex)]) == 0
+    res = json.loads((out / "selftest.json").read_text())
+    assert res["ok"] and res["failing"] == {} and res["n"] == 6 and res["threads"] == 8
+    assert res["per_language"]["python"] == {"passed": 2, "failed": 0, "timed_out": 0, "seconds": 1.5}
+    assert not (out / "bench/python/exercises/practice/old").exists()
+    printed = capsys.readouterr().out
+    assert "2 CPUs, 8 threads" in printed and "6/6 reference solutions pass" in printed
+
+
+def test_selftest_fails_when_the_benchmark_does(tmp_path, monkeypatch):
+    fake_selftest(monkeypatch, dict.fromkeys(("python", "rust", "java", "go", "cpp"), PASS), returncode=2)
+    ex, out = solvable(tmp_path), tmp_path / "selftest"
+    assert pg.main(["selftest", "--out", str(out), "--exercises", str(ex)]) == 1
+    assert json.loads((out / "selftest.json").read_text())["exit_code"] == 2
+    with pytest.raises(SystemExit, match="no exercises with a reference solution"):
+        pg.main(["selftest", "--out", str(out), "--exercises", str(tmp_path / "none")])
