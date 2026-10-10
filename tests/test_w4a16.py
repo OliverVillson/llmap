@@ -133,6 +133,32 @@ def test_oversized_files_fail_after_saving(tmp_path, monkeypatch):
     assert not (job / "work/allocation.json").exists() and not (job / ".done/quantize").exists()
 
 
+class CharTok:
+    """One id per character, no chat template: a row's prompt and answer, concatenated."""
+    chat_template = None
+    eos_token = ""
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+
+def test_calibration_set_takes_its_share_of_extra_rows(tmp_path):
+    """calib_extra_share 0.5 of quant_calib_samples 4: two distinct extra rows (one per language,
+    though each is in train three times) and two task rows."""
+    pytest.importorskip("datasets")
+    job = make_job(tmp_path, max_size_gb=1.0)
+    cfg = json.loads((job / "config.json").read_text())
+    (job / "config.json").write_text(json.dumps({**cfg, "calib_extra_share": 0.5}))
+    extra = [{"messages": [{"role": "user", "content": f"aider {lang} {i}"}, {"role": "assistant", "content": "edit"}],
+              "meta": {"source": "aider", "language": lang, "extra": True}}
+             for lang in ("go", "rust") for i in range(3)]
+    with open(job / "data/train.jsonl", "a") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in extra * 3))
+    texts = ["".join(map(chr, ids)) for ids in quantize_ct.calibration_set(Job(job), CharTok())["input_ids"]]
+    aider = sorted(t.split()[1] for t in texts if t.startswith("aider"))
+    assert len(texts) == 4 and aider == ["go", "rust"] and sum(t.startswith("Answer in JSON") for t in texts) == 2
+
+
 def test_unknown_quant_format_is_refused(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"quant_format": "nvfp4"}))
     with pytest.raises(ValueError, match="quant_format"):

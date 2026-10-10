@@ -82,15 +82,14 @@ def choose_keep(saliency: list[float], freq: list[float], n_keep: int) -> list[i
 
 def calib_sequences(job: Job, tok) -> list[list[int]]:
     """Token ids REAP calibrates on: the task's own train.jsonl (reap_calib
-    "task"), or a general-text file (reap_calib "general", see Config)."""
-    from stages.taskdata import load_examples, to_messages, tokenize_example
+    "task", calib_extra_share of it extra rows), or a general-text file
+    (reap_calib "general", see Config)."""
+    from stages.taskdata import calib_examples, to_messages, tokenize_example
 
     cfg = job.config
     if cfg.reap_calib == "task":
-        examples = load_examples(job.path("data", "train.jsonl"))
-        random.Random(0).shuffle(examples)
-        return [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"]
-                for ex in examples[: cfg.reap_calib_samples]]
+        examples = calib_examples(job.path("data", "train.jsonl"), cfg.reap_calib_samples, cfg.calib_extra_share)
+        return [tokenize_example(tok, ex["messages"], cfg.reap_max_seq)["input_ids"] for ex in examples]
     if cfg.reap_calib != "general":
         raise ValueError(f'reap_calib must be "task" or "general", not {cfg.reap_calib!r}')
     if not cfg.reap_calib_path:

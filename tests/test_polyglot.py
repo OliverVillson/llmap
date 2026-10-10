@@ -300,6 +300,9 @@ def test_logged_run_becomes_rows(tmp_path):
     assert "--- FAIL: TestLeap" in fix["messages"][-2]["content"] and "leap.go" in fix["messages"][-2]["content"]
     assert fix["messages"][-1] == {"role": "assistant", "content": "leap.go\n<<<<<<< SEARCH\nfixed",
                                    "reasoning_content": "Fix it."}
+    # each row names its exercise, so calibration can spread across languages (calib_extra_share)
+    assert first["meta"] == {"source": "aider", "language": "python", "exercise": "leap"}
+    assert fix["meta"] == {"source": "aider", "language": "go", "exercise": "leap"}
     assert stats["rows"] == 2 and stats["fix_rows"] == 1 and stats["requests"] == 8
     assert stats["unmatched_requests"] == 1  # the history summary
     assert stats["per_language"] == {

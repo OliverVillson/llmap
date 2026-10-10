@@ -1,14 +1,19 @@
-"""Task data helpers for the REAP and heal stages: read <job>/data/train.jsonl
-into chat messages and tokenize them with the prompt masked out of the loss."""
+"""Task data helpers for the REAP, heal and quantize stages: read <job>/data/train.jsonl
+into chat messages, pick calibration rows, and tokenize them with the prompt masked out
+of the loss."""
 from __future__ import annotations
 
+import itertools
 import json
+import random
+from collections import Counter
 from pathlib import Path
 
 
 def load_examples(path: Path) -> list[dict]:
     """Read a jsonl file into a list of {"messages": [...]} where the
-    last message is the assistant target. Accepts prompt/response, input/output,
+    last message is the assistant target, plus the row's "meta" if it has one
+    (training ignores it). Accepts prompt/response, input/output,
     instruction/output and messages rows."""
     path = Path(path)
     if not path.exists():
@@ -22,9 +27,43 @@ def load_examples(path: Path) -> list[dict]:
             row = json.loads(line)
             msgs = to_messages(row)
             if msgs:
-                out.append({"messages": msgs})
+                out.append({"messages": msgs, **({"meta": row["meta"]} if "meta" in row else {})})
     if not out:
         raise ValueError(f"no usable examples in {path}")
+    return out
+
+
+def is_extra(ex: dict) -> bool:
+    """A row the data stage took from Config.data_extra_rows."""
+    return bool((ex.get("meta") or {}).get("extra"))
+
+
+def calib_examples(path: Path, n: int, extra_share: float = 0.0) -> list[dict]:
+    """n rows of a train.jsonl to calibrate on, in a fixed shuffle. extra_share
+    (Config.calib_extra_share) of them are extra rows, each distinct row at most once,
+    taken from each language (meta.language) in turn; the rest are the other rows, then
+    any extra rows left. 0 takes the first n of the shuffle, copies and all."""
+    if not 0 <= extra_share <= 1:
+        raise ValueError(f"calib_extra_share must be between 0 and 1, not {extra_share}")
+    examples = load_examples(path)
+    rng = random.Random(0)
+    rng.shuffle(examples)
+    if not extra_share:
+        return examples[:n]
+    by_lang, other, seen = {}, [], set()
+    for ex in examples:
+        if not is_extra(ex):
+            other.append(ex)
+        elif (key := json.dumps(ex["messages"], sort_keys=True)) not in seen:
+            seen.add(key)
+            by_lang.setdefault(str(ex["meta"].get("language") or ""), []).append(ex)
+    extra = [ex for turn in itertools.zip_longest(*(by_lang[k] for k in sorted(by_lang))) for ex in turn if ex]
+    k = min(round(n * extra_share), len(extra))
+    out = (extra[:k] + other + extra[k:])[:n]
+    rng.shuffle(out)  # REAP measures layer importance on the first rows
+    langs = Counter(str(ex["meta"].get("language") or "?") for ex in out if is_extra(ex))
+    print(f"calibration: {sum(langs.values())} of {len(out)} rows are extra rows {dict(sorted(langs.items()))}",
+          flush=True)
     return out
 
 

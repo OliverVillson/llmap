@@ -57,8 +57,16 @@ class Config:
     data_contest_harness_share: float = 0.0  # share asked as a Mugge ticket instead of a plain prompt
     # A .jsonl of ready chat rows added to train as they are, for code specs (train only, no
     # teacher): e.g. aider transcripts from scripts/polyglot.py rows. A relative path is
-    # resolved in the job dir.
+    # resolved in the job dir. The data stage marks them in train.jsonl with "meta": {"extra": true}
+    # (training ignores meta).
     data_extra_rows: str = ""
+    # Each extra row appears this many times in train, so heal sees it that often per epoch.
+    data_extra_weight: int = 1
+    # Share of the calibration samples drawn from the extra rows, for REAP (reap_calib "task",
+    # reap_calib_samples) and w4a16 GPTQ (quant_calib_samples): each distinct row at most once,
+    # taken from each language (meta.language) in turn; the rest are the other train rows.
+    # 0 = train rows as they come, copies included.
+    calib_extra_share: float = 0.0
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
@@ -87,7 +95,7 @@ class Config:
     # Quantize: "gguf" = llama.cpp mixed-bit GGUF (below); "w4a16" = compressed-tensors
     # for vLLM on a GPU (stages/quantize_ct.py): int4 experts, FP8 attention, BF16 rest.
     quant_format: str = "gguf"
-    quant_calib_samples: int = 128  # w4a16: train.jsonl rows GPTQ calibrates on
+    quant_calib_samples: int = 128  # w4a16: train.jsonl rows GPTQ calibrates on (see calib_extra_share)
     quant_calib_len: int = 2048  # w4a16: tokens per calibration row
     quant_fp8_attention: bool = True  # w4a16: False keeps attention, DeltaNet, lm_head, Gemma's MLP BF16
     # Quantize: aim below the TaskSpec max size by this margin.
