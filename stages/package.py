@@ -3,6 +3,7 @@
 Writes:
   out/model.gguf   the model the TUI downloads
   out/Modelfile    for `ollama create <name> -f Modelfile`
+or, for a vLLM checkpoint (quant_format "w4a16"), out/model/ (hard links, no copy).
 
 The Modelfile spells out the chat template and stop tokens (ChatML for Qwen,
 Gemma 4's <|turn> format, Gemma 2/3's <start_of_turn>) instead of relying on
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 
 from common.progress import emit
 from stages._util import Job
@@ -109,6 +111,13 @@ def run_stage(job: Job) -> None:
     report = json.loads(job.path("out", "eval.json").read_text())
     alloc = json.loads(job.path("work", "allocation.json").read_text())
     src = alloc["candidates"][report["winner"]]["path"]
+    if os.path.isdir(src):  # a vLLM checkpoint (quant_format "w4a16"): hard-linked to out/model/
+        dst = job.path("out", "model")
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst, copy_function=os.link)
+        job.mark_done(STAGE, {"winner": report["winner"], "model": str(dst)})
+        emit(STAGE, "done", 100, f"{report['winner']} ready at out/model/ (vLLM)")
+        return
 
     dst = job.path("out", "model.gguf")
     dst.unlink(missing_ok=True)

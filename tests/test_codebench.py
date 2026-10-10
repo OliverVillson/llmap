@@ -316,8 +316,8 @@ def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monke
 
 
 def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch):
-    """Thinking loops under greedy decoding, so a single-sample thinking eval
-    samples at 0.6 with a fixed seed and passes thinking through."""
+    """Thinking loops under greedy decoding, so a thinking eval samples at 0.6 with
+    a fixed seed per sample, one sample or several, and passes thinking through."""
     from stages import eval as ev
     from stages._util import Job
 
@@ -338,6 +338,28 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     assert calls == [(24576, 0.6, 0, True)]
     # Progress for the Mac runner's bar: 0 of 1 before answering, 1 of 1 after.
     assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
+    calls.clear()
+    job.config.code_eval_samples = 2
+    ev.code_eval(job, "cand", probs, "task system")
+    assert sorted(calls) == [(24576, 0.6, 0, True), (24576, 0.6, 1, True)]
+
+
+def test_examples_only_and_pick_at_examples():
+    """A sample that passes the examples shown in the problem is the one handed in;
+    with none, the first sample is."""
+    R = sandbox.Result
+    stdio = {"suite": "livecodebench", "language": "python", "public": 1,
+             "tests": [{"input": "1", "output": "1"}, {"input": "2", "output": "2"}]}
+    func = {**stdio, "tests": {"func": "f", "cases": [["1", "1"], ["2", "2"]]}}
+    assert cb.examples_only(stdio)["tests"] == [{"input": "1", "output": "1"}]
+    assert cb.examples_only(func)["tests"] == {"func": "f", "cases": [["1", "1"]]}
+    probs = [stdio, func, {**stdio, "public": 0}]
+    results = [[R(False, "test_failed"), R(True, "")], [R(False, "test_failed"), R(True, "")],
+               [R(True, ""), R(True, "")]]
+    examples = [[False, True], [False, False], []]
+    suites = {"livecodebench": {"pass@1": 0.5}}
+    cb.add_pick_scores(suites, probs, results, examples)
+    assert suites["livecodebench"]["pick@examples"] == 0.5  # 1 of the 2 problems with examples
 
 
 def test_generate_sends_thinking_flag(monkeypatch):

@@ -195,6 +195,26 @@ def add_fix_scores(suites: dict, problems: list[dict], first: list, fixed: list)
         s["fixed"] = sum(bool(fixed[j] and fixed[j].passed) for j in idx)
 
 
+def examples_only(p: dict) -> dict:
+    """The problem with only the example cases its text shows (LiveCodeBench's public
+    tests, the first p["public"] cases), as a coder can check before handing in."""
+    k, tests = p["public"], p["tests"]
+    return {**p, "tests": {**tests, "cases": tests["cases"][:k]} if isinstance(tests, dict) else tests[:k]}
+
+
+def add_pick_scores(suites: dict, problems: list[dict], results: list[list], examples: list[list]) -> None:
+    """pick@examples per suite: of a problem's samples, the first that passes the examples
+    in its text is handed in (the first sample when none does), as Mugge's loop would.
+    Only problems with example cases count. results and examples hold one entry per sample."""
+    picked: dict[str, list[bool]] = {}
+    for p, rs, ex in zip(problems, results, examples):
+        if p.get("public") and len(ex) == len(rs):
+            picked.setdefault(p["suite"], []).append(rs[next((i for i, ok in enumerate(ex) if ok), 0)].passed)
+    for name, got in picked.items():
+        if "pass@1" in suites.get(name, {}):
+            suites[name]["pick@examples"] = round(sum(got) / len(got), 4)
+
+
 def mean_fix1(suites: dict) -> float | None:
     vals = [s["fix@1"] for s in suites.values() if "fix@1" in s]
     return round(sum(vals) / len(vals), 4) if vals else None

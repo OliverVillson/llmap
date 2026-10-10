@@ -244,6 +244,36 @@ def test_sampled_passes_run_at_once_and_give_the_rows_of_one_after_another(tmp_p
     assert out["tok_s_total"] > 0 and out["answer_s"] > 0 and out["tok_s_vm"] == 40.0
 
 
+def test_sampled_lcb_answers_are_checked_on_the_examples(tmp_path, monkeypatch):
+    """Each sampled answer that fails is run on the examples alone; pick@examples hands
+    in the first sample that passes them, and rows record it."""
+    job = Job(tmp_path)
+    job.config.code_eval_samples, job.config.code_eval_thinking = 3, True
+    cases = [{"input": "1", "output": "1"}, {"input": "2", "output": "2"}]
+    probs = [{"suite": "livecodebench", "id": i, "language": "python", "prompt": f"q{i}", "stub": "", "entry": "",
+              "tests": cases, "public": 1} for i in "ab"]
+    plan = {"qa": ["bad", "examples", "good"], "qb": ["bad", "good", "bad"]}  # "examples" passes only the first case
+    monkeypatch.setattr(ev.codebench, "assemble", lambda p, a, code=None: (a, json.dumps(p["tests"])))
+    monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
+        sandbox.Result(ok, "" if ok else "test_failed")
+        for ok in (code == "good" or code == "examples" and len(json.loads(tests)) == 1 for _, code, tests, *_ in items)])
+
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False,
+                      on_answer=None, infos=None):
+        infos.extend({} for _ in prompts)
+        for _ in prompts:
+            on_answer()
+        return [next(v[seed] for k, v in plan.items() if p.startswith(k)) for p in prompts], None
+
+    monkeypatch.setattr(ev, "generate", fake_generate)
+    out = ev.code_eval(job, "cand", probs, "task system")
+    lcb = out["suites"]["livecodebench"]
+    assert lcb["pass@1"] == round(1 / 3, 4) and lcb["pick@examples"] == 0.5  # a hands in "examples", b "good"
+    rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
+    assert [(r["id"], r["examples_passed"]) for r in rows] == [
+        ("a", False), ("b", False), ("a", True), ("b", True), ("a", True), ("b", False)]
+
+
 def test_answer_stats():
     rows = [{"tokens": 100, "finish": "stop", "forced": None},
             {"tokens": 300, "finish": "length", "forced": "length", "forced_tokens": 50},

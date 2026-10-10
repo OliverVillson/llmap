@@ -550,10 +550,10 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 emit(STAGE, msg=f"{name}: {done}/{total} code answers", answered=done, total=total)
 
     greedy = n == 1
-    # Greedy decoding loops when thinking, so thinking always samples (at the
-    # model card's temperature), seeded for repeatability.
-    temperature = (cfg.code_eval_temperature if not greedy
-                   else cfg.code_eval_thinking_temperature if cfg.code_eval_thinking else 0.0)
+    # Greedy decoding loops when thinking, so thinking always samples at the model
+    # card's temperature, seeded for repeatability, however many samples there are.
+    temperature = (cfg.code_eval_thinking_temperature if cfg.code_eval_thinking
+                   else 0.0 if greedy else cfg.code_eval_temperature)
     seeds = [i if cfg.code_eval_thinking or not greedy else None for i in range(n)]
     finished: list[float] = []  # when each pass got its last answer
 
@@ -579,6 +579,8 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
 
     emit(STAGE, msg=f"{name}: 0/{total} code answers", answered=0, total=total)
     fixed: list = [None] * len(problems)
+    # Sampled: whether each sample passes the examples in its problem's text, for pick@examples
+    examples: list[list[bool]] = [[] for _ in problems]
     start = time.monotonic()
     for i, (answers, infos) in enumerate(passes()):
         ran: list = [None] * len(problems)
@@ -589,6 +591,17 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
                 items.append((problems[j]["language"], code, tests, codebench.time_limit(problems[j])))
             for j, r in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 ran[j] = r
+        if not greedy:
+            check = [j for j, p in enumerate(problems) if p.get("public") and not ran[j].passed]
+            items = []
+            for j in check:
+                pj = codebench.examples_only(problems[j])
+                code, tests = codebench.assemble(pj, answers[j], code_of(pj, answers[j]))
+                items.append((pj["language"], code, tests, codebench.time_limit(pj)))
+            ex = dict(zip(check, (r.passed for r in sandbox.run_many(items)))) if items else {}
+            for j, p in enumerate(problems):
+                if p.get("public"):
+                    examples[j].append(ran[j].passed or ex[j])  # a full pass passes the examples too
         fix_answers = [""] * len(problems)
         if cfg.code_eval_fix and greedy:
             todo = {j for j, r in enumerate(ran) if not r.passed and r.reason not in codebench.CANNOT_RUN}
@@ -616,11 +629,14 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
             fix = ({"fix_passed": fixed[j].passed, "fix_reason": fixed[j].reason, "fix_output": fixed[j].output[-500:],
                     "fix_answer": fix_answers[j]} if fixed[j] else {})
             rows.append({"suite": p["suite"], "id": p["id"], "sample": i, "passed": r.passed,
-                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j], **fix})
+                         "reason": r.reason, "output": r.output[-500:], "answer": a, **infos[j], **fix,
+                         **({"examples_passed": examples[j][i]} if len(examples[j]) > i else {})})
     out_dir = job.path("work", "code_eval")
     out_dir.mkdir(exist_ok=True)
     write_jsonl(out_dir / f"{name}.jsonl", rows)
     suites = codebench.summarize(problems, results, cfg.code_eval_k)
+    if not greedy:
+        codebench.add_pick_scores(suites, problems, results, examples)
     fix = {}
     if cfg.code_eval_fix and n == 1:
         codebench.add_fix_scores(suites, problems, [rs[0] for rs in results], fixed)

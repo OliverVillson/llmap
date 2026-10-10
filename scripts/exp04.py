@@ -415,9 +415,9 @@ def summary() -> str:
         table.append([label, f"{main.get('size_gb', 0):.1f} GB" if main.get("size_gb") else "",
                       pct(lc.get("pass@1")), pct(lc.get("pick@examples")),
                       pct(lc["pass@1"] / ref) if lc.get("pass@1") is not None and ref else "",
-                      *[pct(x) for x in rest], pct(fix), pct(code.get("capped")),
-                      f"{gpu['busy_mean']:.0f}%" if gpu.get("busy_mean") is not None else "",
-                      f"{code['out_tok_s']:.0f}" if code.get("out_tok_s") else ""])
+                      *[pct(x) for x in rest], pct(fix), pct(code.get("hit_cap_share")),
+                      f"{gpu['busy_pct']:.0f}%" if gpu.get("busy_pct") is not None else "",
+                      f"{code['tok_s_total']:.0f}" if code.get("tok_s_total") else ""])
     widths = [max(len(r[i]) for r in table) for i in range(len(head))]
     out = ["\n".join("  ".join(x.ljust(widths[i]) if i == 0 else x.rjust(widths[i]) for i, x in enumerate(r)).rstrip()
                      for r in table)]
