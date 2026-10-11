@@ -1,0 +1,7 @@
+{
+  "files": {
+    "calc/mul.py": "from calc.add import add\n\n\ndef mul(a, b):\n    out = 0\n    for _ in range(a):\n        out = add(out, b)\n    return out\n"
+  },
+  "note": "reference",
+  "canary": "MUGGE-BENCH-TEST-FIXTURE"
+}

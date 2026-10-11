@@ -11,7 +11,7 @@ export const ROLES = ['architect', 'implement', 'test', 'fix', 'refactor', 'docs
 export type Role = (typeof ROLES)[number];
 
 /** Toolchain image a ticket's acceptance commands run in. See sandbox/images/. */
-export const IMAGES = ['c', 'node', 'python', 'web'] as const;
+export const IMAGES = ['c', 'node', 'python', 'web', 'dotnet'] as const;
 export type Image = (typeof IMAGES)[number];
 
 export interface Budget {

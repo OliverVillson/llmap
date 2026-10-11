@@ -1,0 +1,80 @@
+{
+  "bench": {
+    "canary": "MUGGE-BENCH-TEST-FIXTURE",
+    "version": "test",
+    "split": "dev"
+  },
+  "interfaces": [
+    "calc/API.md"
+  ],
+  "tickets": [
+    {
+      "id": "add",
+      "title": "calc: add",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "calc/add.py"
+      ],
+      "reads": [
+        "calc/*.py",
+        "tests/test_add.py"
+      ],
+      "context": "Implement add in calc/add.py as calc/API.md says.",
+      "acceptance": [
+        "python3 -m unittest tests.test_add"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 2,
+        "max_tokens": 4000
+      },
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "python3 -m unittest tests.test_hidden_add"
+        ]
+      }
+    },
+    {
+      "id": "mul",
+      "title": "calc: mul",
+      "role": "implement",
+      "model": "coder-py",
+      "priority": 2,
+      "depends_on": [
+        "add"
+      ],
+      "owns": [
+        "calc/mul.py"
+      ],
+      "reads": [
+        "calc/*.py",
+        "tests/test_mul.py"
+      ],
+      "context": "Implement mul in calc/mul.py as calc/API.md says.",
+      "acceptance": [
+        "python3 -m unittest tests.test_mul"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 2,
+        "max_tokens": 4000
+      },
+      "escalate_to": null,
+      "bench": {
+        "theme": "ml",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "python3 -m unittest tests.test_hidden_mul"
+        ]
+      }
+    }
+  ]
+}

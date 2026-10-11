@@ -545,6 +545,7 @@ def run_stage(job: Job) -> None:
     if think:
         stats["thinking_chars_median"] = statistics.median(
             len(r["messages"][-1].get("reasoning_content", "")) for r in train) if train else 0
+    train = drop_bench_rows(train, stats)
     rng.shuffle(train)
     calib = train[:1000]  # without the copies below
     train += extra * (cfg.data_extra_weight - 1)  # last, so a prefix of train.jsonl reads each row once
@@ -710,6 +711,20 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
     print(f"[data] contest: {len(out)} rows ({n_ticket} as tickets) from {len(asks)} LiveCodeBench problems "
           f"released before {cfg.data_contest_before}, {len(best)} solved, dropped {drops}", flush=True)
     return out
+
+
+# Every MuggeBench task file carries a canary starting with this (mugge/bench/check.ts
+# enforces it), so no benchmark task can end up in heal, REAP or GPTQ data.
+BENCH_CANARY = "MUGGE-BENCH-"
+
+
+def drop_bench_rows(rows: list[dict], stats: dict) -> list[dict]:
+    """rows without any that contain a MuggeBench canary; counts them in stats."""
+    kept = [r for r in rows if BENCH_CANARY not in json.dumps(r, ensure_ascii=False)]
+    if len(kept) < len(rows):
+        stats["bench_rows_dropped"] = len(rows) - len(kept)
+        print(f"[data] dropped {len(rows) - len(kept)} rows holding a MuggeBench canary", flush=True)
+    return kept
 
 
 def extra_rows(job: Job, stats: dict) -> list[dict]:
