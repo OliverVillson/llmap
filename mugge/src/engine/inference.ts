@@ -33,6 +33,8 @@ export interface InferenceConfig {
    */
   guided?: 'response_format' | 'guided_json' | 'none';
   temperature?: number;
+  /** Extra request fields sent as they are, e.g. seed, top_p, top_k, chat_template_kwargs. */
+  extra?: Record<string, unknown>;
   timeoutMs?: number;
 }
 
@@ -62,6 +64,7 @@ export class OpenAICompatible implements Inference {
       messages,
       max_tokens: maxTokens,
       temperature: this.cfg.temperature ?? 0.2,
+      ...this.cfg.extra,
     };
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };

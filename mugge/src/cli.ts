@@ -33,6 +33,7 @@ const HELP = `mugge ${VERSION}: parallel coding with small specialist models
   mugge close <project>          save state, stop the VM, billing stops
   mugge list                     projects and their state
   mugge spike [--fake]           the engine spike on the polyglot test project
+  mugge bench run|check|report … MuggeBench (see bench/run.ts, check.ts, report.ts)
   mugge engine serve --port N --project <dir>    (on the VM) the engine API
   mugge dog                      the dog
 
@@ -238,6 +239,12 @@ async function main(argv: string[]) {
       const r = await runSpike({ fake, latencyMs: fake ? 300 : undefined });
       console.log('\n' + formatSummary(r.summary));
       process.exit(r.summary.done === r.summary.tickets && r.integrated ? 0 : 1);
+    }
+    case 'bench': {
+      const sub = rest[0];
+      if (!['run', 'check', 'report'].includes(sub)) die('mugge bench run|check|report …');
+      const p = Bun.spawnSync(['bun', join(import.meta.dir, '..', 'bench', `${sub}.ts`), ...rest.slice(1)], { stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
+      process.exit(p.exitCode ?? 1);
     }
     case 'engine': {
       const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { port: { type: 'string' }, project: { type: 'string' }, concurrency: { type: 'string' } } });

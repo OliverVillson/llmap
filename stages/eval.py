@@ -658,6 +658,46 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str) -> di
             **answer_stats(rows, max(finished, default=start) - start)}
 
 
+MUGGE_DIR = Path(__file__).resolve().parent.parent / "mugge"
+
+
+def mugge_bench_command(job: Job, name: str, out: Path) -> list[str]:
+    """`bun mugge/bench/run.ts` against the candidate served on PORT, with the eval's
+    thinking and sampling settings."""
+    cfg = job.config
+    thinking = cfg.code_eval_thinking
+    cmd = ["bun", str(MUGGE_DIR / "bench" / "run.ts"), "--bench", cfg.mugge_bench_dir, "--out", str(out),
+           "--url", f"http://127.0.0.1:{PORT}/v1", "--model", name, "--name", name,
+           "--seeds", str(cfg.mugge_bench_seeds), "--concurrency", str(cfg.mugge_bench_concurrency),
+           "--sandbox", cfg.mugge_bench_sandbox, "--thinking", "on" if thinking else "off",
+           "--temperature", str(cfg.code_eval_thinking_temperature if thinking else cfg.code_eval_temperature),
+           "--top-p", "0.95"]
+    if thinking:
+        cmd += ["--top-k", str(cfg.thinking_top_k)]
+    if cfg.mugge_bench_split:
+        cmd += ["--split", cfg.mugge_bench_split]
+    return cmd
+
+
+def mugge_bench(job: Job, name: str) -> dict | None:
+    """Runs MuggeBench on the running server; its report.json, or None when it failed.
+    Per-run rows stay in work/mugge_bench/<name>/results.jsonl for paired comparisons
+    (bun mugge/bench/report.ts <run> --ref <ref run>)."""
+    out = job.path("work", "mugge_bench", name)
+    out.mkdir(parents=True, exist_ok=True)
+    log = job.path("work", f"mugge-bench-{name}.log")
+    with open(log, "w") as f:
+        code = subprocess.run(mugge_bench_command(job, name, out), stdout=f, stderr=subprocess.STDOUT, cwd=MUGGE_DIR).returncode
+    report = out / "report.json"
+    if code != 0 or not report.exists():
+        emit(STAGE, msg=f"{name}: MuggeBench failed (exit {code}); see {log}")
+        return None
+    r = json.loads(report.read_text())
+    emit(STAGE, msg=f"{name}: Mugge score {r['score']}% ({r['tickets']} tickets x {r['seeds']} seeds), "
+                    f"{r.get('solvedPerGpuHour')} solved per GPU-hour")
+    return r
+
+
 def answer_stats(rows: list[dict], seconds: float) -> dict:
     """How long the code answers ran: completion tokens per answer (thinking in, a
     forced answer not), the shares that hit the cap and that needed a forced answer,
@@ -729,7 +769,7 @@ def run_stage(job: Job) -> None:
     system = system_prompt(spec)
     teacher_name = cfg.teacher.split("/")[-1]
     problems = code_problems(job, held) if cfg.code_eval_suites else []
-    if not inputs and not problems:
+    if not inputs and not problems and not cfg.mugge_bench_dir:
         raise RuntimeError("nothing to evaluate: no data/heldout.jsonl and no code_eval_suites")
     use_judge = bool(inputs) and bool(judge_key(cfg.judge_model)) and not DRY_RUN
     if inputs and not use_judge and not DRY_RUN:
@@ -762,7 +802,7 @@ def run_stage(job: Job) -> None:
             emit(STAGE, pct=10 + 85 * i / n, msg=f"running {name}")
             proc = serve(job, c["path"], name)
             end_watch = watch_gpu()  # from here on: the load is not the eval
-            agree = score = tps = code = None
+            agree = score = tps = code = bench = None
             answers: list[str] = []
             try:
                 if inputs:
@@ -770,6 +810,9 @@ def run_stage(job: Job) -> None:
                 if problems:
                     emit(STAGE, pct=10 + 85 * (i + 0.3) / n, msg=f"{name}: answering {len(problems)} code problems")
                     code = code_eval(job, name, problems, system)
+                if cfg.mugge_bench_dir:
+                    emit(STAGE, pct=10 + 85 * (i + 0.5) / n, msg=f"{name}: running MuggeBench")
+                    bench = mugge_bench(job, name)
             finally:
                 gpu = end_watch()
                 stop(proc)
@@ -782,7 +825,7 @@ def run_stage(job: Job) -> None:
                 per = ", ".join(f"{k} {v['pass@1']:.0%}" for k, v in code["suites"].items() if "pass@1" in v)
                 emit(STAGE, pct=10 + 85 * (i + 0.9) / n, msg=f"{name}: pass@1 {per}")
             results[name] = {
-                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code, "gpu": gpu,
+                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code, "gpu": gpu, "mugge_bench": bench,
                 "samples": [{"input": a, "output": b, "reference": r} for a, b, r in list(zip(inputs, answers, refs))[:3]],
             }
 
@@ -802,6 +845,7 @@ def run_stage(job: Job) -> None:
         candidates.append({
             "name": name, "size_gb": c["size_gb"], "score": score,
             "agreement": r["agreement"], "judge_score": r["judge"], "code": r["code"],
+            "mugge_bench": r.get("mugge_bench"),
             "tok_s_est": tok_s_est, "tok_s_vm": r["tok_s_vm"], "gpu": r["gpu"],
             "meets_target": c["size_gb"] <= spec.target.max_size_gb and (tok_s_est or 0) >= spec.target.min_tok_s,
         })
