@@ -1,4 +1,9 @@
 {
+  "bench": {
+    "canary": "MUGGE-BENCH-PUBLIC-EXAMPLE-6f1d2c",
+    "version": "example",
+    "split": "dev"
+  },
   "interfaces": [
     "libshort/include/short.h",
     "api/API.md",
@@ -29,7 +34,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "systems",
+        "language": "c",
+        "role": "implement",
+        "hidden": [
+          "mkdir -p libshort/build && cc -Wall -Werror -std=c11 -O1 -Ilibshort/include -o libshort/build/hidden_encode libshort/tests/hidden_encode.c libshort/src/encode.c && ./libshort/build/hidden_encode"
+        ]
+      }
     },
     {
       "id": "c-base62-decode",
@@ -55,7 +68,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "systems",
+        "language": "c",
+        "role": "implement",
+        "hidden": [
+          "mkdir -p libshort/build && cc -Wall -Werror -std=c11 -O1 -Ilibshort/include -o libshort/build/hidden_decode libshort/tests/hidden_decode.c libshort/src/decode.c && ./libshort/build/hidden_decode"
+        ]
+      }
     },
     {
       "id": "c-hash",
@@ -81,7 +102,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "systems",
+        "language": "c",
+        "role": "implement",
+        "hidden": [
+          "mkdir -p libshort/build && cc -Wall -Werror -std=c11 -O1 -Ilibshort/include -o libshort/build/hidden_hash libshort/tests/hidden_hash.c libshort/src/hash.c && ./libshort/build/hidden_hash"
+        ]
+      }
     },
     {
       "id": "c-table",
@@ -110,7 +139,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "systems",
+        "language": "c",
+        "role": "implement",
+        "hidden": [
+          "mkdir -p libshort/build && cc -Wall -Werror -std=c11 -O1 -Ilibshort/include -o libshort/build/hidden_table libshort/tests/hidden_table.c libshort/src/table.c libshort/src/hash.c && ./libshort/build/hidden_table"
+        ]
+      }
     },
     {
       "id": "c-short",
@@ -141,7 +178,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "systems",
+        "language": "c",
+        "role": "implement",
+        "hidden": [
+          "mkdir -p libshort/build && cc -Wall -Werror -std=c11 -O1 -Ilibshort/include -o libshort/build/hidden_short libshort/tests/hidden_short.c libshort/src/shortener.c libshort/src/table.c libshort/src/hash.c libshort/src/encode.c && ./libshort/build/hidden_short"
+        ]
+      }
     },
     {
       "id": "py-validate",
@@ -166,7 +211,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "python3 -m unittest discover -t api -s api/tests -p test_hidden_validate.py"
+        ]
+      }
     },
     {
       "id": "py-store",
@@ -191,7 +244,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "python3 -m unittest discover -t api -s api/tests -p test_hidden_store.py"
+        ]
+      }
     },
     {
       "id": "py-binding",
@@ -220,7 +281,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_hidden_binding.py"
+        ]
+      }
     },
     {
       "id": "py-handlers",
@@ -252,7 +321,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_hidden_handlers.py"
+        ]
+      }
     },
     {
       "id": "py-server",
@@ -280,7 +357,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "python",
+        "role": "implement",
+        "hidden": [
+          "make -C libshort lib && python3 -m unittest discover -t api -s api/tests -p test_hidden_server.py"
+        ]
+      }
     },
     {
       "id": "ts-args",
@@ -306,7 +391,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "ts",
+        "role": "implement",
+        "hidden": [
+          "bun test ./cli/test/hidden_args.test.ts"
+        ]
+      }
     },
     {
       "id": "ts-format",
@@ -332,7 +425,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "ts",
+        "role": "implement",
+        "hidden": [
+          "bun test ./cli/test/hidden_format.test.ts"
+        ]
+      }
     },
     {
       "id": "ts-client",
@@ -359,7 +460,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "ts",
+        "role": "implement",
+        "hidden": [
+          "bun test ./cli/test/hidden_client.test.ts"
+        ]
+      }
     },
     {
       "id": "ts-config",
@@ -385,7 +494,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "ts",
+        "role": "implement",
+        "hidden": [
+          "bun test ./cli/test/hidden_config.test.ts"
+        ]
+      }
     },
     {
       "id": "ts-main",
@@ -420,7 +537,15 @@
         "attempts": 4,
         "max_tokens": 60000
       },
-      "escalate_to": null
+      "escalate_to": null,
+      "bench": {
+        "theme": "backend",
+        "language": "ts",
+        "role": "implement",
+        "hidden": [
+          "bun test ./cli/test/hidden_main.test.ts"
+        ]
+      }
     }
   ]
 }
