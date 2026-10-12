@@ -11,19 +11,17 @@ LiveCodeBench window and finds how small it can get before the score drops, as t
 baseline for an LCB-per-GB record (plan: /mnt/project-files/plan/granite-record.md).
 Recipes (stages/dense.py), each a GGUF scored by llama-server:
   bf16  the model as released, ~7.3 GB
-  q8    Q8_0, ~3.9 GB
   q4    r25q4's bits (Q4_K_M-like), ~2.2 GB
-  m35   feed-forward ~3.5 bits by saliency, attention q5_k, head q6_k, embedding q4_k, ~1.9 GB
-  m28   feed-forward ~2.8 bits, attention q4_k, head q5_k, embedding q3_k, ~1.5 GB
+  m28   feed-forward ~2.8 bits by saliency, attention q4_k, head q5_k, embedding q3_k, ~1.5 GB
 
-Steps (docs: /mnt/project-files/plan/exp05-granite.md):
+Steps (docs: /mnt/project-files/plan/exp05-granite.md), two llama-servers sharing the GPU:
   1. VM setup (scripts/setup_vm.sh) and the Granite download
   2. a BF16 GGUF
-  3. calibration text: the model answers MultiPL-E and C problems with thinking on
-  4. the importance matrix on that text
-  5. per recipe: quantize, LiveCodeBench v6 (2025-01..04) with thinking on and a 32k
-     budget, then the 8k (the card's recommended cap) and 16k scores by cutting that thinking
-  6. the GGUFs and the job results to the mugge-library bucket
+  3. bf16 scored on LiveCodeBench v6 (2025-01..04), thinking on, 16k budget and an 8k cut
+     (the card's recommended cap); beside it, the calibration answers, the importance
+     matrix and the q4 and m28 GGUFs
+  4. q4 and m28 scored the same way, at once
+  5. the GGUFs and the job results to the mugge-library bucket
 
 Scores are compared with the card's 69.7 (its own window and settings). Runs with the
 system python3 (stdlib only); each step sources .env.vm. Logs are in ~/exp05-logs.
@@ -35,10 +33,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Callable
 
-from runner import REPO, Skip, Step, evroc_ok, read, run_plan, sh, state_lock, write
+from runner import REPO, Skip, Step, evroc_ok, read, run_plan, sh, write
 
 NVME = Path(os.environ.get("NVME", "/mnt/nvme"))
 J = Path(os.environ.get("LOBBOT_JOBS", NVME / "jobs"))
@@ -49,11 +49,11 @@ HF_DIR = NVME / "models" / "granite-4.2-3b"
 BF16 = NVME / "models" / "gguf" / "granite-4.2-3b-BF16.gguf"
 BASE = J / "granite-base"  # calibration answers and the importance matrix
 TASKSPEC = "examples/python-utils.code.taskspec.json"
-RECIPES = ["bf16", "q8", "q4", "m35", "m28"]
+RECIPES = ["bf16", "q4", "m28"]
 CARD_LCB = 0.697  # Granite 4.2 3B model card, LiveCodeBench v6 (window and settings not stated)
-# The card recommends 8192 new tokens with thinking; 32k leaves room to see what a longer cap buys.
-MAX_TOKENS = 32768
-BUDGETS = [8192, 16384]
+# The card recommends 8192 new tokens with thinking; 16k shows whether a longer cap buys anything.
+MAX_TOKENS = 16384
+BUDGETS = [8192]
 CALIB_SUITES = ["multipl-e-py", "multipl-e-js", "multipl-e-ts", "multipl-e-cpp", "c-set"]
 
 
@@ -72,15 +72,17 @@ def vram_gb() -> float:
 
 # A 3B fits any GPU in BF16 (~7.3 GB), so the model itself writes the calibration
 # answers and the importance pass runs on the GPU. Its KV cache is ~80 KiB per token
-# (40 layers, 8 KV heads of 64), ~2.7 GB per answer at 32k in 16 bits. An L40S (48 GB)
-# scores with an 8-bit KV cache, 16 answers at once next to the BF16 model; a B200
-# keeps 16-bit and runs 48.
+# (40 layers, 8 KV heads of 64), ~0.65 GB per answer at 16k in 8 bits. Two llama-servers
+# share the GPU (ports 8091 and 8092): one 3B server alone leaves an L40S mostly idle.
+# On an L40S each runs 16 answers at once with an 8-bit KV cache (two BF16 servers ~35 GB);
+# a B200 keeps 16-bit and runs 48 each.
 B200 = vram_gb() >= 150
 EVAL_SLOTS, CALIB_SLOTS = ("48", "48") if B200 else ("16", "16")
 KV_TYPE = "" if B200 else "q8_0"
-MINUTES = ({"setup": 40, "download": 3, "gguf": 3, "calib": 8, "imatrix": 3, "eval": 15, "budgets": 5}
+PORTS = ("8091", "8092")
+MINUTES = ({"setup": 40, "download": 3, "gguf": 3, "phase1": 15, "phase2": 12}
            if B200 else
-           {"setup": 45, "download": 5, "gguf": 5, "calib": 15, "imatrix": 5, "eval": 40, "budgets": 10})
+           {"setup": 45, "download": 5, "gguf": 5, "phase1": 35, "phase2": 30})
 # The card's sampling: temperature 1.0, top_p 0.95, no top_k (0 turns it off in llama-server).
 THINKING = {"teacher": MODEL, "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0,
             "thinking_top_k": 0, "eval_kv_type": KV_TYPE}
@@ -98,11 +100,6 @@ def make_job(d: Path, cfg: dict, max_size_gb: float = 10.0) -> Path:
     spec["target"] = {**spec.get("target", {}), "max_size_gb": max_size_gb}
     write(d / "taskspec.json", spec)
     return d
-
-
-def skip_part(step: Step, part: str) -> None:
-    with state_lock:
-        step.finished.add(part)
 
 
 # ---------- the steps ----------
@@ -148,46 +145,89 @@ def run_ggufs(step: Step) -> None:
     sh(step, f"python -m stages.dense gguf --job {BASE} --hf {HF_DIR} --bf16 {BF16}")
 
 
-def run_calib(step: Step) -> None:
-    base_job()
-    sh(step, f"python -m stages.dense calib --job {BASE} --model {BF16}", {"LOBBOT_EVAL_SLOTS": CALIB_SLOTS})
-
-
-def run_imatrix(step: Step) -> None:
-    base_job()
-    sh(step, f"python -m stages.dense imatrix --job {BASE} --bf16 {BF16}")
-
-
 def model_of(recipe: str) -> Path:
     """The recipe's GGUF: the BF16 one as released, or its job's quantized copy."""
     return BF16 if recipe == "bf16" else job_dir(recipe) / "out" / "model.gguf"
 
 
-def run_recipe(recipe: str):
-    def run(step: Step) -> None:
-        d = job_dir(recipe)
-        if not (d / "config.json").exists():
-            make_job(d, {**THINKING, "code_eval_suites": ["livecodebench"], "lcb_since": "2025-01-01",
-                         "code_eval_max_tokens": MAX_TOKENS, "code_eval_budgets": BUDGETS, "code_eval_ref": "",
-                         "eval_candidates": {f"granite-{recipe}": str(model_of(recipe))}})
-        env = {"LOBBOT_EVAL_SLOTS": EVAL_SLOTS}
-        if recipe == "bf16" or (d / ".done" / "quantize").exists():
-            skip_part(step, "quantize")
-        else:
-            sh(step, f"python -m stages.dense quantize --job {d} --recipe {recipe} --bf16 {BF16} "
+def recipe_job(recipe: str) -> Path:
+    d = job_dir(recipe)
+    if not (d / "config.json").exists():
+        make_job(d, {**THINKING, "code_eval_suites": ["livecodebench"], "lcb_since": "2025-01-01",
+                     "code_eval_max_tokens": MAX_TOKENS, "code_eval_budgets": BUDGETS, "code_eval_ref": "",
+                     "eval_candidates": {f"granite-{recipe}": str(model_of(recipe))}})
+    return d
+
+
+def env_for(port: str, slots: str = EVAL_SLOTS) -> dict:
+    return {"LOBBOT_EVAL_SLOTS": slots, "LOBBOT_EVAL_PORT": port}
+
+
+def score(step: Step, recipe: str, port: str) -> None:
+    """LiveCodeBench at MAX_TOKENS, then the BUDGETS cuts, on its own llama-server port."""
+    d = recipe_job(recipe)
+    if not (d / ".done" / "eval").exists():  # --only always reruns
+        sh(step, f"python pipeline.py --job {d} --only eval", env_for(port))
+    if not (d / ".done" / "budgets").exists():
+        sh(step, f"python -m stages.budget --job {d}", env_for(port))
+
+
+def make_small(step: Step, port: str) -> None:
+    """Calibration answers, the importance matrix, then every quantized recipe."""
+    base_job()
+    if not (BASE / "work" / "calib-chat.txt").exists():
+        sh(step, f"python -m stages.dense calib --job {BASE} --model {BF16}", env_for(port, CALIB_SLOTS))
+    if not (BASE / "work" / "imatrix.gguf").exists():
+        sh(step, f"python -m stages.dense imatrix --job {BASE} --bf16 {BF16}")
+    for r in RECIPES[1:]:
+        d = recipe_job(r)
+        if not (d / ".done" / "quantize").exists():
+            sh(step, f"python -m stages.dense quantize --job {d} --recipe {r} --bf16 {BF16} "
                      f"--imatrix {BASE / 'work' / 'imatrix.gguf'}")
-        if (d / ".done" / "eval").exists():  # --only always reruns
-            skip_part(step, "eval")
-        else:
-            sh(step, f"python pipeline.py --job {d} --only eval", env)
-        sh(step, f"python -m stages.budget --job {d}", env)
-    return run
+
+
+def at_once(*jobs: Callable[[], None]) -> None:
+    """Runs the jobs in threads and waits for all; the first error is raised after."""
+    errors: list[BaseException] = []
+
+    def wrap(fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 - reported below
+            errors.append(e)
+
+    threads = [threading.Thread(target=wrap, args=(fn,)) for fn in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+def run_phase1(step: Step) -> None:
+    """BF16 is scored while the calibration, importance pass and quantizing run beside it."""
+    at_once(lambda: score(step, "bf16", PORTS[0]), lambda: make_small(step, PORTS[1]))
+
+
+def phase1_done() -> bool:
+    return (job_dir("bf16") / ".done" / "budgets").exists() and all(
+        (job_dir(r) / ".done" / "quantize").exists() for r in RECIPES[1:])
+
+
+def run_phase2(step: Step) -> None:
+    """The quantized recipes scored at once, one server each."""
+    at_once(*[(lambda r=r, port=port: score(step, r, port)) for r, port in zip(RECIPES[1:], PORTS)])
+
+
+def phase2_done() -> bool:
+    return all((job_dir(r) / ".done" / "budgets").exists() for r in RECIPES[1:])
 
 
 def run_upload(step: Step) -> None:
-    """Every job file under 200 MB (configs, thinking, scores, the imatrix) and both GGUFs."""
+    """Every job file under 200 MB (configs, thinking, scores, the imatrix) and the quantized GGUFs."""
     if not evroc_ok():
-        raise Skip("no evroc login. Log in (runbook step 4) and re-run to upload.")
+        raise Skip("no evroc login. Log in (runbook step 5) and re-run to upload.")
     tar = NVME / "exp05-jobs.tar"
     sh(step, f"mkdir -p {J}/_logs_exp05 && cp {LOGS}/*.log {J}/_logs_exp05/ && cd {J.parent} && "
              f"find {J.name}/granite-* {J.name}/_logs_exp05 -type f -size -200M -print0 | tar cf {tar} --null -T -")
@@ -207,23 +247,19 @@ def steps() -> list[Step]:
         Step("VM setup", {"": MINUTES["setup"]}, run_setup, setup_done),
         Step("Granite 4.2 3B download", {"": MINUTES["download"]}, run_download, download_done, download_progress),
         Step("BF16 GGUF", {"gguf": MINUTES["gguf"]}, run_ggufs, BF16.exists),
-        Step("calibration answers (BF16)", {"calib": MINUTES["calib"]},
-             run_calib, (BASE / "work" / "calib-chat.txt").exists),
-        Step("importance pass (BF16)", {"imatrix": MINUTES["imatrix"]},
-             run_imatrix, (BASE / "work" / "imatrix.gguf").exists),
-        *[Step(r, {"quantize": 5, "eval": MINUTES["eval"], "budgets": MINUTES["budgets"]}, run_recipe(r),
-               (job_dir(r) / ".done" / "budgets").exists) for r in RECIPES],
-        Step("upload to the bucket", {"": 25}, run_upload, (LOGS / ".uploaded").exists),
+        Step("bf16 scored; q4 and m28 made beside it", {"": MINUTES["phase1"]}, run_phase1, phase1_done),
+        Step("q4 and m28 scored at once", {"": MINUTES["phase2"]}, run_phase2, phase2_done),
+        Step("upload to the bucket", {"": 15}, run_upload, (LOGS / ".uploaded").exists),
     ]
 
 
 # ---------- summary ----------
 
 def summary() -> str:
-    """LiveCodeBench pass@1 at each thinking budget, the 32k score as a share of the card, and
+    """LiveCodeBench pass@1 at each thinking budget, the 16k score as a share of the card, and
     points per GB of file (the record metric)."""
     head = ["model", "size", "FFN bits"] + [f"LCB {b // 1024}k" for b in BUDGETS + [MAX_TOKENS]] \
-        + ["of card", "%/GB", "hit 32k", "tok/s"]
+        + ["of card", "%/GB", "hit 16k", "tok/s"]
     table, lost = [head], []
     for r in RECIPES:
         d, name = job_dir(r), f"granite-{r}"
@@ -257,8 +293,8 @@ def summary() -> str:
     widths = [max(len(row[i]) for row in table) for i in range(len(head))]
     out = "\n".join("  ".join(x.ljust(widths[i]) if i == 0 else x.rjust(widths[i]) for i, x in enumerate(row)).rstrip()
                     for row in table)
-    return out + (f"\n\nof card: the 32k score against the card's LiveCodeBench v6 {CARD_LCB:.1%}, which used its own "
-                  f"window and budget, so it is approximate. %/GB: the 32k score in points per GB of file. hit 32k: answers whose thinking reached the cap. "
+    return out + (f"\n\nof card: the 16k score against the card's LiveCodeBench v6 {CARD_LCB:.1%}, which used its own "
+                  f"window and budget, so it is approximate. %/GB: the 16k score in points per GB of file. hit 16k: answers whose thinking reached the cap. "
                   f"tok/s: per answer, with {EVAL_SLOTS} running at once and {'a 16-bit' if not KV_TYPE else 'an 8-bit'} KV cache."
                   + (f"\nAnswers the server never returned, scored as failures: {', '.join(lost)}." if lost else ""))
 
