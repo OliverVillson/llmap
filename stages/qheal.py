@@ -173,6 +173,25 @@ def heal(hf_dir: str, gguf_path: Path, traces: Path, out: Path, gguf, *, r: int 
     return report
 
 
+def export(hf_dir: str, gguf_path: Path, out: Path, gguf, adapter: Path | None = None) -> dict:
+    """The quantized model as a plain bf16 HF checkpoint (the GGUF's weights dequantized),
+    with the repair adapter merged in when given, so vLLM scores exactly what llama.cpp
+    runs and what qheal trained on (training also saw bf16 copies of these weights)."""
+    from transformers import AutoTokenizer
+
+    from stages.sft import save_checkpoint
+
+    tok = AutoTokenizer.from_pretrained(hf_dir)
+    model = load_causal_lm(hf_dir)
+    err = load_quantized(model, gguf_path, gguf)
+    if adapter is not None:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(adapter)).merge_and_unload()
+    save_checkpoint(model, tok, out)
+    log(f"qheal: {out} written ({'with' if adapter else 'without'} the repair), relative error by kind {err}")
+    return err
+
+
 def to_gguf(llama_cpp: Path, hf_dir: str, adapter: Path, out: Path, outtype: str = "q8_0") -> Path:
     """The PEFT adapter as a llama.cpp LoRA GGUF (convert_lora_to_gguf.py)."""
     subprocess.run([sys.executable, str(llama_cpp / "convert_lora_to_gguf.py"), str(adapter), "--base", hf_dir,
@@ -184,9 +203,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="blackhole repair adapter")
     ap.add_argument("--hf", required=True, help="the original HF checkpoint")
     ap.add_argument("--gguf", required=True, help="the quantized GGUF")
-    ap.add_argument("--traces", required=True)
+    ap.add_argument("--traces", default="")
+    ap.add_argument("--export", default="", help="only write the quantized model (plus --adapter) as an HF checkpoint here")
+    ap.add_argument("--adapter", default="")
     ap.add_argument("--llama-cpp", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default="")
     ap.add_argument("--r", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--tokens", type=float, default=20e6)
@@ -196,11 +217,17 @@ def main() -> None:
     lc = Path(a.llama_cpp)
     sys.path.insert(0, str(lc / "gguf-py"))
     import gguf
+    if a.export:
+        export(a.hf, Path(a.gguf), Path(a.export), gguf, Path(a.adapter) if a.adapter else None)
+        return
     out = Path(a.out)
     heal(a.hf, Path(a.gguf), Path(a.traces), out, gguf, r=a.r, lr=a.lr, tokens=a.tokens, length=a.length,
          max_minutes=a.max_minutes)
-    to_gguf(lc, a.hf, out / "adapter", out / "lora.gguf")
-    log(f"qheal: adapter at {out / 'lora.gguf'} ({(out / 'lora.gguf').stat().st_size / 1e6:.0f} MB)")
+    try:  # the llama.cpp copy of the adapter is for shipping; scoring uses the PEFT one
+        to_gguf(lc, a.hf, out / "adapter", out / "lora.gguf")
+        log(f"qheal: adapter at {out / 'lora.gguf'} ({(out / 'lora.gguf').stat().st_size / 1e6:.0f} MB)")
+    except subprocess.CalledProcessError as e:
+        log(f"qheal: convert_lora_to_gguf failed ({e}); the PEFT adapter is at {out / 'adapter'}")
 
 
 if __name__ == "__main__":

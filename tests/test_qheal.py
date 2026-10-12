@@ -77,3 +77,21 @@ def test_the_adapter_closes_the_gap_to_the_original(tmp_path):
     assert kls[-1] < 0.8 * kls[0]
     assert (tmp_path / "out" / "adapter" / "adapter_config.json").exists()
     assert json.loads((tmp_path / "out" / "qheal.json").read_text())["lora_r"] == 8
+    # vLLM scores these: the GGUF weights as a checkpoint, then with the adapter merged in
+    from transformers import AutoModelForCausalLM
+    ids = torch.tensor([[2, 5, 9, 11, 3, 7]])
+    healed = qheal.load_causal_lm(str(tmp_path / "m"))
+    qheal.load_quantized(healed, tmp_path / "q.gguf", gguf)
+    from peft import PeftModel
+    healed = PeftModel.from_pretrained(healed, str(tmp_path / "out" / "adapter")).eval()
+    for adapter, ref in ((None, None), (tmp_path / "out" / "adapter", healed)):
+        out = tmp_path / ("hf-repair" if adapter else "hf")
+        qheal.export(str(tmp_path / "m"), tmp_path / "q.gguf", out, gguf, adapter)
+        back = AutoModelForCausalLM.from_pretrained(out).eval()
+        if ref is None:
+            m2 = qheal.load_causal_lm(str(tmp_path / "m"))
+            qheal.load_quantized(m2, tmp_path / "q.gguf", gguf)
+            assert all(torch.equal(a, b) for a, b in zip(back.state_dict().values(), m2.state_dict().values()))
+        else:
+            with torch.no_grad():
+                assert torch.allclose(back(ids).logits, ref(ids).logits, atol=1e-4)

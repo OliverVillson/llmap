@@ -15,19 +15,19 @@ Oliver, 2026-10-12: "Lets aim for an as reliable result as possible. I can spare
            embedding Q3_K: ~1.45 GB, runs fast anywhere llama.cpp does
   repair   a ~0.03 GB LoRA trained so the quantized model matches the original
            (stages/qheal.py: KL on the original's own thinking, the quantized weights
-           frozen and read back from the GGUF), loaded on top by llama-server
+           frozen and read back from the GGUF), loaded on top by llama-server --lora
 
-Steps, two jobs sharing the GPU wherever they can:
-  1. VM setup, the Granite download, a BF16 GGUF
-  2. the original scored, while the training text (the original's thinking on clean
-     CodeContests problems, never LiveCodeBench) is written and bh15 is made
-  3. bh15 scored as it is, while the repair adapter trains
-  4. bh15 with the adapter scored
-  5. results to the mugge-library bucket
+Steps, one job at a time on the whole GPU (two servers starting together miscount each
+other's memory): setup, download, BF16 GGUF; the original scored; the training text (the
+original's thinking on clean CodeContests problems, never LiveCodeBench); bh15 made;
+bh15 scored; the repair adapter trained; bh15 + repair scored; upload.
 
 Every score: LiveCodeBench v6 2025-01..04, thinking on at the card's sampling, 16k
-tokens, 4 answers per problem, the same llama-server settings for all three. The
-summary compares each with the original problem by problem and gives a 95% interval
+tokens, 4 answers per problem, all three on vLLM with the same settings (llama.cpp
+managed ~100 answers an hour, ~7 h a model). bh15 is scored as its GGUF weights
+dequantized into a bf16 checkpoint, the repair merged in for the last one: the same
+weights llama.cpp runs, minus llama.cpp's 8-bit rounding of activations inside its
+matmuls. The summary compares each with the original problem by problem and gives a 95% interval
 for the share kept. Logs are in ~/blackhole-logs.
 """
 
@@ -50,44 +50,54 @@ RECIPE = "bh15"
 QUANT_JOB = e5.J / "blackhole-bh15"  # dense.py's quantize job; its out/model.gguf
 QUANT = QUANT_JOB / "out" / "model.gguf"
 HEAL = W / "heal"
-LORA = HEAL / "lora.gguf"
-JOBS = {"original": e5.J / "blackhole-original", "bh15": e5.J / "blackhole-bh15-score",
-        "bh15+repair": e5.J / "blackhole-bh15-repair"}
+LORA = HEAL / "lora.gguf"  # the adapter for llama.cpp (shipped); scoring merges the PEFT one
+ADAPTER = HEAL / "adapter"
+HF = {"original": e5.HF_DIR, "bh15": W / "bh15-hf", "bh15+repair": W / "bh15-repair-hf"}
+# All three are scored by vLLM (llama.cpp managed ~100 answers an hour on the L40S, ~7 h a
+# model); the quantized ones as their GGUF weights dequantized into an HF checkpoint.
+JOBS = {k: e5.J / f"blackhole-{k.replace('+', '-')}-vllm" for k in HF}
 LIMIT_GB = 1.5
 SAMPLES = 4
 LCB_TOKENS = 16384
 GEN_PORT = "8093"
 GEN_TOKENS = 12e6  # the training text; the adapter trains on it once
 HEAL_CAP_MINUTES = 100
-MINUTES = {"setup": 45, "download": 5, "gguf": 5, "phase1": 100, "phase2": 95, "phase3": 70}
+# One job at a time on the whole GPU: two servers starting together miscount each
+# other's memory (vLLM saw -13.9 GiB of KV cache on the first run).
+MINUTES = {"setup": 45, "download": 5, "gguf": 5, "score": 40, "gen": 45, "quant": 20, "export": 5}
 
 
 def eval_job(key: str) -> Path:
     d = JOBS[key]
     if not (d / "config.json").exists():
-        model = {"original": e5.BF16, "bh15": QUANT, "bh15+repair": QUANT}[key]
         cfg = {**e5.THINKING, "code_eval_suites": ["livecodebench"], "lcb_since": "2025-01-01",
                "code_eval_max_tokens": LCB_TOKENS, "code_eval_samples": SAMPLES, "code_eval_ref": "",
-               "eval_candidates": {key: str(model)}}
-        if key == "bh15+repair":
-            cfg["eval_lora"] = str(LORA)
+               "eval_candidates": {key: str(HF[key])}}
         e5.make_job(d, cfg)
     return d
 
 
-def score(step: Step, key: str, port: str = e5.PORTS[0]) -> None:
-    d = eval_job(key)
-    if not (d / ".done" / "eval").exists():
-        sh(step, f"python pipeline.py --job {d} --only eval", e5.env_for(port))
+def scored(key: str) -> bool:
+    return (JOBS[key] / ".done" / "eval").exists()
+
+
+def score(step: Step, key: str) -> None:
+    """LiveCodeBench on vLLM with the whole GPU; for bh15 and bh15+repair the checkpoint
+    is exported from the GGUF first."""
+    if key != "original" and not (HF[key] / "config.json").exists():
+        sh(step, f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --llama-cpp {e5.NVME}/llama.cpp "
+                 f"--export {HF[key]}" + (f" --adapter {ADAPTER}" if key == "bh15+repair" else ""))
+    if not scored(key):
+        sh(step, f"python pipeline.py --job {eval_job(key)} --only eval", {"LOBBOT_VLLM_GPU_UTIL": "0.9"})
 
 
 def gen_command() -> str:
-    """A vLLM on 40% of the GPU for the original's thinking, then the text; it stops after."""
+    """A vLLM on the GPU for the original's thinking, then the text; it stops after."""
     return "\n".join([
         "set -e",
         f"mkdir -p {W}",
         f"$LOBBOT_VLLM_PY -m vllm.entrypoints.openai.api_server --model {e5.HF_DIR} --served-model-name student "
-        f"--host 127.0.0.1 --port {GEN_PORT} --max-model-len 12288 --gpu-memory-utilization 0.4 "
+        f"--host 127.0.0.1 --port {GEN_PORT} --max-model-len 12288 --gpu-memory-utilization 0.9 "
         f"--enable-prefix-caching > {W}/vllm-gen.log 2>&1 & gen=$!",
         "trap 'kill $gen 2>/dev/null' EXIT",
         f"until curl -sf http://127.0.0.1:{GEN_PORT}/health >/dev/null; do "
@@ -107,48 +117,33 @@ def setup_done() -> bool:
     return e5.setup_done() and (e5.NVME / "codebench/codecontests.jsonl").exists()
 
 
-def make_text_and_quant(step: Step) -> None:
-    """The training text (vLLM, then stopped), then calibration, importance matrix and bh15
-    on the second llama-server port."""
-    if not (W / ".gen-done").exists():
-        sh(step, gen_command())
-        W.mkdir(parents=True, exist_ok=True)
-        (W / ".gen-done").write_text("ok")
+def make_text(step: Step) -> None:
+    sh(step, gen_command())
+    (W / ".gen-done").write_text("ok")
+
+
+def text_progress() -> float | None:
+    """~7 bytes of the traces file per token (the ids as JSON, plus the prompts)."""
+    return min(0.99, TRACES.stat().st_size / (7 * GEN_TOKENS)) if TRACES.exists() else None
+
+
+def make_quant(step: Step) -> None:
+    """Calibration answers, importance matrix and bh15, on llama.cpp."""
     e5.base_job()
     if not (e5.BASE / "work" / "calib-chat.txt").exists():
         sh(step, f"python -m stages.dense calib --job {e5.BASE} --model {e5.BF16}", e5.env_for(e5.PORTS[1], e5.CALIB_SLOTS))
     if not (e5.BASE / "work" / "imatrix.gguf").exists():
         sh(step, f"python -m stages.dense imatrix --job {e5.BASE} --bf16 {e5.BF16}")
-    if not (QUANT_JOB / ".done" / "quantize").exists():
-        if not (QUANT_JOB / "config.json").exists():
-            e5.make_job(QUANT_JOB, dict(e5.THINKING))
-        sh(step, f"python -m stages.dense quantize --job {QUANT_JOB} --recipe {RECIPE} --bf16 {e5.BF16} "
-                 f"--imatrix {e5.BASE / 'work' / 'imatrix.gguf'}")
-
-
-def run_phase1(step: Step) -> None:
-    e5.at_once(lambda: score(step, "original"), lambda: make_text_and_quant(step))
-
-
-def phase1_done() -> bool:
-    return (JOBS["original"] / ".done" / "eval").exists() and (QUANT_JOB / ".done" / "quantize").exists() \
-        and (W / ".gen-done").exists()
+    if not (QUANT_JOB / "config.json").exists():
+        e5.make_job(QUANT_JOB, dict(e5.THINKING))
+    sh(step, f"python -m stages.dense quantize --job {QUANT_JOB} --recipe {RECIPE} --bf16 {e5.BF16} "
+             f"--imatrix {e5.BASE / 'work' / 'imatrix.gguf'}")
 
 
 def train_repair(step: Step) -> None:
-    if not LORA.exists():
-        sh(step, f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --traces {TRACES} "
-                 f"--llama-cpp {e5.NVME}/llama.cpp --tokens {GEN_TOKENS:.0f} --max-minutes {HEAL_CAP_MINUTES} "
-                 f"--out {HEAL}")
-
-
-def run_phase2(step: Step) -> None:
-    """bh15 scored as it is while the repair adapter trains beside it."""
-    e5.at_once(lambda: score(step, "bh15"), lambda: train_repair(step))
-
-
-def phase2_done() -> bool:
-    return (JOBS["bh15"] / ".done" / "eval").exists() and LORA.exists()
+    sh(step, f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --traces {TRACES} "
+             f"--llama-cpp {e5.NVME}/llama.cpp --tokens {GEN_TOKENS:.0f} --max-minutes {HEAL_CAP_MINUTES} "
+             f"--out {HEAL}")
 
 
 def run_upload(step: Step) -> None:
@@ -171,15 +166,19 @@ def run_upload(step: Step) -> None:
 
 
 def steps() -> list[Step]:
+    score_min = {"eval": MINUTES["score"]}
     return [
         Step("VM setup", {"": MINUTES["setup"]}, run_setup, setup_done),
         Step("Granite 4.2 3B download", {"": MINUTES["download"]}, e5.run_download, e5.download_done,
              e5.download_progress),
         Step("BF16 GGUF", {"gguf": MINUTES["gguf"]}, e5.run_ggufs, e5.BF16.exists),
-        Step("original scored; text and bh15 made", {"": MINUTES["phase1"]}, run_phase1, phase1_done),
-        Step("bh15 scored; repair adapter trained", {"": MINUTES["phase2"]}, run_phase2, phase2_done),
-        Step("bh15 + repair scored", {"": MINUTES["phase3"]}, lambda s: score(s, "bh15+repair"),
-             lambda: (JOBS["bh15+repair"] / ".done" / "eval").exists()),
+        Step("original scored", score_min, lambda s: score(s, "original"), lambda: scored("original")),
+        Step("training text written", {"": MINUTES["gen"]}, make_text, (W / ".gen-done").exists, text_progress),
+        Step("bh15 made", {"": MINUTES["quant"]}, make_quant, (QUANT_JOB / ".done" / "quantize").exists),
+        Step("bh15 scored", {"": MINUTES["export"], **score_min}, lambda s: score(s, "bh15"), lambda: scored("bh15")),
+        Step("repair adapter trained", {"": HEAL_CAP_MINUTES}, train_repair, (ADAPTER / "adapter_config.json").exists),
+        Step("bh15 + repair scored", {"": MINUTES["export"], **score_min}, lambda s: score(s, "bh15+repair"),
+             lambda: scored("bh15+repair")),
         Step("upload to the bucket", {"": 15}, run_upload, (LOGS / ".uploaded").exists),
     ]
 
@@ -221,7 +220,8 @@ def share_kept(model: dict[str, float], ref: dict[str, float], n: int = 4000, se
 
 def size_gb() -> dict[str, float]:
     q = QUANT.stat().st_size / 1e9 if QUANT.exists() else None
-    lora = LORA.stat().st_size / 1e9 if LORA.exists() else 0.0
+    fp32 = ADAPTER / "adapter_model.safetensors"  # if the llama.cpp copy failed: ~a quarter as Q8_0
+    lora = LORA.stat().st_size / 1e9 if LORA.exists() else fp32.stat().st_size / 4e9 if fp32.exists() else 0.0
     return {"original": e5.BF16.stat().st_size / 1e9 if e5.BF16.exists() else 7.32,
             "bh15": q, "bh15+repair": None if q is None else q + lora}
 
@@ -251,7 +251,7 @@ def summary() -> str:
         out += (f"\n\nGoal (at most {LIMIT_GB} GB, 95% of the original): {gb:.2f} GB, {kept[0]:.1%} kept: {verdict}. "
                 f"{sizes['original'] / gb:.1f}x smaller than BF16.")
     return out + ("\nEvery model: same window, 16k thinking, 4 answers per problem at temperature 1.0, "
-                  "same llama-server settings. The interval comes from resampling problems.")
+                  "same vLLM settings. The interval comes from resampling problems.")
 
 
 def shutdown_after() -> None:

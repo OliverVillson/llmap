@@ -129,10 +129,14 @@ def check_finite(model) -> None:
 
 
 def save_merged(model, tok, out_dir: Path) -> None:
-    """Merges the LoRA and saves a plain bf16 HF checkpoint at out_dir, via a .tmp dir
-    so a stop never leaves half a model there."""
+    """Merges the LoRA and saves a plain bf16 HF checkpoint at out_dir."""
+    save_checkpoint(model.merge_and_unload(), tok, out_dir)
+
+
+def save_checkpoint(model, tok, out_dir: Path) -> None:
+    """Saves a plain HF checkpoint at out_dir (bf16 when on the GPU), via a .tmp dir so
+    a stop never leaves half a model there."""
     device = next(model.parameters()).device
-    model = model.merge_and_unload()
     if device.type == "cuda":
         model.to(torch.bfloat16)
     model.config.use_cache = True
