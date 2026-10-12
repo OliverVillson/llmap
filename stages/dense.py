@@ -43,12 +43,20 @@ FFN = {"ffn_gate": "gate", "ffn_up": "up", "ffn_down": "down"}
 Q4_ARGS = ["--output-tensor-type", "q6_k", "--token-embedding-type", "q4_k",
            "--tensor-type", r"attn_(q|k|v|output)\.weight=q5_k",
            "--tensor-type", r"ffn_(gate|up|down)\.weight=q4_k"]
-RECIPES = ("q4", "w18s")
+# Small-model recipes (experiment 05, Granite 4.2 3B): the feed-forward by saliency at an
+# average of these bits, and attention, output head and token embedding at fixed types.
+# A 3B's attention and embeddings are ~30% of its weights, so q8_0 there (w18s) would
+# cost more than the feed-forward saves.
+MIXED = {
+    "m35": (3.5, {"attn": "q5_k", "output": "q6_k", "token_embd": "q4_k"}),
+    "m28": (2.8, {"attn": "q4_k", "output": "q5_k", "token_embd": "q3_k"}),
+}
+RECIPES = ("q4", "w18s", "q8", *MIXED)
 # Calibration problems per suite, spread over each suite; LiveCodeBench is the test.
 CALIB_SUITES = {"multipl-e-py": 10, "multipl-e-js": 10, "multipl-e-ts": 10, "multipl-e-cpp": 10, "c-set": 8}
 CALIB_MAX_TOKENS = 6144
 IMATRIX_CHUNKS = 400  # x 512 tokens
-END_OF_TURN = "<|im_end|>\n"  # Qwen's chat format
+END_OF_TURN = "<|im_end|>\n"  # Qwen's chat format; calibration() reads the served model's own
 
 
 @dataclass
@@ -122,9 +130,17 @@ def ffn_params(tensors: list[Tensor], layers: int) -> int:
     return sum(t.n for t in tensors if (s := ffn_slot(t.name)) and s[0] < layers)
 
 
-def static_gb(tensors: list[Tensor], layers: int, qtype: str = "q8_0") -> float:
-    """Everything outside the main layers' feed-forward tensors, at one type."""
-    return sum(tensor_gb(t, qtype) for t in tensors if not ((s := ffn_slot(t.name)) and s[0] < layers))
+def static_type(name: str, types: str | dict[str, str]) -> str:
+    """A non-feed-forward tensor's type: one type for all, or by kind (MIXED)."""
+    if isinstance(types, str):
+        return types
+    return types.get(name.split(".")[0] if name.startswith(("token_embd.", "output.")) else "attn", types["attn"])
+
+
+def static_gb(tensors: list[Tensor], layers: int, qtype: str | dict[str, str] = "q8_0") -> float:
+    """Everything outside the main layers' feed-forward tensors, at one type or by kind."""
+    return sum(tensor_gb(t, static_type(t.name, qtype)) for t in tensors
+               if not ((s := ffn_slot(t.name)) and s[0] < layers))
 
 
 def shape_of(tensors: list[Tensor], layers: int) -> bits.MoEShape:
@@ -137,9 +153,10 @@ def shape_of(tensors: list[Tensor], layers: int) -> bits.MoEShape:
 
 
 def allocate_w(tensors: list[Tensor], layers: int, energy: dict[str, list[float]] | None,
-               ffn_bits: float = FFN_BITS) -> tuple[list[bits.LayerBits], float, float]:
-    """w18s: (per-layer FFN types, estimated size in GB, FFN average bits)."""
-    fixed = static_gb(tensors, layers)
+               ffn_bits: float = FFN_BITS, static: str | dict[str, str] = "q8_0"
+               ) -> tuple[list[bits.LayerBits], float, float]:
+    """w18s and MIXED: (per-layer FFN types, estimated size in GB, FFN average bits)."""
+    fixed = static_gb(tensors, layers, static)
     n_ffn = ffn_params(tensors, layers)
     shape = shape_of(tensors, layers)
     plan = bits.allocate(shape, None, fixed + n_ffn * ffn_bits / 8e9, "q2_k", "q8_0", proj_energy=energy,
@@ -149,9 +166,13 @@ def allocate_w(tensors: list[Tensor], layers: int, energy: dict[str, list[float]
     return plan, fixed + ffn_gb, ffn_gb * 8e9 / n_ffn
 
 
-def w_args(plan: list[bits.LayerBits], qtype: str = "q8_0") -> list[str]:
-    """llama-quantize flags for w18s; the base type (qtype) covers every tensor not named."""
-    args = ["--output-tensor-type", qtype, "--token-embedding-type", qtype]
+def w_args(plan: list[bits.LayerBits], qtype: str | dict[str, str] = "q8_0") -> list[str]:
+    """llama-quantize flags for w18s (one static type) or MIXED (types by kind, attention
+    named); the base type passed to llama-quantize covers every tensor not named."""
+    out_t, embd_t = static_type("output.weight", qtype), static_type("token_embd.weight", qtype)
+    args = ["--output-tensor-type", out_t, "--token-embedding-type", embd_t]
+    if isinstance(qtype, dict):
+        args += ["--tensor-type", rf"attn_(q|k|v|output)\.weight={qtype['attn']}"]
     for l in plan:
         args += ["--tensor-type", rf"blk\.{l.layer}\.ffn_(gate|up)\.weight={l.gate_up}",
                  "--tensor-type", rf"blk\.{l.layer}\.ffn_down\.weight={l.down}"]
@@ -237,10 +258,31 @@ def calib_problems(bench_dir: str) -> list[dict]:
     return [p for i in range(max(map(len, picks))) for rows in picks if i < len(rows) for p in [rows[i]]]
 
 
-def chat_text(prompt: str, reasoning: str, answer: str) -> str:
+def chat_text(prompt: str, reasoning: str, answer: str, end: str = END_OF_TURN) -> str:
     """One conversation as the model sees it: the template's prompt (thinking opened),
-    the thinking, and the answer."""
-    return f"{prompt}{reasoning.strip()}\n</think>\n\n{answer.strip()}{END_OF_TURN}"
+    the thinking, the answer and the template's end of turn."""
+    return f"{prompt}{reasoning.strip()}\n</think>\n\n{answer.strip()}{end}"
+
+
+def end_of_turn() -> str:
+    """What the served model's chat template writes after an assistant message (Qwen's
+    <|im_end|>, Granite's <|end_of_text|>), from llama-server's /apply-template."""
+    import httpx
+
+    from stages import eval as ev
+
+    mark = "END-OF-ANSWER-MARK"
+    try:
+        text = httpx.post(f"http://127.0.0.1:{ev.PORT}/apply-template", timeout=60, json={
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": mark},
+                         {"role": "user", "content": "again"}]}).json()["prompt"]
+        tail = text.split(mark, 1)[1]
+        end = tail[:tail.index("again")] if "again" in tail else tail
+        # keep the end marker, not the next turn's opening role tag
+        cut = re.match(r"\s*(<\|[^|]+\|>)\s*", end)
+        return cut.group(0) if cut else END_OF_TURN
+    except Exception:
+        return END_OF_TURN
 
 
 def calibration(job: Job, model: Path) -> Path:
@@ -274,9 +316,10 @@ def calibration(job: Job, model: Path) -> Path:
         answers, tps = ev.generate(codebench.SYSTEM, [codebench.build_prompt(p) for p in probs], CALIB_MAX_TOKENS,
                                    cfg.code_eval_thinking_temperature, 0, True, answered, infos=infos,
                                    keep_reasoning=True)
+        end = end_of_turn()
         texts = [chat_text(ev.thinking_prompt([{"role": "system", "content": codebench.SYSTEM},
                                                {"role": "user", "content": codebench.build_prompt(p)}]),
-                           info.get("reasoning", ""), a)
+                           info.get("reasoning", ""), a, end)
                  for p, a, info in zip(probs, answers, infos)]
     finally:
         ev.stop(proc)
@@ -358,16 +401,20 @@ def quantize_recipe(job: Job, recipe: str, bf16: Path, imatrix: Path) -> dict:
     report: dict = {"recipe": recipe, "layers": None}
     if recipe == "q4":
         args, base = Q4_ARGS, "Q4_K_M"
+    elif recipe == "q8":
+        args, base = [], "Q8_0"
     else:
+        target, static = MIXED.get(recipe, (FFN_BITS, "q8_0"))
         energy = None
         if not DRY_RUN:
             emit(STAGE, pct=5, msg="feed-forward sensitivity from the imatrix")
             energy = imatrix_energy(job, bf16, imatrix, layers)
-        plan, est, ffn_bits = allocate_w(tensors, layers, energy)
-        args, base = w_args(plan), "Q8_0"
+        plan, est, ffn_bits = allocate_w(tensors, layers, energy, target, static)
+        args = w_args(plan, static)
+        base = (static if isinstance(static, str) else static["attn"]).upper()
         report.update(layers=[asdict(l) for l in plan], est_gb=round(est, 2), est_ffn_bits=round(ffn_bits, 2),
                       sensitivity=bits.sensitivities(layers, None, energy))
-        emit(STAGE, pct=20, msg=f"w18s plan: ~{est:.1f} GB, feed-forward ~{ffn_bits:.2f} bits")
+        emit(STAGE, pct=20, msg=f"{recipe} plan: ~{est:.1f} GB, feed-forward ~{ffn_bits:.2f} bits")
     emit(STAGE, pct=25, msg=f"llama-quantize {recipe}")
     if DRY_RUN:
         out.write_bytes(b"GGUF dry run")

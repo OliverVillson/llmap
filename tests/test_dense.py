@@ -93,3 +93,49 @@ def test_imatrix_energy_reads_dense_feed_forward_tensors(tmp_path):
     e = dense.imatrix_energy(J(), tmp_path / "m.gguf", tmp_path / "im.gguf", 1)
     for k, x in w.items():
         assert e[k][0] == pytest.approx(float(s2 @ (x ** 2).sum(axis=0)))
+
+
+def granite_3b_tensors():
+    """Granite 4.2 3B's tensors from its config: 40 layers, hidden 2560, FFN 8192,
+    40 query heads and 8 KV heads of 64, untied 100352-token embeddings."""
+    T = dense.Tensor
+    h, f, v = 2560, 8192, 100352
+    out = [T("token_embd.weight", v * h, 2, (v, h)), T("output.weight", v * h, 2, (v, h)), T("output_norm.weight", h, 1)]
+    for l in range(40):
+        b = f"blk.{l}."
+        for name, o, i in (("ffn_gate", f, h), ("ffn_up", f, h), ("ffn_down", h, f), ("attn_q", h, h),
+                           ("attn_k", 512, h), ("attn_v", 512, h), ("attn_output", h, h)):
+            out.append(T(b + name + ".weight", o * i, 2, (o, i)))
+        out.append(T(b + "attn_norm.weight", h, 1))
+    return out
+
+
+@pytest.mark.parametrize("recipe, lo, hi", [("m35", 1.8, 2.0), ("m28", 1.45, 1.6)])
+def test_small_model_recipes_shrink_attention_and_embeddings_too(recipe, lo, hi):
+    tensors = granite_3b_tensors()
+    target, static = dense.MIXED[recipe]
+    plan, est, ffn_bits = dense.allocate_w(tensors, 40, None, target, static)
+    assert lo < est < hi and abs(ffn_bits - target) < 0.3
+    # q8_0 outside the feed-forward, as in w18s, would cost a 3B over half a GB
+    assert dense.allocate_w(tensors, 40, None, target)[1] - est > 0.4
+    args = dense.w_args(plan, static)
+    assert args[:4] == ["--output-tensor-type", static["output"], "--token-embedding-type", static["token_embd"]]
+    assert rf"attn_(q|k|v|output)\.weight={static['attn']}" in args
+
+
+def test_end_of_turn_reads_the_template(monkeypatch):
+    import httpx
+
+    class R:
+        def __init__(self, text):
+            self.text = text
+
+        def json(self):
+            return {"prompt": self.text}
+
+    granite = ("<|start_of_role|>user<|end_of_role|>hi<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+               "END-OF-ANSWER-MARK<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>again<|end_of_text|>\n")
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: R(granite))
+    assert dense.end_of_turn() == "<|end_of_text|>\n"
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    assert dense.end_of_turn() == dense.END_OF_TURN
