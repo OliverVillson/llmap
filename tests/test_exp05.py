@@ -47,9 +47,9 @@ def test_phases_share_the_gpu_on_two_ports(tmp_path, monkeypatch):
     bf16 = [c for c in calls if c[1] == m.PORTS[0]]
     assert bf16 == [("pipeline.py", "8091"), ("stages.budget", "8091")]
     side = [c[0] for c in calls if c[1] != m.PORTS[0]]
-    assert side == ["stages.dense", "stages.dense", "stages.dense", "stages.dense"]  # calib, imatrix, q4, m28
+    assert side == ["stages.dense"] * 5  # calib, imatrix, q4, m28, m22
     calls.clear()
     m.run_phase2(m.Step("p2", {"": 1}, m.run_phase2))
     assert m.phase2_done()
-    assert sorted(p for _, p in calls) == ["8091", "8091", "8092", "8092"]
-    assert m.RECIPES == ["bf16", "q4", "m28"] and m.MAX_TOKENS == 16384 and m.BUDGETS == [8192]
+    assert sorted(p for _, p in calls) == ["8091"] * 4 + ["8092"] * 2  # q4 then m22; m28
+    assert m.RECIPES == ["bf16", "q4", "m28", "m22"] and m.MAX_TOKENS == 16384 and m.BUDGETS == [8192]

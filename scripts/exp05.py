@@ -13,6 +13,8 @@ Recipes (stages/dense.py), each a GGUF scored by llama-server:
   bf16  the model as released, ~7.3 GB
   q4    r25q4's bits (Q4_K_M-like), ~2.2 GB
   m28   feed-forward ~2.8 bits by saliency, attention q4_k, head q5_k, embedding q3_k, ~1.5 GB
+  m22   feed-forward IQ2 (~2.2 bits), attention iq3_xxs, head q4_k, embedding q3_k, ~1.2 GB:
+        where the 3B falls off the cliff
 
 Steps (docs: /mnt/project-files/plan/exp05-granite.md), two llama-servers sharing the GPU:
   1. VM setup (scripts/setup_vm.sh) and the Granite download
@@ -20,7 +22,7 @@ Steps (docs: /mnt/project-files/plan/exp05-granite.md), two llama-servers sharin
   3. bf16 scored on LiveCodeBench v6 (2025-01..04), thinking on, 16k budget and an 8k cut
      (the card's recommended cap); beside it, the calibration answers, the importance
      matrix and the q4 and m28 GGUFs
-  4. q4 and m28 scored the same way, at once
+  4. q4, m28 and m22 scored the same way, on both ports
   5. the GGUFs and the job results to the mugge-library bucket
 
 Scores are compared with the card's 69.7 (its own window and settings). Runs with the
@@ -49,7 +51,7 @@ HF_DIR = NVME / "models" / "granite-4.2-3b"
 BF16 = NVME / "models" / "gguf" / "granite-4.2-3b-BF16.gguf"
 BASE = J / "granite-base"  # calibration answers and the importance matrix
 TASKSPEC = "examples/python-utils.code.taskspec.json"
-RECIPES = ["bf16", "q4", "m28"]
+RECIPES = ["bf16", "q4", "m28", "m22"]
 CARD_LCB = 0.697  # Granite 4.2 3B model card, LiveCodeBench v6 (window and settings not stated)
 # The card recommends 8192 new tokens with thinking; 16k shows whether a longer cap buys anything.
 MAX_TOKENS = 16384
@@ -80,9 +82,9 @@ B200 = vram_gb() >= 150
 EVAL_SLOTS, CALIB_SLOTS = ("48", "48") if B200 else ("16", "16")
 KV_TYPE = "" if B200 else "q8_0"
 PORTS = ("8091", "8092")
-MINUTES = ({"setup": 40, "download": 3, "gguf": 3, "phase1": 15, "phase2": 12}
+MINUTES = ({"setup": 40, "download": 3, "gguf": 3, "phase1": 15, "phase2": 18}
            if B200 else
-           {"setup": 45, "download": 5, "gguf": 5, "phase1": 35, "phase2": 30})
+           {"setup": 45, "download": 5, "gguf": 5, "phase1": 35, "phase2": 45})
 # The card's sampling: temperature 1.0, top_p 0.95, no top_k (0 turns it off in llama-server).
 THINKING = {"teacher": MODEL, "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0,
             "thinking_top_k": 0, "eval_kv_type": KV_TYPE}
@@ -216,8 +218,10 @@ def phase1_done() -> bool:
 
 
 def run_phase2(step: Step) -> None:
-    """The quantized recipes scored at once, one server each."""
-    at_once(*[(lambda r=r, port=port: score(step, r, port)) for r, port in zip(RECIPES[1:], PORTS)])
+    """The quantized recipes scored on both ports at once, each port taking its share in turn."""
+    def port_job(rs, port):
+        return lambda: [score(step, r, port) for r in rs]
+    at_once(*[port_job(RECIPES[1:][i::len(PORTS)], port) for i, port in enumerate(PORTS)])
 
 
 def phase2_done() -> bool:
@@ -247,8 +251,8 @@ def steps() -> list[Step]:
         Step("VM setup", {"": MINUTES["setup"]}, run_setup, setup_done),
         Step("Granite 4.2 3B download", {"": MINUTES["download"]}, run_download, download_done, download_progress),
         Step("BF16 GGUF", {"gguf": MINUTES["gguf"]}, run_ggufs, BF16.exists),
-        Step("bf16 scored; q4 and m28 made beside it", {"": MINUTES["phase1"]}, run_phase1, phase1_done),
-        Step("q4 and m28 scored at once", {"": MINUTES["phase2"]}, run_phase2, phase2_done),
+        Step("bf16 scored; q4, m28, m22 made beside it", {"": MINUTES["phase1"]}, run_phase1, phase1_done),
+        Step("q4, m28, m22 scored on two ports", {"": MINUTES["phase2"]}, run_phase2, phase2_done),
         Step("upload to the bucket", {"": 15}, run_upload, (LOGS / ".uploaded").exists),
     ]
 

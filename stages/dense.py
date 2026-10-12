@@ -51,7 +51,14 @@ MIXED = {
     "m35": (3.5, {"attn": "q5_k", "output": "q6_k", "token_embd": "q4_k"}),
     "m28": (2.8, {"attn": "q4_k", "output": "q5_k", "token_embd": "q3_k"}),
 }
-RECIPES = ("q4", "w18s", "q8", *MIXED)
+# Fixed-type recipes below q2_k, which the allocator's ladder starts at: llama.cpp's
+# imatrix-guided 2-bit codebooks (IQ2) for the feed-forward, ffn_down a step up as it
+# writes straight into the residual stream. m22: ~2.2-bit feed-forward, ~1.2 GB for Granite 3B.
+FIXED = {
+    "m22": {"ffn_gate_up": "iq2_xxs", "ffn_down": "iq2_s", "attn": "iq3_xxs", "output": "q4_k", "token_embd": "q3_k"},
+}
+FIXED_BPW = {"iq2_xxs": 2.0625, "iq2_xs": 2.3125, "iq2_s": 2.5625, "iq3_xxs": 3.0625}
+RECIPES = ("q4", "w18s", "q8", *MIXED, *FIXED)
 # Calibration problems per suite, spread over each suite; LiveCodeBench is the test.
 CALIB_SUITES = {"multipl-e-py": 10, "multipl-e-js": 10, "multipl-e-ts": 10, "multipl-e-cpp": 10, "c-set": 8}
 CALIB_MAX_TOKENS = 6144
@@ -123,7 +130,7 @@ def synthetic_tensors(layers: int = 64, hidden: int = 5120, ffn: int = 17408, vo
 
 def tensor_gb(t: Tensor, qtype: str) -> float:
     """Size at a llama.cpp type; 1D tensors (norms, biases) stay F32."""
-    return t.n * (32 if t.dims < 2 else bits.BPW[qtype]) / 8e9
+    return t.n * (32 if t.dims < 2 else {**bits.BPW, **FIXED_BPW}[qtype]) / 8e9
 
 
 def ffn_params(tensors: list[Tensor], layers: int) -> int:
@@ -177,6 +184,16 @@ def w_args(plan: list[bits.LayerBits], qtype: str | dict[str, str] = "q8_0") -> 
         args += ["--tensor-type", rf"blk\.{l.layer}\.ffn_(gate|up)\.weight={l.gate_up}",
                  "--tensor-type", rf"blk\.{l.layer}\.ffn_down\.weight={l.down}"]
     return args
+
+
+def fixed_plan(tensors: list[Tensor], layers: int, types: dict[str, str]) -> tuple[list[str], float, float]:
+    """A FIXED recipe: (llama-quantize flags, estimated size in GB, feed-forward average bits)."""
+    static = {k: types[k] for k in ("attn", "output", "token_embd")}
+    ffn_bits = (2 * FIXED_BPW[types["ffn_gate_up"]] + FIXED_BPW[types["ffn_down"]]) / 3
+    est = static_gb(tensors, layers, static) + ffn_params(tensors, layers) * ffn_bits / 8e9
+    args = w_args([], static) + ["--tensor-type", rf"ffn_(gate|up)\.weight={types['ffn_gate_up']}",
+                                 "--tensor-type", rf"ffn_down\.weight={types['ffn_down']}"]
+    return args, est, ffn_bits
 
 
 def imatrix_energy(job: Job, bf16: Path, imatrix: Path, layers: int) -> dict[str, list[float]]:
@@ -403,6 +420,11 @@ def quantize_recipe(job: Job, recipe: str, bf16: Path, imatrix: Path) -> dict:
         args, base = Q4_ARGS, "Q4_K_M"
     elif recipe == "q8":
         args, base = [], "Q8_0"
+    elif recipe in FIXED:
+        args, est, ffn_bits = fixed_plan(tensors, layers, FIXED[recipe])
+        base = FIXED[recipe]["ffn_gate_up"].upper()
+        report.update(est_gb=round(est, 2), est_ffn_bits=round(ffn_bits, 2))
+        emit(STAGE, pct=20, msg=f"{recipe} plan: ~{est:.1f} GB, feed-forward ~{ffn_bits:.2f} bits")
     else:
         target, static = MIXED.get(recipe, (FFN_BITS, "q8_0"))
         energy = None

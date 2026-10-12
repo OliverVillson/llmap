@@ -123,6 +123,13 @@ def test_small_model_recipes_shrink_attention_and_embeddings_too(recipe, lo, hi)
     assert rf"attn_(q|k|v|output)\.weight={static['attn']}" in args
 
 
+def test_m22_goes_below_the_ladder_with_iq2():
+    args, est, ffn_bits = dense.fixed_plan(granite_3b_tensors(), 40, dense.FIXED["m22"])
+    assert 1.1 < est < 1.3 and 2.1 < ffn_bits < 2.3
+    assert rf"ffn_(gate|up)\.weight=iq2_xxs" in args and rf"ffn_down\.weight=iq2_s" in args
+    assert rf"attn_(q|k|v|output)\.weight=iq3_xxs" in args and "m22" in dense.RECIPES
+
+
 def test_end_of_turn_reads_the_template(monkeypatch):
     import httpx
 
