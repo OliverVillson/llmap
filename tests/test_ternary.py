@@ -94,3 +94,16 @@ def test_check_ternary_rejects_a_plain_model(tmp_path):
     tiny(tmp_path / "m")
     with pytest.raises(ValueError):
         T.check_ternary(tmp_path / "m")
+
+
+def test_attention_stays_full_precision_and_is_sized_at_its_export_types(tmp_path):
+    m = tiny(tmp_path / "m")
+    n = T.ternary_model(m)
+    layer = T.decoder_layers(m)[0]
+    assert n == 2 * 3  # gate, up, down per layer
+    assert type(layer.self_attn.q_proj) is torch.nn.Linear and type(layer.mlp.down_proj) is T.TernaryLinear
+    attn = sum(p.numel() * T.ATTENTION[k.split(".")[-2]][1] for k, p in m.named_parameters() if "self_attn" in k) / 8e9
+    mlp = sum(p.numel() for k, p in m.named_parameters() if ".mlp." in k) * T.TQ1_0_BPW / 8e9
+    other = sum(p.numel() for k, p in m.named_parameters() if "norm" in k) * 32 / 8e9
+    emb = 2 * 64 * 256 * 4.5 / 8e9
+    assert abs(T.size_gb(m) - (attn + mlp + other + emb)) < 1e-9

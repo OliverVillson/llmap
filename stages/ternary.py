@@ -52,6 +52,11 @@ from stages.sft import NonFiniteTraining, kd_kl, load_causal_lm, log
 
 BLOCK = 256
 TQ1_0_BPW = 1.6875
+# Attention is not ternary (Oliver, 2026-10-12: up to 0.2 GB more for it). Long thinking
+# needs exact looking-back over thousands of tokens, which coarse q/k blur. It trains in
+# full precision and is quantized to these llama.cpp types at export (with an imatrix,
+# where 4-bit costs little): ~0.32 GB instead of ~0.13 GB ternary on Granite 3B.
+ATTENTION = {"q_proj": ("q4_k", 4.5), "k_proj": ("q4_k", 4.5), "v_proj": ("q4_k", 4.5), "o_proj": ("q3_k", 3.4375)}
 HELD_OUT = 64  # trace rows kept out of training, for the KL gate
 
 
@@ -82,10 +87,10 @@ class TernaryLinear(nn.Linear):
 
 def to_ternary(module: nn.Module) -> int:
     """Swaps every nn.Linear under module for a TernaryLinear in place (same weights).
-    Returns how many; rows not a multiple of BLOCK are left alone."""
+    Returns how many; attention (ATTENTION) and rows not a multiple of BLOCK are left alone."""
     n = 0
     for name, child in list(module.named_children()):
-        if type(child) is nn.Linear and child.in_features % BLOCK == 0:
+        if type(child) is nn.Linear and child.in_features % BLOCK == 0 and name not in ATTENTION:
             child.__class__ = TernaryLinear
             n += 1
         else:
@@ -113,8 +118,9 @@ def ternary_model(model) -> int:
 
 
 def size_gb(model, vocab: int | None = None, embd_bits: float = 4.5) -> float:
-    """The TQ1_0 GGUF's size: ternary layer linears, embedding and head at embd_bits
-    (with their rows cut to `vocab` when given), everything else F32."""
+    """The GGUF's size: ternary layer linears in TQ1_0, attention at its ATTENTION types,
+    embedding and head at embd_bits (with their rows cut to `vocab` when given), everything
+    else F32."""
     total = 0.0
     emb = model.get_input_embeddings().weight
     head = model.get_output_embeddings().weight
@@ -122,6 +128,8 @@ def size_gb(model, vocab: int | None = None, embd_bits: float = 4.5) -> float:
     for n, p in model.named_parameters():
         if p is emb or p is head:
             total += rows * p.shape[1] * embd_bits
+        elif p.dim() >= 2 and ".layers." in n and n.split(".")[-2] in ATTENTION:
+            total += p.numel() * ATTENTION[n.split(".")[-2]][1]
         elif p.dim() >= 2 and ".layers." in n and p.shape[-1] % BLOCK == 0:
             total += p.numel() * TQ1_0_BPW
         else:
@@ -418,7 +426,8 @@ def save(model, tok, out: Path, snapped: bool) -> None:
 def check_ternary(model_dir: Path, samples: int = 4) -> None:
     """Every layer linear of a snapped checkpoint really is s * {-1, 0, 1} per block."""
     m = load_causal_lm(str(model_dir))
-    lin = [mod for mod in decoder_layers(m).modules() if isinstance(mod, nn.Linear) and mod.in_features % BLOCK == 0]
+    lin = [mod for name, mod in decoder_layers(m).named_modules() if isinstance(mod, nn.Linear)
+           and mod.in_features % BLOCK == 0 and name.split(".")[-1] not in ATTENTION]
     for mod in lin[:: max(1, len(lin) // samples)]:
         w = mod.weight.float().reshape(mod.weight.shape[0], -1, BLOCK)
         s = w.abs().amax(-1, keepdim=True)
