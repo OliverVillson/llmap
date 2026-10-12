@@ -50,7 +50,8 @@ def test_steps_run_in_order_and_resume(tmp_path, monkeypatch):
         run(s)
     order = [c.split()[3] if "stages.ternary" in c else "eval" for c, _ in calls if "set -e" not in c]
     assert order == ["eval", "kl", "block", "e2e", "eval"]
-    assert "--student " + str(m.W / "block" / "latent") in next(c for c, _ in calls if "ternary e2e" in c)
+    e2e = next(c for c, _ in calls if "ternary e2e" in c)
+    assert "--student " + str(m.W / "block" / "latent") in e2e and "--length 8192 --batch 2" in e2e
     assert str(m.W / "e2e" / "snapped") in (m.FINAL_JOB / "config.json").read_text()
     calls.clear()
     m.run_phase1(s)

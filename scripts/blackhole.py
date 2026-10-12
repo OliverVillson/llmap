@@ -43,6 +43,9 @@ BASE_JOB, FINAL_JOB = e5.J / "blackhole-base", e5.J / "blackhole-final"
 GEN_PORT = "8093"
 GEN_TOKENS = 40e6
 E2E_TOKENS, E2E_CAP_MINUTES = 60e6, 75
+# Long windows, so positions far into a thinking answer are trained too (LCB answers run to 16k);
+# the layer-by-layer phase stays at 2048, each layer only needs typical hidden states.
+E2E_WINDOW = 8192
 BLOCK_WINDOWS = 2048  # x 2048 tokens
 LCB_TOKENS = 16384
 MINUTES = {"setup": 40, "download": 3, "phase1": 35, "snap": 5, "block": 15, "e2e": E2E_CAP_MINUTES + 10, "score": 25}
@@ -115,7 +118,7 @@ def run_block(step: Step) -> None:
 
 def run_e2e(step: Step) -> None:
     sh(step, f"python -m stages.ternary e2e --student {W}/block/latent --teacher {e5.HF_DIR} --traces {TRACES} "
-             f"--tokens {E2E_TOKENS:.0f} --max-minutes {E2E_CAP_MINUTES} --out {W}/e2e")
+             f"--tokens {E2E_TOKENS:.0f} --length {E2E_WINDOW} --batch 2 --max-minutes {E2E_CAP_MINUTES} --out {W}/e2e")
 
 
 def run_score(step: Step) -> None:
