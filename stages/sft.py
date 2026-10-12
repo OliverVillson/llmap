@@ -120,6 +120,32 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
     return pm
 
 
+def check_finite(model) -> None:
+    """Never hand quantize NaN/inf weights. Only the trained tensors can have gone bad
+    (some base tensors are legitimately inf, e.g. Gemma 4's audio clipping bounds)."""
+    bad_w = [n for n, p in model.named_parameters() if p.requires_grad and not torch.isfinite(p).all()]
+    if bad_w:
+        raise NonFiniteTraining(f"{len(bad_w)} trained tensors are not finite, e.g. {bad_w[0]}")
+
+
+def save_merged(model, tok, out_dir: Path) -> None:
+    """Merges the LoRA and saves a plain bf16 HF checkpoint at out_dir, via a .tmp dir
+    so a stop never leaves half a model there."""
+    device = next(model.parameters()).device
+    model = model.merge_and_unload()
+    if device.type == "cuda":
+        model.to(torch.bfloat16)
+    model.config.use_cache = True
+    tmp = out_dir.parent / (out_dir.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
+    tok.save_pretrained(tmp)
+    mu.fix_saved_config(tmp)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    tmp.rename(out_dir)
+
+
 def _batches(data: list[dict], max_tokens: int, max_bs: int, seed: int):
     order = sorted(range(len(data)), key=lambda i: len(data[i]["input_ids"]))
     batches, cur, cur_max = [], [], 0
@@ -264,26 +290,10 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
 
     if ema is None:
         raise NonFiniteTraining("no finite training step")
-    # Never hand quantize NaN/inf weights. Only the trained tensors can have
-    # gone bad (some base tensors are legitimately inf, e.g. Gemma 4's audio
-    # clipping bounds).
-    bad_w = [n for n, p in model.named_parameters() if p.requires_grad and not torch.isfinite(p).all()]
-    if bad_w:
-        raise NonFiniteTraining(f"{len(bad_w)} trained tensors are not finite, e.g. {bad_w[0]}")
+    check_finite(model)
     progress(92, "merging LoRA and saving")
     del teacher, opt
-    model = model.merge_and_unload()
-    if device.type == "cuda":
-        model.to(torch.bfloat16)
-    model.config.use_cache = True
-    tmp = out_dir.parent / (out_dir.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
-    tok.save_pretrained(tmp)
-    mu.fix_saved_config(tmp)
-    shutil.rmtree(out_dir, ignore_errors=True)
-    tmp.rename(out_dir)
+    save_merged(model, tok, out_dir)
     log(f"sft: saved merged model to {out_dir} (final loss {ema:.3f}"
         + (f", {skipped} non-finite steps skipped)" if skipped else ")"))
     return out_dir
