@@ -48,11 +48,16 @@ class Config:
     # extra answers sampled at temperature 1.0. 0 and 0 = plain rows only.
     data_harness_share: float = 0.0
     data_fix_rows: int = 0
-    # Contest rows for code specs: LiveCodeBench problems (code_eval_dir) older than the
-    # eval's, answered by the teacher (thinking per data_thinking) and kept when they pass
-    # their tests. Train only, never held out; must not overlap the eval (lcb_since).
+    # Contest rows for code specs: contest problems answered by the teacher (thinking per
+    # data_thinking) and kept when they pass their tests. Train only, never held out.
     data_contest_rows: int = 0  # contest rows to add; 0 = off
-    data_contest_before: str = "2024-10-01"  # only problems released before this date
+    # "codecontests": deepmind/code_contests (fetched to code_eval_dir), every problem from
+    # before 2022, so none of LiveCodeBench's (v6 starts 2023-05), and any whose statement
+    # shares a long word run with a LiveCodeBench problem is dropped too. "livecodebench":
+    # LiveCodeBench problems released before data_contest_before; those are LCB v6
+    # problems, so never use it when LCB v6 is a score that counts.
+    data_contest_source: str = "codecontests"
+    data_contest_before: str = "2024-10-01"  # livecodebench source: only problems released before this date
     data_contest_samples: int = 2  # teacher answers per problem; the shortest passing one is kept
     data_contest_harness_share: float = 0.0  # share asked as a Mugge ticket instead of a plain prompt
     # A .jsonl of ready chat rows added to train as they are, for code specs (train only, no

@@ -164,6 +164,17 @@ def test_lcb_row_shapes():
     assert r["tests"] == {"func": "f", "cases": [["1", "1"]]} and "starter code" in r["prompt"]
 
 
+def test_codecontests_row_keeps_examples_first_and_drops_huge_cases():
+    t = lambda ins, outs: {"input": ins, "output": outs}
+    r = fc.codecontests_row({"name": "1000_A. Sum", "description": "Add them.", "source": 2, "difficulty": 7,
+                             "public_tests": t(["1 2\n"], ["3\n"]), "private_tests": t(["2 2\n", "x" * 30000], ["4\n", "y"]),
+                             "generated_tests": t(["5 5\n"], ["10\n"])}, 50)
+    assert r["id"] == "codeforces/1000_A" and r["public"] == 1 and r["prompt"] == "Add them."
+    assert [c["input"] for c in r["tests"]] == ["1 2\n", "2 2\n", "5 5\n"]
+    assert fc.codecontests_row({"name": "x", "description": "d", "public_tests": t(["1"], ["1"]),
+                                "private_tests": t([], []), "generated_tests": t([], [])}, 50) is None
+
+
 def test_load_suite_filters_by_date_and_limit(tmp_path):
     rows = [{"id": str(i), "language": "py", "prompt": "", "tests": "", "date": d}
             for i, d in enumerate(["2025-12-01", "2026-05-01", "2026-07-01"])]

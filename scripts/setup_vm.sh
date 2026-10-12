@@ -123,6 +123,10 @@ export LOBBOT_CODEBENCH=$NVME/codebench
 ENV
 [ -f "$NVME/codebench/livecodebench.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
   python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" || echo 'WARNING: code suites not downloaded; code eval will fail'
+# contest training problems (data_contest_source "codecontests"), for a codebench made before they were added
+[ -f "$NVME/codebench/codecontests.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
+  python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" --only codecontests \
+  || echo 'WARNING: CodeContests not downloaded; the data stage fails if contest rows are on'
 
 say "llm-compressor in the training venv (quant_format w4a16: int4 experts, FP8 attention, for vLLM)"
 # 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: inside this venv's

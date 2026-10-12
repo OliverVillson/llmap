@@ -7,6 +7,10 @@ Writes <out>/<suite>.jsonl in the problem shape stages/codebench.py reads:
                             falls back to openai/openai_humaneval)
   livecodebench             livecodebench/code_generation_lite, every release
                             file; stages/eval.py keeps the recent ones (Config.lcb_since)
+  codecontests              deepmind/code_contests train split (Codeforces, AtCoder and
+                            others, all from before 2022): training problems for the
+                            data stage's contest rows (Config.data_contest_source), never
+                            scored
   general-calib             general English text (WikiText-103) for REAP calibration
                             in experiment 01's r50mix-gen ablation (Config.reap_calib_path)
 Run it once per VM; eval reads the files offline.
@@ -116,6 +120,43 @@ def fetch_livecodebench(out: Path, max_cases: int) -> None:
         print(f"livecodebench: {rows[0]['date']} .. {rows[-1]['date']}")
 
 
+# deepmind/code_contests' source codes
+CC_SOURCES = {1: "codechef", 2: "codeforces", 3: "hackerearth", 4: "codejam", 5: "atcoder", 6: "aizu"}
+CC_MAX_CASE_CHARS = 20000  # cases with a longer input or output are dropped, to keep the file small
+
+
+def codecontests_row(r: dict, max_cases: int) -> dict | None:
+    """A deepmind/code_contests problem as a stdin/stdout problem: examples first, then the
+    private and generated cases, up to max_cases."""
+    def cases(t):
+        return [{"input": i, "output": o} for i, o in zip(t["input"], t["output"])
+                if len(i) <= CC_MAX_CASE_CHARS and len(o) <= CC_MAX_CASE_CHARS]
+
+    public = cases(r["public_tests"])
+    tests = (public + cases(r["private_tests"]) + cases(r["generated_tests"]))[:max_cases]
+    if len(tests) < 2 or not r["description"].strip():
+        return None
+    source = CC_SOURCES.get(r.get("source"), "other")
+    return {"id": f"{source}/{r['name'].split('.')[0].strip()}", "language": "python",
+            "prompt": r["description"].strip(), "stub": "", "entry": "", "tests": tests,
+            "difficulty": r.get("difficulty"), "public": min(len(public), len(tests))}
+
+
+def fetch_codecontests(out: Path, max_cases: int, n: int = 6000) -> None:
+    """Up to n problems of the train split, streamed so the multi-GB split is not all downloaded."""
+    from datasets import load_dataset
+
+    rows, seen = [], set()
+    for r in load_dataset("deepmind/code_contests", split="train", streaming=True):
+        row = codecontests_row(r, max_cases)
+        if row and row["id"] not in seen:
+            seen.add(row["id"])
+            rows.append(row)
+            if len(rows) >= n:
+                break
+    write(out / "codecontests.jsonl", rows)
+
+
 def fetch_general_calib(out: Path, n: int = 2000) -> None:
     """Wikipedia articles of at least ~200 words, one {"text"} row each."""
     from datasets import load_dataset
@@ -142,8 +183,8 @@ def write(path: Path, rows: list[dict]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--only", choices=["multipl-e", "livecodebench", "general-calib"])
-    ap.add_argument("--max-cases", type=int, default=50, help="test cases kept per LiveCodeBench problem")
+    ap.add_argument("--only", choices=["multipl-e", "livecodebench", "codecontests", "general-calib"])
+    ap.add_argument("--max-cases", type=int, default=50, help="test cases kept per LiveCodeBench or CodeContests problem")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -151,6 +192,8 @@ def main() -> None:
         fetch_multipl_e(out)
     if args.only in (None, "livecodebench"):
         fetch_livecodebench(out, args.max_cases)
+    if args.only in (None, "codecontests"):
+        fetch_codecontests(out, args.max_cases)
     if args.only in (None, "general-calib"):
         fetch_general_calib(out)
 

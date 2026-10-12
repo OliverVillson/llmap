@@ -14,6 +14,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from stages import moe_utils as mu
 from stages.taskdata import tokenize_example
@@ -28,6 +29,26 @@ LINEAR_ATTN = ["in_proj_qkv", "in_proj_z", "out_proj"]
 
 class NonFiniteTraining(RuntimeError):
     """Training produced NaN/inf losses or weights; nothing was saved."""
+
+
+# Answer positions per KD chunk: each chunk's fp32 softmaxes are tokens x vocab x 4 bytes
+# (2 GB for 2048 positions of a 248k vocab), so a long thinking answer is never all in memory.
+KD_CHUNK = 2048
+
+
+def kd_kl(s_logits, t_logits, temp: float = 1.0, chunk: int = KD_CHUNK):
+    """KL(teacher || student) per answer position, averaged ("batchmean"), times temp^2,
+    computed chunk by chunk. Each chunk is recomputed in the backward pass (checkpoint)
+    instead of keeping its softmaxes, so memory stays at one chunk whatever the length."""
+    def part(s, t):
+        return F.kl_div(F.log_softmax(s.float() / temp, -1), F.log_softmax(t.float() / temp, -1),
+                        log_target=True, reduction="sum")
+
+    n = s_logits.shape[0]
+    total = s_logits.new_zeros((), dtype=torch.float32)
+    for i in range(0, n, chunk):
+        total = total + checkpoint(part, s_logits[i:i + chunk], t_logits[i:i + chunk], use_reentrant=False)
+    return total / max(n, 1) * temp ** 2
 
 
 def log(msg: str) -> None:
@@ -197,12 +218,11 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
                 ce = F.cross_entropy(logits, tgt[mask])
                 loss = ce
                 if teacher is not None:
-                    with torch.no_grad():
+                    with torch.no_grad():  # bf16, half the size of an fp32 copy
                         t_logits = teacher(input_ids=ids.to(teacher.device), attention_mask=att.to(teacher.device)
-                                           ).logits[:, :-1][mask.to(teacher.device)].float().to(device)
-                    s = F.log_softmax(logits / kd_temp, -1)
-                    t = F.log_softmax(t_logits / kd_temp, -1)
-                    kl = F.kl_div(s, t, log_target=True, reduction="batchmean") * kd_temp ** 2
+                                           ).logits[:, :-1][mask.to(teacher.device)].to(device)
+                    kl = kd_kl(logits, t_logits, kd_temp)
+                    del t_logits
                     loss = (1 - kd_weight) * ce + kd_weight * kl
             # One inf/NaN gradient is enough to turn every LoRA weight into NaN
             # (clip_grad_norm_ scales by a NaN norm), so a bad batch skips the
