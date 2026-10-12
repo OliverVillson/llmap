@@ -130,6 +130,12 @@ def test_m22_goes_below_the_ladder_with_iq2():
     assert rf"attn_(q|k|v|output)\.weight=iq3_xxs" in args and "m22" in dense.RECIPES
 
 
+def test_bh15_leaves_room_for_the_repair_adapter_under_1_5_gb():
+    args, est, ffn_bits = dense.fixed_plan(granite_3b_tensors(), 40, dense.FIXED["bh15"])
+    assert 1.40 < est < 1.47 and 2.6 < ffn_bits < 2.8
+    assert rf"attn_(q|k|v|output)\.weight=iq4_xs" in args and "bh15" in dense.RECIPES
+
+
 def test_end_of_turn_reads_the_template(monkeypatch):
     import httpx
 

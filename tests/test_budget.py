@@ -109,3 +109,9 @@ def test_kv_cache_type_reaches_llama_server(tmp_path):
     args = ev.server_args(Config(eval_kv_type="q8_0"), str(tmp_path / "m.gguf"))
     assert args[-6:] == ["-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on"]
     assert "-ctk" not in ev.server_args(Config(), str(tmp_path / "m.gguf"))
+
+
+def test_repair_lora_reaches_llama_server(tmp_path):
+    args = ev.server_args(Config(eval_lora="/x/lora.gguf"), str(tmp_path / "m.gguf"))
+    assert args[args.index("--lora") + 1] == "/x/lora.gguf"
+    assert "--lora" not in ev.server_args(Config(), str(tmp_path / "m.gguf"))

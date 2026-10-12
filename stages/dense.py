@@ -56,8 +56,11 @@ MIXED = {
 # writes straight into the residual stream. m22: ~2.2-bit feed-forward, ~1.2 GB for Granite 3B.
 FIXED = {
     "m22": {"ffn_gate_up": "iq2_xxs", "ffn_down": "iq2_s", "attn": "iq3_xxs", "output": "q4_k", "token_embd": "q3_k"},
+    # blackhole (Oliver, 2026-10-12: at most 1.5 GB, reliability first): ~1.45 GB plus a
+    # ~0.03 GB repair LoRA (stages/qheal.py). IQ2_S/IQ3_XXS beat Q2_K at the same size.
+    "bh15": {"ffn_gate_up": "iq2_s", "ffn_down": "iq3_xxs", "attn": "iq4_xs", "output": "q4_k", "token_embd": "q3_k"},
 }
-FIXED_BPW = {"iq2_xxs": 2.0625, "iq2_xs": 2.3125, "iq2_s": 2.5625, "iq3_xxs": 3.0625}
+FIXED_BPW = {"iq2_xxs": 2.0625, "iq2_xs": 2.3125, "iq2_s": 2.5625, "iq3_xxs": 3.0625, "iq4_xs": 4.25}
 RECIPES = ("q4", "w18s", "q8", *MIXED, *FIXED)
 # Calibration problems per suite, spread over each suite; LiveCodeBench is the test.
 CALIB_SUITES = {"multipl-e-py": 10, "multipl-e-js": 10, "multipl-e-ts": 10, "multipl-e-cpp": 10, "c-set": 8}

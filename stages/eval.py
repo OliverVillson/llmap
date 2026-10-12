@@ -132,6 +132,8 @@ def server_args(cfg, gguf: str) -> list[str]:
             "-c", str(SLOTS * limits(cfg)[1]), "-np", str(SLOTS), "--jinja"]
     if cfg.eval_experts_used:
         args += ["--override-kv", f"{gguf_arch(gguf)}.expert_used_count=int:{cfg.eval_experts_used}"]
+    if cfg.eval_lora:
+        args += ["--lora", cfg.eval_lora]
     if cfg.eval_kv_type:  # a quantized V cache needs flash attention
         args += ["-ctk", cfg.eval_kv_type, "-ctv", cfg.eval_kv_type, "-fa", "on"]
     return args
