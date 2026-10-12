@@ -5,6 +5,7 @@ score, measured so the result can be trusted. One command.
     python3 scripts/blackhole.py          # everything; re-run after a stop and finished steps are skipped
     python3 scripts/blackhole.py --list   # the steps and their time guesses
     python3 scripts/blackhole.py summary  # the results table
+    python3 scripts/blackhole.py --shutdown  # everything, then power the VM off once the results are uploaded
 
 Oliver, 2026-10-12: "Lets aim for an as reliable result as possible. I can spare up to
 1.5GB". Only proven pieces (plan: /mnt/project-files/plan/blackhole.md):
@@ -154,12 +155,14 @@ def run_upload(step: Step) -> None:
     """Configs, logs, scores and every answer, bh15 and the adapter (not the training text)."""
     if not evroc_ok():
         raise Skip("no evroc login. Log in (runbook step 5) and re-run to upload.")
+    (W / "summary.txt").write_text(summary() + "\n")
     tar = e5.NVME / "blackhole.tar"
     dirs = " ".join(f"{e5.J.name}/{d.name}" for d in [W.parent, QUANT_JOB, *JOBS.values()])
     sh(step, f"mkdir -p {W}/logs && cp {LOGS}/*.log {W}/logs/ && cd {e5.J.parent} && "
              f"find {dirs} -type f -size -200M ! -name traces.jsonl ! -name '*.safetensors' -print0 "
              f"| tar cf {tar} --null -T -")
-    for src, key in ((tar, "blackhole/blackhole.tar"), (QUANT, "gguf/granite42-3b-bh15.gguf"),
+    for src, key in ((W / "summary.txt", "blackhole/summary.txt"), (tar, "blackhole/blackhole.tar"),
+                     (QUANT, "gguf/granite42-3b-bh15.gguf"),
                      (LORA, "gguf/granite42-3b-bh15-repair-lora.gguf")):
         if src.exists():
             sh(step, f"evroc storage bucket get-s3-credentials >/dev/null && "
@@ -251,8 +254,21 @@ def summary() -> str:
                   "same llama-server settings. The interval comes from resampling problems.")
 
 
+def shutdown_after() -> None:
+    """Powers the VM off after a run, but only once the results are safe in the bucket:
+    the VM's disk is wiped when it stops."""
+    if not (LOGS / ".uploaded").exists():
+        print("\nNot shutting down: the results aren't uploaded yet, and stopping the VM wipes them.")
+        return
+    print("\nResults uploaded. Shutting the VM down in 5 minutes (cancel with: sudo shutdown -c).")
+    os.system("sudo shutdown -h +5")
+
+
 def main() -> int:
-    return run_plan(steps(), summary, LOGS)
+    code = run_plan(steps(), summary, LOGS)
+    if "--shutdown" in sys.argv and code != 130:
+        shutdown_after()
+    return code
 
 
 if __name__ == "__main__":

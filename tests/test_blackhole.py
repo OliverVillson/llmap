@@ -80,3 +80,15 @@ def test_summary_gives_the_share_kept_with_a_paired_interval(tmp_path, monkeypat
     assert 0.95 < share < 0.99 and lo < share < hi <= 1.0
     out = m.summary()
     assert "bh15+repair" in out and "kept" in out and "95% interval" in out
+
+
+def test_shutdown_only_once_the_results_are_uploaded(tmp_path, monkeypatch):
+    bh = load(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(bh.os, "system", calls.append)
+    bh.LOGS.mkdir(parents=True)
+    bh.shutdown_after()
+    assert calls == []  # the VM's disk would be wiped with the results on it
+    (bh.LOGS / ".uploaded").write_text("x")
+    bh.shutdown_after()
+    assert calls == ["sudo shutdown -h +5"]
