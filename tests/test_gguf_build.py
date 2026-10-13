@@ -1,7 +1,6 @@
 """stages/gguf_build.py on a tiny GraniteForCausalLM: HF -> convert_hf_to_gguf.py ->
 trained K-quant integers -> GGUF -> gguf-py, llama.cpp and the vLLM checkpoint all see
 exactly those integers."""
-import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +13,7 @@ torch = pytest.importorskip("torch")
 gguf = pytest.importorskip("gguf")
 
 from stages import gguf_build as GB  # noqa: E402
+from stages import horizon  # noqa: E402
 from stages import kquant as K  # noqa: E402
 from stages import qheal  # noqa: E402
 
@@ -165,12 +165,9 @@ def llama_kld(llama_cpp: Path, base: Path, model: Path, tmp: Path) -> float | No
     if not logits.exists():
         subprocess.run([str(exe), "-m", str(base), "-f", str(text), "-c", "64", "--chunks", "4", "-t", "2",
                         "--kl-divergence-base", str(logits)], check=True, capture_output=True)
-    r = subprocess.run([str(exe), "-m", str(model), "-c", "64", "--chunks", "4", "-t", "2",
-                        "--kl-divergence-base", str(logits), "--kl-divergence"],
-                       check=True, capture_output=True, text=True)
-    m = re.search(r"Mean\s+KLD:\s+([-0-9.e+]+)", r.stdout + r.stderr)
-    assert m, (r.stdout + r.stderr)[-2000:]
-    return float(m.group(1))
+    # horizon's runner: the pinned llama-perplexity can lose its summary under load, and is run again
+    return horizon._kld_run([str(exe), "-m", str(model), "-c", "64", "--chunks", "4", "-t", "2",
+                             "--kl-divergence-base", str(logits), "--kl-divergence"])["kld"]
 
 
 def test_llama_quantize_output_read_back_and_rebuilt_is_the_same_bytes(tiny, tmp_path):

@@ -739,11 +739,16 @@ def cli_calls(cmd: str) -> list[tuple[str, list[str]]]:
 
 def parse_in_real_cli(target: str, args: list[str], monkeypatch, capsys) -> argparse.Namespace:
     """The target's own main() up to its parse_args: unknown flags, missing required ones,
-    bad types and choices fail here as they would on the VM."""
+    bad types and choices fail here as they would on the VM, and so does a flag that
+    argparse would only take as an abbreviation."""
     real, got = argparse.ArgumentParser.parse_args, {}
 
     def parse(self, a=None, namespace=None):
         got["ns"] = real(self, a, namespace)
+        flags = {o for p in [self, *(c for x in self._actions if isinstance(x, argparse._SubParsersAction)
+                                      for c in x.choices.values())] for x in p._actions for o in x.option_strings}
+        short = [x for x in args if x.startswith("--") and x.split("=")[0] not in flags]
+        assert not short, f"{target}: {short} only match as abbreviations"
         raise Parsed
 
     with monkeypatch.context() as mp, warnings.catch_warnings():

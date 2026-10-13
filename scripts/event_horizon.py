@@ -1434,7 +1434,7 @@ def run_rates(step: Step) -> None:
         raise RuntimeError("vLLM smoke on the B200 failed: " + "; ".join(bad))
     sh(step, gpu(f"python -m stages.qat e2e --state {B}/state --teacher {HF_DIR} --traces {traces_file()}"
                  f"{vocab_flag()} --tokens {RATES['qat_tokens']} --length {E2E['length']} --eval-every 1000000 "
-                 f"--held-n 1 --held-length 2048 --out {R}/qat"))
+                 f"--held-rows 1 --held-length 2048 --out {R}/qat"))
     q = load(R / "qat" / "e2e.json") or {}
     ev = ((load(d / "out" / "eval.json") or {}).get("candidates") or [{}])[0].get("code") or {}
     dump(R / "rates.json", {"qat_tok_s": q["tokens"] / (q["minutes"] * 60) if q.get("minutes") else None,

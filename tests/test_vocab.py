@@ -562,9 +562,10 @@ def test_selection_and_gate_halves_split_the_held_out_problems_evenly():
     assert gat == one and not sel
 
 
-def test_llama_tokenize_runs_a_cut_output_again_and_then_fails_loudly(tmp_path):
+def test_llama_tokenize_runs_a_cut_output_again_and_then_fails_loudly(tmp_path, capsys):
     """The pinned llama.cpp's tools can exit 0 with their output cut short; a run without a
-    whole "[...]" line is repeated, and raises after TOKENIZE_TRIES."""
+    whole "[...]" line is repeated, and raises after TOKENIZE_TRIES. Saying so goes to
+    stderr: the run reads tokcheck's stdout back as JSON (> tokenize.json)."""
     runs = tmp_path / "runs"
     fake = tmp_path / "llama-tokenize"
     fake.write_text(f"#!{sys.executable}\n"
@@ -577,6 +578,8 @@ def test_llama_tokenize_runs_a_cut_output_again_and_then_fails_loudly(tmp_path):
     fake.chmod(0o755)
     assert vocab.llama_tokenize(fake, tmp_path / "x.gguf", ["some text"], workers=1) == [[1, 2, 3]]
     assert runs.read_text() == "2"  # the first run's output was cut: it ran again
+    out = capsys.readouterr()
+    assert out.out == "" and "running it again" in out.err
     runs.write_text("5")  # from now on every run is cut
     with pytest.raises(RuntimeError, match="no whole id line in 3 runs"):
         vocab.llama_tokenize(fake, tmp_path / "x.gguf", ["some text"], workers=1)

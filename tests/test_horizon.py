@@ -208,7 +208,8 @@ def test_a_kld_run_that_lost_its_summary_runs_again(monkeypatch):
     """llama-perplexity's log is asynchronous and not flushed at exit: a run that exits 0
     can end before its summary. It runs again; a run that fails, or keeps losing it, raises."""
     full = "   4     289.7799 ±    7.9754\nMean    KLD:  -0.000010 ±   0.000002\nSame top p: 98.500 ± 0.300 %\n"
-    outs = iter(["   1     301.7 ±   17.7\n", full])
+    cut = full.split("Same top p")[0]  # the mean KLD made it out, the top-1 line did not
+    outs = iter(["   1     301.7 ±   17.7\n", cut, full])
     calls = []
 
     def run(cmd, **k):
@@ -216,7 +217,9 @@ def test_a_kld_run_that_lost_its_summary_runs_again(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, next(outs), "")
     monkeypatch.setattr(horizon.subprocess, "run", run)
     r = horizon._kld_run(["exe", "-m", "x.gguf", "--kl-divergence"])
-    assert len(calls) == 2 and r["kld"] == pytest.approx(-1e-5) and r["top1"] == pytest.approx(0.985)
+    assert len(calls) == 3 and r["kld"] == pytest.approx(-1e-5) and r["top1"] == pytest.approx(0.985)
+    with pytest.raises(ValueError, match="top-1 line missing"):
+        horizon.parse_kld(cut)
     monkeypatch.setattr(horizon.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "1 2\n", ""))
     with pytest.raises(ValueError, match="no KLD summary"):
         horizon._kld_run(["exe", "-m", "x.gguf"], tries=2)

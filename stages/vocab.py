@@ -114,7 +114,9 @@ EDGE_TEXTS = [
 
 
 def log(msg: str) -> None:
-    print(f"[vocab] {msg}", flush=True)
+    """To stderr: stdout is the CLI's report (smoke and tokcheck print JSON, register the
+    hash), which callers redirect to a file and read back."""
+    print(f"[vocab] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------- the tokenizer as data ----------

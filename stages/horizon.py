@@ -797,7 +797,9 @@ _LADDER = {"kld": r"Mean\s+KLD:\s+([-\d.e+]+)\s+±\s+([\d.e+-]+)", "top1": r"Sam
 
 
 def parse_kld(text: str) -> dict:
-    """The summary of a llama-perplexity --kl-divergence run (top1 as a share)."""
+    """The summary of a llama-perplexity --kl-divergence run (top1 as a share). Both lines
+    the parity check reads must be there: the top-1 share is the summary's last line, so
+    an output cut short can have the mean KLD without it, and that is a lost summary too."""
     out = {}
     for k, pat in _LADDER.items():
         m = re.search(pat, text)
@@ -807,8 +809,9 @@ def parse_kld(text: str) -> dict:
                 out["kld_se"] = float(m[2])
             if k == "top1":
                 out[k], out["top1_se"] = float(m[1]) / 100, float(m[2]) / 100
-    if "kld" not in out:
-        raise ValueError(f"no KLD summary in llama-perplexity's output:\n{text[-2000:]}")
+    if "kld" not in out or "top1" not in out:
+        raise ValueError(f"no KLD summary in llama-perplexity's output ({'top-1 line' if 'kld' in out else 'mean KLD'} "
+                         f"missing):\n{text[-2000:]}")
     return out
 
 
