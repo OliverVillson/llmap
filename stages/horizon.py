@@ -113,7 +113,7 @@ LADDER_CTX, LADDER_CHUNKS = 4096, 16
 # at ~2.6 bits, so a tolerance on the KL would never fire.
 GAIN_SE = 2.0
 GAIN_SHORT = 0.5
-KLD_TRIES = 3  # llama-perplexity runs per ladder rung when its summary is lost (see _kld_run)
+KLD_TRIES = 3  # plain llama-perplexity runs per ladder rung when its summary is lost (see _kld_run)
 
 
 # ---------- the model's tensors and groups ----------
@@ -857,7 +857,8 @@ _LADDER = {"kld": r"Mean\s+KLD:\s+([-\d.e+]+)\s+±\s+([\d.e+-]+)", "top1": r"Sam
 def parse_kld(text: str) -> dict:
     """The summary of a llama-perplexity --kl-divergence run (top1 as a share). Both lines
     the parity check reads must be there: the top-1 share is the summary's last line, so
-    an output cut short can have the mean KLD without it, and that is a lost summary too."""
+    an output cut short can have the mean KLD without it, and that is a lost summary too.
+    (llama-perplexity prints no summary at all when fewer than 100 positions were scored.)"""
     out = {}
     for k, pat in _LADDER.items():
         m = re.search(pat, text)
@@ -873,21 +874,66 @@ def parse_kld(text: str) -> dict:
     return out
 
 
+# llama-perplexity prints everything, its KLD summary included, through llama.cpp's
+# asynchronous log (common/log.cpp): a worker thread prints a queue of lines. The pinned
+# tool returns from main without common_log_flush(), so the process can exit with the
+# last lines still queued: one run in ten lost its summary on an idle 4-core machine,
+# nearly every run with the cores busy. No flag or environment variable makes that log
+# synchronous (--log-file is written by the same thread), and the KLD statistics go to
+# no file. So the tool's own entry point, llama_perplexity() in the
+# libllama-perplexity-impl.so it is built on, is called from a small Python process that
+# then calls common_log_flush(common_log_main()), as log.h asks of a program that needs
+# all of its log, and exits with the tool's return code. Python's SIGINT and SIGPIPE
+# handling is put back to the defaults first, so the tool stops as the binary would.
+_FLUSHED = """\
+import ctypes, os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+lib = ctypes.CDLL(sys.argv[1])
+main, log_main, flush = lib._Z16llama_perplexityiPPc, lib._Z15common_log_mainv, lib._Z16common_log_flushP10common_log
+main.argtypes, main.restype = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)], ctypes.c_int
+log_main.restype, flush.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+argv = [os.fsencode(a) for a in sys.argv[2:]]
+rc = main(len(argv), (ctypes.c_char_p * (len(argv) + 1))(*argv, None))
+flush(log_main())
+ctypes.CDLL(None).fflush(None)
+os._exit(rc & 0xFF)
+"""
+PERPLEXITY_LIB = "libllama-perplexity-impl.so"
+
+
+def perplexity_lib(exe: str | Path) -> Path | None:
+    """The library llama-perplexity is built on, beside the binary, or None."""
+    lib = Path(exe).parent / PERPLEXITY_LIB
+    return lib if lib.exists() else None
+
+
+def perplexity_cmd(cmd: list[str]) -> list[str]:
+    """cmd (llama-perplexity and its arguments) as a command whose output is the tool's
+    whole log (_FLUSHED): through the tool's library when it is built beside the binary,
+    else the binary itself (_kld_run then repeats a run that lost its summary)."""
+    lib = perplexity_lib(cmd[0])
+    return [sys.executable, "-I", "-c", _FLUSHED, str(lib), *map(str, cmd)] if lib else [*map(str, cmd)]
+
+
 def _kld_run(cmd: list[str], tries: int = KLD_TRIES) -> dict:
-    """One llama-perplexity --kl-divergence run, parsed. Its log is asynchronous and the
-    pinned llama.cpp never flushes it before exiting, so under load a run that exits 0 can
-    lose its last lines, the summary among them: that run is repeated (up to `tries`)."""
-    for i in range(tries):
-        r = subprocess.run(cmd, capture_output=True, text=True)
+    """One llama-perplexity --kl-divergence run (cmd: the binary and its arguments),
+    parsed, its log flushed before it exits (perplexity_cmd). Without the tool's library
+    only the plain binary can run, whose log can lose its last lines: a run that exits 0
+    without the summary is then repeated (up to `tries`)."""
+    model = Path(cmd[cmd.index("-m") + 1]).name if "-m" in cmd else "?"
+    run, flushed = perplexity_cmd(cmd), perplexity_lib(cmd[0]) is not None
+    for i in range(1 if flushed else tries):
+        r = subprocess.run(run, capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"llama-perplexity --kl-divergence on {Path(cmd[2]).name} exited with "
+            raise RuntimeError(f"llama-perplexity --kl-divergence on {model} exited with "
                                f"{r.returncode}:\n{(r.stdout + r.stderr)[-3000:]}")
         try:
             return parse_kld(r.stdout + r.stderr)
         except ValueError:
-            if i == tries - 1:
+            if flushed or i == tries - 1:
                 raise
-            log(f"horizon: llama-perplexity's output on {Path(cmd[2]).name} lost its summary; running it again")
+            log(f"horizon: llama-perplexity's output on {model} lost its summary; running it again")
     raise AssertionError("unreachable")
 
 
@@ -918,8 +964,8 @@ def ladder(bf16: Path, ggufs: list[Path], text: Path, out: Path, llama_cpp, *, c
     want = {"bf16": _stamp(bf16), "text": _stamp(text), "ctx": ctx, "chunks": chunks}
     if not (base.exists() and stamp.exists() and json.loads(stamp.read_text()) == want):
         tmp = Path(str(base) + ".tmp")
-        r = subprocess.run([str(exe), "-m", str(bf16), "-f", str(text), "--kl-divergence-base", str(tmp), *common],
-                           capture_output=True, text=True)
+        r = subprocess.run(perplexity_cmd([str(exe), "-m", str(bf16), "-f", str(text), "--kl-divergence-base",
+                                           str(tmp), *common]), capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"llama-perplexity on {bf16.name} exited with {r.returncode}:\n"
                                f"{(r.stdout + r.stderr)[-3000:]}")

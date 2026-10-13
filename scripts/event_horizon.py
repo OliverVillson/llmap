@@ -59,14 +59,14 @@ for the 8k re-scoring (stages/budget.py) and gets a thinking report
 fails, listing the processes holding it, if it is not freed.
 
 Artifacts: each step's outputs live on the NVMe in dirs named by hashes of what they
-were made from (map, args, imatrix sha, traces sha, vocab sha, eval settings), so a
-changed input never reuses an old result. After every step the runner's after_step hook
-uploads them to <bucket>/horizon/<run-id>/<step>/<hash>/ (HORIZON_RUN names the run),
-and once more however the run ends; the first step after setup restores whatever
-matches. W/.uploaded on the NVMe holds the fingerprint of what was uploaded, so it is
-wiped with the results; --shutdown powers off only after a run that exited 0 and whose
-results still match it. The evroc login is checked at the start (--shutdown refuses to
-start without one) and the last step waits a bounded time for one.
+were made from (map, args, imatrix sha, traces sha and held-out split, vocab sha, eval
+settings), so a changed input never reuses an old result. After every step the runner's
+after_step hook uploads them to <bucket>/horizon/<run-id>/<step>/<hash>/ (HORIZON_RUN
+names the run), and once more however the run ends; the first step after setup restores
+whatever matches. W/.uploaded on the NVMe holds the fingerprint of what was uploaded, so
+it is wiped with the results; --shutdown powers off only after a run that exited 0 and
+whose results still match it. The evroc login is checked at the start (--shutdown
+refuses to start without one) and the last step waits a bounded time for one.
 
 The stages run through their CLIs (python -m stages.X), in the training venv that
 .env.vm puts first on PATH; this script itself is stdlib only, and its `smoke` and
@@ -77,6 +77,8 @@ Logs are in ~/event-horizon-logs/<session> (HORIZON_LOGS), and in the bucket.
 from __future__ import annotations
 
 import argparse
+import ast
+import functools
 import hashlib
 import json
 import math
@@ -117,7 +119,10 @@ HF_DIR = NVME / "models" / "granite-4.2-3b"
 BF16 = NVME / "models" / "gguf" / "granite-4.2-3b-BF16.gguf"
 LLAMA_CPP = NVME / "llama.cpp"
 LLAMA_CPP_SHA = os.environ.get("LLAMA_CPP_SHA", "af50f2f248b475d9760f8e67503d01c0f194f5f4")
-LLAMA_BINS = ("llama-server", "llama-quantize", "llama-imatrix", "llama-perplexity", "llama-tokenize")
+# What setup builds: the tools, and the library llama-perplexity is built on (stages/horizon.py
+# runs the tool through it so that its log, the parity KLD in it, is flushed before it exits).
+LLAMA_BINS = ("llama-server", "llama-quantize", "llama-imatrix", "llama-perplexity", "llama-tokenize",
+              "libllama-perplexity-impl.so")
 CODEBENCH = NVME / "codebench"
 SUITES = ("livecodebench", "codecontests", "apps")
 TASKSPEC = REPO / "examples" / "python-utils.code.taskspec.json"
@@ -225,7 +230,11 @@ def minutes() -> dict[str, float]:
         m["e2e"] = min(E2E["tokens"] / qat / 60, E2E["max_minutes"]) + 5
     if qat and roll:
         a = ONPOLICY
-        fresh = min(a["fresh"] * a["rollouts"] * ROLLOUT_TOKENS, a["rollout_tokens_cap"] or math.inf)
+        # qat holds the fresh rollouts to the cap within about one problem (it asks lazily,
+        # each problem in flight reserved at the mean answer so far), so a model that loops
+        # costs the cap's tokens, fewer problems, not more tokens
+        fresh = min(a["fresh"] * a["rollouts"] * ROLLOUT_TOKENS,
+                    (a["rollout_tokens_cap"] or math.inf) + a["rollouts"] * LCB_TOKENS)
         held = a["held"] * 2 * ROLLOUT_TOKENS
         train = min(2 * fresh / qat / 60, a["max_minutes"])
         m["onpolicy"] = a["rounds"] * ((fresh + held) / roll / 60 + train + 10)
@@ -445,9 +454,25 @@ def traces_progress(session: str) -> float | None:
     return min(0.99, c["tokens"] / c["target"]) if c and c.get("target") else None
 
 
+@functools.cache
+def split_rule() -> dict:
+    """The held-out split of the training text (stages/traces.py's HELD_FRAC and
+    SPLIT_RULE, read from its source: this script is stdlib only). Every key below the
+    traces carries it: vocab's gates, the imatrix's text, horizon's sweep and check
+    halves, the Block-AP windows and everything trained after them depend on the split,
+    so an artifact made under another split is never reused. The traces themselves do
+    not (gen writes every problem's rows)."""
+    src = REPO / "stages" / "traces.py"
+    got = {t.id: ast.literal_eval(n.value) for n in ast.parse(src.read_text()).body if isinstance(n, ast.Assign)
+           for t in n.targets if isinstance(t, ast.Name) and t.id in ("HELD_FRAC", "SPLIT_RULE")}
+    if set(got) != {"HELD_FRAC", "SPLIT_RULE"}:
+        raise RuntimeError(f"{src} does not set HELD_FRAC and SPLIT_RULE as constants (found {sorted(got)})")
+    return {"held_frac": got["HELD_FRAC"], "rule": got["SPLIT_RULE"]}
+
+
 def vocab_dir() -> Path | None:
     sha = traces_sha()
-    return W / f"vocab-{h(sha, MODEL, 'vocab run: the measured set, 65536, then none')}" if sha else None
+    return W / f"vocab-{h(sha, split_rule(), MODEL, 'vocab run: the measured set, 65536, then none')}" if sha else None
 
 
 def vocab() -> dict | None:
@@ -473,7 +498,7 @@ def vocab_flag() -> str:
 
 def imatrix_dir() -> Path | None:
     v, t = vocab_sha(), traces_sha()
-    return W / f"imatrix-{h(v, t, IMATRIX_TOKENS, 'ctx 8192, output head')}" if v and t else None
+    return W / f"imatrix-{h(v, t, split_rule(), IMATRIX_TOKENS, 'ctx 8192, output head')}" if v and t else None
 
 
 def imatrix_sha() -> str | None:
@@ -483,7 +508,7 @@ def imatrix_sha() -> str | None:
 
 def ptq_dir() -> Path | None:
     v, i, g = vocab_sha(), imatrix_sha(), gate("gate0")
-    return W / f"ptq-{h(v, i, g and g.get('budget_gb'), 'horizon run')}" if v and i and g else None
+    return W / f"ptq-{h(v, i, g and g.get('budget_gb'), split_rule(), 'horizon run')}" if v and i and g else None
 
 
 def type_map() -> dict | None:
@@ -494,7 +519,7 @@ def type_map() -> dict | None:
 
 def blockap_dir() -> Path | None:
     m, i, t, v = type_map(), imatrix_sha(), traces_sha(), vocab_sha()
-    return W / f"blockap-{h(m and m.get('sha256'), i, t, v, BLOCK)}" if m and i and t and v else None
+    return W / f"blockap-{h(m and m.get('sha256'), i, t, v, split_rule(), BLOCK)}" if m and i and t and v else None
 
 
 def rates_dir() -> Path | None:
@@ -747,7 +772,9 @@ def shares(rows: list[dict]) -> dict[str, float]:
 
 
 def budget_score(r: Reading, b: int = BUDGETS[0]) -> float | None:
-    """The reading re-scored at b thinking tokens (stages/budget.py; first answer per problem)."""
+    """The reading re-scored at b thinking tokens (stages/budget.py; first answer per problem).
+    b = LCB_TOKENS is the long run itself on those same answers (budget.long_run), the
+    figure an 8k re-score is paired with; R is over every answer."""
     d = reading_dir(r)
     rep = load(d / "out" / "eval.json") if d else None
     for c in (rep or {}).get("candidates", []):
@@ -767,7 +794,7 @@ def reading_stats(r: Reading) -> dict | None:
     allc = outcomes(rows_of(r, "-allcases"))
     return {"R": R, "se": se, "lb": lower_bound(R, se), "gb": m[2], "problems": len(outs), "answers": len(rows),
             "outs": outs, "boot": bootstrap(outs), "shares": shares(rows), "budget8k": budget_score(r),
-            "allcases": score(allc) if allc else None}
+            "budget16k": budget_score(r, LCB_TOKENS), "allcases": score(allc) if allc else None}
 
 
 # ---------- the gates, as rules ----------
@@ -973,6 +1000,9 @@ class Art:
     # holds other files under its key is refused, not marked in sync (restore_art then
     # replaces them with the bucket's).
     once: bool = False
+    # A once art's reasons not to pin what is on the disk (a partial fetch, say): while it
+    # lists any, upload_art uploads nothing, so a later setup fetches again.
+    unfit: Callable[[], list[str]] = list
 
     def files(self) -> list[Path]:
         out: list[Path] = []
@@ -1016,11 +1046,12 @@ def in_sync(art: Art) -> bool:
 def upload_art(art: Art, complete: bool = True) -> bool:
     """Uploads what the art has on disk: big files one by one, the rest as small.tar, then
     the manifest last (its presence means the rest is there). False when there is nothing,
-    and for a once art that is not complete (a partial pin would be restored as the pin).
+    and for a once art that is not complete or is unfit (a partial pin would be restored
+    as the pin).
     A once art the bucket already holds is marked in sync only when every file's sha256
     is the manifest's; other files under its key raise."""
     key, files = art.key(), art.files()
-    if key is None or not files or (art.once and not complete):
+    if key is None or not files or (art.once and (not complete or art.unfit())):
         return False
     fp = fingerprint(files)
     m = load(marker(art))
@@ -1155,8 +1186,9 @@ def run_setup(step: Step) -> None:
     bucket's copy replaces anything on the disk once the NVMe is mounted) and the first
     setup's freeze of both venvs (installed as constraints). Only the first setup of a run
     fetches the suites and freezes the venvs, and uploads them (the setup step's art, and
-    pin_venvs). Their bucket copies are looked up into a temp dir on the root disk: on a
-    new VM the NVMe is mounted only by setup_vm.sh."""
+    pin_venvs); a first fetch that is not whole fails the step instead, and is never
+    pinned. Their bucket copies are looked up into a temp dir on the root disk: on a new
+    VM the NVMe is mounted only by setup_vm.sh."""
     pins = Path(tempfile.mkdtemp(prefix="event-horizon-setup-"))
     try:
         cons = pins / "venvs"
@@ -1168,10 +1200,20 @@ def run_setup(step: Step) -> None:
                  "bash scripts/setup_vm.sh")
     finally:
         shutil.rmtree(pins, ignore_errors=True)
-    if have_bench:
-        restore_codebench()
     if not have_venvs:
         pin_venvs()
+    if have_bench:
+        restore_codebench()
+        return
+    # The first fetch is the one pinned, so it must be whole: setup_vm.sh only warns when a
+    # suite fails to download, and a pin without one could never be repaired (every later
+    # setup restores the pin and skips the fetch). The step fails instead, nothing is
+    # pinned (upload_art refuses an unfit pin), and a re-run fetches the missing suites.
+    bad = codebench_problems()
+    if bad:
+        raise RuntimeError("the code suites this setup fetched are not whole, so nothing is pinned: "
+                           + "; ".join(bad) + ". Re-run: setup_vm.sh fetches every suite whose meta is missing "
+                           f"(for a JSONL that does not match its meta, delete both from {CODEBENCH} first).")
 
 
 def codebench_pinned(tmp: Path) -> bool:
@@ -1192,14 +1234,16 @@ def restore_codebench() -> None:
 
 
 def codebench_problems() -> list[str]:
-    """Why the code suites on the disk are not whole: a meta without its JSONL, or a JSONL
-    whose sha256 is not the one its meta recorded when it was fetched."""
-    out = [] if (CODEBENCH / "livecodebench.meta.json").exists() else ["no livecodebench.meta.json"]
+    """Why the code suites on the disk are not whole: a suite of SUITES (setup_vm.sh's own
+    list with SKIP_EXTRAS: the record's problems, the training text's CodeContests and
+    APPS) without its meta or its JSONL, or a JSONL whose sha256 is not the one its meta
+    recorded when it was fetched."""
+    out = []
     for s in SUITES:
         meta, f = load(CODEBENCH / f"{s}.meta.json"), CODEBENCH / f"{s}.jsonl"
         if meta is None:
-            continue
-        if not f.exists():
+            out.append(f"no {s}.meta.json")
+        elif not f.exists():
             out.append(f"{s}.jsonl missing")
         elif meta.get("file_sha256") and sha256_file(f) != meta["file_sha256"]:
             out.append(f"{s}.jsonl is not the file its meta records (sha256)")
@@ -1240,7 +1284,7 @@ def llama_cpp_head() -> str | None:
 def setup_done() -> bool:
     return ((REPO / ".env.vm").exists() and llama_cpp_head() == LLAMA_CPP_SHA
             and all((LLAMA_CPP / "build" / "bin" / b).exists() for b in LLAMA_BINS)
-            and all((CODEBENCH / f"{s}.meta.json").exists() for s in ("livecodebench", "codecontests")))
+            and all((CODEBENCH / f"{s}.meta.json").exists() for s in SUITES))
 
 
 def run_restore(step: Step, session: str) -> None:
@@ -1637,12 +1681,32 @@ def run_ptq(step: Step) -> None:
         pf = {**preflight(floor["floor_bytes"], g0["budget_gb"], g0["R0"]), "floor": True,
               "note": "the cheapest map at the kept vocab; nothing was swept"}
     elif hz:
-        pf = preflight(hz["bytes"], g0["budget_gb"], g0["R0"], (P / "map.json").exists())
+        # horizon's check of the verified map against its prediction (gain_check): a map no
+        # better than the floor was replaced by the floor (fallback); a short gain is a warning
+        pf = {**preflight(hz["bytes"], g0["budget_gb"], g0["R0"], (P / "map.json").exists()),
+              "gain": hz.get("gain"), "fallback": hz.get("fallback"), "warnings": hz.get("warnings") or []}
     else:
         raise RuntimeError(f"horizon run wrote neither {P}/horizon.json nor {P}/floor.json")
     dump(P / "preflight.json", pf)
+    for line in ptq_lines(pf):
+        above(f"    {line}")
     above(f"    preflight: {pf['gb']:.3f} GB against a budget of {pf['budget_gb']:.3f} GB and R0 {pf['R0']:.1f}: "
           + ("pass" if pf["pass"] else f"fail ({pf['why']})"))
+
+
+def ptq_lines(pf: dict) -> list[str]:
+    """What horizon's gain check said of the map (preflight.json's copy of horizon.json's
+    gain, fallback and warnings): a fallback and each warning as a "!" line of their own."""
+    out, g = [], pf.get("gain") or {}
+    if pf.get("fallback"):
+        rej = pf["fallback"].get("rejected") or {}
+        out.append(f"!!! PTQ MAP FELL BACK TO THE FLOOR: {pf['fallback'].get('why')}. The floor map ships "
+                   f"(map.json's fallback has the rejected {rej.get('bytes', 0) / 1e9:.3f} GB map).")
+    out += [f"! PTQ map warning: {w}" for w in pf.get("warnings") or []]
+    if g:
+        out.append(f"PTQ map gain over the floor (KL, sweep windows): {g.get('real')} measured, {g.get('pred')} "
+                   f"predicted, SE {g.get('se')}: {g.get('verdict')}")
+    return out
 
 
 def ptq_done() -> bool:
@@ -1674,6 +1738,8 @@ def run_blockap(step: Step) -> None:
         sh(step, gpu(f"python -m stages.qat block --base {vocab_hf()} --map {P}/map.json --gguf {P}/ptq/*.gguf "
                      f"--traces {traces_file()}{vocab_flag()} --llama-cpp {LLAMA_CPP} --windows {BLOCK['windows']} "
                      f"--length {BLOCK['length']} --epochs {BLOCK['epochs']} --lr {BLOCK['lr']} --out {B}"))
+    for w in (load(B / "block.json") or {}).get("warnings") or []:  # e.g. fewer windows than asked, and why
+        above(f"    ! Block-AP warning: {w}")
     sha = text(B / "export" / "model.gguf.sha256")
     run_export(step, B / "state", B / "export")
     if sha and text(B / "export" / "model.gguf.sha256") != sha:
@@ -1696,7 +1762,9 @@ def onpolicy_flags(a: dict) -> str:
 def run_rates(step: Step) -> None:
     """S2.2: vLLM on the B200 (a few dev problems x 1 at 16k, streaming, the sandbox); 20
     QAT steps at 16k windows with the codes never frozen (so the step costs what the e2e
-    step costs), timed and with their peak memory; then the plan's on-policy steps: one
+    step costs; fit would not freeze a 20-step run at the default anyway, --freeze-steps 0
+    says so whatever the step count), timed from step 1 on (qat's tok_s: step 0 allocates
+    the optimizer) and with their peak memory; then the plan's on-policy steps: one
     tiny qat onpolicy session from those steps' state in a throwaway work dir, which
     writes the serve dir and serves it on vLLM (fp8 KV at 22.5k, as the rounds do), rolls
     out, labels, judges the start model and trains a round in the trainer's own process.
@@ -1726,8 +1794,8 @@ def run_rates(step: Step) -> None:
              for x in ((O / "round1" / p).read_text().splitlines() if (O / "round1" / p).exists() else []) if x.strip()]
     q = load(R / "qat" / "e2e.json") or {}
     ev = ((load(d / "out" / "eval.json") or {}).get("candidates") or [{}])[0].get("code") or {}
-    dump(R / "rates.json", {"qat_tok_s": q["tokens"] / (q["minutes"] * 60) if q.get("minutes") else None,
-                            "qat_steps": q.get("steps"), "qat_minutes": q.get("minutes"), "qat_peak_gb": q.get("peak_gb"),
+    dump(R / "rates.json", {"qat_tok_s": q.get("tok_s"), "qat_steps": q.get("steps"), "qat_minutes": q.get("minutes"),
+                            "qat_peak_gb": q.get("peak_gb"),
                             "vllm_smoke_tok_s": ev.get("tok_s_total"), "gpu": (gpu_info() or ("?",))[0],
                             "onpolicy": {"rollouts": len(rolls), "steps": train.get("steps"),
                                          "minutes": train.get("minutes"), "peak_gb": train.get("peak_gb"),
@@ -2017,7 +2085,8 @@ def codebench_art() -> Art:
     on every later VM before anything reads it)."""
     return Art("codebench", lambda: "pinned",
                lambda: [CODEBENCH / f"{s}.{x}" for s in SUITES for x in ("jsonl", "meta.json")],
-               SESSIONS, light=lambda: [CODEBENCH / f"{s}.meta.json" for s in SUITES], once=True)
+               SESSIONS, light=lambda: [CODEBENCH / f"{s}.meta.json" for s in SUITES], once=True,
+               unfit=codebench_problems)
 
 
 def choice_art() -> Art:
@@ -2214,7 +2283,8 @@ def reading_lines(r: Reading) -> list[str]:
            f"  R {R:.1f}  SE {f1(se, 2)}  lower bound {f1(lb)}  problem bootstrap {f1(boot[0])}-{f1(boot[1])}  |  "
            f"{gb:.3f} GB: {R / gb:.1f} points/GB (lower bound {f1(lb and lb / gb)})  |  R/40 = {R / GOAL_PTS_PER_GB:.3f} GB",
            "  shares: " + ", ".join(f"{k} {100 * v:.1f}%" for k, v in st["shares"].items())
-           + f"  |  8k re-scored {f1(st['budget8k'])}  |  all cases {f1(st['allcases'])}"]
+           + f"  |  8k re-scored {f1(st['budget8k'])} vs {LCB_TOKENS // 1024}k {f1(st['budget16k'])} on the same "
+             f"answers (the first per problem)  |  all cases {f1(st['allcases'])}"]
     ref = READINGS[r.ref]
     if ref is not r:
         base = outcomes(rows_of(ref))
@@ -2268,6 +2338,9 @@ def gate_lines() -> list[str]:
                    f"budget {g['budget_gb']:.3f} GB, "
                    f"40 x size = {GOAL_PTS_PER_GB * g['gb']:.1f} vs R0 {g['R0']:.1f}: "
                    + ("pass" if g["pass"] else f"STOP ({g['why']})"))
+        out += [f"  {x}" for x in ptq_lines(g)]
+    b = blockap_dir()
+    out += [f"  ! Block-AP warning: {w}" for w in ((load(b / "block.json") if b else None) or {}).get("warnings") or []]
     for name, n in (("gate1", "Gate 1"), ("gate2", "Gate 2")):
         g = gate(name)
         if g:

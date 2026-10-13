@@ -76,7 +76,7 @@ import sys
 import time
 import zlib
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import torch
@@ -1096,9 +1096,10 @@ class OnPolicy:
     ce_weight: float = CE_WEIGHT
     # A session's budgets; qat onpolicy --max-minutes and --rollout-tokens-cap set them for
     # the sessions that follow. max_minutes caps a round's training (fit anneals the rate
-    # by time to it, and freezes the codes before it); rollout_tokens_cap stops the fresh
-    # rollouts once they hold that many answer tokens (the held-out ones are never cut:
-    # the keep rules compare the same problems every round). 0: no cap.
+    # by time to it, and freezes the codes before it); rollout_tokens_cap keeps the fresh
+    # rollouts within that many answer tokens, those in flight counted at the mean so far
+    # (sample_rollouts; the held-out ones are never cut: the keep rules compare the same
+    # problems every round). 0: no cap.
     max_minutes: float = 0.0
     rollout_tokens_cap: int = 0
     freeze_steps: int = FREEZE_STEPS
@@ -1131,11 +1132,15 @@ def sample_rollouts(url: str, tok, probs: list[dict], n: int, out: str | Path, *
     forced answer (opd.continue_forced), as in ternary.gen. Rows in traces' format
     (passed None until labelled), appended to out per problem; a rerun skips the problems
     already there. A problem whose request fails after opd's retries is skipped; more
-    than max_fail of them, or a dead server, raise. With token_cap, no problem is started
-    once out's rows hold that many answer tokens, those of an earlier attempt included:
-    sampling time follows the tokens, and a model that loops or thinks to its budget
-    makes far more of them than a time guess assumes. The problems already running
-    finish and are kept, so the file ends over the cap by at most what was in flight."""
+    than max_fail of them, or a dead server, raise. With token_cap, out's rows (those of
+    an earlier attempt included) and the problems in flight stay within that many answer
+    tokens: sampling time follows the tokens, and a model that loops or thinks to its
+    budget makes far more of them than a time guess assumes. So problems are asked
+    lazily, at most `workers` at a time, and the next one only while the tokens written
+    plus a reservation for each problem in flight (n x the mean answer so far, never
+    below the mean the cap allows per rollout) are under the cap. Nothing is cancelled:
+    the file ends over the cap by at most what the reservations of the problems in
+    flight were short, about one problem once a mean is known."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = _complete_rows(out, n)
@@ -1167,41 +1172,55 @@ def sample_rollouts(url: str, tok, probs: list[dict], n: int, out: str | Path, *
                  "forced": r["forced"]} for r in got]
 
     asked = failed = too_long = 0
-    capped = False
     t0, toks0 = time.time(), toks
+    # the mean answer the cap allows each rollout still to come: the reservation before any
+    # answer is in, and its floor after (the first answers back are the short ones)
+    allowed = (token_cap - toks) / (len(todo) * n) if token_cap else 0.0
+
+    def room(in_flight: int) -> bool:
+        if not token_cap:
+            return True
+        mean = max(allowed, toks / len(rows) if rows else 0.0)
+        return toks + in_flight * n * mean < token_cap
+
+    queue = list(reversed(todo))  # popped from the end: todo's order
+    futs: dict = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(ask, p): p for p in todo}
         try:
-            for f in as_completed(futs):
-                if f.cancelled():  # not started: the token cap was reached
-                    continue
-                asked += 1
-                try:
-                    got = f.result()
-                except opd.ServerDead:
-                    raise
-                except Exception as e:
-                    failed += 1
-                    log(f"onpolicy: {futs[f]['id']} skipped ({type(e).__name__}: {e})")
-                    if failed > max(2, max_fail * asked):
-                        raise RuntimeError(f"onpolicy: {failed} of {asked} problems failed; stopping") from e
-                    continue
-                if got is None:
-                    too_long += 1
-                    continue
-                with out.open("a") as fh:
-                    fh.write("".join(json.dumps(r) + "\n" for r in got))
-                rows += got
-                toks += sum(len(r["tokens"]) for r in got)
-                if token_cap and toks >= token_cap and not capped:
-                    capped = True
-                    left = sum(x.cancel() for x in futs)
-                    log(f"onpolicy: {out.name}: {toks} answer tokens reach the cap of {token_cap}; "
-                        f"{left} problems not asked, those running finish")
+            while True:
+                while queue and len(futs) < workers and room(len(futs)):
+                    p = queue.pop()
+                    futs[ex.submit(ask, p)] = p
+                if not futs:
+                    break
+                done, _ = wait(futs, return_when=FIRST_COMPLETED)
+                for f in done:
+                    p = futs.pop(f)
+                    asked += 1
+                    try:
+                        got = f.result()
+                    except opd.ServerDead:
+                        raise
+                    except Exception as e:
+                        failed += 1
+                        log(f"onpolicy: {p['id']} skipped ({type(e).__name__}: {e})")
+                        if failed > max(2, max_fail * asked):
+                            raise RuntimeError(f"onpolicy: {failed} of {asked} problems failed; stopping") from e
+                        continue
+                    if got is None:
+                        too_long += 1
+                        continue
+                    with out.open("a") as fh:
+                        fh.write("".join(json.dumps(r) + "\n" for r in got))
+                    rows += got
+                    toks += sum(len(r["tokens"]) for r in got)
         except BaseException:
             for f in futs:
                 f.cancel()
             raise
+    if queue:
+        log(f"onpolicy: {out.name}: {toks} answer tokens against the cap of {token_cap}: {len(queue)} problems "
+            "not asked")
     log(f"onpolicy: {out.name}: {len(rows)} rollouts of {len(rows) // n} problems, {toks / 1e6:.2f}M tokens, "
         f"{(toks - toks0) / max(time.time() - t0, 1e-3):.0f} tok/s, {failed} failed, {too_long} prompts too long")
     return rows
@@ -1856,8 +1875,8 @@ def main() -> None:
                    help="training minutes of each session's round, the rate annealed by time to it (0: no cap); "
                         "a later call's value holds from its session on, no value keeps the last")
     o.add_argument("--rollout-tokens-cap", type=int, default=None,
-                   help="stop starting fresh rollouts once a session's hold this many answer tokens (0: no cap); "
-                        "kept like --max-minutes")
+                   help="keep a session's fresh rollouts within this many answer tokens, those in flight counted "
+                        "at the mean answer so far (0: no cap); kept like --max-minutes")
     o.add_argument("--seqs", type=int, default=SEQS["b200"])
     o.add_argument("--port", type=int, default=8095)
     x = sub.add_parser("export")

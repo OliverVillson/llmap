@@ -165,7 +165,7 @@ def llama_kld(llama_cpp: Path, base: Path, model: Path, tmp: Path) -> float | No
     if not logits.exists():
         subprocess.run([str(exe), "-m", str(base), "-f", str(text), "-c", "64", "--chunks", "4", "-t", "2",
                         "--kl-divergence-base", str(logits)], check=True, capture_output=True)
-    # horizon's runner: the pinned llama-perplexity can lose its summary under load, and is run again
+    # horizon's runner, which flushes the pinned llama-perplexity's log before it exits (perplexity_cmd)
     return horizon._kld_run([str(exe), "-m", str(model), "-c", "64", "--chunks", "4", "-t", "2",
                              "--kl-divergence-base", str(logits), "--kl-divergence"])["kld"]
 

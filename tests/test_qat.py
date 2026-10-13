@@ -616,6 +616,46 @@ def test_fresh_rollouts_stop_at_the_token_cap(rounds, tmp_path):
         slow.stop()
 
 
+def test_the_token_cap_holds_with_many_problems_in_flight(tmp_path, monkeypatch):
+    """round 2, training: with every problem asked at once and only queued ones cancelled,
+    96 problems in flight ran past the cap (1.2-1.8x it on the B200's settings). Asked
+    lazily, at most `workers` at a time and each in flight reserved at the mean answer so
+    far, a model whose answers run to twice the cap's mean stops within one problem of
+    the cap, about half its problems asked; one at the cap's mean is asked in full; and
+    no more than `workers` problems are ever in flight."""
+    import threading
+    import time
+    state = {"L": 0, "now": 0, "most": 0}
+    lock = threading.Lock()
+
+    def sample(url, model, prompt, n, max_tokens):
+        with lock:
+            state["now"] += 1
+            state["most"] = max(state["most"], state["now"])
+        time.sleep(0.002)
+        with lock:
+            state["now"] -= 1
+        return [{"tokens": [7] * state["L"], "finish": "stop"} for _ in range(n)]
+
+    monkeypatch.setattr(opd, "client", lambda w: None)
+    monkeypatch.setattr(opd, "render_remote", lambda url, m, p: [1, 2, 3])
+    monkeypatch.setattr(opd, "render", lambda tok, p: [1, 2, 3])
+    monkeypatch.setattr(opd, "sample", sample)
+    monkeypatch.setattr(opd, "forced_reason", lambda tok, t, f: None)
+    probs, n, workers, mean = [{"id": f"p{i}"} for i in range(60)], 2, 8, 500
+    cap = len(probs) * n * mean  # the cap's mean answer: 500 tokens
+    for L, out in ((2 * mean, tmp_path / "long.jsonl"), (mean, tmp_path / "even.jsonl")):
+        state.update(L=L, most=0)
+        rows = qat.sample_rollouts("u", None, probs, n, out, workers=workers, token_cap=cap, max_tokens=16384,
+                                   max_model_len=22528)
+        toks, asked = sum(len(r["tokens"]) for r in rows), len({r["id"] for r in rows})
+        assert state["most"] <= workers and len(rows) == n * asked
+        if L > mean:
+            assert cap <= toks < cap + n * L and asked < len(probs) // 2 + 2
+        else:
+            assert toks == cap and asked == len(probs)
+
+
 def test_onpolicy_session_budgets_follow_the_latest_call(tmp_path, monkeypatch):
     """--max-minutes (a round's training minutes, the rate annealed by time) and
     --rollout-tokens-cap are a session's budgets: a call that gives them sets them from

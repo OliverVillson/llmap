@@ -88,7 +88,7 @@ MIN_PROB = 1e-6  # mean probability at answer positions that keeps an id
 DROP_MEAN, DROP_P999 = 1e-4, 1e-2  # the original's mass on dropped ids per answer position
 NLL_RISE = 0.003  # NLL per byte may rise by 0.3%
 N_TEXTS = 500  # llama-tokenize == HF on this many texts
-TOKENIZE_TRIES = 3  # llama-tokenize runs per text when its id line is missing (see llama_tokenize)
+TOKENIZE_TRIES = 3  # llama-tokenize runs per text when its id line is missing (a guard, see llama_tokenize)
 FALLBACK = (None, 65536)  # the measured set, then 65,536 rows; after that no trim
 PROBE_WINDOWS, GATE_WINDOWS, WINDOW = 32, 16, 8192
 CHUNK = 1024  # positions per softmax chunk: 1024 x 100k fp32 is 0.4 GB
@@ -647,9 +647,12 @@ def tokenizer_binary(llama_cpp: str | Path) -> Path | None:
 def llama_tokenize(binary: str | Path, gguf: str | Path, texts: list[str], workers: int = 8,
                    tries: int = TOKENIZE_TRIES) -> list[list[int]]:
     """llama-tokenize's ids for each text: special tokens parsed, no BOS, no escapes,
-    as HF's encode(text, add_special_tokens=False). A run whose output has no whole
-    "[...]" id line is run again (the pinned llama.cpp's tools can exit 0 with their
-    output cut short under load, see horizon._kld_run), then raises."""
+    as HF's encode(text, add_special_tokens=False). The tool prints the ids with printf
+    from its main thread, so exit flushes them; llama.cpp's asynchronous log, which
+    can lose a tool's last lines (horizon.perplexity_cmd), carries none of it, and
+    --log-disable stops that log before the model loads. (300 runs, 8 at a time on 4
+    busy cores, all printed their id line.) A run whose output still has no whole
+    "[...]" id line is run again, then raises."""
     def one(text):
         for i in range(tries):
             r = subprocess.run([str(binary), "-m", str(gguf), "--stdin", "--ids", "--no-bos", "--no-escape",

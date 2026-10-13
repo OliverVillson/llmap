@@ -79,6 +79,23 @@ def test_held_out_share_gives_the_plans_problem_counts():
     assert sum(T.is_held(i) for i in ids[:5000]) >= 256
 
 
+def test_the_split_rule_is_pinned_to_its_version():
+    """event_horizon keys everything made from the split (vocab, imatrix, PTQ, Block-AP and
+    what follows) by HELD_FRAC and SPLIT_RULE. The rule's output at a fixed fraction is
+    pinned here: a change to bucket (seed 0), is_held, split's fallback or half fails this
+    test until SPLIT_RULE is bumped (and the digest updated with it), so no artifact made
+    under the old split is reused."""
+    import hashlib
+    ids = [f"cc/{i}_{c}" for i in range(3000) for c in "AB"] + [f"apps/{i}" for i in range(500)]
+    few = [i for i in ids if not T.is_held(i, 0.06)][:3]
+    out = {"held": sorted(r["id"] for r in T.split([{"id": i} for i in ids], 0.06)[1]),
+           "few": [r["id"] for r in T.split([{"id": i} for i in few], 0.06)[1]],
+           "halves": "".join(str(T.half(i)) for i in ids)}
+    digest = hashlib.sha256(json.dumps(out, sort_keys=True).encode()).hexdigest()
+    assert len(out["held"]) == 372 and out["few"] == ["cc/0_B"]
+    assert (T.SPLIT_RULE, digest) == (1, "9c003bfc46e9ec9de2c6119bdf45368961304350c21f4cb17c7e9a18ce4857de")
+
+
 def test_halves_and_other_seeds_are_independent_of_the_crc32_split():
     """crc32 is linear: for ids of one length, a crc32 of a prefixed id is the id's own
     crc32 xor a constant, so a second crc32 put every held-out id in the same half and

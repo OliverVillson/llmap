@@ -48,6 +48,11 @@ import torch
 # CodeContests pool gives qat ~300 held ids to take its 128 from. Fixed before the
 # first gen: vocab, imatrix, PTQ, Block-AP and qat all depend on the split.
 HELD_FRAC = 0.06
+# The version of the rule that places a problem (bucket at seed 0, is_held, split's
+# fallback, half). scripts/event_horizon.py keys everything made from the split by it and
+# HELD_FRAC, so bump it with any change to the rule: what was made under the old split is
+# then made again, never reused. test_traces pins the rule's output to this number.
+SPLIT_RULE = 1
 MIN_MEDIAN = 500  # answer tokens: a thinking model's answers are thousands long; fewer means broken text
 # Rows per bucket before sorting by length: enough to keep padding small, few enough
 # that each epoch's seed still mixes different rows into each batch.

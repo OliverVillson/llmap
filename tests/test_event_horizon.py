@@ -76,6 +76,8 @@ def bench(m, lcb_sha="lcbsha"):
     (m.CODEBENCH / "livecodebench.jsonl").write_text("{}\n")
     (m.CODEBENCH / "codecontests.meta.json").write_text(json.dumps({"sha": "ccsha", "ids_sha256": "ccids"}))
     (m.CODEBENCH / "codecontests.jsonl").write_text("{}\n")
+    (m.CODEBENCH / "apps.meta.json").write_text(json.dumps({"sha": "appssha", "ids_sha256": "appsids"}))
+    (m.CODEBENCH / "apps.jsonl").write_text("{}\n")
     granite(m)
     (m.NVME / "download.log").write_text("DOWNLOADS_DONE\n")
 
@@ -137,7 +139,8 @@ class Shell:
             rep = json.loads((d / "out" / "eval.json").read_text())
             rows = [json.loads(x) for x in (d / "work" / "code_eval" / f"{d.name}.jsonl").read_text().splitlines()]
             first = [r for r in rows if r["sample"] == 0]
-            rep["candidates"][0]["code"]["budgets"] = {"8192": {"mean_pass@1": sum(r["passed"] for r in first) / len(first)}}
+            p0 = sum(r["passed"] for r in first) / len(first)  # budget.long_run: 16k on the 8k re-score's answers
+            rep["candidates"][0]["code"]["budgets"] = {"8192": {"mean_pass@1": 0.9 * p0}, "16384": {"mean_pass@1": p0}}
             w(d / "out" / "eval.json", rep)
             w(d / ".done" / "budgets", {})
         elif "thinking_report.py" in cmd:
@@ -190,7 +193,7 @@ class Shell:
             w(out / "model-hf" / "config.json", {})
         elif "stages.qat e2e" in cmd:
             out = arg(cmd, "--out")
-            w(out / "e2e.json", {"tokens": 327680, "minutes": 2.0, "steps": 20, "peak_gb": 151.2})
+            w(out / "e2e.json", {"tokens": 327680, "minutes": 2.0, "steps": 20, "peak_gb": 151.2, "tok_s": 2900.0})
             w(out / "state" / "qat.json", {"phase": "e2e"})
         elif "stages.qat onpolicy" in cmd and "--until-session 1" in cmd and "--rounds 1 " in cmd:  # S2.2's smoke
             o, rd = arg(cmd, "--work"), arg(cmd, "--work") / "round1"
@@ -562,11 +565,13 @@ def test_restore_needs_a_login_and_the_earlier_sessions(tmp_path, monkeypatch):
 
 class SetupShell:
     """setup_vm.sh on a new VM: a fresh fetch of the suites unless SKIP_SUITES=1 (LiveCodeBench's
-    main has moved since session 1: another commit, another file), and this VM's freeze of
-    both venvs. Records what CONSTRAINTS held when it ran."""
+    main has moved since session 1: another commit, another file; the other suites are
+    fetched when their meta is missing), and this VM's freeze of both venvs. Records what
+    CONSTRAINTS held when it ran. A suite in `fail` does not download (setup_vm.sh warns and
+    goes on)."""
 
-    def __init__(self, m, freeze="torch==2.14.0\n"):
-        self.m, self.freeze, self.calls, self.constraints = m, freeze, [], {}
+    def __init__(self, m, freeze="torch==2.14.0\n", fail=()):
+        self.m, self.freeze, self.calls, self.constraints, self.fail = m, freeze, [], {}, set(fail)
 
     def __call__(self, step, cmd, env=None):
         self.calls.append(cmd)
@@ -575,12 +580,16 @@ class SetupShell:
         self.constraints = {f.name: f.read_text() for f in Path(cons).glob("*.txt")} if cons else {}
         if "SKIP_SUITES=1 " not in cmd:
             m.CODEBENCH.mkdir(parents=True, exist_ok=True)
-            fresh = b'{"id": "new"}\n'
-            (m.CODEBENCH / "livecodebench.jsonl").write_bytes(fresh)
-            meta = json.loads((m.CODEBENCH / "livecodebench.meta.json").read_text()) \
-                if (m.CODEBENCH / "livecodebench.meta.json").exists() else {}
-            (m.CODEBENCH / "livecodebench.meta.json").write_text(json.dumps(
-                {**meta, "sha": "lcbsha-NEW", "file_sha256": hashlib.sha256(fresh).hexdigest()}))
+            for s in m.SUITES:
+                if s in self.fail or (s != "livecodebench" and (m.CODEBENCH / f"{s}.meta.json").exists()):
+                    continue
+                fresh = json.dumps({"id": f"new {s}"}).encode() + b"\n"
+                (m.CODEBENCH / f"{s}.jsonl").write_bytes(fresh)
+                meta = json.loads((m.CODEBENCH / f"{s}.meta.json").read_text()) \
+                    if (m.CODEBENCH / f"{s}.meta.json").exists() else {}
+                (m.CODEBENCH / f"{s}.meta.json").write_text(json.dumps(
+                    {**meta, "sha": "lcbsha-NEW" if s == "livecodebench" else f"{s}-NEW",
+                     "file_sha256": hashlib.sha256(fresh).hexdigest()}))
         m.venvs_dir().mkdir(parents=True, exist_ok=True)
         for v in m.VENVS:
             (m.venvs_dir() / f"{v}.txt").write_text(self.freeze)
@@ -654,6 +663,38 @@ def test_a_new_vm_gets_the_runs_code_suites_from_the_bucket_never_a_fresh_fetch(
     with pytest.raises(RuntimeError, match="do not check out"):
         m.run_setup(m.Step("VM setup", {"": 1}, None))
     assert "SKIP_SUITES=1 " in shell.calls[-1]
+
+
+@pytest.mark.parametrize("lost", ["livecodebench", "apps"])
+def test_a_partial_first_fetch_is_never_pinned_and_the_rerun_fetches_the_rest(tmp_path, monkeypatch, lost):
+    """round 2, orchestration: setup_vm.sh only warns when a suite does not download. The
+    first setup must not pin what it got: its step fails, the codebench art refuses to pin
+    (whatever the hook says), and the re-run fetches the missing suite and pins all three.
+    A missing APPS, which no check used to see, is caught the same way."""
+    m = load(tmp_path, monkeypatch)
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    m.NVME.mkdir(parents=True)
+    shell = SetupShell(m, fail=[lost])
+    monkeypatch.setattr(m, "sh", shell)
+    with pytest.raises(RuntimeError, match=f"not whole, so nothing is pinned: no {lost}.meta.json"):
+        m.run_setup(m.Step("VM setup", {"": 1}, None))
+    art = m.codebench_art()
+    assert art.unfit() == [f"no {lost}.meta.json"]
+    assert not m.upload_art(art, complete=True) and not m.upload_art(art, complete=False)  # the hook, either way
+    assert not (root / "codebench").exists() and not m.setup_done()
+    with pytest.raises(RuntimeError, match=f"not whole: no {lost}.meta.json"):
+        m.run_restore(m.Step("restore", {"": 1}, None), "measure")
+
+    shell.fail.clear()  # the re-run: nothing is pinned, so setup_vm.sh fetches again
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert "SKIP_SUITES= " in shell.calls[-1] and m.codebench_problems() == []
+    assert m.upload_art(art)
+    man = json.loads((root / "codebench" / "pinned" / "manifest.json").read_text())
+    assert sorted(f["path"] for f in man["files"]) == sorted(f"codebench/{s}.{x}" for s in m.SUITES
+                                                              for x in ("jsonl", "meta.json"))
+    new_vm(m)  # the next session's VM restores all three
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert "SKIP_SUITES=1 " in shell.calls[-1] and m.codebench_problems() == [] and m.in_sync(art)
 
 
 def test_the_first_setups_venv_freeze_constrains_every_later_vm(tmp_path, monkeypatch):
@@ -733,6 +774,29 @@ def test_choice_json_is_one_per_run_whatever_moves_upstream(tmp_path, monkeypatc
     with pytest.raises(RuntimeError, match="checked against the bucket"):
         m.run_choice(m.Step("x", {"": 1}, None))
     assert not m.CHOICE.exists()
+
+
+def test_every_key_below_the_traces_carries_the_held_out_split(tmp_path, monkeypatch):
+    """traces-opd#0's follow-up: the split is read from stages/traces.py (this script is
+    stdlib only), and another HELD_FRAC or SPLIT_RULE moves vocab, imatrix, PTQ and
+    Block-AP (and everything keyed by their names) but not the traces, which gen writes
+    whole whatever the split."""
+    m = load(tmp_path, monkeypatch)
+    T = pytest.importorskip("stages.traces")
+    assert m.split_rule() == {"held_frac": T.HELD_FRAC, "rule": T.SPLIT_RULE}
+    bench(m)
+    for f, v in (("traces_sha", lambda session="measure": f"traces-{session}"), ("vocab_sha", lambda: "toksha"),
+                 ("imatrix_sha", lambda: "imsha"), ("gate", lambda name: {"budget_gb": 1.25}),
+                 ("type_map", lambda: {"sha256": "mapsha"})):
+        monkeypatch.setattr(m, f, v)
+    keys = ("traces_dir", "vocab_dir", "imatrix_dir", "ptq_dir", "blockap_dir", "rates_dir", "e2e_dir", "onpolicy_dir")
+    names = lambda: {k: getattr(m, k)().name for k in keys}
+    now = names()
+    for other in ({"held_frac": 0.02, "rule": T.SPLIT_RULE}, {"held_frac": T.HELD_FRAC, "rule": T.SPLIT_RULE + 1}):
+        monkeypatch.setattr(m, "split_rule", lambda other=other: other)
+        moved = names()
+        assert moved["traces_dir"] == now["traces_dir"]
+        assert all(moved[k] != now[k] for k in keys[1:]), (other, moved, now)
 
 
 def test_a_stopped_download_is_started_again_a_bounded_number_of_times(tmp_path, monkeypatch):
@@ -915,13 +979,18 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     assert "--rounds 1 --fresh 2 --rollouts 2 --held 2 --max-minutes 5 --rollout-tokens-cap 0" in smoke_op
     assert "--max-minutes 25 --rollout-tokens-cap 8000000 " in op  # each session's caps
     rates = json.loads((m.rates_dir() / "rates.json").read_text())
+    assert rates["qat_tok_s"] == 2900.0  # qat's own rate from step 1 on, not tokens / minutes (2731)
     assert rates["qat_peak_gb"] == 151.2 and rates["onpolicy"] == {"rollouts": 4, "steps": 4, "minutes": 0.4,
                                                                    "peak_gb": 163.0, "longest_row": 22100}
     # on-policy guesses: fresh rollouts capped at 8M tokens, training at 25 min, + 10 per session
-    qat, roll = 327680 / 120, 20000
+    qat, roll = 2900.0, 20000
     held = 128 * 2 * 8000
     assert m.minutes()["onpolicy"] == pytest.approx(4 * ((8e6 + held) / roll / 60 + min(16e6 / qat / 60, 25) + 10))
     assert m.minutes()["onpolicy-judge"] == pytest.approx(held / roll / 60 + 10)
+    with monkeypatch.context() as mp:  # a cap under the guess: qat holds it within one problem's rollouts
+        mp.setitem(m.ONPOLICY, "rollout_tokens_cap", 4_000_000)
+        fresh = 4e6 + 4 * m.LCB_TOKENS
+        assert m.minutes()["onpolicy"] == pytest.approx(4 * ((fresh + held) / roll / 60 + min(2 * fresh / qat / 60, 25) + 10))
     traces24 = m.traces_file("train").read_text().splitlines()
     assert len(traces24) == 2  # the 8M rows, then gen resumed on the copy
     assert json.loads((m.onpolicy_dir() / "audit.json").read_text())["ok"]
@@ -929,7 +998,7 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     c = m.choice()
     assert c["gguf_sha256"] == hashlib.sha256((m.final_dir() / "model.gguf").read_bytes()).hexdigest()
     assert c["record"]["answers"] == 37 * 2 + 37 * 8 + 108 * 4 and c["record"]["seed_offset"] == 1000
-    assert m.minutes()["e2e"] == pytest.approx(min(40e6 / (327680 / 120) / 60, 60) + 5)
+    assert m.minutes()["e2e"] == pytest.approx(min(40e6 / 2900.0 / 60, 60) + 5)
 
     shell.calls.clear()
     run_steps(m, "read")
@@ -943,6 +1012,9 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     assert "Verdict (pre-registered in choice.json, one look): REACHED" in out
     assert "final-record (the verdict): 182 problems, 802 answers" in out
     assert "8k re-scored" in out and "all cases" in out and "R/40" in out and "shares:" in out
+    p0 = 100 * sum(passes(i, 0) for i in TEST_IDS) / len(TEST_IDS)  # the first answer of each problem
+    assert f"8k re-scored {0.9 * p0:.1f} vs 16k {p0:.1f} on the same answers (the first per problem)" in out
+    assert f"  R {100 * (37 * 0.5 + 108) / 182:.1f}  " in out  # the headline stays over every answer
     assert "settings: same as original-ref" in out
     assert all(ok for ok in m.record_checks().values())
 
@@ -972,12 +1044,13 @@ def test_onpolicy_runs_one_session_per_step_and_uploads_each(tmp_path, monkeypat
           "problems": {"n": 128, "ok": True}}
     flat = {**ok, "kl": {"new": 0.99, "kept": 0.9, "drop": 0.01, "ok": False}}
     keep = {1: True, 2: False, 3: False}
-    calls, seen = [], []
+    calls, seen, cmds = [], [], []
 
     def trainer(step, cmd, env=None):
         """qat onpolicy's sessions: session k judges round k-1, then trains round k."""
         until = int(re.search(r"--until-session (\d+)", cmd)[1])
         calls.append(until)
+        cmds.append(cmd)
         st = json.loads((O / "state.json").read_text()) if (O / "state.json").exists() else \
             {"session": 1, "trained": 0, "rounds": [], "done": False, "final": None}
         while not st["done"] and st["session"] <= until:
@@ -1008,6 +1081,8 @@ def test_onpolicy_runs_one_session_per_step_and_uploads_each(tmp_path, monkeypat
     logs.parent.mkdir(parents=True)
     assert runner.run_plan(plan, lambda: "s", logs, ["run"], after_step=m.make_hook("train")) == 0
     assert calls == [1, 2, 3, 4]  # the stop rule fired in session 4: session 5 is done without a call
+    # every session passes its caps (qat keeps the last values given, so each call restates them)
+    assert all(f"--max-minutes 25 --rollout-tokens-cap {250 * 4 * 8000} " in c for c in cmds)
     assert seen[:4] == [2, 3, 4, 4]  # each session's state reaches the bucket as it ends
     audit = json.loads((O / "audit.json").read_text())
     assert audit["ok"] and [r["kept"] for r in audit["rounds"]] == [True, False, False]
@@ -1061,6 +1136,50 @@ def test_a_budget_under_the_cheapest_map_fails_the_preflight(tmp_path, monkeypat
         line = re.sub(r"^python -m stages\.horizon run .*?(?= \|\| )", f"(exit {code})", cmd)
         r = subprocess.run(["bash", "-c", f"set -e\n{line}\necho after"], capture_output=True, text=True)
         assert (r.returncode == 0 and "after" in r.stdout) is ok, (code, line)
+
+
+class FallbackShell(Shell):
+    """horizon run whose verified map bought nothing over the floor (gain_check's "no
+    better": the floor ships, map.json and horizon.json say so), and a Block-AP that found
+    fewer windows than asked."""
+
+    def __call__(self, step, cmd, env=None):
+        super().__call__(step, cmd, env)
+        if "stages.horizon run" in cmd:
+            p = arg(cmd, "--out")
+            hz = json.loads((p / "horizon.json").read_text())
+            gain = {"pred": 0.02, "real": 0.001, "se": 0.002, "ratio": 0.05, "verdict": "no better",
+                    "why": "the map's KL 0.39900 is within 2 SE (0.00400) of the floor's 0.40000"}
+            fb = {"why": gain["why"], "rejected": {"sha256": "rejected", "bytes": 1_240_000_000}}
+            self.write(p / "horizon.json", {**hz, "gain": gain, "fallback": fb, "warnings": []})
+        elif "stages.qat block" in cmd:
+            self.write(arg(cmd, "--out") / "block.json", {"asked": 2048, "windows": 1500, "warnings": [
+                "1500 of the 2048 windows asked: the traces have too few rows long enough"]})
+
+
+def test_a_map_that_fell_back_to_the_floor_and_block_ap_warnings_are_shown(tmp_path, monkeypatch, capsys):
+    """quant-formats#2's follow-up: horizon.json's gain, fallback and warnings are copied into
+    preflight.json and printed above the bar ("!" lines), and so are block.json's warnings;
+    the summary carries both."""
+    m = load(tmp_path, monkeypatch)
+    fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    monkeypatch.setattr(m, "sh", FallbackShell(m))
+    run_steps(m, "measure")
+    pf = m.gate("preflight")
+    assert pf["pass"] and pf["gain"]["verdict"] == "no better" and pf["warnings"] == []
+    assert pf["fallback"]["rejected"]["sha256"] == "rejected"
+    shown = capsys.readouterr().out
+    assert "!!! PTQ MAP FELL BACK TO THE FLOOR: the map's KL 0.39900 is within 2 SE" in shown
+    assert "rejected 1.240 GB map" in shown and "0.001 measured, 0.02 predicted, SE 0.002: no better" in shown
+    assert "! Block-AP warning: 1500 of the 2048 windows asked" in shown
+    out = m.summary()
+    assert "  !!! PTQ MAP FELL BACK TO THE FLOOR" in out and "  ! Block-AP warning: 1500 of the 2048" in out
+    # a short gain ships the map with a warning line of its own
+    lines = m.ptq_lines({"gain": {"verdict": "short", "real": 0.004, "pred": 0.02, "se": 0.001}, "fallback": None,
+                         "warnings": ["the map gains 0.00400 of the 0.02000 predicted (20%, under 50%)"]})
+    assert lines[0] == "! PTQ map warning: the map gains 0.00400 of the 0.02000 predicted (20%, under 50%)"
+    assert not any(x.startswith("!!!") for x in lines)
 
 
 # ---------- the command lines against the real CLIs ----------

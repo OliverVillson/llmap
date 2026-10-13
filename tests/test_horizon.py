@@ -275,6 +275,56 @@ def test_a_kld_run_that_lost_its_summary_runs_again(monkeypatch):
         horizon._kld_run(["exe", "-m", "x.gguf"])
 
 
+def test_with_the_tools_library_a_kld_run_flushes_its_log_and_is_not_repeated(tmp_path, monkeypatch):
+    """Built beside the binary, libllama-perplexity-impl.so runs the tool in a process that
+    flushes llama.cpp's log before it exits, so a summary missing there is not a lost
+    one: it raises at once (llama-perplexity prints none under 100 scored positions)."""
+    exe = tmp_path / "bin" / "llama-perplexity"
+    exe.parent.mkdir()
+    exe.write_text("")
+    assert horizon.perplexity_cmd([str(exe), "-m", "x.gguf"]) == [str(exe), "-m", "x.gguf"]  # no library: the binary
+    (exe.parent / horizon.PERPLEXITY_LIB).write_text("")
+    cmd = horizon.perplexity_cmd([str(exe), "-m", "x.gguf"])
+    assert cmd[:3] == [sys.executable, "-I", "-c"] and cmd[4:] == [str(exe.parent / horizon.PERPLEXITY_LIB),
+                                                                  str(exe), "-m", "x.gguf"]
+    assert "common_log_flush" in cmd[3]
+    calls = []
+
+    def run(c, **k):
+        calls.append(c)
+        return subprocess.CompletedProcess(c, 0, "   1     301.7 ±   17.7\n", "")
+    monkeypatch.setattr(horizon.subprocess, "run", run)
+    with pytest.raises(ValueError, match="no KLD summary"):
+        horizon._kld_run([str(exe), "-m", "x.gguf", "--kl-divergence"])
+    assert len(calls) == 1 and calls[0][0] == sys.executable
+
+
+def test_the_real_llama_perplexity_prints_its_whole_summary_on_busy_cores(world):
+    """The pinned llama-perplexity, through perplexity_cmd, the ladder's own command 24
+    times, 6 at a time beside 4 spinning processes: every run has its summary, with the
+    ladder's numbers. (Run plainly, most of these runs lose it.)"""
+    from concurrent.futures import ThreadPoolExecutor
+    exe = horizon.tool(world["llama_cpp"], "llama-perplexity")
+    if horizon.perplexity_lib(exe) is None:
+        pytest.skip(f"no {horizon.PERPLEXITY_LIB} beside {exe}")
+    q4 = world["files"]["q4_k"]
+    cmd = [str(exe), "-m", str(q4), "--kl-divergence-base", str(world["out"] / "ladder-base.kld"), "--kl-divergence",
+           "-c", "64", "--chunks", "4", "-ngl", str(999 if torch.cuda.is_available() else 0)]
+    want = next(r for r in json.loads((world["out"] / "ladder.json").read_text()) if Path(r["gguf"]).name == q4.name)
+    spin = [subprocess.Popen([sys.executable, "-c", "while True: pass"]) for _ in range(4)]
+    try:
+        with ThreadPoolExecutor(6) as ex:
+            outs = list(ex.map(lambda _: subprocess.run(horizon.perplexity_cmd(cmd), capture_output=True, text=True),
+                               range(24)))
+    finally:
+        for p in spin:
+            p.kill()
+            p.wait()
+    assert all(r.returncode == 0 for r in outs)
+    got = [horizon.parse_kld(r.stdout + r.stderr) for r in outs]
+    assert all(g["kld"] == want["kld"] and g["top1"] == want["top1"] for g in got)
+
+
 def test_knapsack_cli_replans_and_a_rerun_reuses_everything(world, monkeypatch, capsys):
     from unittest import mock
     out = world["out"]
