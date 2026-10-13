@@ -235,15 +235,12 @@ def expects_json(spec) -> bool:
     return not spec.is_code and "json" in f"{spec.output_format} {spec.eval_criteria}".lower()
 
 
-_CODE_BLOCK = re.compile(r"```[\w+#-]*[ \t]*\n(.*?)```", re.S)
-
-
 def extract_code(text: str) -> str:
-    """The code in an answer: the longest fenced block if there is one ("Here it is: ```c ...```"),
-    else the cleaned text."""
+    """The code in an answer: its last complete fenced block if it has one, as the eval
+    takes it (codebench.extract_code), else the cleaned text."""
     text = _THINK.sub("", text).strip()
-    blocks = _CODE_BLOCK.findall(text)
-    return max(blocks, key=len).strip() if blocks else clean(text)
+    block = codebench.last_block(text)
+    return block.strip() if block is not None else clean(text)
 
 
 def check_answer(text: str, finished: bool, want_json: bool, want_code: bool = False) -> tuple[str | None, str]:
@@ -710,7 +707,7 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
             continue
         note = harness.parse_files(text, [sandbox.layout(p["language"])[0]])[1] if mugge else ""
         cands.append((k // n, code, note, reasoning))
-        items.append((p["language"], *codebench.assemble(p, text, code), codebench.time_limit(p)))
+        items.append(codebench.job(p, text, code))
     emit(STAGE, pct=99, msg=f"running tests for {len(items)} contest answers")
     best: dict[int, tuple] = {}  # problem index -> (code, note, thinking) of its shortest passing answer
     for (i, code, note, reasoning), r in zip(cands, sandbox.run_many(items)):

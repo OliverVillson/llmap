@@ -25,13 +25,23 @@ sft.py does.
 
 The student vLLM must run with --enable-lora --max-lora-rank >= r and
 VLLM_ALLOW_RUNTIME_LORA_UPDATING=True; scripts/exp06.py starts both servers.
+
+The request side here is shared with the training text (stages/ternary.py gen) and
+the QAT on-policy rounds, so every sampled answer is asked the way the eval asks:
+render() is the eval's messages (codebench.SYSTEM, then the problem) in the chat
+template with thinking on, sample() sends the eval's sampling fields explicitly, and
+continue_forced() adds the forced answer eval.force_answer adds when a thinking runs
+out of budget. Requests share one HTTP client and are retried on timeouts, dropped
+connections and 5xx, but not once the server is dead.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -44,15 +54,101 @@ from stages.sft import ATTN, KD_CHUNK, NonFiniteTraining, _lora_model, check_fin
 
 TOKEN_ID = "token_id:"
 STUDENT = "student"  # the base model's served name in the student vLLM (scripts/exp06.py)
+# The eval's sampling (the record harness): temperature 1, top_p 0.95, top_k off (vLLM
+# reads 0 as all tokens), no min_p, no repetition penalty. Sent on every request, so
+# no default from the served model's generation_config can leak in.
+SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "repetition_penalty": 1.0}
+ANSWER_TOKENS = 4096  # eval.ANSWER_TOKENS: the forced answer's cap
+# Functional (LeetCode-style) problems in the training pool: LiveCodeBench scores both
+# stdin programs and starter-code functions, and CodeContests only has the first.
+FUNCTIONAL_SHARE = 0.2
+
+# A request waits behind a full server and then writes up to ~20k tokens: the read
+# timeout covers that; connect and write are short, and a free connection is waited for.
+READ_TIMEOUT = 7200.0
+RETRIES = 3  # after the first try, on timeouts, broken connections and 5xx
+BACKOFF = 5.0  # seconds before the first retry, doubling
+HEALTH_WAIT = 10.0  # seconds between the /health tries that decide a server is dead
 
 
-# ---------- the two servers ----------
+# ---------- the servers ----------
 
-def _post(url: str, path: str, body: dict, timeout: float = 3600) -> dict:
+class ServerDead(RuntimeError):
+    """The server's process exited or /health stopped answering: retrying cannot help."""
+
+
+_http: dict = {"client": None, "size": 0}
+_http_lock = threading.Lock()
+_pids: dict[str, int] = {}
+_tok_lock = threading.Lock()  # one fast tokenizer is not safe to share between threads
+
+
+def client(workers: int | None = None):
+    """The HTTP client every request shares, made on first use; its pool holds `workers`
+    requests at once (default 128) plus 8 for health checks and the like, and grows when
+    a caller asks for more. httpx's default pool of 100 connections would hold back 128
+    threads and fail them with PoolTimeout; pool=None waits for a connection instead."""
     import httpx
-    r = httpx.post(url.rstrip("/") + path, json=body, timeout=timeout)
-    r.raise_for_status()
-    return r.json() if r.content else {}
+    with _http_lock:
+        size = (workers or 128) + 8
+        if _http["client"] is None or workers and _http["size"] < size:
+            _http["client"] = httpx.Client(
+                timeout=httpx.Timeout(connect=30, write=60, pool=None, read=READ_TIMEOUT),
+                limits=httpx.Limits(max_connections=size, max_keepalive_connections=size - 8))
+            _http["size"] = size
+        return _http["client"]
+
+
+def watch(url: str, pid: int | None) -> None:
+    """Tells alive() the server at url runs as process pid (gen gets it from its shell)."""
+    if pid:
+        _pids[url.rstrip("/")] = pid
+
+
+def alive(url: str) -> bool:
+    """False when the server at url is gone: its watched process has exited, or /health
+    failed three times in a row, HEALTH_WAIT apart."""
+    import httpx
+    pid = _pids.get(url.rstrip("/"))
+    if pid:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+    for i in range(3):
+        try:
+            if client().get(url.rstrip("/") + "/health", timeout=30).status_code == 200:
+                return True
+        except httpx.HTTPError:
+            pass
+        if i < 2:
+            time.sleep(HEALTH_WAIT)
+    return False
+
+
+def _post(url: str, path: str, body: dict, timeout: float | None = None) -> dict:
+    """POSTs body as JSON and returns the reply. Timeouts, broken connections and 5xx
+    are retried RETRIES times with backoff while the server is alive; once it is dead
+    this raises ServerDead, and a 4xx raises at once (the request itself is wrong)."""
+    import httpx
+    kw = {"timeout": httpx.Timeout(connect=30, write=60, pool=None, read=timeout)} if timeout else {}
+    for attempt in range(RETRIES + 1):
+        try:
+            r = client().post(url.rstrip("/") + path, json=body, **kw)
+            if r.status_code < 500:
+                r.raise_for_status()
+                return r.json() if r.content else {}
+            err = f"HTTP {r.status_code}: {r.text[:300]}"
+        except httpx.TransportError as e:  # timeouts, refused and dropped connections
+            err = f"{type(e).__name__}: {e}"
+        if not alive(url):
+            raise ServerDead(f"{url} is down ({path}: {err})")
+        if attempt == RETRIES:
+            raise RuntimeError(f"{path} failed {RETRIES + 1} times; last: {err}")
+        log(f"opd: {path} failed ({err}); retry {attempt + 1}/{RETRIES}")
+        time.sleep(BACKOFF * 2 ** attempt)
 
 
 def choice_tokens(choice: dict) -> list[int]:
@@ -67,14 +163,48 @@ def choice_tokens(choice: dict) -> list[int]:
 
 
 def sample(url: str, model: str, prompt: list[int], n: int, max_tokens: int,
-           temperature: float, top_p: float) -> list[dict]:
-    """n answers to one prompt (token ids in, token ids out), with why each stopped."""
+           temperature: float = SAMPLING["temperature"], top_p: float = SAMPLING["top_p"]) -> list[dict]:
+    """n answers to one prompt (token ids in, token ids out), with why each stopped,
+    sampled as the eval samples (SAMPLING)."""
+    if not prompt or not all(type(t) is int for t in prompt):
+        raise ValueError(f"prompt must be token ids, not {prompt[:4]!r}")
     out = _post(url, "/v1/completions", {
-        "model": model, "prompt": prompt, "n": n, "max_tokens": max_tokens, "temperature": temperature,
-        "top_p": top_p, "logprobs": 0, "return_tokens_as_token_ids": True, "return_token_ids": True,
-        "skip_special_tokens": False})
-    return [{"tokens": choice_tokens(c), "finish": c.get("finish_reason")}
-            for c in sorted(out["choices"], key=lambda c: c["index"])]
+        "model": model, "prompt": prompt, "n": n, "max_tokens": max_tokens,
+        **SAMPLING, "temperature": temperature, "top_p": top_p,
+        "logprobs": 0, "return_tokens_as_token_ids": True, "return_token_ids": True, "skip_special_tokens": False})
+    choices = sorted(out["choices"], key=lambda c: c["index"])
+    if len(choices) != n:  # e.g. a list of strings read as a batch of text prompts
+        raise ValueError(f"asked for {n} answers, got {len(choices)}")
+    return [{"tokens": choice_tokens(c), "finish": c.get("finish_reason")} for c in choices]
+
+
+def _tokenize(url: str, model: str, text: str) -> list[int]:
+    return _post(url, "/tokenize", {"model": model, "prompt": text, "add_special_tokens": False})["tokens"]
+
+
+_forced_ids: dict[tuple, list[int]] = {}
+
+
+def continue_forced(url: str, model: str, prompt_ids: list[int], toks: list[int],
+                    max_answer: int = ANSWER_TOKENS, *, why: str = "length") -> list[int]:
+    """What eval.force_answer adds to a thinking that ended without an answer, as token
+    ids to append to toks: Qwen's early-stop line (eval.EARLY_STOP; only when the
+    budget ran out, why="length"), the template's closing thinking tag, then the
+    model's answer on top of that, up to max_answer tokens, sampled as the eval does.
+    toks is the thinking as open_thinking() leaves it (no end-of-text, no closing tag).
+    The line and the tag are tokenized by the server, as eval's text prompt is; the
+    prompt, toks, both and max_answer must fit the server's --max-model-len."""
+    from stages.eval import EARLY_STOP
+    from stages.taskdata import think_tags
+    key = (url, model, why)
+    if key not in _forced_ids:
+        template = _post(url, "/detokenize", {"model": model, "tokens": prompt_ids})["prompt"]
+        _forced_ids[key] = _tokenize(url, model, (EARLY_STOP if why == "length" else "") + think_tags(template)[1])
+    close = _forced_ids[key]
+    out = _post(url, "/v1/completions", {
+        "model": model, "prompt": prompt_ids + toks + close, "n": 1, "max_tokens": max_answer, **SAMPLING,
+        "logprobs": 0, "return_tokens_as_token_ids": True, "return_token_ids": True, "skip_special_tokens": False})
+    return close + choice_tokens(out["choices"][0])
 
 
 def prompt_token_logprobs(entries: list, ids: list[int], start: int) -> list[float]:
@@ -128,35 +258,125 @@ def opd_loss(student_lp: torch.Tensor, teacher_lp: torch.Tensor, clip: float = 5
 
 # ---------- problems and rollouts ----------
 
-def problems(bench_dir: str, limit: int = 0, seed: int = 0) -> list[dict]:
-    """CodeContests problems with no 13-word run in common with LiveCodeBench (data.py's dedupe)."""
+def _functional(bench_dir: str) -> list[dict]:
+    """apps.jsonl's LeetCode-style problems (APPS/TACO call-based, in LiveCodeBench's
+    functional format), with the same length cut and LiveCodeBench dedupe as CodeContests;
+    [] when the file is not there."""
+    from stages import codebench
+    from stages.data import MAX_INPUT_CHARS, _shingles
+    if not codebench.suite_path("apps", bench_dir).exists():
+        return []
+    rows = [p for p in codebench.load_suite("apps", bench_dir) if isinstance(p.get("tests"), dict)]
+    lcb = codebench.suite_path("livecodebench", bench_dir)
+    seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite("livecodebench", bench_dir))
+                       ) if lcb.exists() else set()
+    return [p for p in rows if len(p["prompt"]) <= MAX_INPUT_CHARS and not (_shingles(p["prompt"]) & seen)]
+
+
+def problems(bench_dir: str, limit: int = 0, seed: int = 0, functional_share: float = FUNCTIONAL_SHARE) -> list[dict]:
+    """CodeContests problems with no 13-word run in common with LiveCodeBench (data.py's
+    dedupe), plus functional problems from apps.jsonl (same dedupe) as about
+    functional_share of the pool, shuffled by seed; each id once."""
     from stages.data import contest_problems
     rows = contest_problems(SimpleNamespace(data_contest_source="codecontests", code_eval_dir=bench_dir))
-    random.Random(seed).shuffle(rows)
+    rng = random.Random(seed)
+    fn = _functional(bench_dir) if functional_share > 0 else []
+    rng.shuffle(fn)
+    fn = fn[: int(len(rows) * functional_share / (1 - functional_share))]
+    log(f"opd: {len(rows)} CodeContests and {len(fn)} functional problems"
+        + ("" if fn or not functional_share else " (no apps.jsonl: stdin programs only)"))
+    rows = list({p["id"]: p for p in rows + fn}.values())
+    rng.shuffle(rows)
     return rows[:limit] if limit else rows
 
 
+def messages(p: dict) -> list[dict]:
+    """The eval's messages for a problem: its system prompt, then the problem."""
+    from stages.codebench import SYSTEM, build_prompt
+    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": build_prompt(p)}]
+
+
 def render(tok, p: dict) -> list[int]:
-    """The problem as the eval asks it, in the chat template with thinking on."""
-    from stages.codebench import build_prompt
-    msgs = [{"role": "user", "content": build_prompt(p)}]
-    try:
-        return list(tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True, enable_thinking=True))
-    except TypeError:
-        return list(tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True))
+    """The problem as the eval asks it (messages()), in the chat template with thinking
+    on, as token ids. transformers 5 returns a BatchEncoding unless return_dict=False,
+    and list() of that is its keys; anything but a list of ints raises."""
+    kw = {"add_generation_prompt": True, "tokenize": True, "return_dict": False}
+    with _tok_lock:
+        try:
+            ids = tok.apply_chat_template(messages(p), enable_thinking=True, **kw)
+        except TypeError:
+            ids = tok.apply_chat_template(messages(p), **kw)
+    if hasattr(ids, "keys"):
+        ids = ids["input_ids"]
+    ids = list(ids)
+    if len(ids) <= 20 or not all(type(t) is int for t in ids):
+        raise ValueError(f"render() of {p.get('id')} gave {ids[:4]!r} ({len(ids)} items), not token ids")
+    return ids
+
+
+def render_remote(url: str, model: str, p: dict) -> list[int]:
+    """The ids the server's own chat template gives the same messages (vLLM's /tokenize,
+    as /v1/chat/completions renders them for the eval)."""
+    return _post(url, "/tokenize", {"model": model, "messages": messages(p), "add_generation_prompt": True,
+                                    "add_special_tokens": False,
+                                    "chat_template_kwargs": {"enable_thinking": True}})["tokens"]
+
+
+def answer_text(tok, toks: list[int]) -> str | None:
+    """The text after the thinking closed, without special tokens; None when the
+    thinking never closed. Decoded with special tokens kept, so a closing tag that is a
+    special token is still seen."""
+    from stages.data import split_think
+    with _tok_lock:
+        text = tok.decode(toks, skip_special_tokens=False)
+        special = [s for s in tok.all_special_tokens if s]
+    if "</think>" not in text and "<channel|>" not in text:
+        return None
+    answer = split_think(text)[1]
+    for s in special:
+        answer = answer.replace(s, "")
+    return answer
+
+
+def forced_reason(tok, toks: list[int], finish: str | None) -> str | None:
+    """Why the eval would force an answer onto this answer (it does when no answer text
+    follows the thinking): "length" (out of budget) or "stop" (it ended inside its
+    thinking). None when an answer follows the closed thinking, even one cut by the cap:
+    the eval counts that one, it does not continue it."""
+    answer = answer_text(tok, toks)
+    if answer is not None and answer.strip():
+        return None
+    return "length" if finish == "length" else "stop"
+
+
+def open_thinking(tok, toks: list[int]) -> list[int]:
+    """toks cut back to the thinking, for continue_forced: without a trailing
+    end-of-text, and without a closing tag that no answer followed (the eval closes
+    the thinking again its own way)."""
+    def closes(t):
+        with _tok_lock:
+            text = tok.decode(t, skip_special_tokens=False)
+        return text.count("</think>") + text.count("<channel|>")
+
+    toks, special = list(toks), set(tok.all_special_ids)
+    while toks and toks[-1] in special and not closes(toks[-1:]):
+        toks.pop()
+    n = closes(toks)
+    while n and toks and closes(toks) == n:
+        toks.pop()
+    return toks
 
 
 def passes(tok, items: list[tuple[dict, list[int]]]) -> list[bool]:
-    """Whether each answer closed its thinking and passed the problem's tests."""
+    """Whether each answer closed its thinking and passed the problem's tests (the
+    eval's grading: codebench.job, then the sandbox)."""
     from stages import codebench, sandbox
-    from stages.data import split_think
     jobs, idx = [], []
     for i, (p, toks) in enumerate(items):
-        text = tok.decode(toks, skip_special_tokens=True)
-        if "</think>" not in text:
+        answer = answer_text(tok, toks)
+        if answer is None:
             continue
-        _, answer = split_think(text)
-        jobs.append((p["language"], *codebench.assemble(p, answer), codebench.time_limit(p)))
+        jobs.append(codebench.job(p, answer))
         idx.append(i)
     ok = [False] * len(items)
     for i, r in zip(idx, sandbox.run_many(jobs)):

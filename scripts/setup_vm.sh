@@ -1,17 +1,73 @@
 #!/usr/bin/env bash
 # One-time setup for an evroc GPU VM, B200 or L40S (Ubuntu 24.04).
 #   NVME=/mnt/nvme bash scripts/setup_vm.sh
+#   SKIP_EXTRAS=1 NVME=/mnt/nvme bash scripts/setup_vm.sh   # only what Event Horizon uses
 # Creates two venvs (vLLM and training, which pin different torch versions),
-# builds llama.cpp with CUDA, and downloads the teacher and student weights to
-# the local NVMe. Safe to re-run. Local NVMe is wiped if the VM is stopped.
+# builds llama.cpp with CUDA at LLAMA_CPP_SHA, fetches the code suites and downloads
+# the teacher and student weights to the local NVMe. Safe to re-run. Local NVMe is
+# wiped if the VM is stopped.
+# SKIP_EXTRAS=1 leaves out Node/TypeScript, llm-compressor and Aider Polyglot, and
+# fetches only the livecodebench, codecontests and apps suites: ~15-20 minutes less
+# per boot, which a B200 pays for by the minute.
+# Only vLLM is pinned here; what everything else resolved to, and the llama.cpp
+# commit, go to $NVME/versions.txt, so a reading can say what produced it.
 set -euo pipefail
 
 NVME=${NVME:-/mnt/nvme}
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEACHER=${TEACHER:-Qwen/Qwen3-30B-A3B-Instruct-2507}
 STUDENT=${STUDENT-google/gemma-4-E4B-it}  # STUDENT= (empty) skips it
+SKIP_EXTRAS=${SKIP_EXTRAS:-}
+# The llama.cpp commit everything GGUF comes from: llama-quantize's formats and type
+# rules, convert_hf_to_gguf.py and gguf-py's dequantization all change between commits,
+# and the shipped file must be reproducible.
+LLAMA_CPP_SHA=${LLAMA_CPP_SHA:-af50f2f248b475d9760f8e67503d01c0f194f5f4}
+LLAMA_CPP_REPO=${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp}
 
 say() { printf '\n==> %s\n' "$*"; }
+
+# llama_cpp_checkout DIR: DIR holds llama.cpp at exactly LLAMA_CPP_SHA, fetched on its
+# own (--depth 1). A checkout already there at another commit is moved to the pin when
+# it has no local changes to tracked files, and refused when it has.
+llama_cpp_checkout() {
+  local dir=$1 head
+  [[ $LLAMA_CPP_SHA =~ ^[0-9a-f]{40}$ ]] || { echo "LLAMA_CPP_SHA must be a full 40-character commit, not '$LLAMA_CPP_SHA'"; return 1; }
+  if [ ! -e "$dir/.git" ]; then
+    if [ -e "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
+      echo "$dir is there but is not a git checkout; remove it and re-run"; return 1
+    fi
+    git init -q "$dir"
+  fi
+  head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
+  if [ "$head" != "$LLAMA_CPP_SHA" ]; then
+    if [ -n "$head" ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
+      echo "$dir is at $head with local changes, not at LLAMA_CPP_SHA $LLAMA_CPP_SHA; remove it and re-run"; return 1
+    fi
+    git -C "$dir" fetch -q --depth 1 "$LLAMA_CPP_REPO" "$LLAMA_CPP_SHA"
+    git -C "$dir" checkout -q --detach FETCH_HEAD
+  fi
+  head=$(git -C "$dir" rev-parse HEAD)
+  [ "$head" = "$LLAMA_CPP_SHA" ] || { echo "$dir is at $head, not at LLAMA_CPP_SHA $LLAMA_CPP_SHA"; return 1; }
+  echo "llama.cpp at $head"
+}
+
+# missing_suites DIR SUITE...: the suites DIR has no finished copy of. A suite counts as
+# fetched once scripts/fetch_codebench.py has written its meta file, which it does last;
+# a suite restored from the bucket counts too.
+missing_suites() {
+  local dir=$1 s
+  shift
+  for s in "$@"; do
+    case $s in
+      multipl-e) [ -f "$dir/multipl-e-py.jsonl" ] || echo "$s" ;;
+      general-calib) [ -f "$dir/general-calib.jsonl" ] || echo "$s" ;;
+      *) [ -f "$dir/$s.meta.json" ] || echo "$s" ;;
+    esac
+  done
+}
+
+# tests/test_fetch_codebench.py sources this file for the functions above only.
+if [ -n "${SETUP_VM_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
 
 # evroc's GPU image installs the NVIDIA driver on first boot and then reboots.
 command -v cloud-init >/dev/null && sudo cloud-init status --wait >/dev/null || true
@@ -64,10 +120,11 @@ uv pip install -q --python "$NVME/venv-vllm/bin/python" "vllm==0.31.0" pyyaml ht
 uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 
 say "Training venv (reap, heal, quantize, eval, package, API)"
+# gguf comes from the pinned llama.cpp checkout below, not from PyPI.
 uv venv -q --python 3.12 "$NVME/venv-train"
 uv pip install -q --python "$NVME/venv-train/bin/python" \
   "torch>=2.7" "transformers>=5.5" "peft>=0.17" accelerate safetensors \
-  anthropic httpx fastapi uvicorn sentencepiece gguf
+  anthropic httpx fastapi uvicorn sentencepiece protobuf
 uv pip install -q --python "$NVME/venv-train/bin/python" -e "$REPO" --no-deps
 
 # Written before the llama.cpp build so the data stage works even if that step fails.
@@ -75,6 +132,7 @@ cat > "$REPO/.env.vm" <<ENV
 export LOBBOT_MODELS=$NVME/models
 export LOBBOT_LLAMA_CPP=$NVME/llama.cpp
 export LOBBOT_VLLM_PY=$NVME/venv-vllm/bin/python
+export LOBBOT_CODEBENCH=$NVME/codebench
 export HF_HOME=$NVME/hf-cache
 export UV_CACHE_DIR=$NVME/uv-cache
 export LOBBOT_JOBS=$NVME/jobs
@@ -86,7 +144,7 @@ ENV
 say "vLLM smoke test"
 "$NVME/venv-vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda ok:', torch.cuda.is_available())" || echo 'WARNING: vLLM import failed; the data stage will not run'
 
-say "llama.cpp with CUDA"
+say "llama.cpp with CUDA at $LLAMA_CPP_SHA"
 if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
   # Just the compiler and the libraries llama.cpp links; the full toolkit does not fit the root disk.
   # evroc's image already has NVIDIA's apt repo; add it if not.
@@ -98,45 +156,71 @@ if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
   sudo apt-get clean
 fi
 export PATH="/usr/local/cuda/bin:$PATH"
-[ -d "$NVME/llama.cpp" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$NVME/llama.cpp"
+llama_cpp_checkout "$NVME/llama.cpp"
 # The GPU's own architecture: 100 on a B200, 89 on an L40S.
 CUDA_ARCH=${CUDA_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.[:space:]')}
 cmake -S "$NVME/llama.cpp" -B "$NVME/llama.cpp/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$NVME/llama.cpp/build" -j"$(nproc)" --target llama-quantize llama-imatrix llama-server llama-cli
-# llama.cpp pins a CPU-only torch; installing it as-is replaces the venv's CUDA torch.
-grep -v -E '^(torch|--extra-index-url)' "$NVME/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt" > /tmp/convert-reqs.txt
-uv pip install -q --python "$NVME/venv-train/bin/python" -r /tmp/convert-reqs.txt || true
+# perplexity: the KL-divergence checks; tokenize: llama-tokenize == HF; batched-bench: slot sizing.
+cmake --build "$NVME/llama.cpp/build" -j"$(nproc)" --target llama-quantize llama-imatrix llama-server llama-cli \
+  llama-perplexity llama-tokenize llama-batched-bench
+# gguf-py from the same commit: qheal's and gguf_build's dequantization must be the
+# checkout's. convert_hf_to_gguf.py's own requirements file pins a CPU torch and an
+# older transformers, which would replace the venv's, so only gguf is installed and
+# the converter's imports are checked instead.
+uv pip install -q --python "$NVME/venv-train/bin/python" --reinstall-package gguf "$NVME/llama.cpp/gguf-py"
+"$NVME/venv-train/bin/python" "$NVME/llama.cpp/convert_hf_to_gguf.py" --help >/dev/null
+
+say "Code suites (scripts/fetch_codebench.py)"
+SUITES="livecodebench codecontests apps"
+[ -n "$SKIP_EXTRAS" ] || SUITES="multipl-e $SUITES general-calib"
+MISSING=$(missing_suites "$NVME/codebench" $SUITES | tr '\n' ' ')
+if [ -n "${MISSING// }" ]; then
+  uv run -q --python 3.12 --with datasets --with huggingface_hub \
+    python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" --only $MISSING \
+    || echo "WARNING: not every code suite downloaded ($MISSING): code eval fails without livecodebench, trace generation without codecontests"
+else
+  echo "already there: $SUITES"
+fi
+
+if [ -z "$SKIP_EXTRAS" ]; then
+  say "Code eval in JavaScript/TypeScript: Node 22 + TypeScript (experiment 01)"
+  if ! node -e 'process.exit(+process.versions.node.split(".")[0] < 22)' 2>/dev/null; then
+    NODE_TGZ=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o 'node-v22[^ ]*-linux-x64.tar.xz' | head -1)
+    curl -fsSL "https://nodejs.org/dist/latest-v22.x/$NODE_TGZ" | tar -xJ -C "$NVME"
+    ln -sfn "$NVME/${NODE_TGZ%.tar.xz}" "$NVME/node"
+  fi
+  export PATH="$NVME/node/bin:$PATH"
+  command -v tsc >/dev/null || npm install -g -s --prefix "$NVME/node" typescript
+  grep -q "$NVME/node/bin" "$REPO/.env.vm" || echo "export PATH=$NVME/node/bin:\$PATH" >> "$REPO/.env.vm"
+
+  say "llm-compressor in the training venv (quant_format w4a16: int4 experts, FP8 attention, for vLLM)"
+  # 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: inside this venv's
+  # ranges (transformers>=5.5, torch>=2.7), so it shares the venv; newer releases are moved back.
+  uv pip install -q --python "$NVME/venv-train/bin/python" "llmcompressor==0.14.0"
+fi
+
+say "Training venv check, after its last install"
 "$NVME/venv-train/bin/python" -c "import torch; assert torch.cuda.is_available(), torch.__version__; print('train venv torch', torch.__version__, 'cuda ok')"
 
-
-say "Code eval: Node 22 + TypeScript, and the benchmark suites (experiment 01)"
-if ! node -e 'process.exit(+process.versions.node.split(".")[0] < 22)' 2>/dev/null; then
-  NODE_TGZ=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o 'node-v22[^ ]*-linux-x64.tar.xz' | head -1)
-  curl -fsSL "https://nodejs.org/dist/latest-v22.x/$NODE_TGZ" | tar -xJ -C "$NVME"
-  ln -sfn "$NVME/${NODE_TGZ%.tar.xz}" "$NVME/node"
-fi
-export PATH="$NVME/node/bin:$PATH"
-command -v tsc >/dev/null || npm install -g -s --prefix "$NVME/node" typescript
-grep -q LOBBOT_CODEBENCH "$REPO/.env.vm" || cat >> "$REPO/.env.vm" <<ENV
-export PATH=$NVME/node/bin:\$PATH
-export LOBBOT_CODEBENCH=$NVME/codebench
-ENV
-[ -f "$NVME/codebench/livecodebench.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
-  python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" || echo 'WARNING: code suites not downloaded; code eval will fail'
-# contest training problems (data_contest_source "codecontests"), for a codebench made before they were added
-[ -f "$NVME/codebench/codecontests.jsonl" ] || uv run -q --python 3.12 --with datasets --with huggingface_hub \
-  python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" --only codecontests \
-  || echo 'WARNING: CodeContests not downloaded; the data stage fails if contest rows are on'
-
-say "llm-compressor in the training venv (quant_format w4a16: int4 experts, FP8 attention, for vLLM)"
-# 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: inside this venv's
-# ranges (transformers>=5.5, torch>=2.7), so it shares the venv; newer releases are moved back.
-uv pip install -q --python "$NVME/venv-train/bin/python" "llmcompressor==0.14.0"
+say "Versions: $NVME/versions.txt"
+{
+  echo "# scripts/setup_vm.sh $(date -u +%FT%TZ), repo $(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/gpu: /'
+  echo "nvcc: $(nvcc --version | tail -1)"
+  echo "llama.cpp: $(git -C "$NVME/llama.cpp" rev-parse HEAD)"
+  echo "## venv-vllm"
+  uv pip freeze --python "$NVME/venv-vllm/bin/python"
+  echo "## venv-train"
+  uv pip freeze --python "$NVME/venv-train/bin/python"
+} > "$NVME/versions.txt"
+grep -E '^(gpu|nvcc|llama\.cpp): |^(vllm|torch|transformers|accelerate|gguf)==' "$NVME/versions.txt" || true
 
 say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"
 
-say "Aider Polyglot: docker, the pinned aider and polyglot-benchmark, aider's benchmark image"
-# scripts/polyglot.py setup is idempotent; the image build takes ~15 minutes the first time.
-NVME="$NVME" "$NVME/venv-train/bin/python" "$REPO/scripts/polyglot.py" setup \
-  || echo 'WARNING: Polyglot setup failed; re-run `python scripts/polyglot.py setup` before `polyglot.py run`'
+if [ -z "$SKIP_EXTRAS" ]; then
+  say "Aider Polyglot: docker, the pinned aider and polyglot-benchmark, aider's benchmark image"
+  # scripts/polyglot.py setup is idempotent; the image build takes ~15 minutes the first time.
+  NVME="$NVME" "$NVME/venv-train/bin/python" "$REPO/scripts/polyglot.py" setup \
+    || echo 'WARNING: Polyglot setup failed; re-run `python scripts/polyglot.py setup` before `polyglot.py run`'
+fi

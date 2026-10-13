@@ -36,19 +36,54 @@ class NonFiniteTraining(RuntimeError):
 KD_CHUNK = 2048
 
 
-def kd_kl(s_logits, t_logits, temp: float = 1.0, chunk: int = KD_CHUNK):
+def kd_kl(s_logits, t_logits, temp: float = 1.0, chunk: int = KD_CHUNK, *, weights=None, index=None,
+          reverse: bool = False, return_dropped: bool = False):
     """KL(teacher || student) per answer position, averaged ("batchmean"), times temp^2,
     computed chunk by chunk. Each chunk is recomputed in the backward pass (checkpoint)
-    instead of keeping its softmaxes, so memory stays at one chunk whatever the length."""
-    def part(s, t):
-        return F.kl_div(F.log_softmax(s.float() / temp, -1), F.log_softmax(t.float() / temp, -1),
-                        log_target=True, reduction="sum")
+    instead of keeping its softmaxes, so memory stays at one chunk whatever the length.
+
+    weights: one weight per position (N,); the result is then the weighted mean
+    sum(w * KL) / sum(w). Trace batches (stages/traces.py) give 0 to padding and to
+    targets a trimmed vocab dropped, and a small weight to prompt tokens.
+    index: the teacher ids a trimmed student keeps, in the student's order (LongTensor of
+    the student's vocab size). The teacher's logits are sliced to them, so its
+    distribution is renormalised over the kept ids and the two vocabs line up.
+    reverse: KL(student || teacher) instead, the mode-seeking direction used on the
+    student's own rollouts.
+    return_dropped: also return the teacher's probability on the ids index leaves out,
+    per position (N,), detached, at temperature 1 (zeros without index); the vocab trim's
+    gate reads it."""
+    if index is not None and s_logits.shape[-1] != index.numel():
+        raise ValueError(f"student vocab {s_logits.shape[-1]} != {index.numel()} kept teacher ids")
+
+    def part(s, t, w):
+        ls, lt = F.log_softmax(s.float() / temp, -1), F.log_softmax(t.float() / temp, -1)
+        kl = (ls.exp() * (ls - lt)).sum(-1) if reverse else (lt.exp() * (lt - ls)).sum(-1)
+        return kl.sum() if w is None else (kl * w).sum()
 
     n = s_logits.shape[0]
     total = s_logits.new_zeros((), dtype=torch.float32)
+    dropped = torch.zeros(n, dtype=torch.float32, device=s_logits.device)
+    drop_ids = None
+    if index is not None:
+        index = index.to(t_logits.device)
+        keep = torch.zeros(t_logits.shape[-1], dtype=torch.bool, device=t_logits.device)
+        keep[index] = True
+        drop_ids = (~keep).nonzero().squeeze(-1)
     for i in range(0, n, chunk):
-        total = total + checkpoint(part, s_logits[i:i + chunk], t_logits[i:i + chunk], use_reentrant=False)
-    return total / max(n, 1) * temp ** 2
+        t = t_logits[i:i + chunk]
+        if index is not None:
+            if return_dropped:
+                with torch.no_grad():
+                    tf = t.float()
+                    dropped[i:i + chunk] = (torch.logsumexp(tf.index_select(-1, drop_ids), -1)
+                                            - torch.logsumexp(tf, -1)).exp().to(dropped.device)
+            t = t.index_select(-1, index)
+        w = None if weights is None else weights[i:i + chunk].to(s_logits.device).float()
+        total = total + checkpoint(part, s_logits[i:i + chunk], t.to(s_logits.device), w, use_reentrant=False)
+    norm = max(n, 1) if weights is None else weights.to(s_logits.device).float().sum().clamp_min(1e-12)
+    loss = total / norm * temp ** 2
+    return (loss, dropped) if return_dropped else loss
 
 
 def log(msg: str) -> None:

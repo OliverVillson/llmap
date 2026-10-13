@@ -55,11 +55,13 @@ def test_captured_layer_inputs_replay_the_model():
 
 
 def traces(path, n=120, length=60, seed=0):
+    """n rows in gen's format, two samples per problem."""
     rng = torch.Generator().manual_seed(seed)
     with open(path, "w") as f:
-        for _ in range(n):
+        for i in range(n):
             toks = torch.randint(0, 64, (length,), generator=rng).tolist()
-            f.write(json.dumps({"prompt": toks[:10], "tokens": toks[10:], "finish": "stop"}) + "\n")
+            f.write(json.dumps({"id": f"cc/{i // 2}", "prompt": toks[:10], "tokens": toks[10:], "finish": "stop",
+                                "passed": None, "forced": None}) + "\n")
 
 
 def test_block_then_e2e_move_the_ternary_model_toward_the_teacher(tmp_path):
@@ -79,7 +81,7 @@ def test_block_then_e2e_move_the_ternary_model_toward_the_teacher(tmp_path):
         T.main()
     snap_kl = json.loads((tmp_path / "snap.json").read_text())["kl"]
     with mock.patch.object(sys, "argv", ["x", "e2e", "--student", str(tmp_path / "block" / "latent"),
-                                         "--teacher", str(base), "--tokens", "4096", "--lr", "3e-4", "--batch", "4",
+                                         "--teacher", str(base), "--tokens", "4096", "--lr", "1e-4", "--batch", "4",
                                          "--log-every", "16", "--out", str(tmp_path / "e2e"), *common]):
         T.main()
     e2e = json.loads((tmp_path / "e2e" / "e2e.json").read_text())
