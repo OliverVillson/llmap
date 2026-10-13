@@ -277,6 +277,61 @@ def test_apps_rows_read_numbers_up_to_the_harness_digit_limit_and_drop_longer_on
                         "train") == []
 
 
+def test_fetch_apps_drops_text_that_is_not_utf8(monkeypatch, tmp_path):
+    """A lone surrogate (a JSON \\ud83d escape without its pair) cannot be written to the
+    sandbox or the JSONL: its solution, or its whole problem, is dropped."""
+    files = apps_files()
+    add = "def add(a, b):\n    return a + b\n"
+    lone = json.loads('"\\ud83d"')
+    test = [apps_raw(1, ADD, "add", "def add(a, b):", [[1, 1]], [[2]], ["s = '" + lone + "'\n" + add, add]),
+            apps_raw(9, f"{TWO_SUM} {lone}", "add", "def add(a, b):", [[1, 1]], [[2]], [add])]
+    files["test.jsonl"] = jsonl(test)
+    fake_hub(monkeypatch, tmp_path, {fc.APPS_REPO: files})
+    (tmp_path / "livecodebench.jsonl").write_text("")
+    meta = fc.fetch_apps(tmp_path)
+    ids = [json.loads(l)["id"] for l in (tmp_path / "apps.jsonl").read_text().splitlines()]
+    assert "apps/test/1" in ids and "apps/test/9" not in ids and meta["dropped"]["not_utf8"] == 1
+
+
+class _Answer(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.response = types.SimpleNamespace(status_code=status)
+
+
+def test_hub_calls_are_tried_again_on_server_errors_only(monkeypatch):
+    waits, answers = [], [_Answer(500), ConnectionError("reset"), "ok"]
+    monkeypatch.setattr(fc.time, "sleep", waits.append)
+
+    def call():
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    assert fc.hub(call) == "ok" and waits == list(fc.HUB_WAITS[:2])
+    waits.clear()
+    with pytest.raises(_Answer):
+        fc.hub(lambda: (_ for _ in ()).throw(_Answer(404)))
+    assert waits == []
+    with pytest.raises(_Answer):
+        fc.hub(lambda: (_ for _ in ()).throw(_Answer(503)))
+    assert waits == list(fc.HUB_WAITS)
+
+
+def test_resolve_falls_back_to_the_cached_commit_when_the_hub_keeps_failing(monkeypatch, tmp_path):
+    fake_hub(monkeypatch, tmp_path, {})
+    sys.modules["huggingface_hub"].HfApi = lambda: types.SimpleNamespace(
+        dataset_info=lambda *a, **k: (_ for _ in ()).throw(_Answer(500)))
+    monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fc, "hub_cache", lambda repo: tmp_path / "cache")
+    with pytest.raises(_Answer):
+        fc.resolve(fc.APPS_REPO)
+    (tmp_path / "cache" / "refs").mkdir(parents=True)
+    (tmp_path / "cache" / "refs" / "main").write_text(SHA + "\n")
+    assert fc.resolve(fc.APPS_REPO) == SHA
+
+
 def test_fetch_apps_keeps_problems_a_reference_solution_passes_in_the_form_it_passes(monkeypatch, tmp_path):
     calls = fake_hub(monkeypatch, tmp_path, {fc.APPS_REPO: apps_files()})
     with pytest.raises(FileNotFoundError, match="livecodebench first"):
@@ -292,7 +347,7 @@ def test_fetch_apps_keeps_problems_a_reference_solution_passes_in_the_form_it_pa
     assert rows["apps/train/2"]["tests"]["cases"] == [["[2, 7, 11]\n9", "[0, 1]"], ["[3, 2, 4]\n6", "[1, 2]"]]
     assert rows["apps/train/3"]["tests"]["cases"] == [["[5, 6]", "[5]"], ["[7]", "[7]"]]
     assert meta["outputs_as_given"] == 1
-    assert meta["dropped"] == {"call_based": 7, "duplicate": 1, "lcb_overlap": 1, "no_solution": 1,
+    assert meta["dropped"] == {"call_based": 7, "duplicate": 1, "lcb_overlap": 1, "no_solution": 1, "not_utf8": 0,
                                "reference_failed": 1}
     assert meta["rows"] == 3 and meta["ids_sha256"] == fc.ids_sha256(rows)
 

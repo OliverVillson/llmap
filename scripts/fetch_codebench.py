@@ -94,11 +94,58 @@ SUITES = ("multipl-e", "livecodebench", "codecontests", "apps", "general-calib")
 APPS_SOLUTIONS = 3  # reference solutions tried per APPS problem
 
 
+# Seconds between tries of a Hugging Face call: ~6.5 minutes of Hub errors before a fetch gives up.
+HUB_WAITS = (15, 30, 60, 120, 180)
+
+
+def hub(fn, *args, **kw):
+    """fn(*args, **kw) against the Hugging Face Hub, tried again after each of HUB_WAITS
+    when the Hub answers 429 or 5xx or the connection fails (a 500 on dataset_info
+    stopped the B200's setup on 2026-10-13); any other error (not found, gated) raises
+    at once."""
+    for wait in (*HUB_WAITS, None):
+        try:
+            return fn(*args, **kw)
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None:
+                transient = status == 429 or status >= 500
+            else:  # no answer at all: a dropped or refused connection, a timeout
+                root = type(e).__module__.split(".")[0]
+                transient = not isinstance(e, (ValueError, FileNotFoundError, PermissionError)) and (
+                    isinstance(e, (OSError, TimeoutError)) or root in ("httpx", "httpx2", "requests", "urllib3",
+                                                                       "huggingface_hub"))
+            if wait is None or not transient:
+                raise
+            print(f"Hugging Face: {type(e).__name__}{f' {status}' if status else ''}; trying again in {wait} s",
+                  flush=True)
+            time.sleep(wait)
+
+
+def hub_cache(repo: str) -> Path | None:
+    """The dataset's folder in this machine's Hugging Face cache."""
+    try:
+        from huggingface_hub import constants
+    except ImportError:
+        return None
+    return Path(constants.HF_HUB_CACHE) / f"datasets--{repo.replace('/', '--')}"
+
+
 def resolve(repo: str) -> str:
-    """The commit REVISIONS[repo] names, so one fetch reads every file at one commit."""
+    """The commit REVISIONS[repo] names, so one fetch reads every file at one commit. When
+    the Hub keeps failing, the commit this machine's cache last resolved it to, if any."""
     from huggingface_hub import HfApi
 
-    return HfApi().dataset_info(repo, revision=REVISIONS[repo]).sha
+    try:
+        return hub(HfApi().dataset_info, repo, revision=REVISIONS[repo]).sha
+    except Exception:
+        d = hub_cache(repo)
+        ref = d / "refs" / REVISIONS[repo] if d else None
+        if not (ref and ref.is_file() and re.fullmatch(r"[0-9a-f]{40}", sha := ref.read_text().strip())):
+            raise
+        print(f"{repo}: the Hub did not answer, so {REVISIONS[repo]} is read as this machine's cache last "
+              f"resolved it: {sha}", flush=True)
+        return sha
 
 
 def ids_sha256(ids) -> str:
@@ -187,13 +234,13 @@ def fetch_livecodebench(out: Path, max_cases: int = 0) -> dict:
 
     (out / "livecodebench.meta.json").unlink(missing_ok=True)
     sha = resolve(LCB_REPO)
-    have = set(list_repo_files(LCB_REPO, repo_type="dataset", revision=sha))
+    have = set(hub(list_repo_files, LCB_REPO, repo_type="dataset", revision=sha))
     if missing := [f for f in LCB_FILES if f not in have]:
         raise RuntimeError(f"{LCB_REPO} at {sha} has no {', '.join(missing)}")
     index, seen, read, n = [], set(), 0, {"no_cases_or_func": 0, "duplicate": 0}
     with tempfile.TemporaryFile(dir=out) as spool:
         for f in LCB_FILES:
-            with open(hf_hub_download(LCB_REPO, f, repo_type="dataset", revision=sha), encoding="utf-8") as fh:
+            with open(hub(hf_hub_download, LCB_REPO, f, repo_type="dataset", revision=sha), encoding="utf-8") as fh:
                 for line in fh:
                     if not line.strip():
                         continue
@@ -337,6 +384,16 @@ def apps_rows(r: dict, split: str, max_cases: int = 0) -> list[dict]:
     return rows
 
 
+def utf8(text: str) -> bool:
+    """text can be written as UTF-8: not so with a lone surrogate (a JSON \\ud83d escape
+    without its pair), which the sandbox's and the JSONL's writes would fail on."""
+    try:
+        text.encode()
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def verified(cands: list[list[dict]], solutions: list[list[str]]) -> list[dict | None]:
     """For each problem, the first of its rows (cands[i]) on which one of its reference
     solutions passes every case, run as answers are graded (codebench.job in the
@@ -364,19 +421,22 @@ def fetch_apps(out: Path, max_cases: int = 50) -> dict:
     (out / "apps.meta.json").unlink(missing_ok=True)
     lcb = lcb_shingles(out)
     sha = resolve(APPS_REPO)
-    files = sorted(f for f in list_repo_files(APPS_REPO, repo_type="dataset", revision=sha) if f.endswith(".jsonl"))
+    files = sorted(f for f in hub(list_repo_files, APPS_REPO, repo_type="dataset", revision=sha) if f.endswith(".jsonl"))
     if not files:
         raise RuntimeError(f"{APPS_REPO} at {sha} has no .jsonl files")
     cands, sols, texts = [], [], set()
-    n = {"call_based": 0, "duplicate": 0, "lcb_overlap": 0, "no_solution": 0}
+    n = {"call_based": 0, "duplicate": 0, "lcb_overlap": 0, "no_solution": 0, "not_utf8": 0}
     for f in files:
-        with open(hf_hub_download(APPS_REPO, f, repo_type="dataset", revision=sha), encoding="utf-8") as fh:
+        with open(hub(hf_hub_download, APPS_REPO, f, repo_type="dataset", revision=sha), encoding="utf-8") as fh:
             for line in fh:
                 if not line.strip():
                     continue
                 r = json.loads(line)
                 rows = apps_rows(r, Path(f).stem, max_cases)
                 if not rows:
+                    continue
+                if not utf8(rows[0]["prompt"]):
+                    n["not_utf8"] += 1
                     continue
                 n["call_based"] += 1
                 text = " ".join(re.findall(r"[a-z0-9]+", r["question"].lower()))
@@ -391,7 +451,7 @@ def fetch_apps(out: Path, max_cases: int = 50) -> dict:
                     s = json.loads(r.get("solutions") or "[]")
                 except ValueError:
                     s = []
-                s = [c for c in s if isinstance(c, str) and c.strip()][:APPS_SOLUTIONS]
+                s = [c for c in s if isinstance(c, str) and c.strip() and utf8(c)][:APPS_SOLUTIONS]
                 if not s:
                     n["no_solution"] += 1
                     continue
