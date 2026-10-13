@@ -111,17 +111,36 @@ def suite_path(name: str, bench_dir: str | Path) -> Path:
     return BUNDLED.get(name) or Path(bench_dir) / f"{name}.jsonl"
 
 
-def load_suite(name: str, bench_dir: str | Path, since: str | None = None, limit: int | None = None) -> list[dict]:
+def load_suite(name: str, bench_dir: str | Path, since: str | None = None, limit: int | None = None, *,
+               until: str | None = None, ids=None, fields: tuple[str, ...] | None = None) -> list[dict]:
+    """A suite's problems, read one line at a time and filtered row by row: a LiveCodeBench
+    fetch with every case stored is gigabytes, too much to read whole. Dated rows outside
+    since..until are skipped (undated ones kept), only `ids` when given, only `fields` of
+    each row when given (with its language; e.g. ("id", "prompt") for a dedupe that needs
+    no tests), at most `limit` rows."""
     p = suite_path(name, bench_dir)
     if not p.exists():
         raise FileNotFoundError(f"code suite {name} not found at {p}; run scripts/fetch_codebench.py")
-    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
-    if since:
-        rows = [r for r in rows if not r.get("date") or r["date"][:10] >= since]
-    for r in rows:
-        r["language"] = normalize_language(r["language"])
-        r["suite"] = name
-    return rows[:limit] if limit else rows
+    want = None if ids is None else set(ids)
+    rows = []
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            date = (r.get("date") or "")[:10]
+            if date and ((since and date < since) or (until and date > until)):
+                continue
+            if want is not None and r.get("id") not in want:
+                continue
+            if fields is not None:
+                r = {k: r[k] for k in (*fields, "language") if k in r}
+            r["language"] = normalize_language(r["language"])
+            r["suite"] = name
+            rows.append(r)
+            if limit and len(rows) >= limit:
+                break
+    return rows
 
 
 def heldout_problems(held: list[dict]) -> list[dict]:

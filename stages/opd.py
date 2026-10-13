@@ -268,7 +268,8 @@ def _functional(bench_dir: str) -> list[dict]:
         return []
     rows = [p for p in codebench.load_suite("apps", bench_dir) if isinstance(p.get("tests"), dict)]
     lcb = codebench.suite_path("livecodebench", bench_dir)
-    seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite("livecodebench", bench_dir))
+    seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite("livecodebench", bench_dir,
+                                                                             fields=("id", "prompt")))
                        ) if lcb.exists() else set()
     return [p for p in rows if len(p["prompt"]) <= MAX_INPUT_CHARS and not (_shingles(p["prompt"]) & seen)]
 

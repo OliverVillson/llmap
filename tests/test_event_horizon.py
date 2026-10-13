@@ -2,15 +2,22 @@
 verdict), the three sessions end to end on a fake shell, the bucket round trip and the
 upload hook, the fingerprinted shutdown, and --list on a machine with no nvidia-smi."""
 
+import argparse
+import contextlib
 import hashlib
 import importlib
+import io
 import json
 import math
 import os
 import re
+import runpy
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -387,7 +394,8 @@ def test_list_needs_no_gpu(tmp_path, monkeypatch, capsys):
     assert m.main(["--list"]) == 0
     out = capsys.readouterr().out
     for s in ("session measure:", "session train:", "session read:", "GPU smoke (a)-(h)", "record reading, 182 x K_i",
-              "on-policy rounds (up to 4)", "estimates"):
+              "on-policy session 1 of up to 5 (round 1)", "on-policy session 5 of up to 5 (judges the last round)",
+              "estimates"):
         assert s in out
     assert "original reference reading, 182 x 4 (Gate 0) ~ 4h06m" in out  # 728 answers at the measured rate + 8k
     assert m.main(["--list", "--session", "read"]) == 0
@@ -554,7 +562,7 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     shell.calls.clear()
     run_steps(m, "train")
     assert kinds(shell.calls) == ["eval", "stages.qat e2e", "gen", "stages.qat e2e", "stages.qat onpolicy",
-                                  "stages.qat export", "convert_hf_to_gguf",
+                                  "stages.qat export", "stages.vocab register", "convert_hf_to_gguf",
                                   "stages.horizon ladder", "stages.vocab tokcheck"]
     gen = next(c for c, _ in shell.calls if "gen_command(" in c)
     assert "seqs=384" in gen and "24000000.0" in gen
@@ -591,3 +599,201 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     (m.final_dir() / "model.gguf.sha256").write_text("other\n")
     with pytest.raises(RuntimeError, match="already pre-registers"):
         m.run_choice(m.Step("x", {"": 1}, None))
+
+
+def test_onpolicy_runs_one_session_per_step_and_uploads_each(tmp_path, monkeypatch):
+    """S2.5 on a fake trainer that keeps round 1 and drops rounds 2 and 3: one qat onpolicy
+    call per session (--until-session k), the work dir uploaded after each, the audit
+    when the stop rule ends the rounds in session 4, session 5 never run."""
+    m = load(tmp_path, monkeypatch)
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    import runner
+    O = m.W / "onpolicy-abc123"
+    monkeypatch.setattr(m, "onpolicy_dir", lambda: O)
+    monkeypatch.setattr(m, "e2e_dir", lambda: m.W / "e2e-def456")
+    ok = {"kl": {"new": 0.9, "kept": 1.0, "drop": 0.1, "ok": True}, "loop": {"rise": 0.0, "se": 0.01, "ok": True},
+          "cap": {"rise": 0.0, "se": 0.01, "ok": True}, "pass": {"diff": 0.01, "se": 0.01, "ok": True},
+          "problems": {"n": 128, "ok": True}}
+    flat = {**ok, "kl": {"new": 0.99, "kept": 0.9, "drop": 0.01, "ok": False}}
+    keep = {1: True, 2: False, 3: False}
+    calls, seen = [], []
+
+    def trainer(step, cmd, env=None):
+        """qat onpolicy's sessions: session k judges round k-1, then trains round k."""
+        until = int(re.search(r"--until-session (\d+)", cmd)[1])
+        calls.append(until)
+        st = json.loads((O / "state.json").read_text()) if (O / "state.json").exists() else \
+            {"session": 1, "trained": 0, "rounds": [], "done": False, "final": None}
+        while not st["done"] and st["session"] <= until:
+            if st["trained"]:
+                r = st["trained"]
+                st["rounds"].append({"round": r, "kept": keep[r], "rules": ok if keep[r] else flat})
+            kept = [r["kept"] for r in st["rounds"]]
+            if len(kept) >= m.ROUNDS_MAX or kept[-2:] == [False, False]:
+                st.update(done=True, final=str(O / "round1" / "train" / "state"))
+                (O / "onpolicy.json").write_text(json.dumps({"final": st["final"], "trained": st["trained"]}))
+            else:
+                st.update(trained=st["trained"] + 1, session=st["session"] + 1)
+        O.mkdir(parents=True, exist_ok=True)
+        (O / "state.json").write_text(json.dumps(st))
+
+    upload = m.upload_art
+
+    def recorded(art, complete=True):
+        if art.slug == "onpolicy":
+            seen.append(json.loads((O / "state.json").read_text())["session"])
+        return upload(art, complete)
+
+    monkeypatch.setattr(m, "sh", trainer)
+    monkeypatch.setattr(m, "upload_art", recorded)
+    plan = [s for s in m.steps("train") if s.name.startswith("on-policy session")]
+    assert len(plan) == m.ONPOLICY_SESSIONS == 5
+    logs = m.LOGS / "train"
+    logs.parent.mkdir(parents=True)
+    assert runner.run_plan(plan, lambda: "s", logs, ["run"], after_step=m.make_hook("train")) == 0
+    assert calls == [1, 2, 3, 4]  # the stop rule fired in session 4: session 5 is done without a call
+    assert seen[:4] == [2, 3, 4, 4]  # each session's state reaches the bucket as it ends
+    audit = json.loads((O / "audit.json").read_text())
+    assert audit["ok"] and [r["kept"] for r in audit["rounds"]] == [True, False, False]
+    assert all(s.state == "done" for s in plan) and m.onpolicy_done()
+    assert json.loads((root / "onpolicy" / "abc123" / "manifest.json").read_text())["complete"] is True
+
+    # A session that ends with the state where it was is a failure, not a silent skip.
+    st = json.loads((O / "state.json").read_text())
+    (O / "state.json").write_text(json.dumps({**st, "done": False, "session": 3}))
+    monkeypatch.setattr(m, "sh", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match="left session 3 unfinished"):
+        m.run_onpolicy(m.Step("x", {"": 1}, None), 3)
+    assert not m.onpolicy_session_done(3) and m.onpolicy_session_done(2)
+
+
+class FloorShell(Shell):
+    """horizon run on a budget under its cheapest map: floor.json and exit 3, nothing swept."""
+
+    def __call__(self, step, cmd, env=None):
+        if "stages.horizon run" not in cmd:
+            return super().__call__(step, cmd, env)
+        self.calls.append((cmd, env or {}))
+        self.write(arg(cmd, "--out") / "floor.json", {"floor_bytes": 2_000_000_000, "floor_gb": 2.0,
+                                                      "budget_bytes": 1_250_000_000, "over": True})
+
+
+def test_a_budget_under_the_cheapest_map_fails_the_preflight(tmp_path, monkeypatch):
+    m = load(tmp_path, monkeypatch)
+    fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    shell = FloorShell(m)
+    monkeypatch.setattr(m, "sh", shell)
+    skipped = []
+    for s in m.steps("measure")[2:]:
+        s.log = m.LOGS / "x.log"
+        if not s.done():
+            try:
+                s.run(s)
+            except m.Skip:
+                skipped.append(s.name)
+    assert skipped == ["Block-AP and its export", m.READINGS["blockap-dev"].title]
+    pf = m.gate("preflight")
+    assert pf["floor"] and not pf["pass"] and pf["gb"] == 2.0 and "within the budget" in pf["why"]
+    assert m.ptq_done() and m.uploaded("measure")  # the upload step is not behind the gate
+    assert "Preflight: cheapest possible map 2.000 GB" in m.summary()
+    assert kinds(shell.calls)[-1] == "stages.horizon run"  # no Block-AP, no dev screen
+
+    # horizon's exit 3 is how the floor is reported; any other failure still fails the step.
+    cmd = next(c for c, _ in shell.calls if "stages.horizon run" in c).splitlines()[-1]
+    for code, ok in ((3, True), (1, False), (0, True)):
+        line = re.sub(r"^python -m stages\.horizon run .*?(?= \|\| )", f"(exit {code})", cmd)
+        r = subprocess.run(["bash", "-c", f"set -e\n{line}\necho after"], capture_output=True, text=True)
+        assert (r.returncode == 0 and "after" in r.stdout) is ok, (code, line)
+
+
+# ---------- the command lines against the real CLIs ----------
+
+class Parsed(Exception):
+    """Raised once the real CLI has parsed its arguments: nothing after that runs."""
+
+
+def cli_calls(cmd: str) -> list[tuple[str, list[str]]]:
+    """Each python CLI call in a shell command: (module or script, its arguments up to the
+    next shell operator). `python -` (a heredoc) is not one."""
+    out = []
+    for line in cmd.replace("$gen", "4242").splitlines():
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        try:
+            toks = list(lex)
+        except ValueError:  # a line of a heredoc's python
+            continue
+        for i, t in enumerate(toks[:-1]):
+            if t not in ("python", "python3") or toks[i + 1] == "-":
+                continue
+            j = i + 3 if toks[i + 1] == "-m" else i + 2
+            args = []
+            for x in toks[j:]:
+                if not set(x) - set("();<>|&"):
+                    break
+                args.append(x)
+            out.append((toks[j - 1], args))
+    return out
+
+
+def parse_in_real_cli(target: str, args: list[str], monkeypatch, capsys) -> argparse.Namespace:
+    """The target's own main() up to its parse_args: unknown flags, missing required ones,
+    bad types and choices fail here as they would on the VM."""
+    real, got = argparse.ArgumentParser.parse_args, {}
+
+    def parse(self, a=None, namespace=None):
+        got["ns"] = real(self, a, namespace)
+        raise Parsed
+
+    with monkeypatch.context() as mp, warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # runpy: the module is imported already
+        mp.setattr(argparse.ArgumentParser, "parse_args", parse)
+        mp.setattr(signal, "signal", lambda *a: None)
+        mp.setattr(sys, "argv", [target, *args])
+        try:
+            if target.endswith(".py"):
+                runpy.run_path(str(ROOT / target), run_name="__main__")
+            else:
+                runpy.run_module(target, run_name="__main__", alter_sys=False)
+        except Parsed:
+            return got["ns"]
+        except SystemExit as e:
+            pytest.fail(f"{target} {' '.join(args)}\nexit {e.code}: {capsys.readouterr().err[-800:]}")
+    pytest.fail(f"{target} {' '.join(args)} never parsed its arguments")
+
+
+def test_every_command_line_parses_in_the_stage_it_calls(tmp_path, monkeypatch, capsys):
+    """The three sessions on the fake shell, then each python command line they ran (and
+    the gen script's) through the real CLI's argument parser."""
+    m = load(tmp_path, monkeypatch)
+    fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    shell = Shell(m)
+    monkeypatch.setattr(m, "sh", shell)
+    run_steps(m, "measure")
+    m.run_restore(m.Step("x", {"": 1}, None), "train")
+    run_steps(m, "train")
+    run_steps(m, "read")
+    cmds = [c for c, _ in shell.calls]
+    for c in [c for c in cmds if "gen_command(" in c]:  # the script gen.sh is made from
+        script = re.search(r"<<'EOF'\n(.*?)\nEOF", c, re.S)[1]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exec(script, {})
+        cmds.append(buf.getvalue())
+    calls = [x for c in cmds for x in cli_calls(c)]
+    outside = {Path(t).name for t, _ in calls if Path(t).is_absolute()}
+    assert outside == {"convert_hf_to_gguf.py"}  # llama.cpp's own, not in this repo
+    calls = [(t, a) for t, a in calls if not Path(t).is_absolute()]
+    seen = set()
+    for target, args in calls:
+        ns = parse_in_real_cli(target, args, monkeypatch, capsys)
+        seen.add(f"{target} {getattr(ns, 'cmd', None) or args[0] if args else ''}".strip())
+    assert {"stages.dense gguf", "stages.dense calib", "stages.dense imatrix", "stages.vocab smoke",
+            "stages.vocab run", "stages.vocab register", "stages.vocab tokcheck", "stages.horizon ladder",
+            "stages.horizon run", "stages.qat block", "stages.qat export", "stages.qat e2e", "stages.qat onpolicy",
+            "stages.gguf_build vllm", "stages.ternary gen", "stages.budget --job", "pipeline.py --job",
+            "scripts/event_horizon.py rescore"} <= seen
+    assert any(t == "scripts/thinking_report.py" for t, _ in calls)
+    assert any(t == "scripts/event_horizon.py" and a[:1] == ["smoke"] for t, a in calls)

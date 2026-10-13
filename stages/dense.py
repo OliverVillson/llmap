@@ -441,8 +441,10 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path | None) -> None:
         if DRY_RUN:
             tmp.write_bytes(b"GGUF dry run")
         else:
-            from stages.moe_utils import gguf_convert_flags  # imports torch
+            from stages import vocab  # imports torch
+            from stages.moe_utils import gguf_convert_flags
 
+            vocab.register(lc, hf_dir)  # a trimmed checkpoint's tokenizer; a no-op on any other
             run([sys.executable, str(lc / "convert_hf_to_gguf.py"), str(hf_dir), "--outtype", "bf16",
                  "--outfile", str(tmp), *gguf_convert_flags(hf_dir)], stage)
         tmp.rename(bf16)
@@ -459,8 +461,9 @@ def make_ggufs(job: Job, hf_dir: Path, bf16: Path, q8: Path | None) -> None:
 
 def trace_calibration(job: Job, traces_path: Path, tokenizer_dir: Path, max_tokens: int = CALIB_TOKENS,
                       held_frac: float | None = None, seed: int = 0) -> Path:
-    """work/calib-chat.txt from the training split of the traces: one sample per
-    problem (the first in the file), shuffled by seed, until max_tokens, each decoded
+    """work/calib-chat.txt from the training split of the traces (traces.split with its
+    own fixed seed, the split every other step uses; `seed` only shuffles): one sample
+    per problem (the first in the file), shuffled by seed, until max_tokens, each decoded
     from its prompt and answer ids with the special tokens kept, so llama-imatrix
     (--parse-special) sees the chat format the model is scored in. tokenizer_dir is the
     tokenizer that wrote the ids (the original model's, before any vocab trim).
@@ -479,7 +482,7 @@ def trace_calibration(job: Job, traces_path: Path, tokenizer_dir: Path, max_toke
         emit(stage, "done", 100, f"{out} exists, from the same traces")
         return out
     rows = traces.load(traces_path)
-    train, held = traces.split(rows, held_frac, seed)
+    train, held = traces.split(rows, held_frac)
     first: dict[str, dict] = {}
     for r in train:
         first.setdefault(r["id"], r)

@@ -18,7 +18,8 @@ Phases (plan: /mnt/project-files/plan/event-horizon-qat.md, S1.9, S2.4-S2.6):
             llama-quantize's codes and stay there; then layer by layer, each block's
             QuantWeights (also from llama-quantize's codes) and norms learn to reproduce
             the bf16 block's output from what the quantized blocks before it produce.
-            One block's optimizer state at a time (~1.3 GB), hidden states on the CPU
+            One block's optimizer state at a time (~1.3 GB), hidden states on the CPU,
+            as many windows as its free memory holds (fit_windows)
   e2e       teacher-forced KD on the B200: every weight in its grid, embedding and head
             included, fp32 master weights and AdamW, trace rows of up to 16k tokens from
             their prompt (traces.batches), KL over the kept vocab to the bf16 teacher
@@ -54,7 +55,7 @@ once instead of spilling layers to the CPU.
     python -m stages.qat e2e --state <block dir> --teacher <hf> --traces traces.jsonl \\
         --vocab-index vocab_index.json --out <dir> --tokens 40e6 --max-minutes 45
     python -m stages.qat onpolicy --work <dir> --state <e2e dir> --teacher <hf> --problems <codebench> \\
-        --traces traces.jsonl --vocab-index vocab_index.json --llama-cpp <dir>
+        --traces traces.jsonl --vocab-index vocab_index.json --llama-cpp <dir> [--until-session N]
     python -m stages.qat export --state <dir> --out <dir> --llama-cpp <dir>
 """
 from __future__ import annotations
@@ -96,6 +97,12 @@ D_LR = 0.1
 SCALE_LR = 10.0
 B200_GB = 180.0
 L40S_GB = 46.0
+# Block-AP keeps two hidden-state caches (2 x windows x length x hidden): 2048 x 2048 x 2560
+# in bf16 is ~43 GB, more than some VMs have free. fit_windows() keeps as many windows as
+# the cache device's free memory holds after this reserve, and refuses fewer than
+# MIN_BLOCK_WINDOWS of a request it had to cut.
+CACHE_RESERVE_GB = {"cpu": 8.0, "cuda": 10.0}
+MIN_BLOCK_WINDOWS = 256
 # Keep rules of an on-policy round (plan S2.5), against the last kept model on the same
 # held-out problems: on-policy KL drops by at least KEEP_KL_DROP; loop%, cap% and pass@1
 # move no more than KEEP_SE standard errors of the paired difference the wrong way.
@@ -596,6 +603,42 @@ def block_windows(rows: list[dict], length: int, n: int = 0, seed: int = 0, voca
         w = w[ok]
     w = w[torch.randperm(len(w), generator=torch.Generator().manual_seed(seed))]
     return w[:n] if n else w
+
+
+def free_bytes(device) -> int | None:
+    """Memory the hidden-state caches can take on device: MemAvailable of /proc/meminfo
+    for the CPU, torch's free VRAM for a GPU; None when it cannot be read."""
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        return int(torch.cuda.mem_get_info(dev)[0])
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def fit_windows(n: int, length: int, hidden: int, elem: int, device, *, free: int | None = None) -> dict:
+    """How many of n Block-AP windows of `length` tokens the two hidden-state caches
+    (2 x windows x length x hidden x elem bytes) leave room for on device, after
+    CACHE_RESERVE_GB. free: the device's free bytes (default free_bytes(device)).
+    Returns {"windows", "asked", "cache_gb", "free_gb", "device"}; raises when fewer
+    than MIN_BLOCK_WINDOWS (or n, if smaller) fit."""
+    dev = torch.device(device)
+    per = 2 * length * hidden * elem
+    free = free_bytes(dev) if free is None else free
+    keep = n
+    if free is not None:
+        room = free - CACHE_RESERVE_GB["cuda" if dev.type == "cuda" else "cpu"] * 1e9
+        keep = max(0, min(n, int(room // per)))
+        if keep < min(n, MIN_BLOCK_WINDOWS):
+            raise RuntimeError(f"block: {free / 1e9:.1f} GB free on {dev} holds the hidden states of {keep} windows "
+                               f"of {length} tokens ({per / 1e9:.3f} GB each, {n} asked, at least "
+                               f"{min(n, MIN_BLOCK_WINDOWS)} needed); free memory, or pass --cache-device")
+    return {"windows": keep, "asked": n, "cache_gb": round(keep * per / 1e9, 2),
+            "free_gb": None if free is None else round(free / 1e9, 2), "device": str(dev)}
 
 
 def _rel_err(layer, xs, ys, kw_of, device, amp) -> float:
@@ -1565,14 +1608,20 @@ def cmd_block(a) -> None:
     codes = gguf_codes(a.gguf, a.base, model, type_map, _gguf(a.llama_cpp))
     train, _ = traces.split(traces.load(a.traces))
     wins = block_windows(train, a.length, a.windows, a.seed, vocab_index(a.vocab_index))
-    log(f"block: {len(wins)} windows of {a.length} tokens ({len(wins) * a.length / 1e6:.1f}M tokens), {a.epochs} epochs")
+    cache_device = a.cache_device or ("cpu" if torch.cuda.is_available() else None)
+    emb = model.get_input_embeddings().weight
+    fit = fit_windows(len(wins), a.length, emb.shape[1], emb.element_size(), cache_device or emb.device)
+    if fit["windows"] < len(wins):
+        log(f"block: only {fit['windows']} of {len(wins)} windows fit {fit['free_gb']} GB free on {fit['device']}")
+        wins = wins[:fit["windows"]]
+    log(f"block: {len(wins)} windows of {a.length} tokens ({len(wins) * a.length / 1e6:.1f}M tokens), {a.epochs} epochs; "
+        f"hidden-state caches {fit['cache_gb']} GB on {fit['device']} ({fit['free_gb']} GB free)")
     t0 = time.time()
     report = block_ap(model, wins, type_map, codes, batch=a.batch, epochs=a.epochs, lr=a.lr,
-                      cache_device=a.cache_device or ("cpu" if torch.cuda.is_available() else None),
-                      work=out / "layers")
+                      cache_device=cache_device, work=out / "layers")
     save_state(model, out / "state", {"base": str(Path(a.base).resolve()), "type_map": type_map, "phase": "block"})
     (out / "block.json").write_text(json.dumps({"layers": report, "windows": len(wins), "length": a.length,
-                                                "epochs": a.epochs, "lr": a.lr,
+                                                "epochs": a.epochs, "lr": a.lr, "cache": fit,
                                                 "minutes": round((time.time() - t0) / 60, 1),
                                                 "tensor_bytes": size_bytes(model, type_map)}, indent=1))
     shutil.rmtree(out / "layers", ignore_errors=True)
@@ -1611,8 +1660,11 @@ def cmd_onpolicy(a) -> None:
             base=a.base, llama_cpp=a.llama_cpp, rounds=a.rounds, fresh=a.fresh, rollouts=a.rollouts, held=a.held,
             lr=a.lr, max_minutes=a.max_minutes, seqs=a.seqs, port=a.port, seed=a.seed))
     st = read_state(work)
-    while not st["done"]:
+    while not st["done"] and not (a.until_session and st["session"] > a.until_session):
         st = onpolicy_round(work)
+    if not st["done"]:
+        log(f"onpolicy: stopped after session {st['session'] - 1} (--until-session); a rerun continues")
+        return
     if _config(work).llama_cpp and not (work / "final" / "export.json").exists():
         run_step("export", work, Path(st["final"]))
     (work / "onpolicy.json").write_text(json.dumps({k: st.get(k) for k in ("final", "trained", "rounds")}, indent=1))
@@ -1663,6 +1715,9 @@ def main() -> None:
     o = sub.add_parser("onpolicy")
     o.add_argument("--work", required=True)
     o.add_argument("--step", choices=["all", "train"], default="all", help="train: the trainer's part of a session")
+    o.add_argument("--until-session", type=int, default=0,
+                   help="stop once this session is done (0: run to the end); a caller that uploads between "
+                        "sessions runs one at a time")
     o.add_argument("--state", help="the start model (e2e's output)")
     o.add_argument("--teacher")
     o.add_argument("--problems", help="codebench dir")

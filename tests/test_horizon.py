@@ -182,6 +182,28 @@ def test_ladder_orders_the_types(world):
     assert [r["bytes"] for r in lad] == sorted(r["bytes"] for r in lad)
 
 
+def test_a_budget_under_the_cheapest_map_stops_before_the_sweep(world, tmp_path, monkeypatch):
+    """An untrimmed vocab puts even the floor map over the budget: the run stops right
+    after the byte table (floor.json, exit 3) instead of an hour of cache, teacher and
+    sweep that the knapsack would then refuse."""
+    import shutil
+    from unittest import mock
+    out = tmp_path / "out"
+    shutil.copytree(world["out"] / "ptq", out / "ptq")  # same inputs: the PTQ files are reused
+    info = json.loads((world["out"] / "bytes.json").read_text())
+    assert horizon.floor_bytes(info["group_bytes"], info["fixed"]) == world["floor"]
+    monkeypatch.setattr(horizon, "build_cache", lambda *a, **k: pytest.fail("went on past the byte table"))
+    argv = ["x", "run", "--hf", str(world["hf"]), "--bf16", str(world["bf16"]), "--traces",
+            str(world["root"] / "traces.jsonl"), "--llama-cpp", str(world["llama_cpp"]), "--out", str(out),
+            "--budget-gb", str((world["floor"] - 1) / 1e9)]
+    with mock.patch.object(sys, "argv", argv), pytest.raises(SystemExit) as e:
+        horizon.main()
+    assert e.value.code == 3
+    floor = json.loads((out / "floor.json").read_text())
+    assert floor["over"] and floor["floor_bytes"] == world["floor"] and floor["budget_bytes"] < world["floor"]
+    assert not (out / "sweep.jsonl").exists() and not (out / "map.json").exists()
+
+
 def test_a_kld_run_that_lost_its_summary_runs_again(monkeypatch):
     """llama-perplexity's log is asynchronous and not flushed at exit: a run that exits 0
     can end before its summary. It runs again; a run that fails, or keeps losing it, raises."""

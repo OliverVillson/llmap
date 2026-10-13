@@ -12,7 +12,11 @@ run's text into answers to the words "input_ids" and "attention_mask".
 
 Held-out problems are picked by a stable hash of the problem id (zlib.crc32, not
 Python's per-process salted hash()), so gen, every trainer and every later session
-agree on the split, and all samples of a problem fall on the same side.
+agree on the split, and all samples of a problem fall on the same side. Every other
+draw by problem id (another seed, the halves of the held-out problems) hashes with
+sha256 instead: crc32 is linear, so for ids of one length a crc32 of a prefixed id is
+the id's own crc32 xor a constant, and a draw made that way follows the split (every
+held-out id of a test set fell into the same "half").
 
 batches() replaces packing traces end to end into fixed windows, which put most
 window starts mid-answer with no problem statement in context and let one answer
@@ -26,6 +30,7 @@ vocab dropped the target id.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -73,10 +78,20 @@ def load(path: str | Path) -> list[dict]:
 
 # ---------- held-out split ----------
 
-def bucket(pid: str, seed: int = 0) -> float:
-    """A problem id's place in [0, 1), the same in every process."""
-    key = str(pid) if not seed else f"{seed}:{pid}"
-    return zlib.crc32(key.encode()) / 2 ** 32
+def bucket(pid: str, seed: int | str = 0) -> float:
+    """A problem id's place in [0, 1), the same in every process. Seed 0 is the held-out
+    split's crc32 of the id; any other seed (an int or a salt string) is a sha256 of seed
+    and id, independent of the split and of other seeds (see the module docstring)."""
+    if not seed:
+        return zlib.crc32(str(pid).encode()) / 2 ** 32
+    return int.from_bytes(hashlib.sha256(f"{seed}:{pid}".encode()).digest()[:8], "big") / 2 ** 64
+
+
+def half(pid: str) -> int:
+    """0 or 1 for a problem id, independent of the held-out split. The one rule that
+    halves the held-out problems into a side that chooses (vocab's selection rows,
+    horizon's sweep) and a side that only checks (vocab's gate, horizon's check)."""
+    return hashlib.sha256(str(pid).encode()).digest()[0] & 1
 
 
 def is_held(pid: str, held_frac: float = HELD_FRAC, seed: int = 0) -> bool:
@@ -119,7 +134,8 @@ def batches(rows: list[dict], length: int, batch: int, *, vocab_map=None, prompt
     weights[b, t] belongs to the target input_ids[b, t + 1]: 0 on padding, prompt_weight
     on prompt tokens, 1 on answer tokens. With vocab_map (vocab_lut's forms) the ids
     are the trimmed model's and a target it dropped weighs 0 (its input becomes id 0;
-    vocab.choose keeps every id in the traces, so this only meets other text).
+    vocab.choose counts the training rows and the held-out selection half, so dropped
+    targets turn up in the held-out gate half and in other text).
     Rows with no answer token inside the window are left out."""
     lut = None if vocab_map is None else vocab_lut(vocab_map)
     # (row, tokens in its window) for the rows with an answer token inside it

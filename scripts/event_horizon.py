@@ -27,8 +27,9 @@ written before any reading:
   rounds  an on-policy round is kept only if its held-out on-policy KL drops >= 5%,
           loop% and cap% rise by at most 2 SE, and paired held-out pass@1 falls by at
           most 2 SE; rounds stop after 2 in a row not kept, or after 4 (qat onpolicy
-          decides as it trains; audit_rounds() checks each decision against the rule,
-          and a disagreement stops the run before the export)
+          decides as it trains, one session per step so each round is uploaded as it
+          ends; audit_rounds() checks each decision against the rule, and a
+          disagreement stops the run before the export)
   parity  the final export: bit-exact pack, every type as mapped, size within 0.5% of
           the estimate, llama.cpp KLD <= 0.01 nats/token and top-1 >= 98% against a
           BF16 GGUF of the same weights, llama-tokenize == HF
@@ -126,6 +127,7 @@ Z_ONE_SIDED = 1.645  # one-sided 95%
 K_BY_OUTCOME = {"none": 2, "mixed": 8, "all": 4}  # record answers by the original's 0/4, mixed, 4/4
 KEEP_KL_DROP, KEEP_SE = 0.05, 2.0
 ROUNDS_MAX, ROUNDS_STOP_AFTER = 4, 2
+ONPOLICY_SESSIONS = ROUNDS_MAX + 1  # qat onpolicy sessions: each trains a round; the last only judges
 PARITY = {"size_rel": 0.005, "kld": 0.01, "top1": 0.98}
 LLAMA_CHECK_SE = 2.0
 BOOT_DRAWS = 4000
@@ -168,7 +170,8 @@ L40S_ANSWERS_PER_MIN = 728 / 234
 LLAMA_ANSWERS_PER_MIN = 100 / 60  # llama-server on the L40S, ~100 answers an hour in run 2
 GUESS = {"setup": 45, "restore": 10, "download": 5, "gguf": 5, "smoke": 30, "gen-measure": 90, "vocab": 30,
          "imatrix": 12, "ptq": 48, "blockap": 60, "upload": 10, "budgets": 12, "rates": 18, "gen-train": 36,
-         "e2e": 50, "onpolicy": 4 * 45, "final": 24, "choice": 2, "rebuild": 10, "rescore": 18}
+         "e2e": 50, "onpolicy": 4 * 45, "onpolicy-judge": 15, "final": 24, "choice": 2, "rebuild": 10,
+         "rescore": 18}
 ROLLOUT_TOKENS = 8000  # mean tokens of an on-policy answer, for the time guess
 
 
@@ -186,6 +189,7 @@ def minutes() -> dict[str, float]:
         answers = a["fresh"] * a["rollouts"] + a["held"] * 2
         m["onpolicy"] = a["rounds"] * (answers * ROLLOUT_TOKENS / roll + 2 * a["fresh"] * a["rollouts"]
                                        * ROLLOUT_TOKENS / qat) / 60 + a["rounds"] * 10
+        m["onpolicy-judge"] = a["held"] * 2 * ROLLOUT_TOKENS / roll / 60 + 10
     return m
 
 
@@ -388,7 +392,7 @@ def traces_progress(session: str) -> float | None:
 
 def vocab_dir() -> Path | None:
     sha = traces_sha()
-    return W / f"vocab-{h(sha, MODEL, 'vocab run: 49152, 65536, then none')}" if sha else None
+    return W / f"vocab-{h(sha, MODEL, 'vocab run: the measured set, 65536, then none')}" if sha else None
 
 
 def vocab() -> dict | None:
@@ -1293,9 +1297,12 @@ def register(step: Step) -> None:
 
 
 def run_vocab(step: Step) -> None:
-    """S1.6 (stages/vocab.py run): trim to 49,152 rows if the gates pass on the original's
-    held-out thinking, else 65,536, else no trim (its exit code 3). The vocab's hash in
-    the names downstream is the trimmed tokenizer's sha256."""
+    """S1.6 (stages/vocab.py run): trim to the measured set (the ids the traces, statements
+    and probe keep; the plan's estimate is ~49,152 rows) if the gates pass on the
+    original's held-out thinking, else 65,536, else no trim (its exit code 3). Nothing
+    downstream assumes a size: horizon's byte table comes from the trimmed (or untrimmed)
+    files, and the preflight from its exact bytes. The vocab's hash in the names
+    downstream is the trimmed tokenizer's sha256."""
     V, T = vocab_dir(), traces_file()
     V.mkdir(parents=True, exist_ok=True)
     sh(step, gpu(f"python -m stages.vocab run --hf {HF_DIR} --out {V}/hf --traces {T} --codebench {CODEBENCH} "
@@ -1348,15 +1355,24 @@ def trimmed_bf16(step: Step) -> Path:
 
 def run_ptq(step: Step) -> None:
     """S1.8 (stages/horizon.py run): PTQ GGUFs per type, the delta-KL sweep, the knapsack
-    up to the budget, the chosen map verified; then the preflight."""
+    up to the budget, the chosen map verified; then the preflight. When even the
+    cheapest map at the kept vocab is over the budget (horizon's exit 3, floor.json),
+    nothing is swept and the preflight fails on that floor, which stops the run at the
+    gate (the upload still runs)."""
     P, d, g0, v = ptq_dir(), imatrix_dir(), gate("gate0"), vocab()
     bf = trimmed_bf16(step)
     teacher = f" --teacher {HF_DIR} --vocab-index {v['index']}" if v.get("index") else ""
     sh(step, gpu(f"python -m stages.horizon run --hf {vocab_hf()} --bf16 {bf} --traces {traces_file()} "
                  f"--llama-cpp {LLAMA_CPP} --imatrix {d}/work/imatrix.gguf --budget-gb {g0['budget_gb']:.6f} "
-                 f"--out {P}{teacher}"))
-    hz = load(P / "horizon.json")
-    pf = preflight(hz["bytes"], g0["budget_gb"], g0["R0"], (P / "map.json").exists())
+                 f"--out {P}{teacher} || [ $? -eq 3 ]"))
+    hz, floor = load(P / "horizon.json"), load(P / "floor.json")
+    if floor and floor.get("over"):
+        pf = {**preflight(floor["floor_bytes"], g0["budget_gb"], g0["R0"]), "floor": True,
+              "note": "the cheapest map at the kept vocab; nothing was swept"}
+    elif hz:
+        pf = preflight(hz["bytes"], g0["budget_gb"], g0["R0"], (P / "map.json").exists())
+    else:
+        raise RuntimeError(f"horizon run wrote neither {P}/horizon.json nor {P}/floor.json")
     dump(P / "preflight.json", pf)
     above(f"    preflight: {pf['gb']:.3f} GB against a budget of {pf['budget_gb']:.3f} GB and R0 {pf['R0']:.1f}: "
           + ("pass" if pf["pass"] else f"fail ({pf['why']})"))
@@ -1364,7 +1380,8 @@ def run_ptq(step: Step) -> None:
 
 def ptq_done() -> bool:
     P = ptq_dir()
-    return bool(P and (P / "preflight.json").exists() and (P / "map.json").exists())
+    pf = load(P / "preflight.json") if P else None
+    return bool(pf and ((P / "map.json").exists() or pf.get("floor")))
 
 
 def run_export(step: Step, state: Path, out: Path) -> dict:
@@ -1417,7 +1434,7 @@ def run_rates(step: Step) -> None:
         raise RuntimeError("vLLM smoke on the B200 failed: " + "; ".join(bad))
     sh(step, gpu(f"python -m stages.qat e2e --state {B}/state --teacher {HF_DIR} --traces {traces_file()}"
                  f"{vocab_flag()} --tokens {RATES['qat_tokens']} --length {E2E['length']} --eval-every 1000000 "
-                 f"--held-rows 1 --held-length 2048 --out {R}/qat"))
+                 f"--held-n 1 --held-length 2048 --out {R}/qat"))
     q = load(R / "qat" / "e2e.json") or {}
     ev = ((load(d / "out" / "eval.json") or {}).get("candidates") or [{}])[0].get("code") or {}
     dump(R / "rates.json", {"qat_tok_s": q["tokens"] / (q["minutes"] * 60) if q.get("minutes") else None,
@@ -1443,16 +1460,24 @@ def e2e_done() -> bool:
     return bool(E and (E / "e2e.json").exists() and (E / "state").exists())
 
 
-def run_onpolicy(step: Step) -> None:
-    """S2.5 (qat onpolicy, which resumes from its state.json): up to ROUNDS_MAX rounds,
-    each judged against the last kept model on the same held-out problems; then every
-    decision is checked against the plan's rule (audit_rounds) before anything ships."""
+def run_onpolicy(step: Step, session: int) -> None:
+    """S2.5, one session of qat onpolicy (it resumes from its state.json): the model to
+    judge served alone, its held-out and fresh rollouts, their labels, then the judging
+    against the last kept model on the same held-out problems and the next round's
+    training. One step per session, so the upload hook sends each round to the bucket as
+    it ends (a session is ~45 min of B200 time). Once the rounds are done, every decision
+    is checked against the plan's rule (audit_rounds) before anything ships."""
     O, a = onpolicy_dir(), ONPOLICY
     sh(step, gpu(f"python -m stages.qat onpolicy --work {O} --state {e2e_dir()}/state --teacher {HF_DIR} "
                  f"--problems {CODEBENCH} --traces {traces_file('train')}{vocab_flag()} --rounds {a['rounds']} "
-                 f"--fresh {a['fresh']} --rollouts {a['rollouts']} --held {a['held']}"))
+                 f"--fresh {a['fresh']} --rollouts {a['rollouts']} --held {a['held']} --until-session {session}"))
     st = load(O / "state.json") or {}
-    bad = ([] if st.get("done") else ["the rounds are not done"]) + audit_rounds(st, a["rounds"])
+    if not st.get("done"):
+        if session < ONPOLICY_SESSIONS and st.get("session", 0) > session:
+            return  # the next session's step goes on
+        raise RuntimeError(f"qat onpolicy left session {session} unfinished: {O}/state.json says "
+                           f"session {st.get('session')}, done {st.get('done')}")
+    bad = audit_rounds(st, a["rounds"])
     dump(O / "audit.json", {"ok": not bad, "problems": bad, "final": st.get("final"),
                             "rounds": [{"round": r.get("round"), "kept": r.get("kept"),
                                         "rule": round_rule(r.get("rules") or {})} for r in st.get("rounds") or []]})
@@ -1465,10 +1490,13 @@ def onpolicy_done() -> bool:
     return bool(O and (O / "onpolicy.json").exists() and (load(O / "audit.json") or {}).get("ok"))
 
 
-def onpolicy_progress() -> float | None:
+def onpolicy_session_done(session: int) -> bool:
+    """Session `session` of the rounds has run (or the rounds ended before it, audited)."""
     O = onpolicy_dir()
     st = load(O / "state.json") if O else None
-    return min(0.99, st.get("trained", 0) / ONPOLICY["rounds"]) if st else None
+    if not st:
+        return False
+    return onpolicy_done() if st.get("done") else st.get("session", 0) > session
 
 
 def run_final(step: Step) -> None:
@@ -1476,6 +1504,8 @@ def run_final(step: Step) -> None:
     F, P = final_dir(), ptq_dir()
     ex = run_export(step, final_state(), F)
     if not (F / "dequant-bf16.gguf").exists():  # the same weights in BF16, for llama.cpp's KLD
+        # the converter must know a trimmed tokenizer's hash (vocab_index.json travels with the checkpoint)
+        sh(step, f"python -m stages.vocab register --llama-cpp {LLAMA_CPP} --hf {F}/vllm")
         sh(step, f"python {LLAMA_CPP}/convert_hf_to_gguf.py {F}/vllm --outtype bf16 --outfile {F}/dequant-bf16.part "
                  f"&& mv {F}/dequant-bf16.part {F}/dequant-bf16.gguf")
     sh(step, gpu(f"python -m stages.horizon ladder --bf16 {F}/dequant-bf16.gguf --gguf {F}/model.gguf "
@@ -1585,8 +1615,13 @@ def write_summary() -> Path:
 
 
 def session_arts(session: str) -> list[Art]:
+    """What the session's steps make, each art once (the on-policy sessions share one)."""
     steps(session)
-    return [a for (s, _), a in STEP_ARTS.items() if s == session and a is not None]
+    out: list[Art] = []
+    for (s, _), a in STEP_ARTS.items():
+        if s == session and a is not None and a.slug not in {x.slug for x in out}:
+            out.append(a)
+    return out
 
 
 def arts_through(session: str) -> list[Art]:
@@ -1736,7 +1771,8 @@ def steps(session: str) -> list[Step]:
                          ("model-bf16.gguf",)), G0),
             step(session, "PTQ, sensitivity, knapsack, preflight", {"": m["ptq"]}, run_ptq, ptq_done,
                  dir_art("ptq", ptq_dir, ("measure",),
-                         ("map.json", "horizon.json", "preflight.json", "bytes.json", "ladder.json", "ladder.txt"),
+                         ("map.json", "horizon.json", "preflight.json", "floor.json", "bytes.json", "ladder.json",
+                          "ladder.txt"),
                          ("cache", "teacher-*.pt", "horizon-*.gguf")), G0),
             step(session, "Block-AP and its export", {"": m["blockap"]}, run_blockap, blockap_done,
                  dir_art("blockap", blockap_dir, ("measure", "train"),
@@ -1746,6 +1782,9 @@ def steps(session: str) -> list[Step]:
             upload_step(session, m),
         ]
     if session == "train":
+        onpolicy_art = dir_art("onpolicy", onpolicy_dir, ("train",),
+                               ("state.json", "onpolicy.json", "audit.json", "config.json", "held.json",
+                                "round*/judge.json", "round*/held.metrics.json"), ("serve",))
         return [
             *common_start(session, m),
             step(session, "Granite 4.2 3B download", {"": m["download"]}, run_download, download_done,
@@ -1759,10 +1798,11 @@ def steps(session: str) -> list[Step]:
                  G1, lambda: traces_progress("train")),
             step(session, "end-to-end KD", {"": m["e2e"]}, run_e2e, e2e_done,
                  dir_art("e2e", e2e_dir, ("train",), ("e2e.json",), ("serve",)), G1),
-            step(session, f"on-policy rounds (up to {ROUNDS_MAX})", {"": m["onpolicy"]}, run_onpolicy, onpolicy_done,
-                 dir_art("onpolicy", onpolicy_dir, ("train",),
-                         ("state.json", "onpolicy.json", "audit.json", "config.json", "held.json", "round*/judge.json",
-                          "round*/held.metrics.json"), ("serve",)), G1, onpolicy_progress),
+            *[step(session, f"on-policy session {k} of up to {ONPOLICY_SESSIONS}"
+                   + (" (judges the last round)" if k == ONPOLICY_SESSIONS else f" (round {k})"),
+                   {"": m["onpolicy"] / ROUNDS_MAX if k < ONPOLICY_SESSIONS else m["onpolicy-judge"]},
+                   lambda s, k=k: run_onpolicy(s, k), lambda k=k: onpolicy_session_done(k), onpolicy_art, G1)
+              for k in range(1, ONPOLICY_SESSIONS + 1)],
             step(session, "final export and parity", {"": m["final"]}, run_final, final_done,
                  dir_art("final", final_dir, ("train", "read"),
                          ("export.json", "kld.json", "tokenize.json", "parity.json", "model.gguf.sha256"),
@@ -1871,7 +1911,8 @@ def gate_lines() -> list[str]:
                              for t in v.get("tried", [])))
     g = gate("preflight")
     if g:
-        out.append(f"Preflight: PTQ map {g['gb']:.3f} GB, budget {g['budget_gb']:.3f} GB, "
+        out.append(f"Preflight: {'cheapest possible map' if g.get('floor') else 'PTQ map'} {g['gb']:.3f} GB, "
+                   f"budget {g['budget_gb']:.3f} GB, "
                    f"40 x size = {GOAL_PTS_PER_GB * g['gb']:.1f} vs R0 {g['R0']:.1f}: "
                    + ("pass" if g["pass"] else f"STOP ({g['why']})"))
     for name, n in (("gate1", "Gate 1"), ("gate2", "Gate 2")):
@@ -2130,7 +2171,7 @@ def rescore_main(argv: list[str]) -> int:
     rows = [json.loads(x) for x in src.read_text().splitlines() if x.strip()]
     ids = {x["id"] for x in rows}
     probs = {p["id"]: cap_cases(p, a.max_cases) for p in
-             codebench.load_suite("livecodebench", cfg["code_eval_dir"], cfg["lcb_since"]) if p["id"] in ids}
+             codebench.load_suite("livecodebench", cfg["code_eval_dir"], cfg["lcb_since"], ids=ids)}
     items = [codebench.job(probs[x["id"]], x["answer"], codebench.extract_code(x["answer"])) for x in rows]
     results = sandbox.run_many(items, timeout=a.timeout)
     out = a.job / "work" / "code_eval" / f"{a.name}-allcases.jsonl"

@@ -143,7 +143,12 @@ def _row_order(gguf, t, hf: np.ndarray, gname: str, heads: dict[str, int]) -> np
 
 
 def convert(hf_dir: str | Path, out: Path, llama_cpp: str | Path, outtype: str = "bf16") -> Path:
-    """hf_dir as a GGUF by the llama.cpp checkout's convert_hf_to_gguf.py."""
+    """hf_dir as a GGUF by the llama.cpp checkout's convert_hf_to_gguf.py. A trimmed
+    checkpoint's tokenizer is registered with that converter first (vocab.register, a
+    no-op on an untrimmed one): the converter refuses a tokenizer hash it does not know,
+    and the VM's checkout is a fresh clone every session."""
+    from stages import vocab
+    vocab.register(llama_cpp, hf_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, str(Path(llama_cpp) / "convert_hf_to_gguf.py"), str(hf_dir),
                     "--outtype", outtype, "--outfile", str(out)], check=True)
@@ -362,6 +367,9 @@ def vllm_checkpoint(gguf_path, hf_dir, out_dir) -> dict:
         raise ValueError(f"{len(extra)} parameters of {hf_dir} are not in {gguf_path}, so vLLM would score weights "
                          f"llama.cpp does not have: {', '.join(extra[:8])}{' ...' if len(extra) > 8 else ''}")
     save_checkpoint(model, tok, out_dir)
+    index = Path(hf_dir) / "vocab_index.json"  # a trimmed tokenizer's record, which vocab.register reads
+    if index.exists():
+        shutil.copy2(index, out_dir / index.name)
     log(f"gguf_build: {out_dir} written from {gguf_path.name}, relative error by kind {err}")
     return {"rel_err": err, "path": str(out_dir)}
 

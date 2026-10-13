@@ -513,3 +513,70 @@ def test_smoke_trims_a_dummy_vocab_and_compares_llama_with_hf(tmp_path, llama):
     rep = vocab.smoke(src, llama, tmp_path)
     assert rep["pass"], rep
     assert rep["rows"] < len(tok_of(src)) and rep["trimmed"]["texts"] == len(vocab.EDGE_TEXTS) + 1
+
+
+def test_conversions_register_a_trimmed_checkpoint_with_a_fresh_converter(tmp_path, llama):
+    """Every session clones llama.cpp anew, so the trimmed tokenizer's hash is not in its
+    converter: gguf_build.convert, vocab.convert_vocab and dense's BF16 conversion each
+    register it first (from vocab_index.json) instead of failing on the trimmed model."""
+    from stages import dense, gguf_build
+    from stages._util import Job
+    src, out = tmp_path / "src", tmp_path / "out"
+    toy(src)
+    vocab.register(llama, src, pre="dbrx")  # the original's hash, as the pinned converter would know it
+    fresh = vocab._converter_file(llama).read_text()
+    vocab.trim(src, out, code_kept(src), llama_cpp=llama)
+    h = vocab.load_index(out)["chkhsh"]
+
+    def new_session():
+        vocab._converter_file(llama).write_text(fresh)
+        assert h not in vocab.pre_table(llama)[1]
+
+    new_session()
+    r = subprocess.run([sys.executable, str(llama / "convert_hf_to_gguf.py"), str(out), "--outfile",
+                        str(tmp_path / "raw.gguf"), "--outtype", "f32"], capture_output=True, text=True)
+    assert r.returncode != 0  # the converter refuses a tokenizer hash it does not know
+    gguf_build.convert(out, tmp_path / "built.gguf", llama)
+    assert (tmp_path / "built.gguf").exists() and vocab.pre_table(llama)[1][h] == "dbrx"
+    new_session()
+    assert vocab.convert_vocab(llama, out, tmp_path / "vocab.gguf").exists()
+    new_session()
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "config.json").write_text(json.dumps({"llama_cpp": str(llama)}))
+    dense.make_ggufs(Job(job), out, tmp_path / "dense-bf16.gguf", None)
+    assert (tmp_path / "dense-bf16.gguf").exists()
+    assert vocab.register(llama, src) is None  # an untrimmed checkpoint: nothing to register
+
+
+def test_selection_and_gate_halves_split_the_held_out_problems_evenly():
+    """A second crc32 put every held-out problem of one id length in the selection half,
+    leaving the gate a single problem; traces.half splits them evenly."""
+    rows = [{"id": f"cc/{i}_{c}", "prompt": [1], "tokens": [2]} for i in range(1000, 9000) for c in "AB"]
+    held = traces.split(rows)[1]
+    sel, gat = vocab._halves(held)
+    assert not {r["id"] for r in sel} & {r["id"] for r in gat} and len(sel) + len(gat) == len(held)
+    assert 0.4 < len(gat) / len(held) < 0.6
+    one = [r for r in held if r["id"] == held[0]["id"]]
+    sel, gat = vocab._halves(one)  # one problem: the gate still gets it
+    assert gat == one and not sel
+
+
+def test_llama_tokenize_runs_a_cut_output_again_and_then_fails_loudly(tmp_path):
+    """The pinned llama.cpp's tools can exit 0 with their output cut short; a run without a
+    whole "[...]" line is repeated, and raises after TOKENIZE_TRIES."""
+    runs = tmp_path / "runs"
+    fake = tmp_path / "llama-tokenize"
+    fake.write_text(f"#!{sys.executable}\n"
+                    "import sys\nfrom pathlib import Path\n"
+                    f"p = Path({str(runs)!r})\n"
+                    "n = int(p.read_text()) if p.exists() else 0\n"
+                    "p.write_text(str(n + 1))\n"
+                    "sys.stdin.read()\n"
+                    "print('[1, 2, 3]' if n == 1 else '[1, 2', end='' if n != 1 else '\\n')\n")
+    fake.chmod(0o755)
+    assert vocab.llama_tokenize(fake, tmp_path / "x.gguf", ["some text"], workers=1) == [[1, 2, 3]]
+    assert runs.read_text() == "2"  # the first run's output was cut: it ran again
+    runs.write_text("5")  # from now on every run is cut
+    with pytest.raises(RuntimeError, match="no whole id line in 3 runs"):
+        vocab.llama_tokenize(fake, tmp_path / "x.gguf", ["some text"], workers=1)

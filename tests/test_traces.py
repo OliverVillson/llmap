@@ -63,6 +63,25 @@ def test_split_is_by_problem_stable_across_processes_and_about_held_frac():
     assert len(T.split(few)[1]) == 1  # too few problems for 2%: still one held out
 
 
+def test_halves_and_other_seeds_are_independent_of_the_crc32_split():
+    """crc32 is linear: for ids of one length, a crc32 of a prefixed id is the id's own
+    crc32 xor a constant, so a second crc32 put every held-out id in the same half and
+    made seeds 0 and 1 almost the same order. The split stays crc32 (seed 0); the rest
+    is sha256."""
+    import statistics
+    import zlib
+    ids = [f"cc/{i}_{c}" for i in range(1000, 9000) for c in "AB"]
+    assert all(T.bucket(i) == zlib.crc32(i.encode()) / 2 ** 32 for i in ids[:50])  # the split did not move
+    held = [i for i in ids if T.is_held(i)]
+    assert 250 < len(held) < 400
+    halves = [T.half(i) for i in held]
+    assert 0.4 < sum(halves) / len(held) < 0.6
+    assert 0.4 < sum(T.bucket(i, 1) < 0.5 for i in held) / len(held) < 0.6
+    for a, b in ((0, 1), (1, 2), (0, "gate")):
+        r = statistics.correlation([T.bucket(i, a) for i in ids[:4000]], [T.bucket(i, b) for i in ids[:4000]])
+        assert abs(r) < 0.05, (a, b, r)
+
+
 # ---------- batches ----------
 
 def rows_of(lengths, prompt=4):

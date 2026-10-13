@@ -652,8 +652,8 @@ def contest_problems(cfg) -> list[dict]:
     if cfg.data_contest_source == "codecontests":
         rows = codebench.load_suite("codecontests", cfg.code_eval_dir)
         lcb = codebench.suite_path("livecodebench", cfg.code_eval_dir)
-        seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite("livecodebench", cfg.code_eval_dir))
-                           ) if lcb.exists() else set()
+        seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite(
+            "livecodebench", cfg.code_eval_dir, fields=("id", "prompt")))) if lcb.exists() else set()
         out = [p for p in rows if len(p["prompt"]) <= MAX_INPUT_CHARS and not (_shingles(p["prompt"]) & seen)]
         print(f"[data] contest: {len(out)} of {len(rows)} CodeContests problems kept "
               f"({len(rows) - len(out)} too long or overlapping LiveCodeBench)", flush=True)

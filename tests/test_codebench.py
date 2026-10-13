@@ -404,6 +404,24 @@ def test_load_suite_filters_by_date_and_limit(tmp_path):
         cb.load_suite("multipl-e-js", tmp_path)
 
 
+def test_load_suite_streams_and_filters_row_by_row(tmp_path, monkeypatch):
+    """A LiveCodeBench fetch with every case stored is gigabytes: load_suite reads it a
+    line at a time (never the whole file), filters each row as it goes, keeps only the
+    fields asked for and stops at the limit."""
+    rows = [{"id": str(i), "language": "py", "prompt": f"p{i}", "tests": {"cases": "x" * 1000}, "date": d}
+            for i, d in enumerate(["2024-12-31", "2025-01-01", "2025-03-01", "2025-04-30", "2025-05-01", ""])]
+    path = tmp_path / "livecodebench.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows) + "{not json\n")
+    monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("load_suite read the whole file"))
+    window = cb.load_suite("livecodebench", tmp_path, "2025-01-01", 4, until="2025-04-30")
+    assert [r["id"] for r in window] == ["1", "2", "3", "5"]  # undated rows are kept, as with since
+    assert [r["id"] for r in cb.load_suite("livecodebench", tmp_path, limit=2, ids={"2", "4", "9"})] == ["2", "4"]
+    slim = cb.load_suite("livecodebench", tmp_path, limit=1, fields=("id", "prompt"))
+    assert slim == [{"id": "0", "prompt": "p0", "language": "python", "suite": "livecodebench"}]
+    with pytest.raises(json.JSONDecodeError):  # without a limit the broken last line is reached
+        cb.load_suite("livecodebench", tmp_path, ids={"0"})
+
+
 def test_heldout_rows_from_code_taskspecs():
     held = [{"input": "write f", "reference": "x", "tests": "assert f()", "language": "javascript"},
             {"input": "text task", "reference": "y"}]

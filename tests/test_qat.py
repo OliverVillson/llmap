@@ -155,6 +155,25 @@ def test_block_ap_lowers_every_layers_error_and_the_kl_and_resumes_by_layer(tmp_
     assert all(torch.equal(v, sd[k]) for k, v in again.state_dict().items())
 
 
+def test_block_ap_keeps_as_many_windows_as_the_cache_device_has_room_for(monkeypatch):
+    """2048 windows x 2048 tokens x 2560 hidden in bf16, twice, is ~43 GB of host RAM: on a VM
+    with less free, Block-AP keeps what fits (after a reserve) and says so, and refuses when
+    too few would be left."""
+    per = 2 * 2048 * 2560 * 2  # bytes of one window in the two caches
+    full = qat.fit_windows(2048, 2048, 2560, 2, "cpu", free=100_000_000_000)
+    assert full["windows"] == 2048 and full["cache_gb"] == round(2048 * per / 1e9, 2) and full["free_gb"] == 100.0
+    short = qat.fit_windows(2048, 2048, 2560, 2, "cpu", free=30_000_000_000)
+    assert short["windows"] == int((30e9 - qat.CACHE_RESERVE_GB["cpu"] * 1e9) // per) < 2048
+    assert short["cache_gb"] <= 30 - qat.CACHE_RESERVE_GB["cpu"]
+    with pytest.raises(RuntimeError, match="free memory, or pass --cache-device"):
+        qat.fit_windows(2048, 2048, 2560, 2, "cpu", free=10_000_000_000)
+    assert qat.fit_windows(8, 512, 2560, 2, "cpu", free=9_000_000_000)["windows"] == 8  # a small ask is not refused
+    monkeypatch.setattr(qat, "free_bytes", lambda device: None)  # unknown: the request stands
+    assert qat.fit_windows(2048, 2048, 2560, 2, "cpu")["windows"] == 2048
+    monkeypatch.undo()
+    assert qat.free_bytes("cpu") > 0  # MemAvailable of /proc/meminfo
+
+
 def test_block_windows_start_at_the_prompt_and_drop_ids_the_trim_dropped():
     rows = rows_of(6, vocab=range(3, 300), answer=(60, 61)) + [{"id": "short", "prompt": [5] * 4, "tokens": [6] * 4}]
     rows[0]["tokens"][0] = 310
@@ -419,6 +438,7 @@ def test_cli_block_then_e2e_then_export(tmp_path, monkeypatch):
         "--windows", 16, "--length", 64, "--batch", 4, "--epochs", 1, "--lr", 1e-3)
     block = json.loads((tmp_path / "block" / "block.json").read_text())
     assert len(block["layers"]) == 2 and block["windows"] == 16 and not (tmp_path / "block" / "layers").exists()
+    assert block["cache"]["windows"] == 16 and block["cache"]["device"] == "cpu"  # sized from MemAvailable
     cli("e2e", "--state", tmp_path / "block", "--teacher", hf, "--traces", tr, "--out", tmp_path / "e2e", "--tokens", 4000,
         "--length", 96, "--batch", 4, "--lr", 1e-3, "--eval-every", 5, "--held-rows", 2, "--held-length", 96)
     e2e = json.loads((tmp_path / "e2e" / "e2e.json").read_text())
@@ -649,6 +669,40 @@ def test_onpolicy_rounds_sample_label_judge_train_and_resume(rounds):
     c2 = str(r.served[-1].parent)
     assert st["final"] == (c2 if st["rounds"][1]["kept"] else str(cand))
     assert r.round() == st  # done: nothing more
+
+
+def test_onpolicy_until_session_runs_one_session_per_call(tmp_path, monkeypatch):
+    """--until-session N stops once session N is done, so a caller can upload after each
+    round; a rerun continues, and only the call that ends the rounds writes onpolicy.json."""
+    work = tmp_path / "w"
+    qat.init_onpolicy(work, tmp_path / "start", qat.OnPolicy(teacher="t", problems="p", rounds=2))
+    ran = []
+
+    def one(w):  # a session: trains a round, or (rounds used up) only judges and ends the run
+        st = qat.read_state(w)
+        ran.append(st["session"])
+        if st["trained"] >= 2:
+            st.update(done=True, final=st["best"])
+        else:
+            st.update(trained=st["trained"] + 1, session=st["session"] + 1)
+        qat.write_state(w, st)
+        return st
+
+    monkeypatch.setattr(qat, "onpolicy_round", one)
+
+    def cli(*args):
+        monkeypatch.setattr(sys, "argv", ["qat", "onpolicy", "--work", str(work), *map(str, args)])
+        qat.main()
+
+    for k in (1, 2):
+        cli("--until-session", k)
+        assert ran == list(range(1, k + 1)) and not (work / "onpolicy.json").exists()
+    cli("--until-session", 2)  # already past session 2: nothing runs
+    assert ran == [1, 2]
+    cli("--until-session", 3)
+    assert ran == [1, 2, 3] and json.loads((work / "onpolicy.json").read_text())["final"] == str(tmp_path / "start")
+    cli()  # done: nothing more
+    assert ran == [1, 2, 3]
 
 
 def test_onpolicy_stops_after_two_rounds_in_a_row_not_kept(rounds, monkeypatch):

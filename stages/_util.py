@@ -116,8 +116,8 @@ class Config:
     # Suites: multipl-e-py/js/ts/cpp, c-set, livecodebench, heldout.
     code_eval_suites: list[str] = field(default_factory=list)
     code_eval_dir: str = os.environ.get("LOBBOT_CODEBENCH", "/mnt/nvme/codebench")  # scripts/fetch_codebench.py
-    # A llama.cpp LoRA GGUF loaded on top of the evaluated GGUF (llama-server --lora), e.g.
-    # blackhole's repair adapter (stages/qheal.py). Empty = none.
+    # A llama.cpp LoRA GGUF loaded on top of the evaluated GGUF (llama-server --lora). Nothing
+    # on the Event Horizon path sets it (qheal ships no adapter any more). Empty = none.
     eval_lora: str = ""
     code_eval_samples: int = 1  # answers per problem; 1 is greedy pass@1, more sample at code_eval_temperature
     code_eval_k: list[int] = field(default_factory=lambda: [1])

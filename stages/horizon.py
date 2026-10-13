@@ -14,16 +14,17 @@ then bought by an exact knapsack:
    fixed part (header, metadata, tokenizer, norms) measured from the PTQ files. A map's
    file size is then known to the byte before it is written; the PTQ files must agree
    with the table exactly or the step fails. (bits.REL_MSE is a rule of thumb from
-   another model and plays no part.)
+   another model and plays no part.) When even the floor map (step 5) is over the
+   budget, e.g. at an untrimmed vocab, the run stops here: floor.json, exit 3.
 3. Dequantization cache. gguf-py dequantizes every tensor of every PTQ file once, in
    a process pool, to .npy files in HF row order (q/k un-permuted) and the student's
    dtype, so a swap is a memory-mapped copy, not a GGUF read.
 4. Teacher log-probs. The teacher runs once over held-out trace windows (traces.split's
    held-out problems, not the imatrix text or any training window) and its log-probs
    at every weighted position are cached, sliced to the kept vocab and renormalised as
-   sft.kd_kl(index=...) does. The held-out problems are halved by a second hash: one
-   half chooses (the sweep), the other checks (verify), so the check is not the text
-   the choice was fitted on.
+   sft.kd_kl(index=...) does. The held-out problems are halved by traces.half (a
+   sha256, the halving vocab uses too): one half chooses (the sweep), the other checks
+   (verify), so the check is not the text the choice was fitted on.
 5. Sweep. From the floor map (every group at its cheapest allowed type), each group in
    turn is swapped to each alternative type and the KL measured: layer x {gate+up,
    down, q+o, k+v} x alternatives, plus the embedding and the head. gain = KL(floor) -
@@ -199,6 +200,17 @@ def fixed_bytes(ptq: dict[str, Path], table: dict[str, dict[str, int]]) -> int:
 
 def predict_bytes(types: dict[str, str], table: dict[str, dict[str, int]], fixed: int) -> int:
     return fixed + sum(table[n][t] for n, t in types.items())
+
+
+class OverBudget(ValueError):
+    """Even the cheapest map is over the byte budget (the CLI exits 3)."""
+
+
+def floor_bytes(gbytes: dict[str, dict[str, int]], fixed: int, head_min: str = HEAD_MIN) -> int:
+    """The smallest file any map makes: every group at its cheapest type (the head at
+    head_min or above), plus the fixed bytes. Known from the PTQ files, before the sweep."""
+    return fixed + sum(min(b for t, b in by_t.items() if g != "output" or not head_min or bits(t) >= bits(head_min))
+                       for g, by_t in gbytes.items())
 
 
 # ---------- llama-quantize ----------
@@ -439,10 +451,11 @@ class Held:
 
 
 def half(pid: str) -> int:
-    """0 or 1 for a problem id, stable across processes. Not a second crc32: crc32 is
-    linear, so among the ids whose crc32 put them in the held-out share, a crc32 of a
-    prefixed id clusters (5 of 6 held-out ids landed on one side in a test)."""
-    return hashlib.sha256(str(pid).encode()).digest()[0] & 1
+    """0 or 1 for a problem id, stable across processes: traces.half, the rule vocab's
+    selection and gate halves use too. Not a second crc32: crc32 is linear, so among the
+    ids whose crc32 put them in the held-out share, a crc32 of a prefixed id clusters
+    (5 of 6 held-out ids landed on one side in a test)."""
+    return traces.half(pid)
 
 
 def held_rows(traces_path: str | Path, role: str) -> list[dict]:
@@ -912,6 +925,13 @@ def run(hf_dir: str, bf16: Path, traces_path: Path, out: Path, llama_cpp, budget
     (out / "bytes.json").write_text(json.dumps({"alignment": align, "fixed": fixed, "groups": grp,
                                                 "group_bytes": gbytes, "tensors": table}, indent=1))
     log(f"horizon: byte table exact against {len(ptq_files)} PTQ files; fixed part {fixed} bytes")
+    floor = floor_bytes(gbytes, fixed, head_min)
+    if floor > budget_bytes:  # e.g. an untrimmed vocab: refuse before the hour of cache, teacher and sweep
+        (out / "floor.json").write_text(json.dumps({"floor_bytes": floor, "floor_gb": round(floor / 1e9, 6),
+                                                    "budget_bytes": budget_bytes, "over": True}, indent=1))
+        raise OverBudget(f"the cheapest map is {floor / 1e9:.4f} GB, over the {budget_bytes / 1e9:.4f} GB budget; "
+                         "nothing to sweep")
+    (out / "floor.json").unlink(missing_ok=True)
     emit(STAGE, pct=0, msg="dequantization cache")
     dtype = "bf16" if torch.cuda.is_available() else "f32"
     cache = build_cache(ptq_files, bf16, list(shapes), out / "cache", gguf, heads=qk_heads(bf16, hf_dir, gguf),
@@ -991,12 +1011,16 @@ def main() -> None:
         def window(s: str) -> tuple[int, int]:
             x, y = s.lower().split("x")
             return int(x), int(y)
-        run(a.hf, Path(a.bf16), Path(a.traces), Path(a.out), a.llama_cpp, int(a.budget_gb * 1e9),
-            imatrix=Path(a.imatrix) if a.imatrix else None, teacher=a.teacher, vocab_index=a.vocab_index,
-            types=tuple(a.types.split(",")), head_min=a.head_min, sweep_window=window(a.sweep),
-            check_window=window(a.check), do_ladder=a.ladder != "off",
-            ladder_window=window(a.ladder) if a.ladder != "off" else (LADDER_CTX, LADDER_CHUNKS),
-            workers=a.workers)
+        try:
+            run(a.hf, Path(a.bf16), Path(a.traces), Path(a.out), a.llama_cpp, int(a.budget_gb * 1e9),
+                imatrix=Path(a.imatrix) if a.imatrix else None, teacher=a.teacher, vocab_index=a.vocab_index,
+                types=tuple(a.types.split(",")), head_min=a.head_min, sweep_window=window(a.sweep),
+                check_window=window(a.check), do_ladder=a.ladder != "off",
+                ladder_window=window(a.ladder) if a.ladder != "off" else (LADDER_CTX, LADDER_CHUNKS),
+                workers=a.workers)
+        except OverBudget as e:
+            log(f"horizon: {e} ({Path(a.out) / 'floor.json'})")
+            sys.exit(3)
 
 
 if __name__ == "__main__":

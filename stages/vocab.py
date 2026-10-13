@@ -77,7 +77,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -89,6 +88,7 @@ MIN_PROB = 1e-6  # mean probability at answer positions that keeps an id
 DROP_MEAN, DROP_P999 = 1e-4, 1e-2  # the original's mass on dropped ids per answer position
 NLL_RISE = 0.003  # NLL per byte may rise by 0.3%
 N_TEXTS = 500  # llama-tokenize == HF on this many texts
+TOKENIZE_TRIES = 3  # llama-tokenize runs per text when its id line is missing (see llama_tokenize)
 FALLBACK = (None, 65536)  # the measured set, then 65,536 rows; after that no trim
 PROBE_WINDOWS, GATE_WINDOWS, WINDOW = 32, 16, 8192
 CHUNK = 1024  # positions per softmax chunk: 1024 x 100k fp32 is 0.4 GB
@@ -257,9 +257,10 @@ def count(tok, vocab_size: int, *, rows=(), problems=()) -> torch.Tensor:
 
 
 def stable(rows: list[dict], salt: str = "w") -> list[dict]:
-    """rows in an order fixed by a crc32 of their problem id (samples of a problem stay
-    together, in file order)."""
-    return sorted(rows, key=lambda r: (zlib.crc32(f"{salt}:{r['id']}".encode()), r["id"]))
+    """rows in an order fixed by a salted hash of their problem id (traces.bucket; samples
+    of a problem stay together, in file order)."""
+    from stages import traces
+    return sorted(rows, key=lambda r: (traces.bucket(r["id"], salt), r["id"]))
 
 
 def _windows(rows: list[dict], length: int, n: int):
@@ -583,22 +584,24 @@ def register(llama_cpp: str | Path, hf_dir: str | Path, pre: str | None = None) 
     converter, by adding `if chkhsh == <hash>: res = <name>` just before the
     converter's `if res is None:`. The name is `pre`, else vocab_index.json's; an
     untrimmed hf_dir (no index) is left alone and None returned. Idempotent; raises if
-    the hash is already mapped to another name. Returns the hash."""
+    the hash is already mapped to another name, or is unknown and no name is given.
+    Returns the hash."""
     if pre is None:
         p = Path(hf_dir) / INDEX
         if not p.exists():
             return None
         pre = load_index(p).get("pre")
-        if not pre:
-            raise ValueError(f"{p} names no pre-tokenizer; trim with llama_cpp or pass pre")
     path = _converter_file(llama_cpp)
     src = path.read_text(encoding="utf-8")
     chktxt, table = pre_table(llama_cpp)
     h = chkhsh(hf_dir, chktxt)
     if h in table:
-        if table[h] != pre:
+        if pre and table[h] != pre:
             raise ValueError(f"chkhsh {h} is already mapped to {table[h]!r} in {path}, not {pre!r}")
         return h
+    if not pre:
+        raise ValueError(f"{Path(hf_dir) / INDEX} names no pre-tokenizer and {path} does not know chkhsh {h}; "
+                         "trim with llama_cpp or pass pre")
     fn = _pre_function(src)
     end = next((n for n in fn.body if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
                 and isinstance(n.test.left, ast.Name) and n.test.left.id == "res"
@@ -623,7 +626,9 @@ def register(llama_cpp: str | Path, hf_dir: str | Path, pre: str | None = None) 
 
 
 def convert_vocab(llama_cpp: str | Path, hf_dir: str | Path, out: str | Path) -> Path:
-    """A vocab-only GGUF of hf_dir by the checkout's converter (what llama-tokenize needs)."""
+    """A vocab-only GGUF of hf_dir by the checkout's converter (what llama-tokenize needs),
+    a trimmed hf_dir's tokenizer registered with it first."""
+    register(llama_cpp, hf_dir)
     out = Path(out)
     r = subprocess.run([sys.executable, str(Path(llama_cpp) / "convert_hf_to_gguf.py"), str(hf_dir), "--vocab-only",
                         "--outfile", str(out)], capture_output=True, text=True)
@@ -637,16 +642,26 @@ def tokenizer_binary(llama_cpp: str | Path) -> Path | None:
     return p if p.exists() else None
 
 
-def llama_tokenize(binary: str | Path, gguf: str | Path, texts: list[str], workers: int = 8) -> list[list[int]]:
+def llama_tokenize(binary: str | Path, gguf: str | Path, texts: list[str], workers: int = 8,
+                   tries: int = TOKENIZE_TRIES) -> list[list[int]]:
     """llama-tokenize's ids for each text: special tokens parsed, no BOS, no escapes,
-    as HF's encode(text, add_special_tokens=False)."""
+    as HF's encode(text, add_special_tokens=False). A run whose output has no whole
+    "[...]" id line is run again (the pinned llama.cpp's tools can exit 0 with their
+    output cut short under load, see horizon._kld_run), then raises."""
     def one(text):
-        r = subprocess.run([str(binary), "-m", str(gguf), "--stdin", "--ids", "--no-bos", "--no-escape",
-                            "--log-disable"], input=text.encode("utf-8"), capture_output=True, timeout=600)
-        lines = [ln for ln in r.stdout.decode("utf-8", "replace").splitlines() if ln.startswith("[")]
-        if r.returncode or not lines:
-            raise RuntimeError(f"llama-tokenize failed ({r.returncode}): {r.stderr.decode(errors='replace')[-500:]}")
-        return json.loads(lines[-1])
+        for i in range(tries):
+            r = subprocess.run([str(binary), "-m", str(gguf), "--stdin", "--ids", "--no-bos", "--no-escape",
+                                "--log-disable"], input=text.encode("utf-8"), capture_output=True, timeout=600)
+            if r.returncode:
+                raise RuntimeError(f"llama-tokenize failed ({r.returncode}): "
+                                   f"{r.stderr.decode(errors='replace')[-500:]}")
+            lines = [ln.strip() for ln in r.stdout.decode("utf-8", "replace").splitlines()]
+            lines = [ln for ln in lines if ln.startswith("[") and ln.endswith("]")]
+            if lines:
+                return json.loads(lines[-1])
+            log(f"llama-tokenize printed no whole id line for a {len(text)}-character text; running it again")
+        raise RuntimeError(f"llama-tokenize printed no whole id line in {tries} runs: "
+                           f"{r.stdout.decode(errors='replace')[-300:]!r} {r.stderr.decode(errors='replace')[-300:]}")
 
     with ThreadPoolExecutor(max(1, workers)) as ex:
         return list(ex.map(one, texts))
@@ -875,12 +890,13 @@ def check(hf_dir: str | Path, trimmed_dir: str | Path, *, model=None, gate_rows=
 # ---------- the S1.6 step ----------
 
 def _halves(held: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(selection, gate) halves of the held-out problems, by a second crc32 of the id."""
+    """(selection, gate) halves of the held-out problems, by traces.half (not a second
+    crc32, which would put nearly every held-out problem on one side)."""
     from stages import traces
-    sel = [r for r in held if traces.bucket(r["id"], seed=1) < 0.5]
-    gat = [r for r in held if traces.bucket(r["id"], seed=1) >= 0.5]
+    sel = [r for r in held if traces.half(r["id"]) == 0]
+    gat = [r for r in held if traces.half(r["id"]) == 1]
     if not gat and sel:  # too few problems: the gate gets one
-        last = max({r["id"] for r in sel}, key=lambda i: traces.bucket(i, seed=1))
+        last = max({r["id"] for r in sel}, key=lambda i: traces.bucket(i, "gate"))
         gat, sel = [r for r in sel if r["id"] == last], [r for r in sel if r["id"] != last]
     return sel, gat
 

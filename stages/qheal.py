@@ -197,15 +197,18 @@ def load_quantized(model, gguf_path: Path, gguf, *, workers: int | None = None, 
 
 
 def export(hf_dir: str, gguf_path: Path, out: Path, gguf, *, workers: int | None = None) -> dict:
-    """The quantized model as a plain HF checkpoint (bf16 on the GPU): the GGUF's weights
-    dequantized, so vLLM scores exactly what llama.cpp runs. Returns the relative error
-    by kind."""
-    from transformers import AutoTokenizer
+    """The quantized model as a plain bf16 HF checkpoint: the GGUF's weights dequantized,
+    so vLLM scores exactly what llama.cpp runs. Loaded in bf16 on the CPU too (as
+    gguf_build.vllm_checkpoint does): load_causal_lm's fp32 there would write a
+    checkpoint twice the size of the one vLLM serves. Returns the relative error by kind."""
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from stages.sft import save_checkpoint
 
     tok = AutoTokenizer.from_pretrained(hf_dir)
-    model = load_causal_lm(hf_dir)
+    key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    model = AutoModelForCausalLM.from_pretrained(hf_dir, **{key: torch.bfloat16})
     err = load_quantized(model, gguf_path, gguf, workers=workers)
     save_checkpoint(model, tok, out)
     log(f"qheal: {out} written from {Path(gguf_path).name}, relative error by kind {err}")

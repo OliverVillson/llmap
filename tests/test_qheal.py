@@ -107,11 +107,14 @@ def test_export_writes_the_gguf_weights(tmp_path):
     with mock.patch.object(sys, "argv", ["x", "export", "--hf", str(tmp_path / "m"), "--gguf", str(tmp_path / "q.gguf"),
                                          "--llama-cpp", str(tmp_path / "no-llama-cpp"), "--out", str(tmp_path / "hf")]):
         qheal.main()
+    from safetensors.torch import load_file
     from transformers import AutoModelForCausalLM
-    back = AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    saved = load_file(str(tmp_path / "hf" / "model.safetensors"))
+    assert {t.dtype for t in saved.values()} == {torch.bfloat16}  # bf16 on the CPU too, not fp32 (twice the size)
+    back = AutoModelForCausalLM.from_pretrained(tmp_path / "hf", dtype=torch.bfloat16)
     m2 = qheal.load_causal_lm(str(tmp_path / "m"))
     qheal.load_quantized(m2, tmp_path / "q.gguf", gguf)
-    assert all(torch.equal(a, b) for a, b in zip(back.state_dict().values(), m2.state_dict().values()))
+    assert all(torch.equal(a, b.to(torch.bfloat16)) for a, b in zip(back.state_dict().values(), m2.state_dict().values()))
 
 
 def test_kl_ladder_runs_the_teacher_once_and_reads_each_gguf_once(tmp_path, monkeypatch):

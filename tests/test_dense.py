@@ -328,6 +328,25 @@ def test_trace_calibration_is_the_training_split_one_sample_each(tmp_path, monke
         dense.trace_calibration(Job(tmp_path / "small"), tmp_path / "traces.jsonl", tmp_path / "tok", max_tokens=10)
 
 
+def test_trace_calibration_seed_shuffles_but_never_moves_the_held_out_split(tmp_path, monkeypatch):
+    """The held-out problems are traces.split's (seed 0) for every step; a calibration seed
+    only reorders the training problems, so it can never put held-out text in the imatrix."""
+    pytest.importorskip("tokenizers")
+    from stages import traces
+
+    monkeypatch.setattr(dense, "IMATRIX_CTX", 64)
+    tok = trace_tokenizer(tmp_path / "tok")
+    write_traces(tmp_path / "traces.jsonl", tok, 40)
+    train = {i for i in range(40) if not traces.is_held(f"cc/{i}", 0.25)}
+    orders = []
+    for seed in (0, 7):
+        text = dense.trace_calibration(Job(tmp_path / f"job{seed}"), tmp_path / "traces.jsonl", tmp_path / "tok",
+                                       held_frac=0.25, seed=seed).read_text()
+        orders.append([int(m) for m in re.findall(r"Problem (\d+):", text)])
+        assert set(orders[-1]) == train, seed
+    assert orders[0] != orders[1]
+
+
 # ---------- the real llama.cpp tools on a tiny model ----------
 
 @pytest.fixture(scope="module")
