@@ -64,7 +64,9 @@ GEN_TOKENS = 12e6  # the training text; the adapter trains on it once
 HEAL_CAP_MINUTES = 100
 # One job at a time on the whole GPU: two servers starting together miscount each
 # other's memory (vLLM saw -13.9 GiB of KV cache on the first run).
-MINUTES = {"setup": 45, "download": 5, "gguf": 5, "score": 40, "gen": 45, "quant": 20, "export": 5}
+MINUTES = ({"setup": 40, "download": 3, "gguf": 3, "score": 30, "gen": 15, "quant": 10, "export": 3, "heal": 30}
+           if e5.B200 else
+           {"setup": 45, "download": 5, "gguf": 5, "score": 230, "gen": 90, "quant": 20, "export": 5, "heal": 100})
 
 
 # Every GPU job waits until the last one's memory is back (a stopped vLLM's engine
@@ -188,7 +190,7 @@ def steps() -> list[Step]:
         Step("training text written", {"": MINUTES["gen"]}, make_text, (W / ".gen-done").exists, text_progress),
         Step("bh15 made", {"": MINUTES["quant"]}, make_quant, (QUANT_JOB / ".done" / "quantize").exists),
         Step("bh15 scored", {"": MINUTES["export"], **score_min}, lambda s: score(s, "bh15"), lambda: scored("bh15")),
-        Step("repair adapter trained", {"": HEAL_CAP_MINUTES}, train_repair, (ADAPTER / "adapter_config.json").exists),
+        Step("repair adapter trained", {"": MINUTES["heal"]}, train_repair, (ADAPTER / "adapter_config.json").exists),
         Step("bh15 + repair scored", {"": MINUTES["export"], **score_min}, lambda s: score(s, "bh15+repair"),
              lambda: scored("bh15+repair")),
         Step("upload to the bucket", {"": 15}, run_upload, (LOGS / ".uploaded").exists),
