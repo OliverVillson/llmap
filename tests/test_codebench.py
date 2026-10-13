@@ -203,8 +203,18 @@ LCB_PARITY = [
     # how a stdin program is run
     ("main guard", "def main():\n    a, b = map(int, input().split())\n    print(a + b)\nif __name__ == '__main__':\n    main()",
      ADD, None, True, True),
+    ("main guard, not last", "def main():\n    a, b = map(int, input().split())\n    print(a + b)\n"
+     "if __name__ == '__main__':\n    main()\nx = 0", ADD, None, False, True),
+    ("star import in the main guard", "if __name__ == '__main__':\n    from operator import add as plus\n"
+     "    from math import *\n    print(plus(*map(int, input().split())) + floor(0.5))", ADD, None, True, True),
+    # top-level statements run inside wrapped_function (make_function), so their names are locals
+    ("top-level names are locals", "x = 1\nprint('x' in globals())", [("", "False\n")], None, True, True),
     ("global statement", "n = 0\ndef f():\n    global n\n    n += 1\na, b = map(int, input().split())\nf()\nprint(a + b + n - 1)",
-     ADD, None, False, True),
+     ADD, None, False, False),
+    ("global statement inside main", "def main():\n    global n\n    n = sum(map(int, input().split()))\n    show()\n"
+     "def show():\n    print(n)\nmain()", ADD, None, True, True),
+    ("top-level return", "a, b = map(int, input().split())\nprint(a + b)\nif a:\n    return\nprint('more')",
+     ADD, None, True, True),
     ("sys.exit(0) after printing", "import sys\nprint(sum(map(int, input().split())))\nsys.exit(0)", ADD, None, True, True),
     ("sys.exit(1) after printing", "import sys\nprint(sum(map(int, input().split())))\nsys.exit(1)", ADD, None, True, True),
     ("exit('bye') after printing", "print(sum(map(int, input().split())))\nexit('bye')", ADD, None, True, True),

@@ -143,6 +143,77 @@ def test_forward_is_the_dequantization_of_the_export_bit_for_bit(type):
     assert e.d[0, 0].item() == 65504.0 and K.pack(e)  # packs: everything on its grid
 
 
+def gguf_py_bits(qw) -> np.ndarray:
+    """gguf-py's dequantization of qw's packed export, as uint32 bit patterns."""
+    raw = np.frombuffer(K.pack(qw.export()), np.uint8).reshape(qw.weight.shape[0], -1)
+    return bits(gguf.quants.dequantize(raw, QT[qw.type])).reshape(tuple(qw.weight.shape))
+
+
+@pytest.mark.parametrize("type", K.TYPES)
+def test_a_scale_just_below_zero_packs_as_the_zero_the_trainer_used(type):
+    """round(-0.3) is -0.0; the int8 it packs as is 0, which ggml dequantizes as +0.0.
+    The trainer must use the same +0.0, or the whole sub-block differs in its sign bit
+    (project_ lets an unsigned grid's scale sit down to -0.49)."""
+    qw = K.QuantWeight(weights(), type)
+    with torch.no_grad():
+        qw.scales[0, 0] = qw.scales[1, 0] = -0.3
+        qw.d[1, 0] = -qw.d[1, 0]  # ggml's d * 0 is then -0.0: the sign of d must carry through
+        if qw.mins is not None:
+            qw.mins[0, 1] = -0.3
+        qw.project_()
+    f = bits(qw())
+    assert np.array_equal(f, bits(K.dequant(qw.export())))
+    assert np.array_equal(f, gguf_py_bits(qw))
+
+
+def test_a_q3_k_scale_trapped_below_zero_by_training_stays_bit_exact_through_pack_and_check(tmp_path):
+    """The trap: a Q3_K sub-block at sc = -1 that training shrinks crosses -0.5. Its
+    scale then rounds to -0.0, d * sc is 0, every code rounds to 0 and the scale's
+    gradient is exactly 0, so it stays in (-0.5, 0) for good. AdamW at the rate qat gives
+    scales (10 x a 1e-4 base, qat.param_groups), projected after each step as qat.Guard
+    does. The packed file must still be the trained weights bit for bit, as
+    qat.check_exact holds it at export."""
+    from types import SimpleNamespace
+
+    from stages import qat
+    torch.manual_seed(0)
+    qw = K.QuantWeight(torch.randn(1, 256) * 0.02, "q3_k")
+    with torch.no_grad():
+        qw.scales[0, 3] = -1.0
+    opt = torch.optim.AdamW([qw.scales], lr=1e-3, weight_decay=0.0, betas=(0.9, 0.95))
+    crossed = None
+    for step in range(1500):
+        loss = (qw()[0, 48:64] ** 2).sum()  # shrink sub-block 3 toward 0
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        qw.project_()
+        if crossed is None and qw.scales[0, 3] > -0.5:
+            crossed = step
+    s = qw.scales[0, 3].item()
+    assert crossed is not None and -0.5 < s < 0, s  # trapped: the case that broke the export
+    assert qw.scales.grad[0, 3].item() == 0.0 and (qw()[0, 48:64] == 0).all()
+    f = bits(qw())
+    assert np.array_equal(f, bits(K.dequant(qw.export())))
+    assert np.array_equal(f, gguf_py_bits(qw))
+    # and through a GGUF file and the export's own check
+    path = tmp_path / "x.gguf"
+    w = gguf.GGUFWriter(str(path), "llama")
+    w.add_tensor("blk.0.ffn_down.weight", np.frombuffer(K.pack(qw.export()), np.uint8).reshape(1, -1),
+                 raw_dtype=QT["q3_k"])
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(num_attention_heads=1, num_key_value_heads=1)
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].mlp = torch.nn.Module()
+    model.model.layers[0].mlp.down_proj = qat.QuantLinear(qw)
+    assert qat.check_exact(model, path, {"model.layers.0.mlp.down_proj.weight": "q3_k"}, gguf) == {"q3_k": 1}
+
+
 @pytest.mark.parametrize("type", K.TYPES)
 def test_frozen_codes_stay_put_and_reload_from_a_checkpoint(type):
     qw = K.QuantWeight(weights(), type)

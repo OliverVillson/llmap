@@ -24,7 +24,8 @@ This is a guard against buggy and runaway code, not a hardened jail for hostile
 code: on the VM it runs teacher answers to our own tasks.
 
 Knobs: LOBBOT_SANDBOX_TIMEOUT [10] seconds per build and per run,
-LOBBOT_SANDBOX_MEM_MB [1024], LOBBOT_SANDBOX_WORKERS [physical cores - 2]. Time
+LOBBOT_SANDBOX_MEM_MB [4096, or RAM / workers when that is less; the run's data
+segment, see default_mem_mb], LOBBOT_SANDBOX_WORKERS [physical cores - 2]. Time
 limits are wall clock, so runs sharing a hyperthread with another run (or with a
 model server) time out sooner; one run per physical core, with two cores left for
 the rest of the machine, keeps a slow but correct answer's verdict independent of
@@ -63,9 +64,28 @@ def physical_cores() -> int:
     return len(cores) or 1
 
 
+def ram_mb() -> int | None:
+    """This machine's physical memory in MB, None when the OS does not say."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") >> 20
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def default_mem_mb(workers: int) -> int:
+    """MEM_MB when LOBBOT_SANDBOX_MEM_MB is unset: 4096, the 4 GB lcb_runner's
+    reliability_guard comment names (it then passes no limit at all), so a correct
+    LiveCodeBench answer that needs over 1 GB passes here as it does there; less
+    when this machine's RAM split over `workers` runs at once is less, so a full
+    pool of runaway programs cannot take the machine down."""
+    ram = ram_mb()
+    return min(MEM_CAP_MB, ram // workers) if ram else MEM_CAP_MB
+
+
 TIMEOUT = float(os.environ.get("LOBBOT_SANDBOX_TIMEOUT", 10))
-MEM_MB = int(os.environ.get("LOBBOT_SANDBOX_MEM_MB", 1024))
 WORKERS = int(os.environ.get("LOBBOT_SANDBOX_WORKERS", 0)) or max(1, physical_cores() - 2)
+MEM_CAP_MB = 4096
+MEM_MB = int(os.environ.get("LOBBOT_SANDBOX_MEM_MB", 0)) or default_mem_mb(WORKERS)
 MAX_OUTPUT = 4000
 
 # language -> (source file, build argv or None, run argv)

@@ -34,6 +34,15 @@ class Skip(Exception):
     """A step that cannot run now; the rest of the run goes on."""
 
 
+class Done(Exception):
+    """A step that was already done when it started (a restore before it finished it).
+    It counts as done, and its ~0 s are left out of the speed that scales the time left:
+    counted, a restored 4 h reading once halved every guess after it."""
+
+
+MIN_TIMED_S = 30  # a step that took less says nothing about the guesses (it found its work done)
+
+
 @dataclass
 class Step:
     name: str
@@ -41,6 +50,9 @@ class Step:
     run: Callable[["Step"], None]
     done: Callable[[], bool] = lambda: False
     progress: Callable[[], float | None] = lambda: None  # for steps that send no events
+    # The time guess again (minutes' shape), read when a step starts: a guess an earlier step
+    # re-bases (a measured rate, say) reaches the bar of the run that measured it.
+    refresh: Callable[[], dict[str, float]] | None = None
     # live state
     state: str = "waiting"  # waiting, running, done, skipped, failed, stopped (Ctrl-C)
     part: str = ""
@@ -48,6 +60,10 @@ class Step:
     finished: set = field(default_factory=set)
     started: float = 0.0
     part_started: float = 0.0
+    # [answered at the part's first event, its time, answered now, total] for a part that
+    # reports answers: the bar shows answered/total and the rate counts only answers made
+    # since that first event (an eval resumed from 600 of 728 once showed ~1 min left).
+    counts: list | None = None
     log: Path | None = None
 
     @property
@@ -123,9 +139,14 @@ def on_line(step: Step, line: str) -> None:
                 step.part, step.frac = "", 0.0
                 return
             if step.part != stage:
-                step.part, step.frac, step.part_started = stage, 0.0, time.time()
+                step.part, step.frac, step.part_started, step.counts = stage, 0.0, time.time(), None
             if "answered" in e and e.get("total"):
                 step.frac = max(step.frac, 0.1 + 0.85 * e["answered"] / e["total"])
+                # A count that goes back is a new one (the next candidate in the same stage).
+                if step.counts is None or e["answered"] < step.counts[2]:
+                    step.counts = [e["answered"], time.time(), e["answered"], e["total"]]
+                else:
+                    step.counts[2:] = [e["answered"], e["total"]]
             elif e.get("pct") is not None:
                 step.frac = max(step.frac, e["pct"] / 100)
         if status == "error":
@@ -174,7 +195,14 @@ class Run:
                     frac = s.frac
                     got += mins * frac
                     ran = time.time() - (s.part_started or s.started)
-                    if frac >= 0.05 and ran > 120:
+                    c = s.counts
+                    if c:  # answers left at the rate since the part's first event
+                        since = time.time() - c[1]
+                        if c[2] > c[0] and since > 120:
+                            left += (c[3] - c[2]) * since / (c[2] - c[0])
+                        else:
+                            left += mins * 60 * speed * (1 - frac)
+                    elif frac >= 0.05 and ran > 120:
                         left += ran / frac * (1 - frac)
                     else:
                         left += mins * 60 * speed * (1 - frac)
@@ -189,11 +217,25 @@ class Run:
         what = ""
         if cur:
             i = self.steps.index(cur) + 1
-            part = f" · {cur.part} {cur.frac:.0%}" if cur.part else ""
+            c = cur.counts
+            part = (f" · {cur.part} {c[2]}/{c[3]}" if c else f" · {cur.part} {cur.frac:.0%}") if cur.part else ""
             what = f"  | {i}/{n} {cur.name}{part}"
         filled = int(WIDTH * frac)
         eta = "done" if frac >= 1 else f"~{hm(left)} left" if left >= 60 else "<1m left"
         return f"[{'█' * filled}{'░' * (WIDTH - filled)}] {frac:.0%}  {hm(time.time() - self.t0)} in, {eta}{what}"
+
+
+def refresh_minutes(plan: list[Step]) -> None:
+    """Each step not yet done or running takes its guess again from its refresh (a guess
+    that fails to read keeps the old one)."""
+    for s in plan:
+        if s.refresh is not None and s.state == "waiting":
+            try:
+                new = s.refresh()
+            except Exception:  # noqa: BLE001  (a guess is never worth stopping a run for)
+                continue
+            with state_lock:
+                s.minutes = new
 
 
 def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: list[str] | None = None,
@@ -265,6 +307,7 @@ def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: lis
                 above(f"✓ {i}. {s.name} (done before)")
                 continue
             s.log = logs / f"{i:02d}-{re.sub(r'[^a-z0-9]+', '-', s.name.lower()).strip('-')}.log"
+            refresh_minutes(plan)
             with state_lock:
                 s.state, s.started, s.part_started = "running", time.time(), time.time()
                 s.part = "" if "" in s.minutes else next(iter(s.minutes))
@@ -275,9 +318,14 @@ def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: lis
                 took = time.time() - s.started
                 with state_lock:
                     s.state = "done"
-                    run.done_est += s.total
-                    run.done_real += took / 60
+                    if took >= MIN_TIMED_S:
+                        run.done_est += s.total
+                        run.done_real += took / 60
                 above(f"✓ {i}. {s.name} in {hm(took)}")
+            except Done as e:
+                with state_lock:
+                    s.state = "done"
+                above(f"✓ {i}. {s.name} ({e or 'done before'})")
             except Skip as e:
                 with state_lock:
                     s.state = "skipped"

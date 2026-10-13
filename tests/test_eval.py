@@ -345,6 +345,44 @@ def test_a_stopped_reading_resumes_per_problem_and_sample(tmp_path, monkeypatch)
     assert len(asked) == 8
 
 
+def test_a_fingerprinted_model_resumes_on_a_new_vm(tmp_path, monkeypatch):
+    """orchestration#6: a new VM downloads or rebuilds the same model with new mtimes. With
+    the caller's eval_model_fingerprint the partial answers still resume there; a different
+    fingerprint, or none and a new mtime, is another model and asks everything again."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"w" * 64)
+    probs = [lcb(i) for i in range(3)]
+    asked = []
+    pass_good(monkeypatch)
+
+    def read(**cfg):
+        return ev.code_eval(thinking_job(tmp_path / "job", **cfg), "cand", probs, "task", path=str(model))
+
+    def new_vm():
+        os.utime(model / "model.safetensors", (time.time() + 3600, time.time() + 3600))
+
+    monkeypatch.setattr(ev, "generate", answering(asked, die=lambda q, seed: q == "q2"))
+    with pytest.raises(ev.ServerDead):
+        read(eval_model_fingerprint="hf@abc:123")
+    new_vm()
+    asked.clear()
+    monkeypatch.setattr(ev, "generate", answering(asked))
+    read(eval_model_fingerprint="hf@abc:123")
+    assert asked == [("q2", 0)]
+    cfg = Config(eval_model_fingerprint="hf@abc:123")
+    key = ev.run_key(cfg, str(model), 0.6, False)
+    new_vm()
+    assert ev.run_key(cfg, str(model), 0.6, False) == key
+    assert ev.run_key(Config(eval_model_fingerprint="hf@abd:123"), str(model), 0.6, False) != key
+    (model / "model.safetensors").write_bytes(b"w" * 65)  # the size still counts
+    assert ev.run_key(cfg, str(model), 0.6, False) != key
+    # Without a fingerprint the mtime is what tells models apart, as before.
+    plain = ev.run_key(Config(), str(model), 0.6, False)
+    new_vm()
+    assert ev.run_key(Config(), str(model), 0.6, False) != plain
+
+
 def test_answers_per_problem_seed_offset_and_k(tmp_path, monkeypatch):
     """code_eval_samples_by_id gives p0 three answers and p3 one, and leaves p1 out; p2
     gets code_eval_samples. Answer i draws with seed code_eval_seed_offset + i, and pass@k

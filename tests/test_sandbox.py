@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import shutil
@@ -93,6 +94,51 @@ def test_70_mb_of_cases_passes():
     assert len(item[4][codebench.CASES_FILE]) > 70e6 and len(item[1]) < 10_000
     r = sandbox.run_many([item])[0]
     assert r.passed, r.output
+
+
+def test_memory_limit_defaults_to_4_gb_or_the_ram_each_worker_gets():
+    """lcb_runner sets no memory limit (its comment says 4 GB), so the default is 4096
+    MB, the old 1024 failed correct answers that need more; less when RAM / WORKERS
+    is less. LOBBOT_SANDBOX_MEM_MB still wins."""
+    ram = sandbox.ram_mb()
+    assert ram and sandbox.default_mem_mb(1) == min(4096, ram) and sandbox.default_mem_mb(64) == min(4096, ram // 64)
+    env = {k: v for k, v in os.environ.items() if k not in ("LOBBOT_SANDBOX_MEM_MB", "LOBBOT_SANDBOX_WORKERS")}
+    get = lambda env: subprocess.run([sys.executable, "-c", "from stages import sandbox; print(sandbox.MEM_MB)"],
+                                     cwd=ROOT, env=env, capture_output=True, text=True, check=True).stdout.strip()
+    assert get(env) == str(min(4096, ram // max(1, sandbox.physical_cores() - 2)))
+    assert get({**env, "LOBBOT_SANDBOX_WORKERS": "64"}) == str(min(4096, ram // 64))
+    assert get({**env, "LOBBOT_SANDBOX_MEM_MB": "777"}) == "777"
+
+
+def test_a_correct_answer_may_use_over_a_gigabyte(monkeypatch):
+    """A 1.1 GB stdin answer, which lcb_runner passes: it passes under the 4096 MB cap
+    and failed with MemoryError under the old 1024."""
+    p = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
+         "tests": [{"input": "1\n", "output": "True\n"}]}
+    item = codebench.job(p, "```python\nx = bytearray(1100 * 10 ** 6)\nprint(len(x) > int(input()))\n```")
+    monkeypatch.setattr(sandbox, "MEM_MB", sandbox.MEM_CAP_MB)
+    assert sandbox.run_many([item])[0].passed
+    monkeypatch.setattr(sandbox, "MEM_MB", 1024)
+    r = sandbox.run_many([item])[0]
+    assert not r.passed and "MemoryError" in r.output
+
+
+def test_the_harness_copy_of_the_cases_does_not_count_against_the_program(monkeypatch):
+    """80 MB of cases under a 48 MB limit: the harness reads cases.json one case at a
+    time and lets each case's globals (its stdin among them) go before the next, so
+    the program has the limit to itself. The same cases written as one JSON line are
+    read whole, and that copy alone is over the limit."""
+    line = "7" * 2_000_000
+    p = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
+         "tests": [{"input": f"{line}\n", "output": f"{len(line)}\n"} for _ in range(40)]}
+    # a recursive inner function keeps its globals in a cycle, as many answers' do
+    item = codebench.job(p, "```python\ndef f(n):\n    return 0 if n == 0 else f(n - 1)\nprint(len(input()) + f(3))\n```")
+    assert len(item[4][codebench.CASES_FILE]) > 80e6
+    monkeypatch.setattr(sandbox, "MEM_MB", 48)
+    whole = (*item[:4], {codebench.CASES_FILE: json.dumps(json.loads(item[4][codebench.CASES_FILE]))})
+    ok, bad = sandbox.run_many([item, whole])
+    assert ok.passed, ok.output
+    assert not bad.passed and "MemoryError" in bad.output
 
 
 def test_case_timeout_is_its_own_reason():

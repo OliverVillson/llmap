@@ -352,18 +352,28 @@ def forced_reason(tok, toks: list[int], finish: str | None) -> str | None:
 
 def open_thinking(tok, toks: list[int]) -> list[int]:
     """toks cut back to the thinking, for continue_forced: without a trailing
-    end-of-text, and without a closing tag that no answer followed (the eval closes
-    the thinking again its own way)."""
-    def closes(t):
+    end-of-text, without a closing tag that no answer followed (the eval closes
+    the thinking again its own way), and without the whitespace-only tokens it ends
+    on. eval.split_reasoning strips the thinking before force_answer closes it, so a
+    "\\n" before the model's own closing tag, or a thinking cut by the cap on a
+    newline, would otherwise come before the close here and not there. Only whole
+    tokens are dropped: the rest are the student's sampled ids, which on-policy
+    training needs as they are, so they are not tokenized again."""
+    def text(t):
         with _tok_lock:
-            text = tok.decode(t, skip_special_tokens=False)
-        return text.count("</think>") + text.count("<channel|>")
+            return tok.decode(t, skip_special_tokens=False)
+
+    def closes(t):
+        s = text(t)
+        return s.count("</think>") + s.count("<channel|>")
 
     toks, special = list(toks), set(tok.all_special_ids)
     while toks and toks[-1] in special and not closes(toks[-1:]):
         toks.pop()
     n = closes(toks)
     while n and toks and closes(toks) == n:
+        toks.pop()
+    while toks and not text(toks[-1:]).strip():
         toks.pop()
     return toks
 

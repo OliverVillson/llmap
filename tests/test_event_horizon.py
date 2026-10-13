@@ -17,6 +17,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -64,19 +66,49 @@ TEST_IDS = [f"t{i:03d}" for i in range(182)]
 DEV_IDS = [f"d{i:03d}" for i in range(150)]
 
 
-def bench(m):
+def bench(m, lcb_sha="lcbsha"):
     """The fetched problem sets' records, the downloaded original."""
     m.CODEBENCH.mkdir(parents=True, exist_ok=True)
-    meta = {"sha": "lcbsha", "windows": {
+    meta = {"sha": lcb_sha, "windows": {
         "test": {"since": "2025-01-01", "until": "2025-04-30", "ids": TEST_IDS, "ids_sha256": ids_sha(TEST_IDS)},
         "dev": {"since": "2024-08-01", "until": "2024-12-31", "ids": DEV_IDS, "ids_sha256": ids_sha(DEV_IDS)}}}
     (m.CODEBENCH / "livecodebench.meta.json").write_text(json.dumps(meta))
     (m.CODEBENCH / "livecodebench.jsonl").write_text("{}\n")
     (m.CODEBENCH / "codecontests.meta.json").write_text(json.dumps({"sha": "ccsha", "ids_sha256": "ccids"}))
     (m.CODEBENCH / "codecontests.jsonl").write_text("{}\n")
-    m.HF_DIR.mkdir(parents=True)
-    (m.HF_DIR / "config.json").write_text("{}")
+    granite(m)
     (m.NVME / "download.log").write_text("DOWNLOADS_DONE\n")
+
+
+COMMIT = "c0ffee" * 6 + "abcd"
+
+
+def safetensors_header(p: Path, shapes: dict) -> None:
+    """A safetensors file's header (8-byte length, then the JSON), without its data."""
+    head = json.dumps({k: {"dtype": "BF16", "shape": v, "data_offsets": [0, 0]} for k, v in shapes.items()}).encode()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(len(head).to_bytes(8, "little") + head)
+
+
+def granite_shapes(m, layers=40) -> dict:
+    shapes = {"model.embed_tokens.weight": [100352, 2560], "lm_head.weight": [100352, 2560], "model.norm.weight": [2560]}
+    for i in range(layers):
+        shapes |= {f"model.layers.{i}.{s}.weight": [8, 8] for s in m.BASE_LINEARS}
+        shapes |= {f"model.layers.{i}.{n}.weight": [2560] for n in ("input_layernorm", "post_attention_layernorm")}
+    return shapes
+
+
+def granite(m, d=None, shapes=None, **cfg) -> Path:
+    """What `hf download` leaves for the base: its config, its weights' headers and the
+    commit it read, in .cache/huggingface/download/<file>.metadata."""
+    d = d or m.HF_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps({**m.BASE_CONFIG, **cfg}))
+    safetensors_header(d / "model.safetensors", granite_shapes(m) if shapes is None else shapes)
+    meta = d / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(f"{COMMIT}\netag\n1760000000.0\n")
+    return d
 
 
 def passes(pid: str, sample: int) -> bool:
@@ -112,6 +144,8 @@ class Shell:
             w(arg(cmd, "--out"), {})
         elif "smoke render" in cmd:
             w(arg(cmd, "--traces"), "")
+        elif "smoke template" in cmd:
+            w(arg(cmd, "--out"), {"problems": [], "default_system_text": "You are a helpful model", "accepted": False})
         elif "llama-quantize --pure" in cmd:
             for t in ("q2_k", "q4_k"):
                 w(m.smoke_dir() / f"{t}.gguf", "x")
@@ -156,8 +190,15 @@ class Shell:
             w(out / "model-hf" / "config.json", {})
         elif "stages.qat e2e" in cmd:
             out = arg(cmd, "--out")
-            w(out / "e2e.json", {"tokens": 327680, "minutes": 2.0, "steps": 20})
+            w(out / "e2e.json", {"tokens": 327680, "minutes": 2.0, "steps": 20, "peak_gb": 151.2})
             w(out / "state" / "qat.json", {"phase": "e2e"})
+        elif "stages.qat onpolicy" in cmd and "--until-session 1" in cmd and "--rounds 1 " in cmd:  # S2.2's smoke
+            o, rd = arg(cmd, "--work"), arg(cmd, "--work") / "round1"
+            w(rd / "train" / "train.json", {"steps": 4, "minutes": 0.4, "peak_gb": 163.0})
+            row = lambda n: json.dumps({"id": "c", "prompt": [1] * 100, "tokens": [2] * n, "passed": False}) + "\n"
+            w(rd / "held.labelled.jsonl", row(16000) + row(900))
+            w(rd / "rollouts.labelled.jsonl", row(22000) + row(3000))
+            w(o / "state.json", {"session": 2, "trained": 1, "done": False, "rounds": []})
         elif "stages.qat onpolicy" in cmd:
             o = arg(cmd, "--work")
             final = o / "round2" / "train" / "state"
@@ -341,13 +382,20 @@ def test_template_check(tmp_path, monkeypatch):
         out = "" if any(x["role"] == "system" for x in msgs) else default
         return out + "".join(f"<|start|>{x['role']}\n{x['content']}<|end|>\n" for x in msgs) + gen
 
-    assert m.template_problems(chat, "Answer in code.", "Sum two ints.", markup) == []
-    dflt = m.template_problems(lambda x: chat(x, "<|start|>system\nYou are a helpful model.<|end|>\n"),
-                               "Answer in code.", "Sum two ints.", markup)
-    assert any("default system text" in p for p in dflt)
-    switch = m.template_problems(lambda x: chat(x, gen="<|start|>assistant\n" + ("" if len(x) > 1 else "<think>")),
-                                 "Answer in code.", "Sum two ints.", markup)
+    assert m.template_problems(chat, "Answer in code.", "Sum two ints.", markup) == ([], "")
+    # A default system text only when none is given (Granite's templates) is reported, not
+    # a failure: every prompt the run sends carries codebench.SYSTEM.
+    probs, dflt = m.template_problems(lambda x: chat(x, "<|start|>system\nYou are a helpful model.<|end|>\n"),
+                                      "Answer in code.", "Sum two ints.", markup)
+    assert probs == [] and dflt == "You are helpful model"
+    switch, _ = m.template_problems(lambda x: chat(x, gen="<|start|>assistant\n" + ("" if len(x) > 1 else "<think>")),
+                                    "Answer in code.", "Sum two ints.", markup)
     assert any("generation prompt differs" in p for p in switch)
+    # ... and text next to our system message still fails
+    dated = lambda msgs: chat([{**x, "content": "Today is 2026-10-13.\n" + x["content"]} if x["role"] == "system"
+                               else x for x in msgs])
+    extra, _ = m.template_problems(dated, "Answer in code.", "Sum two ints.", markup)
+    assert any("next to our system message" in p and "Today" in p for p in extra)
 
 
 # ---------- machines, GPU and the command line ----------
@@ -471,12 +519,12 @@ def test_hook_uploads_after_each_step_and_once_at_the_end(tmp_path, monkeypatch)
     assert {p.name for p in (root / "logs" / "measure").iterdir()} == {"01-make.log", "02-fail.log"}
 
 
-def test_shutdown_only_after_exit_0_with_the_uploaded_fingerprint(tmp_path, monkeypatch):
+def test_shutdown_only_after_exit_0_with_the_uploaded_fingerprint(tmp_path, monkeypatch, capsys):
     m = load(tmp_path, monkeypatch)
     fake_bucket(m, tmp_path, monkeypatch)
     bench(m)
     calls = []
-    monkeypatch.setattr(m.os, "system", calls.append)
+    monkeypatch.setattr(m.os, "system", lambda c: calls.append(c) or 0)
     s = m.Step("x", {"": 1}, None)
     m.run_upload(s, "measure")
     marks = json.loads((m.W / ".uploaded").read_text())  # on the NVMe: wiped with the results it describes
@@ -485,9 +533,16 @@ def test_shutdown_only_after_exit_0_with_the_uploaded_fingerprint(tmp_path, monk
     assert calls == []
     m.shutdown_after(0, "measure")
     assert calls == ["sudo shutdown -h +5"]
+    assert "Shutting the VM down in 5 minutes" in capsys.readouterr().out
+    monkeypatch.setattr(m.os, "system", lambda c: calls.append(c) or 256)  # sudo refused
+    m.shutdown_after(0, "measure")
+    out = capsys.readouterr().out
+    assert "SHUTDOWN FAILED" in out and "STILL UP" in out and "Shutting the VM down" not in out
+    monkeypatch.setattr(m.os, "system", lambda c: calls.append(c) or 0)
+    calls.clear()
     (m.CODEBENCH / "livecodebench.jsonl").write_text("changed since the upload\n")
     m.shutdown_after(0, "measure")
-    assert calls == ["sudo shutdown -h +5"] and not m.uploaded("measure")
+    assert calls == [] and not m.uploaded("measure")
 
 
 def test_restore_needs_a_login_and_the_earlier_sessions(tmp_path, monkeypatch):
@@ -505,6 +560,280 @@ def test_restore_needs_a_login_and_the_earlier_sessions(tmp_path, monkeypatch):
         m.run_restore(s, "read")
 
 
+class SetupShell:
+    """setup_vm.sh on a new VM: a fresh fetch of the suites unless SKIP_SUITES=1 (LiveCodeBench's
+    main has moved since session 1: another commit, another file), and this VM's freeze of
+    both venvs. Records what CONSTRAINTS held when it ran."""
+
+    def __init__(self, m, freeze="torch==2.14.0\n"):
+        self.m, self.freeze, self.calls, self.constraints = m, freeze, [], {}
+
+    def __call__(self, step, cmd, env=None):
+        self.calls.append(cmd)
+        m = self.m
+        cons = re.search(r"CONSTRAINTS=(\S*) ", cmd)[1]
+        self.constraints = {f.name: f.read_text() for f in Path(cons).glob("*.txt")} if cons else {}
+        if "SKIP_SUITES=1 " not in cmd:
+            m.CODEBENCH.mkdir(parents=True, exist_ok=True)
+            fresh = b'{"id": "new"}\n'
+            (m.CODEBENCH / "livecodebench.jsonl").write_bytes(fresh)
+            meta = json.loads((m.CODEBENCH / "livecodebench.meta.json").read_text()) \
+                if (m.CODEBENCH / "livecodebench.meta.json").exists() else {}
+            (m.CODEBENCH / "livecodebench.meta.json").write_text(json.dumps(
+                {**meta, "sha": "lcbsha-NEW", "file_sha256": hashlib.sha256(fresh).hexdigest()}))
+        m.venvs_dir().mkdir(parents=True, exist_ok=True)
+        for v in m.VENVS:
+            (m.venvs_dir() / f"{v}.txt").write_text(self.freeze)
+
+
+def new_vm(m):
+    shutil.rmtree(m.NVME)
+    m.NVME.mkdir(parents=True)
+
+
+def test_a_new_vm_gets_the_runs_code_suites_from_the_bucket_never_a_fresh_fetch(tmp_path, monkeypatch):
+    """orchestration#0: session 1's suites are the run's. A later VM's setup skips the fetch
+    and restores the bucket's copy once the NVMe is mounted, checked against the manifest's
+    sha256 and the metas'; a fresh fetch is never marked as the pinned copy."""
+    m = load(tmp_path, monkeypatch)
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    data = b'{"id": "session 1"}\n'
+    (m.CODEBENCH / "livecodebench.jsonl").write_bytes(data)
+    meta = json.loads((m.CODEBENCH / "livecodebench.meta.json").read_text())
+    (m.CODEBENCH / "livecodebench.meta.json").write_text(json.dumps({**meta, "file_sha256": hashlib.sha256(data).hexdigest()}))
+    art = m.codebench_art()
+    assert not m.upload_art(art, complete=False)  # a partial pin is never uploaded
+    assert not (root / "codebench").exists()
+    assert m.upload_art(art)  # the setup step's hook in session 1
+    man = json.loads((root / "codebench" / "pinned" / "manifest.json").read_text())
+    assert all(len(f["sha256"]) == 64 for f in man["files"])
+
+    new_vm(m)  # session train's VM
+    shell = SetupShell(m)
+    monkeypatch.setattr(m, "sh", shell)
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert "SKIP_SUITES=1 " in shell.calls[0]
+    assert m.lcb_meta()["sha"] == "lcbsha" and (m.CODEBENCH / "livecodebench.jsonl").read_bytes() == data
+    assert m.in_sync(art) and m.upload_art(art)  # the hook after setup: already the bucket's
+    assert m.restore_art(art, "train") is None
+
+    # A fresh fetch (the bucket was out of reach at setup) is refused, not marked in sync,
+    # and the restore step then brings back the pinned copy.
+    new_vm(m)
+    pinned = m.codebench_pinned
+    monkeypatch.setattr(m, "codebench_pinned", lambda tmp: False)
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert "SKIP_SUITES= " in shell.calls[-1] and m.lcb_meta()["sha"] == "lcbsha-NEW"
+    with pytest.raises(RuntimeError, match="not the ones .* pins"):
+        m.upload_art(art)
+    assert not m.in_sync(art) and m.restore_art(art, "train") == "all"
+    assert m.lcb_meta()["sha"] == "lcbsha" and (m.CODEBENCH / "livecodebench.jsonl").read_bytes() == data
+    assert m.codebench_problems() == []
+
+    # A file that is not what its meta recorded: the restore step puts the pinned copy back
+    # (a size match is not enough), and a copy it cannot repair stops the run.
+    (m.CODEBENCH / "livecodebench.jsonl").write_bytes(b"other bytes, same len\n")
+    assert m.codebench_problems() == ["livecodebench.jsonl is not the file its meta records (sha256)"]
+    with pytest.raises(RuntimeError, match="session train cannot start"):
+        m.run_restore(m.Step("x", {"": 1}, None), "train")
+    assert (m.CODEBENCH / "livecodebench.jsonl").read_bytes() == data
+    restore = m.restore_art
+    monkeypatch.setattr(m, "restore_art", lambda art, session: None)
+    (m.CODEBENCH / "livecodebench.jsonl").write_bytes(b"other bytes, same len\n")
+    with pytest.raises(RuntimeError, match="not whole: livecodebench.jsonl is not the file"):
+        m.run_restore(m.Step("x", {"": 1}, None), "train")
+    monkeypatch.setattr(m, "restore_art", restore)
+    # ... and so does a bucket copy whose JSONL is not its meta's.
+    monkeypatch.setattr(m, "codebench_pinned", pinned)
+    new_vm(m)
+    bad = tmp_path / "bad.meta.json"
+    bad.write_text(json.dumps({**meta, "file_sha256": "0" * 64}))
+    with tarfile.open(root / "codebench" / "pinned" / "small.tar", "a") as t:  # extracted last, so it wins
+        t.add(bad, arcname="codebench/livecodebench.meta.json")
+    with pytest.raises(RuntimeError, match="do not check out"):
+        m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert "SKIP_SUITES=1 " in shell.calls[-1]
+
+
+def test_the_first_setups_venv_freeze_constrains_every_later_vm(tmp_path, monkeypatch):
+    """orchestration#1: both venvs are frozen across sessions. The first setup's freeze is
+    uploaded once; a later VM installs with it as constraints and never replaces it."""
+    m = load(tmp_path, monkeypatch)
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    m.NVME.mkdir(parents=True)
+    shell = SetupShell(m, freeze="torch==2.14.0\ntransformers==5.17.0\n")
+    monkeypatch.setattr(m, "sh", shell)
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert shell.constraints == {} and "CONSTRAINTS= " in shell.calls[0]
+    assert {f.name for f in (root / "venvs").iterdir()} == {"venv-vllm.txt", "venv-train.txt"}
+
+    new_vm(m)
+    shell.freeze = "torch==2.14.0\ntransformers==5.17.1\n"  # what this VM would install on its own
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert f"UV_EXCLUDE_NEWER={m.UV_EXCLUDE_NEWER} " in shell.calls[1]
+    assert shell.constraints == {"venv-vllm.txt": "torch==2.14.0\ntransformers==5.17.0\n",
+                                 "venv-train.txt": "torch==2.14.0\ntransformers==5.17.0\n"}
+    assert (root / "venvs" / "venv-train.txt").read_text().endswith("5.17.0\n")  # the first setup's wins
+    assert not m.pin_venvs()
+    assert not list(Path(tempfile.gettempdir()).glob("event-horizon-setup-*"))  # the lookup dir is gone
+
+
+def test_settings_block_on_the_harness_namespace_and_report_the_rest(tmp_path, monkeypatch):
+    """orchestration#2: a Config field added between sessions outside the harness (a QAT
+    knob, say) is reported only; one inside it, or a changed value, blocks. So does a venv
+    version or the suites' records in provenance."""
+    m = load(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    base = {**m.EVAL, "code_eval_dir": "/mnt/nvme/codebench", "heal_lr": 1e-4}
+    for d in (a, b):
+        (d / "work").mkdir(parents=True)
+        (d / "work" / "provenance.json").write_text(json.dumps({"gpu": ["NVIDIA L40S, 1, 2"], "eval_venv": {"torch": "2.14.0"}}))
+    write = lambda d, cfg: (d / "work" / "config.effective.json").write_text(json.dumps(cfg))
+    write(a, {**base, "qat_new_knob": 3, "heal_lr": 2e-4, "eval_model_fingerprint": "x", "code_eval_seed_offset": 1000})
+    write(b, {**base, "eval_model_fingerprint": "y"})
+    assert m.settings_diff(a, b) == []
+    assert m.settings_reported(a, b) == ["heal_lr: 0.0002 vs 0.0001", "qat_new_knob: 3 vs '(none)'"]
+    write(a, {**base, "eval_new_knob": 1, "lcb_until": "2025-05-31", "vllm_seqs": 64})
+    write(b, {**base, "lcb_until": "2025-04-30"})
+    assert m.settings_diff(a, b) == ["eval_new_knob: 1 vs '(none)'", "lcb_until: '2025-05-31' vs '2025-04-30'",
+                                     "vllm_seqs: 64 vs 96"]
+    assert m.provenance_diff(a, b) == ([], [])
+    (a / "work" / "provenance.json").write_text(json.dumps({"gpu": ["NVIDIA L40S, 1, 2"], "eval_venv": {"torch": "2.14.1"},
+                                                            "code_suites": {"livecodebench": {"sha": "new"}}}))
+    block, _ = m.provenance_diff(a, b)
+    assert [x.split(":")[0] for x in block] == ["eval_venv", "code_suites"]
+
+
+def test_choice_json_is_one_per_run_whatever_moves_upstream(tmp_path, monkeypatch):
+    """orchestration#3: the choice art has one key per run. A new VM after a change upstream
+    of final_dir restores the run's choice.json, and pre-registering another GGUF is refused."""
+    m = load(tmp_path, monkeypatch)
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    shell = Shell(m)
+    monkeypatch.setattr(m, "sh", shell)
+    run_steps(m, "measure")
+    m.run_restore(m.Step("x", {"": 1}, None), "train")
+    run_steps(m, "train")
+    first = m.choice()["gguf_sha256"]
+    assert [p.name for p in (root / "choice").iterdir()] == ["run"]
+    new_vm(m)
+    bench(m)
+    monkeypatch.setitem(m.ONPOLICY, "fresh", 200)  # every key from onpolicy_dir on moves
+    m.run_restore(m.Step("x", {"": 1}, None), "train")
+    assert m.choice()["gguf_sha256"] == first
+    with pytest.raises(RuntimeError, match="already pre-registers"):
+        run_steps(m, "train")
+    assert [p.name for p in (root / "choice").iterdir()] == ["run"]
+    assert json.loads(next((root / "choice" / "run").glob("manifest.json")).read_text())["complete"]
+    # Nothing is pre-registered without the bucket to check it against.
+    monkeypatch.setattr(m, "evroc_ok", lambda: False)
+    m.CHOICE.unlink()
+    with pytest.raises(RuntimeError, match="checked against the bucket"):
+        m.run_choice(m.Step("x", {"": 1}, None))
+    assert not m.CHOICE.exists()
+
+
+def test_a_stopped_download_is_started_again_a_bounded_number_of_times(tmp_path, monkeypatch):
+    """orchestration#4: no DOWNLOADS_DONE and no hf process: run_download starts setup_vm.sh's
+    download again (same revision, appended to the log), up to DOWNLOAD_RESTARTS times."""
+    m = load(tmp_path, monkeypatch)
+    m.NVME.mkdir(parents=True)
+    (m.NVME / "download.log").write_text("HTTP 502\n")
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))  # pgrep: none
+    cmds = []
+
+    def restart(step, cmd, env=None):
+        cmds.append(cmd)
+        granite(m)
+        with open(m.NVME / "download.log", "a") as f:
+            f.write("DOWNLOADS_DONE\n")
+
+    monkeypatch.setattr(m, "sh", restart)
+    m.run_download(m.Step("x", {"": 1}, None))
+    assert len(cmds) == 1 and m.download_done()
+    assert f"hf download {m.MODEL} --revision main --local-dir {m.HF_DIR} && echo DOWNLOADS_DONE" in cmds[0]
+    assert f">> {m.NVME / 'download.log'}" in cmds[0] and "setsid nohup" in cmds[0]
+
+    (m.NVME / "download.log").write_text("HTTP 502\n")
+    cmds.clear()
+    monkeypatch.setattr(m, "sh", lambda step, cmd, env=None: cmds.append(cmd))  # it keeps failing
+    with pytest.raises(RuntimeError, match="stopped 4 times.*Start it by hand"):
+        m.run_download(m.Step("x", {"": 1}, None))
+    assert len(cmds) == m.DOWNLOAD_RESTARTS == 3
+
+
+def test_the_base_must_be_the_llama_style_granite_every_stage_assumes(tmp_path, monkeypatch):
+    """verdict-quant-training: the architecture guard right after the download."""
+    m = load(tmp_path, monkeypatch)
+    d = granite(m, tmp_path / "ok")
+    assert m.base_problems(d) == []
+    assert any("architectures" in p for p in m.base_problems(granite(m, tmp_path / "a",
+                                                                     architectures=["GraniteMoeHybridForCausalLM"])))
+    assert any("layer_types" in p for p in m.base_problems(granite(m, tmp_path / "l", layer_types=["attention"] * 40)))
+    for k, v in (("num_hidden_layers", 64), ("hidden_size", 4096), ("intermediate_size", 12800),
+                 ("num_key_value_heads", 4), ("vocab_size", 49159), ("tie_word_embeddings", True)):
+        assert any(p.startswith(k) for p in m.base_problems(granite(m, tmp_path / k, **{k: v}))), k
+    shapes = granite_shapes(m)
+    hybrid = {**{k: v for k, v in shapes.items() if ".mlp." not in k},
+              **{f"model.layers.{i}.shared_mlp.input_linear.weight": [16384, 2560] for i in range(40)}}
+    probs = m.base_problems(granite(m, tmp_path / "h", shapes=hybrid))
+    assert any("120 expected projection weights missing" in p for p in probs)
+    assert any("2-D layer weights the stages do not map" in p and "shared_mlp" in p for p in probs)
+    no_head = {k: v for k, v in shapes.items() if k != "lm_head.weight"}
+    assert any("lm_head" in p for p in m.base_problems(granite(m, tmp_path / "t", shapes=no_head)))
+    # a sharded checkpoint: the index names the shards, their headers the shapes
+    s = tmp_path / "sharded"
+    granite(m, s)
+    (s / "model.safetensors").unlink()
+    keys = sorted(shapes)
+    safetensors_header(s / "model-00001-of-00002.safetensors", {k: shapes[k] for k in keys[::2]})
+    safetensors_header(s / "model-00002-of-00002.safetensors", {k: shapes[k] for k in keys[1::2]})
+    (s / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        k: f"model-0000{1 + i % 2}-of-00002.safetensors" for i, k in enumerate(keys)}}))
+    assert m.base_problems(s) == []
+    # the download step: a wrong base fails it, and is never done
+    bench(m)
+    assert m.download_done() and m.download_commit() == COMMIT
+    granite(m, architectures=["GraniteMoeHybridForCausalLM"])
+    assert not m.download_done()
+    with pytest.raises(RuntimeError, match="not the base every stage assumes"):
+        m.run_download(m.Step("x", {"": 1}, None))
+
+
+def test_the_all_cases_rescore_grades_a_few_problems_at_a_time(tmp_path, monkeypatch):
+    """orchestration#9: items are built per chunk of problems and dropped once graded; a
+    chunk the grader cannot write is recorded as grader_error, not the end of the step."""
+    m = load(tmp_path, monkeypatch)
+    from stages import codebench, sandbox
+    job = tmp_path / "job"
+    (job / "work" / "code_eval").mkdir(parents=True)
+    (job / "work" / "config.effective.json").write_text(json.dumps({"code_eval_dir": str(tmp_path), "lcb_since": "x"}))
+    rows = [{"suite": "livecodebench", "id": f"p{i}", "sample": k, "answer": "a", "passed": True}
+            for i in range(5) for k in range(2)]
+    (job / "work" / "code_eval" / "r.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    probs = [{"id": f"p{i}", "tests": [], "language": "python"} for i in range(5)]
+    monkeypatch.setattr(codebench, "load_suite", lambda *a, **k: probs)
+    monkeypatch.setattr(codebench, "job", lambda p, answer, code=None: ("python", p["id"], ""))
+    seen = []
+
+    def run_many(items, timeout=0):
+        seen.append([it[1] for it in items])
+        if "p2" in seen[-1]:
+            raise OSError(28, "No space left on device")
+        return [sandbox.Result(True, "") for _ in items]
+
+    monkeypatch.setattr(sandbox, "run_many", run_many)
+    assert m.rescore_main(["--job", str(job), "--name", "r", "--chunk", "2"]) == 0
+    assert seen == [["p0", "p0", "p1", "p1"], ["p2", "p2", "p3", "p3"], ["p4", "p4"]]
+    out = [json.loads(x) for x in (job / "work" / "code_eval" / "r-allcases.jsonl").read_text().splitlines()]
+    assert [(x["id"], x["sample"]) for x in out] == [(r["id"], r["sample"]) for r in rows]  # the reading's order
+    assert {x["id"] for x in out if x["reason"] == "grader_error"} == {"p2", "p3"}
+    assert all(x["passed"] for x in out if x["id"] in ("p0", "p1", "p4"))
+
+
 # ---------- the three sessions on a fake shell ----------
 
 def test_three_sessions_end_to_end(tmp_path, monkeypatch):
@@ -514,7 +843,10 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     shell = Shell(m)
     monkeypatch.setattr(m, "sh", shell)
     m.run_setup(m.Step("x", {"": 1}, None))
-    assert shell.calls[0][0].startswith("SKIP_EXTRAS=1 ") and "STUDENT= " in shell.calls[0][0]
+    setup = shell.calls[0][0]
+    assert setup.startswith("SKIP_EXTRAS=1 ") and "STUDENT= " in setup and "TEACHER_REVISION=main " in setup
+    assert f"UV_EXCLUDE_NEWER={m.UV_EXCLUDE_NEWER} " in setup  # both venvs as PyPI stood then, every session
+    assert "SKIP_SUITES= " in setup and "CONSTRAINTS= " in setup  # an empty bucket: fetch, nothing to constrain
 
     shell.calls.clear()
     run_steps(m, "measure")
@@ -540,6 +872,11 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     assert "--ref original-ref-" in thinking[0] and "--ref original-dev-" in thinking[2] and "--json" in thinking[0]
     smoke = json.loads((m.smoke_dir() / "smoke.json").read_text())
     assert smoke["ok"] and set(smoke) >= {"a+d", "b", "c", "e", "f", "g", "h"}
+    assert smoke["b"]["default_system_text"] == "You are a helpful model"  # reported, not a failure
+    assert all(e["TMPDIR"] == str(m.NVME / "tmp") and e["VLLM_CACHE_ROOT"].startswith(str(m.NVME)) for e in evals)
+    assert all(e["LOBBOT_EVAL_BASE_REVISION"] == "main" and e["LOBBOT_EVAL_BASE_COMMIT"] == COMMIT for e in evals)
+    # the training text's guess, re-based on the original's reading: 8M at 1500 tok/s x the fp8 KV gain
+    assert m.GUESS["gen-measure"] == 130 and m.minutes()["gen-measure"] == pytest.approx(8e6 / 3000 / 60 + 5)
 
     g0 = m.gate("gate0")
     assert g0["pass"] and g0["R0"] == pytest.approx(100 * (37 * 0.5 + 108) / 182) and g0["budget_gb"] == 1.25
@@ -549,9 +886,13 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     ref_cfg = json.loads((m.reading_dir(m.READINGS["original-ref"]) / "config.json").read_text())
     assert ref_cfg["code_eval_samples"] == 4 and ref_cfg["lcb_since"] == "2025-01-01" and ref_cfg["vllm_seqs"] == 96
     assert "size_gb_override" not in ref_cfg and "code_eval_ids" not in ref_cfg
+    # eval keys resumed answers by content: the original's id, commit and weight sizes
+    assert ref_cfg["eval_model_fingerprint"].startswith(f"{m.MODEL}@{COMMIT}:")
     dev_cfg = json.loads((m.reading_dir(m.READINGS["blockap-dev"]) / "config.json").read_text())
     assert len(dev_cfg["code_eval_ids"]) == 128 and dev_cfg["code_eval_seed_offset"] == 50
     assert list(dev_cfg["size_gb_override"].values()) == [1e-6]  # the GGUF's bytes, not the bf16 checkpoint's
+    assert dev_cfg["eval_model_fingerprint"] == m.model_of("blockap")[1]  # the export's sha256
+    assert "eval_model_fingerprint" in m.PER_READING
     assert (root / "reading-original-ref").exists()  # uploaded by the last step
     assert m.uploaded("measure") and m.vocab_sha() == "toksha"
 
@@ -561,11 +902,26 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
 
     shell.calls.clear()
     run_steps(m, "train")
-    assert kinds(shell.calls) == ["eval", "stages.qat e2e", "gen", "stages.qat e2e", "stages.qat onpolicy",
+    assert kinds(shell.calls) == ["eval", "stages.qat e2e", "stages.qat onpolicy",  # S2.2: rates, on-policy smoke
+                                  "gen", "stages.qat e2e", "stages.qat onpolicy",
                                   "stages.qat export", "stages.vocab register", "convert_hf_to_gguf",
                                   "stages.horizon ladder", "stages.vocab tokcheck"]
     gen = next(c for c, _ in shell.calls if "gen_command(" in c)
     assert "seqs=384" in gen and "24000000.0" in gen
+    rate_e2e, smoke_op, op = (c for c, _ in shell.calls if "stages.qat e2e" in c or "stages.qat onpolicy" in c
+                              if not ("--max-minutes 60" in c))
+    assert "--freeze-steps 0" in rate_e2e and f"--out {m.rates_dir()}/qat" in rate_e2e
+    assert f"--state {m.rates_dir()}/qat/state" in smoke_op and "--until-session 1" in smoke_op
+    assert "--rounds 1 --fresh 2 --rollouts 2 --held 2 --max-minutes 5 --rollout-tokens-cap 0" in smoke_op
+    assert "--max-minutes 25 --rollout-tokens-cap 8000000 " in op  # each session's caps
+    rates = json.loads((m.rates_dir() / "rates.json").read_text())
+    assert rates["qat_peak_gb"] == 151.2 and rates["onpolicy"] == {"rollouts": 4, "steps": 4, "minutes": 0.4,
+                                                                   "peak_gb": 163.0, "longest_row": 22100}
+    # on-policy guesses: fresh rollouts capped at 8M tokens, training at 25 min, + 10 per session
+    qat, roll = 327680 / 120, 20000
+    held = 128 * 2 * 8000
+    assert m.minutes()["onpolicy"] == pytest.approx(4 * ((8e6 + held) / roll / 60 + min(16e6 / qat / 60, 25) + 10))
+    assert m.minutes()["onpolicy-judge"] == pytest.approx(held / roll / 60 + 10)
     traces24 = m.traces_file("train").read_text().splitlines()
     assert len(traces24) == 2  # the 8M rows, then gen resumed on the copy
     assert json.loads((m.onpolicy_dir() / "audit.json").read_text())["ok"]

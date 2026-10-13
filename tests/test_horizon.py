@@ -168,6 +168,13 @@ def test_the_map_is_within_budget_and_verified(world):
     assert v["identical_tensors"] == len(m["types"])  # the swept weights are the shipped ones
     assert s["true_kl"] < s["floor_kl"]  # the bytes bought KL
     assert s["check_kl"] > 0 and abs(s["true_kl"] - s["pred_kl"]) < 0.5 * (s["floor_kl"] - s["pred_kl"]) + 1e-3
+    # the run's own check of that: the gain bought, paired by position with the floor's KL
+    g = s["gain"]
+    assert g["verdict"] == "ok" and g["why"] is None and s["fallback"] is None and s["warnings"] == []
+    assert g["pred"] == pytest.approx(s["floor_kl"] - s["pred_kl"], abs=1e-6)
+    assert g["real"] == pytest.approx(s["floor_kl"] - s["true_kl"], abs=1e-6)
+    assert v["paired"]["sweep"]["gain"] == pytest.approx(g["real"], abs=1e-5) and g["real"] > 2 * g["se"] > 0
+    assert g["ratio"] == pytest.approx(g["real"] / g["pred"], abs=1e-3)
     assert set(m["hf_types"]) == {qheal.hf_name(n) for n in m["types"]}
     assert m["curve"][0]["pred_kl"] == pytest.approx(m["base_kl"])
     assert all(a["pred_kl"] >= b["pred_kl"] - 1e-12 for a, b in zip(m["curve"], m["curve"][1:]))
@@ -202,6 +209,46 @@ def test_a_budget_under_the_cheapest_map_stops_before_the_sweep(world, tmp_path,
     floor = json.loads((out / "floor.json").read_text())
     assert floor["over"] and floor["floor_bytes"] == world["floor"] and floor["budget_bytes"] < world["floor"]
     assert not (out / "sweep.jsonl").exists() and not (out / "map.json").exists()
+
+
+def test_a_map_no_better_than_the_floor_ships_the_floor(world, tmp_path, monkeypatch):
+    """When the verified map does not beat the floor by GAIN_SE standard errors, its
+    bytes above the floor bought nothing measurable: the floor map is written, verified
+    and shipped instead, and map.json and horizon.json say why and what was rejected.
+    (Here the bar is set out of reach.)"""
+    import shutil
+    out = tmp_path / "out"
+    shutil.copytree(world["out"], out)  # the PTQ files and the teacher's log-probs are reused
+    monkeypatch.setattr(horizon, "GAIN_SE", 1e9)
+    s = horizon.run(str(world["hf"]), world["bf16"], world["root"] / "traces.jsonl", out, world["llama_cpp"],
+                    world["budget"], sweep_window=(48, 400), check_window=(48, 400), do_ladder=False, workers=0)
+    m = json.loads((out / "map.json").read_text())
+    base = json.loads((out / "sweep.jsonl").read_text().splitlines()[0])["header"]["base"]
+    assert m["groups"] == base and m["bytes"] == s["bytes"] == world["floor"] and m["pred_kl"] == m["base_kl"]
+    assert s["gain"]["verdict"] == "no better" and "bought nothing measurable" in s["gain"]["why"]
+    rejected = s["fallback"]["rejected"]
+    assert m["fallback"] == s["fallback"] and rejected["gguf"] == str(out / Path(world["summary"]["gguf"]).name)
+    assert Path(rejected["gguf"]).name == f"horizon-{rejected['sha256'][:8]}.gguf"
+    assert rejected["bytes"] == world["summary"]["bytes"] > s["bytes"]
+    assert Path(s["gguf"]).exists() and s["gguf"] != rejected["gguf"]
+    assert s["verify"]["identical_tensors"] == len(m["types"])  # the floor file is verified like any map
+    assert s["true_kl"] == pytest.approx(s["floor_kl"], rel=1e-3)  # what the sweep measured for the floor
+
+
+def test_gain_check_is_relative_to_the_gain_not_the_kl():
+    """At ~2.6 bits the floor's KL is many times what the bytes above it can buy, so a
+    tolerance on the KL (say 25% of it) never fires; the check is on the gain."""
+    g = horizon.gain_check(0.40, 0.38, 0.39, 0.002)  # predicted 0.02, bought 0.01: half
+    assert g["verdict"] == "ok" and g["pred"] == pytest.approx(0.02) and g["real"] == pytest.approx(0.01)
+    assert g["ratio"] == pytest.approx(0.5)
+    g = horizon.gain_check(0.40, 0.38, 0.395, 0.002)  # bought 0.005 of 0.02, above 2 SE: shipped, with a warning
+    assert g["verdict"] == "short" and "25%" in g["why"]
+    assert abs(0.395 - 0.38) < 0.25 * 0.38  # what a tolerance on the KL would have let through
+    g = horizon.gain_check(0.40, 0.38, 0.397, 0.002)  # 0.003 is within 2 SE of nothing: the floor ships
+    assert g["verdict"] == "no better" and "within 2 SE" in g["why"]
+    assert horizon.gain_check(0.40, 0.38, 0.41, 0.002)["verdict"] == "no better"  # worse than the floor
+    g = horizon.gain_check(0.40, 0.40, 0.40, 0.0, is_floor=True)
+    assert g["verdict"] == "floor" and g["ratio"] is None
 
 
 def test_a_kld_run_that_lost_its_summary_runs_again(monkeypatch):

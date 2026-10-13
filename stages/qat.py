@@ -53,9 +53,10 @@ once instead of spilling layers to the CPU.
     python -m stages.qat block --base <trimmed hf> --map map.json --gguf q2k.gguf q3k.gguf q4k.gguf \\
         --traces traces.jsonl --vocab-index vocab_index.json --llama-cpp <dir> --out <dir>
     python -m stages.qat e2e --state <block dir> --teacher <hf> --traces traces.jsonl \\
-        --vocab-index vocab_index.json --out <dir> --tokens 40e6 --max-minutes 45
+        --vocab-index vocab_index.json --out <dir> --tokens 40e6 --max-minutes 45 [--freeze-steps 50]
     python -m stages.qat onpolicy --work <dir> --state <e2e dir> --teacher <hf> --problems <codebench> \\
-        --traces traces.jsonl --vocab-index vocab_index.json --llama-cpp <dir> [--until-session N]
+        --traces traces.jsonl --vocab-index vocab_index.json --llama-cpp <dir> [--until-session N] \\
+        [--max-minutes M] [--rollout-tokens-cap T]
     python -m stages.qat export --state <dir> --out <dir> --llama-cpp <dir>
 """
 from __future__ import annotations
@@ -514,6 +515,19 @@ class Clock:
             self.paused += time.monotonic() - t
 
 
+def reset_peak() -> None:
+    """Starts peak_gb()'s count afresh (no GPU: nothing to do)."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def peak_gb() -> float | None:
+    """The most GPU memory torch has held since reset_peak(), in GB (1e9 bytes), for the
+    fit reports: what a phase really needed, beside e2e_memory()'s estimate. None
+    without a GPU."""
+    return round(torch.cuda.max_memory_allocated() / 1e9, 3) if torch.cuda.is_available() else None
+
+
 class Guard:
     """Applies an update only when its loss and gradient norm are finite: one NaN
     gradient would turn every trained weight into NaN through the optimizer. Skips are
@@ -586,23 +600,46 @@ def _set_lr(opt, lr: float) -> None:
 
 # ---------- Block-AP ----------
 
-def block_windows(rows: list[dict], length: int, n: int = 0, seed: int = 0, vocab_map=None) -> torch.Tensor:
-    """(n, length) windows for Block-AP: one per trace row of at least `length` tokens,
-    from its prompt on and cropped (never mid-answer, never two traces), in the trimmed
-    model's ids with vocab_map (a window holding a dropped id is left out), shuffled."""
-    seqs = [(r["prompt"] + r["tokens"])[:length] for r in rows if len(r["prompt"]) + len(r["tokens"]) >= length]
-    if not seqs:
+def block_windows(rows: list[dict], length: int, n: int = 0, seed: int = 0, vocab_map=None, *,
+                  report: dict | None = None) -> torch.Tensor:
+    """(n, length) windows for Block-AP, in the trimmed model's ids with vocab_map (a
+    window holding a dropped id is left out), shuffled. Each trace row of at least
+    `length` tokens gives its first window, from its prompt on. When those are fewer than
+    n, the rows long enough give more: tokens [length, 2 x length) of the same trace, then
+    [2 x length, 3 x length), and so on until n. A window is never two traces spliced
+    and never overlaps another. One that starts mid-answer is still good calibration:
+    Block-AP fits each layer to the bf16 layer on the same inputs, whatever they are. A
+    row is one whole thinking answer, often several windows long, so one window per row
+    can fall well short of the count asked. n = 0: each row's first window. report, when
+    given, gets the counts: asked, rows_long_enough, windows, by_offset (windows taken
+    at each start k x length)."""
+    long = [r["prompt"] + r["tokens"] for r in rows if len(r["prompt"]) + len(r["tokens"]) >= length]
+    if not long:
         raise ValueError(f"no trace of {length} tokens or more")
-    w = torch.tensor(seqs)
-    if vocab_map is not None:
-        lut = traces.vocab_lut(vocab_map)
-        w = torch.where(w < len(lut), lut[w.clamp(max=len(lut) - 1)], -1)
-        ok = (w >= 0).all(1)
-        if not ok.all():
-            log(f"block: {int((~ok).sum())} windows hold ids the trimmed vocab dropped; left out")
-        w = w[ok]
-    w = w[torch.randperm(len(w), generator=torch.Generator().manual_seed(seed))]
-    return w[:n] if n else w
+    lut = traces.vocab_lut(vocab_map) if vocab_map is not None else None
+    picked, dropped = [], 0
+    for k in itertools.count():
+        tier = [s[k * length:(k + 1) * length] for s in long if len(s) >= (k + 1) * length]
+        if not tier:
+            break
+        w = torch.tensor(tier)
+        if lut is not None:
+            w = torch.where(w < len(lut), lut[w.clamp(max=len(lut) - 1)], -1)
+            ok = (w >= 0).all(1)
+            dropped += int((~ok).sum())
+            w = w[ok]
+        w = w[torch.randperm(len(w), generator=torch.Generator().manual_seed(seed + k))]
+        picked.append(w[: n - sum(map(len, picked))] if n else w)
+        if not n or sum(map(len, picked)) >= n:
+            break
+    if dropped:
+        log(f"block: {dropped} windows hold ids the trimmed vocab dropped; left out")
+    w = torch.cat(picked)
+    if len(picked) > 1:  # later windows mixed in among the first ones
+        w = w[torch.randperm(len(w), generator=torch.Generator().manual_seed(seed))]
+    if report is not None:
+        report.update(asked=n, rows_long_enough=len(long), windows=len(w), by_offset=[len(x) for x in picked])
+    return w
 
 
 def free_bytes(device) -> int | None:
@@ -639,6 +676,16 @@ def fit_windows(n: int, length: int, hidden: int, elem: int, device, *, free: in
                                f"{min(n, MIN_BLOCK_WINDOWS)} needed); free memory, or pass --cache-device")
     return {"windows": keep, "asked": n, "cache_gb": round(keep * per / 1e9, 2),
             "free_gb": None if free is None else round(free / 1e9, 2), "device": str(dev)}
+
+
+def _advance(layer, xs: list, kw_of, device, cache, amp) -> None:
+    """Replaces each cached hidden state in xs by the layer's output on it, in place, one
+    batch at a time, so xs never holds more than one cache plus the batch being made. A
+    new list built beside the old one holds the old cache whole until the new one is
+    finished: with the other cache, three caches where fit_windows budgets two."""
+    with torch.no_grad(), amp:
+        for j in range(len(xs)):
+            xs[j] = run_layer(layer, xs[j].to(device), kw_of[len(xs[j])]).to(cache)
 
 
 def _rel_err(layer, xs, ys, kw_of, device, amp) -> float:
@@ -691,9 +738,7 @@ def block_ap(model, wins: torch.Tensor, type_map, codes: dict | None = None, *, 
     x_s = inputs() if emb in type_map else [x.clone() for x in x_t]  # what the quantized embedding gives
     lp, layers = _layers_prefix(model), decoder_layers(model)
     for li, layer in enumerate(layers):
-        with torch.no_grad(), amp:  # the bf16 layer's output replaces its input: two caches, not three
-            for j, x in enumerate(x_t):
-                x_t[j] = run_layer(layer, x.to(device), kw_of[len(x)]).to(cache)
+        _advance(layer, x_t, kw_of, device, cache, amp)  # the bf16 layer's output replaces its input
         new = _wrap(model, [n for n in type_map if n.startswith(f"{lp}.{li}.")], type_map, codes)
         if li < len(report):
             for p in layer.parameters():  # its norms were trained and saved in fp32
@@ -715,8 +760,7 @@ def block_ap(model, wins: torch.Tensor, type_map, codes: dict | None = None, *, 
                 os.replace(tmp, work / "block.json")
             log(f"block: layer {li + 1}/{len(layers)} relative error {row['rel_err_ptq']:.5f} -> "
                 f"{row['rel_err_trained']:.5f}")
-        with torch.no_grad(), amp:
-            x_s = [run_layer(layer, x.to(device), kw_of[len(x)]).to(cache) for x in x_s]
+        _advance(layer, x_s, kw_of, device, cache, amp)  # the quantized layer's, likewise: two caches in all
         progress(100 * (li + 1) / len(layers), f"layer {li + 1}/{len(layers)}")
     return report
 
@@ -821,10 +865,16 @@ def fit(model, data, n_per_epoch: int, total: int, step_loss, *, lr: float, warm
     dict, every eval_every steps) and checkpoints (out/ckpt.pt every ckpt_minutes of
     training, or every ckpt_every steps) run off the training clock. A rerun with
     out/ckpt.pt resumes its step, optimizer, counters and training seconds. The codes
-    freeze for about the last freeze_steps steps. Returns the report: steps, real
-    tokens, minutes trained, whether the cap fired, skips, the held-out history. The
-    caller saves the model."""
+    freeze for about the last freeze_steps steps, but only in a run of at least
+    2 x freeze_steps steps (by steps or by time at the rate so far): in a shorter one
+    the freeze would come at step 1, and a rate measured on it would leave out the
+    latent weights' gradients and updates. Returns the report: steps, real tokens,
+    minutes trained, whether the cap fired, skips, the held-out history, tokens per
+    training second after this attempt's first step (which allocates the optimizer's
+    state), and peak_gb, the GPU memory torch held (None without a GPU). The caller
+    saves the model."""
     device = next(model.parameters()).device
+    reset_peak()
     opt, params = _optimizer(model, lr)
     st = {"step": 0, "train_s": 0.0, "eval_s": 0.0, "skipped": 0, "run": 0, "ema": None, "tokens": 0,
           "tokens_applied": 0, "hist": [], "frozen": False, "cap_fired": False}
@@ -859,6 +909,7 @@ def fit(model, data, n_per_epoch: int, total: int, step_loss, *, lr: float, warm
         evaluate()
     model.train()
     it, it_epoch = None, -1
+    first, too_short = None, False  # (training seconds, tokens) after this attempt's first step
     while True:
         p = sched.progress(st["step"], clock.seconds())
         if p >= 1:  # checked first, whatever the last step did
@@ -866,9 +917,14 @@ def fit(model, data, n_per_epoch: int, total: int, step_loss, *, lr: float, warm
             break
         left = (1 - p) * st["step"] / p if p > 0 else math.inf  # steps left at the rate so far
         if freeze_steps and not st["frozen"] and left <= freeze_steps:
-            freeze_codes(model)
-            st["frozen"] = True
-            log(f"{name}: codes frozen at step {st['step']} (about {left:.0f} steps left)")
+            if st["step"] + left >= 2 * freeze_steps - 1e-6:  # the whole run, at the rate so far
+                freeze_codes(model)
+                st["frozen"] = True
+                log(f"{name}: codes frozen at step {st['step']} (about {left:.0f} steps left)")
+            elif not too_short:
+                too_short = True
+                log(f"{name}: about {st['step'] + left:.0f} steps in all, under 2 x {freeze_steps}: "
+                    "the codes stay free")
         epoch, pos = divmod(st["step"], n_per_epoch)
         if epoch != it_epoch:
             it, it_epoch = iter(data(epoch)), epoch
@@ -883,6 +939,8 @@ def fit(model, data, n_per_epoch: int, total: int, step_loss, *, lr: float, warm
             st["tokens_applied"] += n_tok
         st["tokens"] += n_tok
         st["step"] += 1
+        if first is None:
+            first = (clock.seconds(), st["tokens"])
         if eval_fn and eval_every and st["step"] % eval_every == 0:
             evaluate()
             model.train()
@@ -898,10 +956,12 @@ def fit(model, data, n_per_epoch: int, total: int, step_loss, *, lr: float, warm
     check_finite(model)
     if st["cap_fired"]:
         log(f"{name}: time cap of {max_minutes:g} min reached at step {st['step']}/{total}")
+    after = (st["tokens"] - first[1], st["train_s"] - first[0]) if first else (0, 0.0)
     return {"steps": st["step"], "total": total, "tokens": st["tokens"], "tokens_applied": st["tokens_applied"],
             "minutes": round(st["train_s"] / 60, 2), "eval_minutes": round(st["eval_s"] / 60, 2),
-            "cap_fired": st["cap_fired"], "skipped": guard.skipped, "frozen": st["frozen"], "lr": lr,
-            "held": st["hist"]}
+            "cap_fired": st["cap_fired"], "skipped": guard.skipped, "frozen": st["frozen"],
+            "freeze_steps": freeze_steps, "lr": lr, "tok_s": round(after[0] / after[1], 1) if after[1] > 0 else None,
+            "peak_gb": peak_gb(), "held": st["hist"]}
 
 
 # ---------- end-to-end KD ----------
@@ -1034,7 +1094,14 @@ class OnPolicy:
     epochs: int = 2
     lr: float = 1e-5
     ce_weight: float = CE_WEIGHT
-    max_minutes: float = 0.0  # time cap of one round's training
+    # A session's budgets; qat onpolicy --max-minutes and --rollout-tokens-cap set them for
+    # the sessions that follow. max_minutes caps a round's training (fit anneals the rate
+    # by time to it, and freezes the codes before it); rollout_tokens_cap stops the fresh
+    # rollouts once they hold that many answer tokens (the held-out ones are never cut:
+    # the keep rules compare the same problems every round). 0: no cap.
+    max_minutes: float = 0.0
+    rollout_tokens_cap: int = 0
+    freeze_steps: int = FREEZE_STEPS
     seqs: int = SEQS["b200"]
     port: int = 8095
     seed: int = 0
@@ -1057,19 +1124,28 @@ def _complete_rows(path: Path, n: int) -> list[dict]:
 
 
 def sample_rollouts(url: str, tok, probs: list[dict], n: int, out: str | Path, *, max_tokens: int = MAX_TOKENS,
-                    workers: int = 64, max_fail: float = 0.03, max_model_len: int = MAX_MODEL_LEN) -> list[dict]:
+                    workers: int = 64, max_fail: float = 0.03, max_model_len: int = MAX_MODEL_LEN,
+                    token_cap: int = 0) -> list[dict]:
     """n rollouts per problem from the served student, asked and sampled as the eval asks
     (opd.render, opd.sample); a thinking that ends without an answer gets the eval's
     forced answer (opd.continue_forced), as in ternary.gen. Rows in traces' format
     (passed None until labelled), appended to out per problem; a rerun skips the problems
     already there. A problem whose request fails after opd's retries is skipped; more
-    than max_fail of them, or a dead server, raise."""
+    than max_fail of them, or a dead server, raise. With token_cap, no problem is started
+    once out's rows hold that many answer tokens, those of an earlier attempt included:
+    sampling time follows the tokens, and a model that loops or thinks to its budget
+    makes far more of them than a time guess assumes. The problems already running
+    finish and are kept, so the file ends over the cap by at most what was in flight."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = _complete_rows(out, n)
     seen = {r["id"] for r in rows}
     todo = [p for p in probs if p["id"] not in seen]
     max_prompt = max_model_len - max_tokens - opd.ANSWER_TOKENS - FORCED_MARGIN
+    toks = sum(len(r["tokens"]) for r in rows)
+    if todo and token_cap and toks >= token_cap:
+        log(f"onpolicy: {out.name} holds {toks} answer tokens, the cap of {token_cap}: {len(todo)} problems not asked")
+        return rows
     if not todo:
         return rows
     opd.client(workers)
@@ -1091,11 +1167,14 @@ def sample_rollouts(url: str, tok, probs: list[dict], n: int, out: str | Path, *
                  "forced": r["forced"]} for r in got]
 
     asked = failed = too_long = 0
-    t0 = time.time()
+    capped = False
+    t0, toks0 = time.time(), toks
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(ask, p): p for p in todo}
         try:
             for f in as_completed(futs):
+                if f.cancelled():  # not started: the token cap was reached
+                    continue
                 asked += 1
                 try:
                     got = f.result()
@@ -1113,13 +1192,18 @@ def sample_rollouts(url: str, tok, probs: list[dict], n: int, out: str | Path, *
                 with out.open("a") as fh:
                     fh.write("".join(json.dumps(r) + "\n" for r in got))
                 rows += got
+                toks += sum(len(r["tokens"]) for r in got)
+                if token_cap and toks >= token_cap and not capped:
+                    capped = True
+                    left = sum(x.cancel() for x in futs)
+                    log(f"onpolicy: {out.name}: {toks} answer tokens reach the cap of {token_cap}; "
+                        f"{left} problems not asked, those running finish")
         except BaseException:
             for f in futs:
                 f.cancel()
             raise
-    toks = sum(len(r["tokens"]) for r in rows)
     log(f"onpolicy: {out.name}: {len(rows)} rollouts of {len(rows) // n} problems, {toks / 1e6:.2f}M tokens, "
-        f"{toks / max(time.time() - t0, 1e-3):.0f} tok/s, {failed} failed, {too_long} prompts too long")
+        f"{(toks - toks0) / max(time.time() - t0, 1e-3):.0f} tok/s, {failed} failed, {too_long} prompts too long")
     return rows
 
 
@@ -1377,10 +1461,15 @@ def onpolicy_round(work: str | Path, *, serve=serve_student, run=run_step) -> di
             kw = {"max_tokens": cfg.max_tokens, "max_model_len": cfg.length}
             sample_rollouts(url, tok, [pool[i] for i in held], cfg.held_rollouts, rd / "held.jsonl",
                             workers=max(1, cfg.seqs // cfg.held_rollouts), **kw)
+            info = {"served": str(served)}
             if fresh:
-                sample_rollouts(url, tok, [pool[i] for i in fresh], cfg.rollouts, rd / "rollouts.jsonl",
-                                workers=max(1, cfg.seqs // cfg.rollouts), **kw)
-        (rd / "rollouts.done").write_text(json.dumps({"served": str(served)}) + "\n")
+                got = sample_rollouts(url, tok, [pool[i] for i in fresh], cfg.rollouts, rd / "rollouts.jsonl",
+                                      workers=max(1, cfg.seqs // cfg.rollouts), token_cap=cfg.rollout_tokens_cap, **kw)
+                toks = sum(len(r["tokens"]) for r in got)
+                info.update(fresh_problems=len(fresh), fresh_sampled=len({r["id"] for r in got}), fresh_tokens=toks,
+                            rollout_tokens_cap=cfg.rollout_tokens_cap,
+                            capped=bool(cfg.rollout_tokens_cap and toks >= cfg.rollout_tokens_cap))
+        (rd / "rollouts.done").write_text(json.dumps(info) + "\n")
     tok = AutoTokenizer.from_pretrained(str(served / "serve"))
     if not (rd / "held.metrics.json").exists():  # the server has stopped: the sandbox has the CPU
         rows = label(tok, _read_jsonl(rd / "held.jsonl"), pool)
@@ -1450,7 +1539,7 @@ def onpolicy_train(work: str | Path, *, load=load_state, teacher=None) -> dict:
     report = onpolicy_fit(student, t_model, _read_jsonl(rd / "rollouts.labelled.jsonl"), out,
                           index=teacher_index(student, t_model, vocab), length=cfg.length, batch=cfg.batch,
                           epochs=cfg.epochs, lr=cfg.lr, ce_weight=cfg.ce_weight, max_minutes=cfg.max_minutes,
-                          seed=cfg.seed + st["session"])
+                          freeze_steps=cfg.freeze_steps, seed=cfg.seed + st["session"])
     cand = save_state(student, out / "state", {**meta, "phase": f"onpolicy{st['trained'] + 1}"})
     write_hf(student, cfg.base or meta["base"], cand / "serve")
     (out / "train.json").write_text(json.dumps(report, indent=1) + "\n")
@@ -1607,22 +1696,36 @@ def cmd_block(a) -> None:
     coverage(model, type_map)
     codes = gguf_codes(a.gguf, a.base, model, type_map, _gguf(a.llama_cpp))
     train, _ = traces.split(traces.load(a.traces))
-    wins = block_windows(train, a.length, a.windows, a.seed, vocab_index(a.vocab_index))
+    vmap = vocab_index(a.vocab_index)
+    got: dict = {}
+    wins = block_windows(train, a.length, a.windows, a.seed, vmap, report=got)
     cache_device = a.cache_device or ("cpu" if torch.cuda.is_available() else None)
     emb = model.get_input_embeddings().weight
     fit = fit_windows(len(wins), a.length, emb.shape[1], emb.element_size(), cache_device or emb.device)
+    used = got
     if fit["windows"] < len(wins):
         log(f"block: only {fit['windows']} of {len(wins)} windows fit {fit['free_gb']} GB free on {fit['device']}")
-        wins = wins[:fit["windows"]]
+        used = {}  # picked again, so the rows' first windows still come first
+        wins = block_windows(train, a.length, fit["windows"], a.seed, vmap, report=used)
+    warnings = []
+    if len(wins) < a.windows:
+        warnings.append(f"{len(wins)} windows of the {a.windows} asked: the traces give {got['windows']} "
+                        f"({got['rows_long_enough']} rows of {a.length} tokens or more, windows by offset "
+                        f"{got['by_offset']})" + (f", and {fit['free_gb']} GB free on {fit['device']} holds "
+                                                   f"{fit['windows']}" if fit["windows"] < got["windows"] else ""))
+        log(f"block: warning: {warnings[-1]}")
     log(f"block: {len(wins)} windows of {a.length} tokens ({len(wins) * a.length / 1e6:.1f}M tokens), {a.epochs} epochs; "
         f"hidden-state caches {fit['cache_gb']} GB on {fit['device']} ({fit['free_gb']} GB free)")
+    reset_peak()
     t0 = time.time()
     report = block_ap(model, wins, type_map, codes, batch=a.batch, epochs=a.epochs, lr=a.lr,
                       cache_device=cache_device, work=out / "layers")
     save_state(model, out / "state", {"base": str(Path(a.base).resolve()), "type_map": type_map, "phase": "block"})
-    (out / "block.json").write_text(json.dumps({"layers": report, "windows": len(wins), "length": a.length,
-                                                "epochs": a.epochs, "lr": a.lr, "cache": fit,
-                                                "minutes": round((time.time() - t0) / 60, 1),
+    (out / "block.json").write_text(json.dumps({"layers": report, "asked": a.windows, "windows": len(wins),
+                                                "rows_long_enough": got["rows_long_enough"],
+                                                "windows_by_offset": used["by_offset"], "warnings": warnings,
+                                                "length": a.length, "epochs": a.epochs, "lr": a.lr, "cache": fit,
+                                                "minutes": round((time.time() - t0) / 60, 1), "peak_gb": peak_gb(),
                                                 "tensor_bytes": size_bytes(model, type_map)}, indent=1))
     shutil.rmtree(out / "layers", ignore_errors=True)
     log(f"block: saved to {out / 'state'}")
@@ -1639,7 +1742,8 @@ def cmd_e2e(a) -> None:
     train, held = traces.split(traces.load(a.traces))
     report = e2e_kd(student, teacher, train, held, out, vocab=a.vocab_index, length=a.length, batch=a.batch,
                     tokens=a.tokens, lr=a.lr, max_minutes=a.max_minutes, eval_every=a.eval_every,
-                    held_n=a.held_rows, held_length=a.held_length, ckpt_minutes=a.ckpt_minutes, seed=a.seed)
+                    held_n=a.held_rows, held_length=a.held_length, ckpt_minutes=a.ckpt_minutes,
+                    freeze_steps=a.freeze_steps, seed=a.seed)
     save_state(student, out / "state", {**meta, "phase": "e2e"})
     (out / "e2e.json").write_text(json.dumps(report, indent=1))
     (out / "ckpt.pt").unlink(missing_ok=True)
@@ -1647,18 +1751,38 @@ def cmd_e2e(a) -> None:
         f"{' (time cap)' if report['cap_fired'] else ''}; saved to {out / 'state'}")
 
 
+def set_budgets(work: str | Path, **budgets) -> OnPolicy:
+    """A session's budgets (OnPolicy.max_minutes, rollout_tokens_cap) in an existing run's
+    config.json, for the sessions that follow (and the one a rerun continues); the
+    run's other settings stay as it started."""
+    cfg = _config(work)
+    new = dataclasses.replace(cfg, **budgets)
+    if new != cfg:
+        p = Path(work) / "config.json"
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(dataclasses.asdict(new), indent=1) + "\n")
+        os.replace(tmp, p)
+        log("onpolicy: " + ", ".join(f"{k} {getattr(cfg, k)} -> {v}" for k, v in budgets.items()
+                                     if getattr(cfg, k) != v))
+    return new
+
+
 def cmd_onpolicy(a) -> None:
     work = Path(a.work)
     if a.step == "train":
         onpolicy_train(work)
         return
+    budgets = {k: v for k, v in (("max_minutes", a.max_minutes), ("rollout_tokens_cap", a.rollout_tokens_cap))
+               if v is not None}
     if not (work / "state.json").exists():
         if not (a.state and a.teacher and a.problems):
             raise SystemExit("onpolicy: a new run needs --state, --teacher and --problems")
         init_onpolicy(work, a.state, OnPolicy(
             teacher=a.teacher, problems=a.problems, traces=a.traces or "", vocab_index=a.vocab_index,
             base=a.base, llama_cpp=a.llama_cpp, rounds=a.rounds, fresh=a.fresh, rollouts=a.rollouts, held=a.held,
-            lr=a.lr, max_minutes=a.max_minutes, seqs=a.seqs, port=a.port, seed=a.seed))
+            lr=a.lr, seqs=a.seqs, port=a.port, seed=a.seed, **budgets))
+    elif budgets:
+        set_budgets(work, **budgets)
     st = read_state(work)
     while not st["done"] and not (a.until_session and st["session"] > a.until_session):
         st = onpolicy_round(work)
@@ -1712,6 +1836,8 @@ def main() -> None:
     e.add_argument("--held-rows", type=int, default=16)
     e.add_argument("--held-length", type=int, default=8192)
     e.add_argument("--ckpt-minutes", type=float, default=20.0)
+    e.add_argument("--freeze-steps", type=int, default=FREEZE_STEPS,
+                   help="the codes freeze for about the last N steps (only in a run of at least 2 x N); 0: never")
     o = sub.add_parser("onpolicy")
     o.add_argument("--work", required=True)
     o.add_argument("--step", choices=["all", "train"], default="all", help="train: the trainer's part of a session")
@@ -1726,7 +1852,12 @@ def main() -> None:
     o.add_argument("--rollouts", type=int, default=4)
     o.add_argument("--held", type=int, default=128)
     o.add_argument("--lr", type=float, default=1e-5)
-    o.add_argument("--max-minutes", type=float, default=0.0)
+    o.add_argument("--max-minutes", type=float, default=None,
+                   help="training minutes of each session's round, the rate annealed by time to it (0: no cap); "
+                        "a later call's value holds from its session on, no value keeps the last")
+    o.add_argument("--rollout-tokens-cap", type=int, default=None,
+                   help="stop starting fresh rollouts once a session's hold this many answer tokens (0: no cap); "
+                        "kept like --max-minutes")
     o.add_argument("--seqs", type=int, default=SEQS["b200"])
     o.add_argument("--port", type=int, default=8095)
     x = sub.add_parser("export")

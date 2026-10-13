@@ -1061,12 +1061,15 @@ def errored(info: dict | None) -> bool:
 
 def run_key(cfg, path: str, temperature: float, keep_reasoning: bool) -> str:
     """What the answers depend on besides the problem and the seed: the model at path
-    (size and modification time of its files), the cap, sampling and the server settings
-    that change what it writes. Answers resumed from a partial file must have been made
-    under the same key. Known before any server starts, so a run with every answer in
-    the partial file starts none."""
+    (size of its files, and the caller's eval_model_fingerprint or else their modification
+    time), the cap, sampling and the server settings that change what it writes. Answers
+    resumed from a partial file must have been made under the same key. Known before any
+    server starts, so a run with every answer in the partial file starts none. The mtime
+    only holds on the VM that wrote the answers: a new VM downloads or rebuilds the same
+    model with new mtimes, so a caller that knows the model by content passes that."""
     files = [f for f in model_files(Path(path)) if f.exists()] if path else []
-    key = {"model": [path, sum(f.stat().st_size for f in files), max((f.stat().st_mtime for f in files), default=0)],
+    made = cfg.eval_model_fingerprint or max((f.stat().st_mtime for f in files), default=0)
+    key = {"model": [path, sum(f.stat().st_size for f in files), made],
            "max_tokens": cfg.code_eval_max_tokens, "thinking": cfg.code_eval_thinking, "temperature": temperature,
            "top_k": cfg.thinking_top_k, "min_p": cfg.eval_min_p, "format": cfg.code_eval_format, "kv": cfg.eval_kv_type,
            "lora": cfg.eval_lora, "vllm_args": list(cfg.eval_vllm_args), "parser": cfg.eval_reasoning_parser,

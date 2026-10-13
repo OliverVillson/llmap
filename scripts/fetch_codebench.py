@@ -29,9 +29,9 @@ the test window that is reported, so every reading can check it scored the same 
 
 Pinning. Every Hugging Face read names a revision (REVISIONS). A branch name is resolved
 to its commit once per fetch and every file is read at that commit, which the meta
-records. The VM's NVMe is wiped when it stops, so the fetched suites are meant to go to
-the bucket once and be restored from there; setup_vm.sh fetches only the suites that
-have no meta file.
+records. The VM's NVMe is wiped when it stops, so the fetched suites go to the bucket
+once and are restored from there (setup_vm.sh SKIP_SUITES=1 skips the fetch); otherwise
+setup_vm.sh fetches only the suites that have no meta file.
 
 Contamination. A CodeContests or APPS problem that shares a 13-word run with any
 LiveCodeBench statement (stages/data.py _shingles, the dedupe the data stage and opd
@@ -72,9 +72,13 @@ CC_REPO = "deepmind/code_contests"
 APPS_REPO = "codeparrot/apps"
 # The revision each dataset is read at; resolve() turns a branch into its commit, and
 # each fetch records that commit as "sha" in <suite>.meta.json (Config.code_eval_dir),
-# for the job's provenance.
-# TODO: "main" until a VM has fetched them; then replace each with the "sha" that VM
-# recorded, so a later fetch reads the same files.
+# for the job's provenance. Event Horizon fetches once, in session 1, and every later VM
+# restores that copy from the bucket instead of fetching (scripts/event_horizon.py
+# run_setup); a commit pinned here keeps a fetch after that (a lost bucket copy, another
+# experiment) on the same files.
+# TODO(after Event Horizon's session 1): replace each "main" with the "sha" its
+# <suite>.meta.json recorded (the summary's "Code suites at" line), so a later fetch reads
+# the same files; test_revisions_are_branches_or_full_commits checks the form.
 REVISIONS = {LCB_REPO: "main", CC_REPO: "main", APPS_REPO: "main"}
 # release_v6: the files lcb_runner's --release_version release_v6 reads (1055 problems).
 # Later releases add files; naming these keeps the set fixed even if the pin moves.

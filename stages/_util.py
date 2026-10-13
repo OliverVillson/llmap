@@ -188,6 +188,12 @@ class Config:
     # compressed-tensors, served with vLLM). Lets an eval-only job (pipeline.py
     # --only eval) score an uncompressed reference.
     eval_candidates: dict[str, str] = field(default_factory=dict)
+    # What the model being scored is, by content, from the caller ("" = not given): e.g.
+    # scripts/event_horizon.py's hash key of the reading's model. When set it stands in
+    # for the model files' modification time in the eval's run key, so answers uploaded
+    # from a failed reading resume on a new VM, where the same model was downloaded or
+    # rebuilt with new mtimes. One fingerprint per job, so set it for one candidate only.
+    eval_model_fingerprint: str = ""
     # Reference job for code scores: its out/eval.json's pass@1 is the 100% mark
     # (experiment 01's `ref`). Relative paths resolve against this job's parent dir.
     code_eval_ref: str = ""

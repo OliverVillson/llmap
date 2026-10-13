@@ -155,6 +155,40 @@ def test_block_ap_lowers_every_layers_error_and_the_kl_and_resumes_by_layer(tmp_
     assert all(torch.equal(v, sd[k]) for k, v in again.state_dict().items())
 
 
+def test_block_ap_holds_two_hidden_state_caches_not_three(tmp_path, monkeypatch):
+    """fit_windows budgets two caches: the bf16 layers' hidden states and the quantized
+    layers'. Each advances a layer in place, a batch at a time. Rebuilt as a new list
+    beside the old one, the quantized cache was held twice at the end of every layer:
+    three caches (64 GB at 2,048 windows of 2,048 tokens and 2,560 hidden, against the
+    43 GB budgeted). Every cached batch is followed with a weakref and counted as each
+    layer output is made."""
+    import weakref
+    m = tiny_granite(tmp_path / "hf", init=0.02)
+    m.config.use_cache = False
+    wins = qat.block_windows(rows_of(8, answer=(100, 112)), 64)
+    batch, cached, alive = 2, [], []
+    real_inputs, real_run = qat.layer_inputs, qat.run_layer
+
+    def inputs(model, ids):
+        h, kw = real_inputs(model, ids)
+        cached.append(weakref.ref(h))
+        return h, kw
+
+    def run(layer, h, kw):  # without gradients: a cache update (or a held-out error, freed at once)
+        if torch.is_grad_enabled():
+            return real_run(layer, h, kw)
+        alive.append(sum(r() is not None for r in cached))
+        out = real_run(layer, h, kw)
+        cached.append(weakref.ref(out))
+        return out
+
+    monkeypatch.setattr(qat, "layer_inputs", inputs)
+    monkeypatch.setattr(qat, "run_layer", run)
+    qat.block_ap(m, wins, plan(m), batch=batch, epochs=1, lr=1e-3)
+    n = len(wins) // batch  # batches per cache
+    assert len(wins) == 8 and alive and max(alive) == 2 * n, alive
+
+
 def test_block_ap_keeps_as_many_windows_as_the_cache_device_has_room_for(monkeypatch):
     """2048 windows x 2048 tokens x 2560 hidden in bf16, twice, is ~43 GB of host RAM: on a VM
     with less free, Block-AP keeps what fits (after a reserve) and says so, and refuses when
@@ -182,6 +216,36 @@ def test_block_windows_start_at_the_prompt_and_drop_ids_the_trim_dropped():
     kept = [i for i in range(320) if i != 310]
     w = qat.block_windows(rows, 64, vocab_map={"kept": kept, "old_to_new": {o: k for k, o in enumerate(kept)}})
     assert len(w) == 5 and int(w.max()) < len(kept)
+
+
+def test_block_windows_take_further_windows_of_the_same_trace_up_to_the_count_asked():
+    """Too few rows for one window each: the long rows give their next `length` tokens,
+    then the next, until the count asked; each window one row's own, none overlapping,
+    the rows' first windows (from the prompt) all in. Fewer than asked is reported."""
+    rows = rows_of(6, vocab=range(3, 300), answer=(200, 201)) + [{"id": "short", "prompt": [5] * 4, "tokens": [6] * 4}]
+    seq = {r["id"]: r["prompt"] + r["tokens"] for r in rows}  # 216 tokens: windows at 0, 64 and 128
+    rep = {}
+    w = qat.block_windows(rows, 64, 10, report=rep)
+    assert w.shape == (10, 64) and rep == {"asked": 10, "rows_long_enough": 6, "windows": 10, "by_offset": [6, 4]}
+    where = []
+    for x in w.tolist():
+        at = [(i, k) for i, s in seq.items() for k in range(0, len(s) - 63, 64) if s[k:k + 64] == x]
+        assert len(at) == 1, at  # one row's own tokens, at a multiple of the length
+        where.append(at[0])
+    assert len(set(where)) == 10  # no window twice
+    assert {i for i, k in where if k == 0} == set(seq) - {"short"} and {k for _, k in where} == {0, 64}
+    rep = {}
+    assert len(qat.block_windows(rows, 64, 100, report=rep)) == 18 and rep["by_offset"] == [6, 6, 6]
+    assert rep["windows"] < rep["asked"]  # the shortfall cmd_block writes into block.json
+    # what fits in the first windows is what one window per row gave before
+    assert torch.equal(qat.block_windows(rows, 64, 4), qat.block_windows(rows, 64)[:4])
+    # a later window holding a dropped id is left out too
+    rows[0]["tokens"][100] = 310
+    kept = [i for i in range(320) if i != 310]
+    rep = {}
+    qat.block_windows(rows, 64, 100, vocab_map={"kept": kept, "old_to_new": {o: k for k, o in enumerate(kept)}},
+                      report=rep)
+    assert rep["by_offset"] == [6, 5, 6]
 
 
 # ---------- the loop: guard, time cap, resume ----------
@@ -304,6 +368,29 @@ def test_resume_keeps_the_schedule_the_optimizer_and_the_training_seconds(tmp_pa
     assert [h["step"] for h in rep2["held"]] == [h["step"] for h in rep["held"]]
     assert rep2["held"][-1]["kl"] == rep["held"][-1]["kl"] < rep["held"][0]["kl"]
     assert rep2["frozen"] and all(q.frozen for q in qat.quant_weights(resumed))
+
+
+def test_codes_freeze_only_in_a_run_long_enough_and_the_report_has_the_rate_and_peak():
+    """In a run shorter than 2 x freeze_steps the freeze would come at step 1, and a rate
+    measured on it would leave out the latent weights' gradients: the codes stay free.
+    The report gives tokens per second after the first step (whose optimizer state is
+    allocated then) and the GPU peak (None without a GPU)."""
+    torch.manual_seed(0)
+    lin = torch.nn.Sequential(qat.QuantLinear(kquant.QuantWeight(torch.randn(8, 256), "q2_k")))
+    x = torch.randn(4, 256)
+
+    def step_loss(b):
+        return lin(b).pow(2).mean(), 4
+
+    def run(total, freeze):
+        qat.thaw_codes(lin)
+        return qat.fit(lin, lambda e: [x] * total, total, total, step_loss, lr=1e-3, warm=1, freeze_steps=freeze)
+
+    rep = run(20, 50)
+    assert not rep["frozen"] and rep["steps"] == 20 and rep["freeze_steps"] == 50
+    assert not any(q.frozen for q in qat.quant_weights(lin))
+    assert run(19, 10)["frozen"] is False and run(20, 10)["frozen"] is True
+    assert rep["tok_s"] > 0 and "peak_gb" in rep and (rep["peak_gb"] is None) == (not torch.cuda.is_available())
 
 
 # ---------- end-to-end KD ----------
@@ -439,10 +526,23 @@ def test_cli_block_then_e2e_then_export(tmp_path, monkeypatch):
     block = json.loads((tmp_path / "block" / "block.json").read_text())
     assert len(block["layers"]) == 2 and block["windows"] == 16 and not (tmp_path / "block" / "layers").exists()
     assert block["cache"]["windows"] == 16 and block["cache"]["device"] == "cpu"  # sized from MemAvailable
+    assert block["asked"] == 16 and block["warnings"] == [] and block["windows_by_offset"] == [16]
+    gpu = torch.cuda.is_available()
+    assert "peak_gb" in block and (block["peak_gb"] is None) == (not gpu)
+    # more windows than the rows have: the long rows give a second and third, and the shortfall is written
+    cli("block", "--base", hf, "--map", tmp_path / "map.json", "--gguf", q2k, "--traces", tr, "--out", tmp_path / "more",
+        "--windows", 500, "--length", 32, "--batch", 8, "--epochs", 1, "--lr", 1e-3)
+    more = json.loads((tmp_path / "more" / "block.json").read_text())
+    rows = more["rows_long_enough"]
+    assert more["asked"] == 500 and rows == len(traces.split(traces.load(tr))[0])
+    assert more["windows"] == sum(more["windows_by_offset"]) < 500 and more["windows_by_offset"][:2] == [rows, rows]
+    assert len(more["warnings"]) == 1 and f"{more['windows']} windows of the 500 asked" in more["warnings"][0]
     cli("e2e", "--state", tmp_path / "block", "--teacher", hf, "--traces", tr, "--out", tmp_path / "e2e", "--tokens", 4000,
-        "--length", 96, "--batch", 4, "--lr", 1e-3, "--eval-every", 5, "--held-rows", 2, "--held-length", 96)
+        "--length", 96, "--batch", 4, "--lr", 1e-3, "--eval-every", 5, "--held-rows", 2, "--held-length", 96,
+        "--freeze-steps", 2)
     e2e = json.loads((tmp_path / "e2e" / "e2e.json").read_text())
     assert e2e["steps"] == e2e["total"] > 0 and e2e["tokens"] >= 4000 and not e2e["cap_fired"]
+    assert e2e["freeze_steps"] == 2 and e2e["frozen"] and (e2e["peak_gb"] is None) == (not gpu)
     assert not (tmp_path / "e2e" / "ckpt.pt").exists()
     meta = json.loads((tmp_path / "e2e" / "state" / qat.META).read_text())
     assert meta["phase"] == "e2e" and meta["type_map"] == qat.load_type_map(tmp_path / "map.json")
@@ -490,6 +590,60 @@ def test_loops_are_thinking_reports_and_cut_rollout_files_are_repaired(tmp_path)
                  + '{"id": "c", "n')
     assert [r["id"] for r in qat._complete_rows(p, 2)] == ["a", "a"]
     assert [json.loads(x)["id"] for x in p.read_text().splitlines()] == ["a", "a"]
+
+
+def test_fresh_rollouts_stop_at_the_token_cap(rounds, tmp_path):
+    """--rollout-tokens-cap: once a session's fresh rollouts hold that many answer tokens
+    no further problem is asked (the ones running finish and are kept); a rerun of the
+    session asks nothing more, and without the cap it asks the rest."""
+    import time
+    r = rounds()
+    slow = FakeVLLM(r.tok, lambda body: time.sleep(0.2) or r.fake.complete(body))  # one problem at a time
+    try:
+        pool = {p["id"]: p for p in opd.problems(str(r.bench))}
+        probs = [pool[i] for i in r.fresh]
+        out = tmp_path / "fresh.jsonl"
+        kw = {"max_tokens": 300, "max_model_len": qat._config(r.work).length, "workers": 1}
+        rows = qat.sample_rollouts(slow.url, r.tok, probs, 2, out, token_cap=1, **kw)
+        ids = {x["id"] for x in rows}
+        assert 1 <= len(ids) <= 2 < len(probs) and len(rows) == 2 * len(ids)  # the first, and the one running
+        assert [json.loads(x)["id"] for x in out.read_text().splitlines()] == [x["id"] for x in rows]
+        asked = len(slow.bodies("/v1/completions"))
+        assert qat.sample_rollouts(slow.url, r.tok, probs, 2, out, token_cap=1, **kw) == rows
+        assert len(slow.bodies("/v1/completions")) == asked
+        assert {x["id"] for x in qat.sample_rollouts(slow.url, r.tok, probs, 2, out, **kw)} == set(r.fresh)
+    finally:
+        slow.stop()
+
+
+def test_onpolicy_session_budgets_follow_the_latest_call(tmp_path, monkeypatch):
+    """--max-minutes (a round's training minutes, the rate annealed by time) and
+    --rollout-tokens-cap are a session's budgets: a call that gives them sets them from
+    its session on, in the config.json the trainer and the sampler read; a call
+    without them keeps the last; the run's other settings stay as it started."""
+    work = tmp_path / "w"
+    seen = []
+
+    def one(w):
+        cfg, st = qat._config(w), qat.read_state(w)
+        seen.append((st["session"], cfg.max_minutes, cfg.rollout_tokens_cap))
+        st.update(trained=st["trained"] + 1, session=st["session"] + 1)
+        qat.write_state(w, st)
+        return st
+
+    monkeypatch.setattr(qat, "onpolicy_round", one)
+
+    def cli(*args):
+        monkeypatch.setattr(sys, "argv", ["qat", "onpolicy", "--work", str(work), *map(str, args)])
+        qat.main()
+
+    cli("--state", tmp_path / "start", "--teacher", "t", "--problems", "p", "--rounds", 4, "--until-session", 1,
+        "--max-minutes", 30, "--rollout-tokens-cap", 8_000_000)
+    cli("--until-session", 2)
+    cli("--until-session", 3, "--max-minutes", 20.5, "--rollout-tokens-cap", 0)
+    assert seen == [(1, 30.0, 8_000_000), (2, 30.0, 8_000_000), (3, 20.5, 0)]
+    cfg = qat._config(work)
+    assert (cfg.teacher, cfg.problems, cfg.rounds, cfg.freeze_steps) == ("t", "p", 4, qat.FREEZE_STEPS)
 
 
 def test_cross_entropy_only_on_passing_answers_the_student_wrote():
@@ -620,7 +774,7 @@ def rounds(tmp_path, monkeypatch):
 
 
 def test_onpolicy_rounds_sample_label_judge_train_and_resume(rounds):
-    r = rounds(rounds=2)
+    r = rounds(rounds=2, freeze_steps=3)  # a 12-step round freezes its codes only with freeze_steps <= 6
     start = r.start
     r.fail_train = True
     with pytest.raises(RuntimeError, match="the trainer stopped"):
@@ -641,6 +795,9 @@ def test_onpolicy_rounds_sample_label_judge_train_and_resume(rounds):
             assert x["tokens"] == r.cut + close + r.wrong and not x["passed"] and x["forced"] == "length"
     m = json.loads((rd / "held.metrics.json").read_text())
     assert (m["pass"], m["cap"], m["loop"], m["problems"]) == (0.5, 0.5, 0.0, 2)
+    done = json.loads((rd / "rollouts.done").read_text())
+    assert done == {"served": str(start), "fresh_problems": 3, "fresh_sampled": 3, "rollout_tokens_cap": 0,
+                    "fresh_tokens": sum(len(x["tokens"]) for x in fresh), "capped": False}
 
     st = r.round()  # the rerun resumes with the trainer: nothing sampled again
     assert r.asked() == asked and r.trains == 2 and r.served == [start / "serve"]
@@ -649,7 +806,7 @@ def test_onpolicy_rounds_sample_label_judge_train_and_resume(rounds):
     assert (cand / "serve" / "config.json").exists() and json.loads((cand / qat.META).read_text())["phase"] == "onpolicy1"
     train = json.loads((rd / "train" / "train.json").read_text())
     assert train["steps"] == 2 * 6 and train["passing"] == train["ce_rows"] == 3 and train["frozen"]
-    assert train["skipped"] == 0
+    assert train["skipped"] == 0 and "peak_gb" in train and (train["peak_gb"] is None) == (not torch.cuda.is_available())
     assert not (rd / "train" / "ckpt.pt").exists()
 
     st = r.round()  # session 2 judges round 1 on the same held-out problems, then trains round 2

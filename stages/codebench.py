@@ -28,16 +28,23 @@ them, so our reading of an answer is the official one:
   - the last complete fenced block is the code (extract_code)
   - a program that runs main() in a thread and returns is not waited for: what the
     thread prints after that is lost and the case fails, as in lcb_runner
+  - a stdin program runs inside one function, as lcb_runner's make_function puts it
+    (stdio_harness): its top-level names are locals, so top-level loops run as fast
+    as there, and a `global` statement naming one fails there and here. That
+    failure is kept, not fixed: lcb_runner's verdict is the one we report
 Where we differ from lcb_runner, checked by running both on the same answers
 (tests/test_codebench.py, LCB_PARITY): lcb_runner patches builtins.open with the
 case input, but its own prelude has already bound the real open in the answer's
 namespace, so there open(0) reads the runner's own stdin; we give the case input
 to open(0), open('/dev/stdin') and open(sys.stdin.fileno()), as it means to.
 Its stdin stand-in cannot be iterated (`for line in sys.stdin`) and its
-sys.stdin.buffer.readline() returns the first line every time, and it runs a
-stdin program inside a function, so `global` names fail; all of these pass here.
+sys.stdin.buffer.readline() returns the first line every time; both pass here.
+It runs the program in a module named tmp_sol, so a main guard that is not the
+program's last statement (which clean_if_name unwraps) never runs there; here
+__name__ is '__main__' and it does.
 The cases go to the sandbox as a cases.json file next to the program (job()), so
-large test data never hits the sandbox's file size limit.
+large test data never hits the sandbox's file size limit, and the harness reads it
+one case at a time, so it does not eat into the program's memory limit either.
 
 Suites (Config.code_eval_suites):
   multipl-e-py, multipl-e-js, multipl-e-ts, multipl-e-cpp
@@ -312,7 +319,7 @@ def job(p: dict, answer: str, code: str | None = None) -> tuple[str, str, str, f
     much test data a problem has. code is the answer's code when the caller already
     took it out (see assemble)."""
     code, tests, cases = _assemble(p, answer, code, embed=False)
-    files = {CASES_FILE: json.dumps(cases)} if cases is not None else {}
+    files = {CASES_FILE: cases_text(cases)} if cases is not None else {}
     return p["language"], code, tests, time_limit(p), files
 
 
@@ -394,10 +401,30 @@ _GUARD = _NO_EXIT + (
     "_atexit.register(_exited)\n")
 
 
+def cases_text(cases: list) -> str:
+    """CASES_FILE's content: a JSON list with one case per line, so the harness can
+    read it a case at a time (json.dumps never writes a raw newline inside a value)."""
+    return "[\n" + ",\n".join(json.dumps(c) for c in cases) + "\n]\n"
+
+
 def _load_cases(cases: list | None) -> str:
-    """Harness line that sets _CASES: from CASES_FILE, or written in when cases are given."""
+    """Harness lines that set _CASES: from CASES_FILE, or written in when cases are
+    given. From the file, _CASES yields one case at a time, so the harness never holds
+    a problem's whole test data, which in the all-cases rescore can run to hundreds of
+    MB: the program under test gets the sandbox's memory limit to itself, as under
+    lcb_runner, which sets none. A file in another layout is read whole."""
     if cases is None:
-        return f"with _io.open({CASES_FILE!r}, encoding='utf-8') as _fh:\n    _CASES = _json.load(_fh)\n"
+        return ("def _read_cases():\n"
+                f"    with _io.open({CASES_FILE!r}, encoding='utf-8') as _fh:\n"
+                "        _first = _fh.readline()\n"
+                "        if _first.strip() != '[':\n"
+                "            yield from _json.loads(_first + _fh.read())\n"
+                "            return\n"
+                "        for _line in _fh:\n"
+                "            _line = _line.strip().rstrip(',')\n"
+                "            if _line and _line != ']':\n"
+                "                yield _json.loads(_line)\n"
+                "_CASES = _read_cases()\n")
     return f"_CASES = _json.loads({json.dumps(cases)!r})\n"
 
 
@@ -434,14 +461,30 @@ def stdio_harness(code: str, cases: list | None = None) -> str:
     expected output the way lcb_runner's grade_stdio compares them, within
     CASE_TIMEOUT seconds. cases are [input, output] pairs; they come from CASES_FILE
     unless given. A thread the program starts is not waited for (lcb_runner does not
-    either)."""
+    either).
+
+    The program runs the way grade_stdio runs it (clean_if_name, then make_function):
+    a main guard that is its last statement is unwrapped, its top-level imports stay
+    at module level and every other top-level statement goes into
+    `def wrapped_function():`, which each case calls. Its top-level names are then
+    that function's locals, which Python reads far faster than module globals, so a
+    hot top-level loop takes about as long as under lcb_runner instead of up to twice
+    as long, and fails its time limit only where lcb_runner's fails too. The same
+    wrapping makes a `global` statement that names one of them fail, as it does there."""
     return (
-        _HEAD + _NO_EXIT + "import ast as _ast, builtins as _bi\nfrom decimal import Decimal as _Decimal\n" +
+        _HEAD + _NO_EXIT + "import ast as _ast, builtins as _bi, gc as _gc\nfrom decimal import Decimal as _Decimal\n" +
         _load_cases(cases) +
-        # One module, prelude first (so a late __future__ import fails, as in
-        # lcb_runner), with the answer's own line numbers in its tracebacks.
+        # lcb_runner's clean_if_name and make_function on the parsed answer, not on
+        # unparsed text as there, so tracebacks keep the answer's own line numbers.
+        # The prelude goes first, so a late __future__ import fails, as in lcb_runner.
         f"_tree = _ast.parse({PY_PRELUDE!r})\n"
-        f"_tree.body += _ast.parse({code!r}, 'answer.py').body\n"
+        f"_body = _ast.parse({code!r}, 'answer.py').body\n"
+        "if _body and isinstance(_body[-1], _ast.If) and _ast.unparse(_body[-1].test).strip() == \"__name__ == '__main__'\":\n"
+        "    _body[-1:] = _body[-1].body\n"
+        "_imports = (_ast.Import, _ast.ImportFrom)\n"
+        "_fn = _ast.parse('def wrapped_function():\\n    pass').body[0]\n"
+        "_fn.body = [_s for _s in _body if not isinstance(_s, _imports)] or _fn.body\n"
+        "_tree.body += [_s for _s in _body if isinstance(_s, _imports)] + [_fn]\n"
         "_CODE = compile(_tree, 'answer.py', 'exec')\n"
         "_real_out, _real_open = _sys.stdout, _bi.open\n"
         "class _Stdin(_io.TextIOWrapper):\n"
@@ -473,9 +516,17 @@ def stdio_harness(code: str, cases: list | None = None) -> str:
         "    _buf = _io.BytesIO()\n"
         "    _out = _io.TextIOWrapper(_buf, encoding='utf-8', write_through=True)\n"
         "    _sys.stdout, _bi.open = _out, _open\n"
+        # The module runs again for each case, after the stdin and open swap, so the
+        # prelude's `from sys import *` and `from builtins import *` bind this case's
+        # stand-ins. Like lcb_runner's compile_code and its call, the imports and the
+        # call each get the case's time limit. __name__ stays '__main__', so a main
+        # guard that is not the last statement runs too.
         f"    _signal.setitimer(_signal.ITIMER_REAL, {CASE_TIMEOUT})\n"
         "    try:\n"
-        "        exec(_CODE, {'__name__': '__main__'})\n"
+        "        _g = {'__name__': '__main__'}\n"
+        "        exec(_CODE, _g)\n"
+        f"        _signal.setitimer(_signal.ITIMER_REAL, {CASE_TIMEOUT})\n"
+        "        _g['wrapped_function']()\n"
         "    except SystemExit:\n"
         "        pass\n"
         "    except _CaseTimeout:\n"
@@ -486,7 +537,13 @@ def stdio_harness(code: str, cases: list | None = None) -> str:
         "        _sys.stdout, _bi.open = _real_out, _real_open\n"
         "    _got = _buf.getvalue().decode('utf-8', 'replace')\n"
         "    if not _same(_got, _want):\n"
-        "        raise SystemExit(f'case {_i}: expected {_want[:200]!r}, got {_got[:200]!r}')\n")
+        "        raise SystemExit(f'case {_i}: expected {_want[:200]!r}, got {_got[:200]!r}')\n"
+        # Each case's globals hold its stdin and stdout (the prelude's `from sys import *`)
+        # and are in a reference cycle with wrapped_function (and with any recursive
+        # inner function of the answer), which only the cycle collector frees: without
+        # a collection here the cases' inputs pile up against the program's memory limit.
+        "    _g = None\n"
+        "    _gc.collect()\n")
 
 
 CANNOT_RUN = {"missing_toolchain", "unsupported_language"}

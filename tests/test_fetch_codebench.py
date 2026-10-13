@@ -320,10 +320,10 @@ def test_main_fetches_the_named_suites_livecodebench_first_with_every_lcb_case(m
 # ---------- setup_vm.sh ----------
 
 
-def bash(script: str, **env) -> subprocess.CompletedProcess:
+def bash(script: str, stdin: str | None = None, **env) -> subprocess.CompletedProcess:
     """Runs script in bash with setup_vm.sh sourced for its functions only."""
     return subprocess.run(["bash", "-c", f'source "{SETUP}"\n{script}'], capture_output=True, text=True,
-                          env={**os.environ, "SETUP_VM_LIB": "1", **env}, timeout=120)
+                          input=stdin, env={**os.environ, "SETUP_VM_LIB": "1", **env}, timeout=120)
 
 
 def test_setup_vm_parses_and_sources_without_side_effects(tmp_path):
@@ -424,7 +424,7 @@ def test_setup_vm_extras_pins_builds_and_the_cuda_check_order():
     for target in ("llama-quantize", "llama-perplexity", "llama-tokenize", "llama-batched-bench"):
         assert target in build
     # gguf from the checkout, not PyPI; the CUDA check runs after the last install into venv-train
-    first = text[text.index('"torch>=2.7"'):]
+    first = text[text.index('"torch==2.14.0"'):]
     assert "gguf" not in first[:first.index("\n\n")].split("--no-deps")[0]
     assert '"$NVME/llama.cpp/gguf-py"' in text
     installs = [i for i, l in enumerate(lines) if "uv pip install" in l and "venv-train" in l]
@@ -432,3 +432,63 @@ def test_setup_vm_extras_pins_builds_and_the_cuda_check_order():
     assert installs and max(installs) < check
     assert text.count("torch.cuda.is_available(), torch") == 1
     assert 'uv pip freeze --python "$NVME/venv-train/bin/python"' in text
+
+
+def test_revisions_are_branches_or_full_commits():
+    """orchestration#0: a suite's revision is "main" until session 1's fetch is pinned (the
+    TODO at REVISIONS), then the full commit its meta recorded; an abbreviated sha is never
+    a pin."""
+    assert set(fc.REVISIONS) == {fc.LCB_REPO, fc.CC_REPO, fc.APPS_REPO}
+    for repo, rev in fc.REVISIONS.items():
+        assert rev == "main" or re.fullmatch(r"[0-9a-f]{40}", rev), (repo, rev)
+
+
+def test_setup_vm_pins_both_venvs_and_keeps_temp_files_and_caches_on_the_nvme():
+    """orchestration#1, #9: every install into a venv takes that venv's constraints, the
+    training venv pins what the plan checked (llm-compressor's ranges hold them), the
+    freezes are written after the last install, SKIP_SUITES skips the fetch, and .env.vm
+    puts TMPDIR and the vLLM/torch caches on the NVMe (the root disk is 14 GB)."""
+    text = SETUP.read_text()
+    lines = text.splitlines()
+    installs = [l for l in lines if "uv pip install" in l and "venv-" in l and '-e "$REPO"' not in l]
+    assert len(installs) == 4
+    for line in installs:
+        venv = "VLLM_C" if "venv-vllm" in line else "TRAIN_C"
+        assert f'"${{{venv}[@]}}"' in line, line
+    for pin in ('"vllm==0.31.0"', '"torch==2.14.0"', '"transformers==5.17.0"', '"accelerate==1.15.0"'):
+        assert text.count(pin) == 1, pin
+    assert 'mapfile -t VLLM_C < <(constraints_for venv-vllm)' in text
+    assert 'if [ -n "${UV_EXCLUDE_NEWER:-}" ]; then export UV_EXCLUDE_NEWER; fi' in text
+    assert '${TEACHER_REVISION:+--revision "$TEACHER_REVISION"}' in text
+    check = next(i for i, l in enumerate(lines) if "torch.cuda.is_available(), torch" in l)
+    freeze = next(i for i, l in enumerate(lines) if "| pinned_lines >" in l)
+    last_install = max(i for i, l in enumerate(lines) if "uv pip install" in l)
+    assert last_install < check < freeze < next(i for i, l in enumerate(lines) if l.startswith('say "Versions'))
+    suites = text[text.index('say "Code suites'):]
+    assert suites.index('if [ -n "$SKIP_SUITES" ]') < suites.index("fetch_codebench.py\" --out")
+    env = text[text.index("> \"$REPO/.env.vm\" <<ENV"):text.index("\nENV\n")]
+    for var, where in (("TMPDIR", "tmp"), ("XDG_CACHE_HOME", "cache"), ("VLLM_CACHE_ROOT", "cache/vllm"),
+                       ("TRITON_CACHE_DIR", "cache/triton"), ("TORCHINDUCTOR_CACHE_DIR", "cache/torchinductor")):
+        assert f"export {var}=$NVME/{where}\n" in env, var
+    assert "mkdir -p \\$TMPDIR \\$VLLM_CACHE_ROOT" in env
+
+
+def test_venv_freezes_become_constraints_only_for_the_venv_they_froze(tmp_path):
+    """pinned_lines keeps name==version lines, normalized and sorted, so two VMs that
+    installed the same versions write the same file (the repo's editable install and gguf
+    from the llama.cpp checkout are not PyPI pins); constraints_for gives uv's -c for a
+    venv whose freeze CONSTRAINTS holds, and nothing otherwise."""
+    freeze = ("Torch==2.14.0\n-e file:///home/x/llmap\ngguf @ file:///mnt/nvme/llama.cpp/gguf-py\n"
+              "zope.interface==7.2\nnvidia_cudnn_cu12==9.10.2.21\naccelerate==1.15.0\n")
+    r = bash("pinned_lines", stdin=freeze)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["accelerate==1.15.0", "nvidia-cudnn-cu12==9.10.2.21", "torch==2.14.0",
+                                     "zope-interface==7.2"]
+    r = bash("set -o pipefail; pinned_lines", stdin="-e file:///x\n")
+    assert r.returncode == 0 and r.stdout == ""  # nothing to pin is not an error under pipefail
+    (tmp_path / "venv-train.txt").write_text("torch==2.14.0\n")
+    script = 'mapfile -t C < <(constraints_for "$1"); printf "%s|" "${#C[@]}" "${C[@]}"'
+    r = bash(f"set -- venv-train\n{script}", CONSTRAINTS=str(tmp_path))
+    assert r.returncode == 0 and r.stdout == f"2|-c|{tmp_path}/venv-train.txt|", r.stderr
+    assert bash(f"set -- venv-vllm\n{script}", CONSTRAINTS=str(tmp_path)).stdout == "0|"
+    assert bash(f"set -- venv-train\n{script}", CONSTRAINTS="").stdout == "0|"

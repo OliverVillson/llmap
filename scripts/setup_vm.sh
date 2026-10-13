@@ -9,15 +9,26 @@
 # SKIP_EXTRAS=1 leaves out Node/TypeScript, llm-compressor and Aider Polyglot, and
 # fetches only the livecodebench, codecontests and apps suites: ~15-20 minutes less
 # per boot, which a B200 pays for by the minute.
-# Only vLLM is pinned here; what everything else resolved to, and the llama.cpp
-# commit, go to $NVME/versions.txt, so a reading can say what produced it.
+# SKIP_SUITES=1 fetches no code suite: the caller restores them from the bucket once the
+# NVMe is mounted (scripts/event_horizon.py, after the first session's fetch).
+# TEACHER_REVISION: the revision the teacher is downloaded at (default: the hub's main).
+# Pins: vLLM, and torch, transformers and accelerate in the training venv. UV_EXCLUDE_NEWER
+# (an RFC 3339 time, read by every uv call) resolves the rest as PyPI stood then, and
+# CONSTRAINTS (a dir of <venv>.txt, an earlier setup's $NVME/venvs) installs each venv at
+# exactly those versions; both keep the venvs the same from one VM to the next. What
+# everything resolved to, and the llama.cpp commit, go to $NVME/versions.txt, so a reading
+# can say what produced it, and each venv's freeze to $NVME/venvs/<venv>.txt.
 set -euo pipefail
 
 NVME=${NVME:-/mnt/nvme}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEACHER=${TEACHER:-Qwen/Qwen3-30B-A3B-Instruct-2507}
 STUDENT=${STUDENT-google/gemma-4-E4B-it}  # STUDENT= (empty) skips it
+TEACHER_REVISION=${TEACHER_REVISION:-}
 SKIP_EXTRAS=${SKIP_EXTRAS:-}
+SKIP_SUITES=${SKIP_SUITES:-}
+CONSTRAINTS=${CONSTRAINTS:-}
+if [ -n "${UV_EXCLUDE_NEWER:-}" ]; then export UV_EXCLUDE_NEWER; fi
 # The llama.cpp commit everything GGUF comes from: llama-quantize's formats and type
 # rules, convert_hf_to_gguf.py and gguf-py's dequantization all change between commits,
 # and the shipped file must be reproducible.
@@ -66,6 +77,20 @@ missing_suites() {
   done
 }
 
+# constraints_for VENV: uv's constraint arguments (one per line) for VENV when CONSTRAINTS
+# holds an earlier setup's freeze of it, else nothing.
+constraints_for() {
+  if [ -n "$CONSTRAINTS" ] && [ -f "$CONSTRAINTS/$1.txt" ]; then printf -- '-c\n%s\n' "$CONSTRAINTS/$1.txt"; fi
+}
+
+# pinned_lines: a `uv pip freeze` as constraints: only name==version lines (not the repo's
+# editable install or gguf from the llama.cpp checkout), names normalized, sorted, so two
+# VMs that installed the same versions write the same file.
+pinned_lines() {
+  { grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*==' || true; } | awk -F'==' '{n=tolower($1); gsub(/[._]/, "-", n); print n "==" $2}' \
+    | LC_ALL=C sort
+}
+
 # tests/test_fetch_codebench.py sources this file for the functions above only.
 if [ -n "${SETUP_VM_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
 
@@ -106,7 +131,8 @@ elif pgrep -f "hf download" >/dev/null; then
 else
 say "Downloading weights in the background (log: $NVME/download.log)"
 (
-  uv tool run --from huggingface_hub hf download "$TEACHER" --local-dir "$NVME/models/${TEACHER##*/}"
+  uv tool run --from huggingface_hub hf download "$TEACHER" ${TEACHER_REVISION:+--revision "$TEACHER_REVISION"} \
+    --local-dir "$NVME/models/${TEACHER##*/}"
   if [ -n "$STUDENT" ]; then
     uv tool run --from huggingface_hub hf download "$STUDENT" --local-dir "$NVME/models/${STUDENT##*/}"
   fi
@@ -114,16 +140,19 @@ say "Downloading weights in the background (log: $NVME/download.log)"
 ) > "$NVME/download.log" 2>&1 &
 fi
 
-say "vLLM venv (data stage)"
+mapfile -t VLLM_C < <(constraints_for venv-vllm)
+mapfile -t TRAIN_C < <(constraints_for venv-train)
+say "vLLM venv (data stage)${UV_EXCLUDE_NEWER:+, PyPI as of $UV_EXCLUDE_NEWER}${VLLM_C[1]:+, constraints $CONSTRAINTS}"
 uv venv -q --python 3.12 "$NVME/venv-vllm"
-uv pip install -q --python "$NVME/venv-vllm/bin/python" "vllm==0.31.0" pyyaml httpx  # the version exp04 was checked against
+uv pip install -q --python "$NVME/venv-vllm/bin/python" "${VLLM_C[@]}" \
+  "vllm==0.31.0" pyyaml httpx  # the version exp04 was checked against
 uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 
 say "Training venv (reap, heal, quantize, eval, package, API)"
 # gguf comes from the pinned llama.cpp checkout below, not from PyPI.
 uv venv -q --python 3.12 "$NVME/venv-train"
-uv pip install -q --python "$NVME/venv-train/bin/python" \
-  "torch>=2.7" "transformers>=5.5" "peft>=0.17" accelerate safetensors \
+uv pip install -q --python "$NVME/venv-train/bin/python" "${TRAIN_C[@]}" \
+  "torch==2.14.0" "transformers==5.17.0" "peft>=0.17" "accelerate==1.15.0" safetensors \
   anthropic httpx fastapi uvicorn sentencepiece protobuf
 uv pip install -q --python "$NVME/venv-train/bin/python" -e "$REPO" --no-deps
 
@@ -137,9 +166,18 @@ export HF_HOME=$NVME/hf-cache
 export UV_CACHE_DIR=$NVME/uv-cache
 export LOBBOT_JOBS=$NVME/jobs
 export PATH=$NVME/venv-train/bin:\$PATH
+# Temp files (the sandbox's cases.json copies) and the vLLM/torch compile caches on the
+# NVMe: the root disk is 14 GB.
+export TMPDIR=$NVME/tmp
+export XDG_CACHE_HOME=$NVME/cache
+export VLLM_CACHE_ROOT=$NVME/cache/vllm
+export TRITON_CACHE_DIR=$NVME/cache/triton
+export TORCHINDUCTOR_CACHE_DIR=$NVME/cache/torchinductor
+mkdir -p \$TMPDIR \$VLLM_CACHE_ROOT \$TRITON_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR
 # API keys (GEMINI_API_KEY, ANTHROPIC_API_KEY) live outside the repo, mode 600.
 if [ -f \$HOME/.lobbot-env ]; then . \$HOME/.lobbot-env; fi
 ENV
+if [ -n "${UV_EXCLUDE_NEWER:-}" ]; then echo "export UV_EXCLUDE_NEWER=$UV_EXCLUDE_NEWER" >> "$REPO/.env.vm"; fi
 
 say "vLLM smoke test"
 "$NVME/venv-vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda ok:', torch.cuda.is_available())" || echo 'WARNING: vLLM import failed; the data stage will not run'
@@ -167,14 +205,16 @@ cmake --build "$NVME/llama.cpp/build" -j"$(nproc)" --target llama-quantize llama
 # checkout's. convert_hf_to_gguf.py's own requirements file pins a CPU torch and an
 # older transformers, which would replace the venv's, so only gguf is installed and
 # the converter's imports are checked instead.
-uv pip install -q --python "$NVME/venv-train/bin/python" --reinstall-package gguf "$NVME/llama.cpp/gguf-py"
+uv pip install -q --python "$NVME/venv-train/bin/python" "${TRAIN_C[@]}" --reinstall-package gguf "$NVME/llama.cpp/gguf-py"
 "$NVME/venv-train/bin/python" "$NVME/llama.cpp/convert_hf_to_gguf.py" --help >/dev/null
 
 say "Code suites (scripts/fetch_codebench.py)"
 SUITES="livecodebench codecontests apps"
 [ -n "$SKIP_EXTRAS" ] || SUITES="multipl-e $SUITES general-calib"
 MISSING=$(missing_suites "$NVME/codebench" $SUITES | tr '\n' ' ')
-if [ -n "${MISSING// }" ]; then
+if [ -n "$SKIP_SUITES" ]; then
+  echo "not fetched (SKIP_SUITES=1): the caller restores them from the bucket"
+elif [ -n "${MISSING// }" ]; then
   uv run -q --python 3.12 --with datasets --with huggingface_hub \
     python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" --only $MISSING \
     || echo "WARNING: not every code suite downloaded ($MISSING): code eval fails without livecodebench, trace generation without codecontests"
@@ -194,13 +234,20 @@ if [ -z "$SKIP_EXTRAS" ]; then
   grep -q "$NVME/node/bin" "$REPO/.env.vm" || echo "export PATH=$NVME/node/bin:\$PATH" >> "$REPO/.env.vm"
 
   say "llm-compressor in the training venv (quant_format w4a16: int4 experts, FP8 attention, for vLLM)"
-  # 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: inside this venv's
-  # ranges (transformers>=5.5, torch>=2.7), so it shares the venv; newer releases are moved back.
-  uv pip install -q --python "$NVME/venv-train/bin/python" "llmcompressor==0.14.0"
+  # 0.14 pins transformers 5.15-5.17, torch 2.10-2.14.0 and accelerate 1.15.0: this venv's pins
+  # (transformers 5.17.0, torch 2.14.0, accelerate 1.15.0) are inside them, so it shares the venv.
+  uv pip install -q --python "$NVME/venv-train/bin/python" "${TRAIN_C[@]}" "llmcompressor==0.14.0"
 fi
 
 say "Training venv check, after its last install"
 "$NVME/venv-train/bin/python" -c "import torch; assert torch.cuda.is_available(), torch.__version__; print('train venv torch', torch.__version__, 'cuda ok')"
+
+say "Venv freezes: $NVME/venvs (an evroc run pins the first VM's for the next ones)"
+mkdir -p "$NVME/venvs"
+for v in venv-vllm venv-train; do
+  uv pip freeze --python "$NVME/$v/bin/python" | pinned_lines > "$NVME/venvs/$v.txt.part"
+  mv "$NVME/venvs/$v.txt.part" "$NVME/venvs/$v.txt"
+done
 
 say "Versions: $NVME/versions.txt"
 {

@@ -42,7 +42,12 @@ from pathlib import Path
 
 import torch
 
-HELD_FRAC = 0.02  # share of problems held out for the KL gate
+# Share of problems held out (the KL gates, vocab's and horizon's halves, and qat's
+# on-policy held set). The 8M-token text is ~500 problems at ~8k tokens per answer and
+# 2 samples, so 0.06 holds out ~30 (2% held ~10, a handful per half); a ~5000-problem
+# CodeContests pool gives qat ~300 held ids to take its 128 from. Fixed before the
+# first gen: vocab, imatrix, PTQ, Block-AP and qat all depend on the split.
+HELD_FRAC = 0.06
 MIN_MEDIAN = 500  # answer tokens: a thinking model's answers are thousands long; fewer means broken text
 # Rows per bucket before sorting by length: enough to keep padding small, few enough
 # that each epoch's seed still mixes different rows into each batch.

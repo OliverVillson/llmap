@@ -251,6 +251,37 @@ def test_forced_reason_and_open_thinking_follow_the_eval(tmp_path):
     assert opd.answer_text(tok, done) == "\n\n```python\nprint(1)\n```" and opd.answer_text(tok, cut) is None
 
 
+def test_forced_contexts_are_token_for_token_what_eval_force_answer_sends(tmp_path, monkeypatch):
+    """eval.force_answer sends the template, the thinking as split_reasoning strips it,
+    the early-stop line (when the budget ran out) and the closing tag, as one text.
+    The training text's forced context must be those very ids: a thinking that closed
+    Granite-style ("\\n</think>\\n") with no answer, and one the cap cut on a newline,
+    keep no whitespace before the close. The thinking's other ids stay as sampled."""
+    from stages import eval as ev
+    from stages.taskdata import think_tags
+    monkeypatch.setattr(opd, "_forced_ids", {})
+    tok = chat_tokenizer(tmp_path / "tok")
+    enc = lambda text: tok.encode(text, add_special_tokens=False)  # noqa: E731
+    answer = enc("```python\nprint(int(input()) * 2)\n```") + [tok.eos_token_id]
+    fake = FakeVLLM(tok, complete=lambda body: [(answer, "stop")])
+    template = tok.apply_chat_template(opd.messages(STDIN), tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=True)
+    try:
+        prompt = opd.render(tok, STDIN)
+        for sampled, finish in ((enc("Let me think about the input format.\n</think>\n") + [tok.eos_token_id], "stop"),
+                                (enc("Let me think about the input format.\n\n"), "length")):
+            why = opd.forced_reason(tok, sampled, finish)
+            think = opd.open_thinking(tok, sampled)
+            assert think == sampled[:len(think)] and tok.decode(think) == "Let me think about the input format."
+            close = opd.continue_forced(fake.url, opd.STUDENT, prompt, think, why=why)[:-len(answer)]
+            reasoning, _ = ev.split_reasoning({"content": tok.decode(sampled, skip_special_tokens=True)},
+                                              cut=finish == "length")
+            sent = template + reasoning + (ev.EARLY_STOP if why == "length" else "") + think_tags(template)[1]
+            assert prompt + think + close == enc(sent), why
+    finally:
+        fake.stop()
+
+
 def test_passes_grades_with_the_eval_harness(tmp_path):
     if not hasattr(codebench, "job"):
         pytest.skip("codebench.job (the shared grading interface) is not in this tree yet")

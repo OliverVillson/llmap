@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import runner  # noqa: E402
-from runner import Skip, Step, clock_fill, on_line, run_plan  # noqa: E402
+from runner import Run, Skip, Step, clock_fill, on_line, run_plan  # noqa: E402
 
 
 def event(stage, status="running", **kw):
@@ -162,3 +162,99 @@ def test_without_a_hook_nothing_changes(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Uploads that failed" not in out and "SUMMARY" in out
     assert [s.state for s in plan] == ["done", "failed"]
+
+
+class Clock:
+    """runner's time module, moved by hand: time() is now, and steps advance it."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, s):
+        pass
+
+    def strftime(self, fmt):
+        return time.strftime(fmt)
+
+
+def test_steps_found_done_leave_the_speed_alone(tmp_path, monkeypatch, capsys):
+    """orchestration#7: a step a restore finished (Done) and one that found its work done
+    in seconds count as done but not in the speed: counted, a restored 4 h reading made
+    every later guess half."""
+    clock = Clock()
+    monkeypatch.setattr(runner, "time", clock)
+    runs = []
+    monkeypatch.setattr(runner, "Run", lambda steps: runs.append(Run(steps)) or runs[-1])
+
+    def restored(step):
+        raise runner.Done("done before it started: a restore finished it")
+
+    def quick(step):
+        clock.now += 5
+
+    def slow(step):
+        clock.now += 40 * 60
+
+    plan = [Step("reading", {"": 240}, restored), Step("check", {"": 30}, quick), Step("train", {"": 20}, slow)]
+    assert run_plan(plan, lambda: "", tmp_path / "logs", argv=[]) == 0
+    assert [s.state for s in plan] == ["done"] * 3
+    assert runs[0].done_est == 20 and runs[0].done_real == pytest.approx(40)
+    assert "✓ 1. reading (done before it started: a restore finished it)" in capsys.readouterr().out
+
+
+def test_waiting_steps_take_their_guess_again_when_a_step_starts(tmp_path, monkeypatch):
+    """orchestration#7: a guess an earlier step re-bases (gen-measure's rate) reaches the
+    plan that measured it; a guess that cannot be read keeps the old one, and a step that
+    is done keeps the minutes it was counted with."""
+    measured, seen = {}, {}
+
+    def measure(step):
+        measured["rate"] = 2.0
+
+    def look(step):
+        seen[step.name] = dict(step.minutes)
+
+    def broken():
+        raise FileNotFoundError("no eval.json yet")
+
+    plan = [Step("gen-measure", {"": 130}, measure, refresh=lambda: {"": 999}),
+            Step("e2e", {"": 60}, look, refresh=lambda: {"": 60 / measured.get("rate", 1)}),
+            Step("onpolicy", {"rollouts": 50, "train": 25}, look, refresh=broken)]
+    assert run_plan(plan, lambda: "", tmp_path / "logs", argv=[]) == 0
+    assert seen == {"e2e": {"": 30.0}, "onpolicy": {"rollouts": 50, "train": 25}}
+    assert plan[0].minutes == {"": 999}  # read before it ran: it started with it
+    plan[0].state = "done"
+    plan[0].refresh = lambda: {"": 1}
+    runner.refresh_minutes(plan)
+    assert plan[0].minutes == {"": 999}
+
+
+def test_a_resumed_eval_shows_its_answers_and_the_rate_since_it_began(monkeypatch):
+    """orchestration#7: an eval resumed at 600 of 728 answers. The bar shows 600/728, and
+    the time left comes from the answers made since its first event, not from the
+    fraction done (which once said ~1 min left for 128 answers of ~1 min each)."""
+    clock = Clock()
+    monkeypatch.setattr(runner, "time", clock)
+    s = Step("reading", {"eval": 300}, None)
+    s.state, s.part, s.started, s.part_started = "running", "eval", clock.now, clock.now
+    run = runner.Run([s])
+    on_line(s, event("eval", answered=600, total=728))
+    assert s.counts == [600, clock.now, 600, 728]
+    clock.now += 60
+    on_line(s, event("eval", answered=601, total=728))
+    left_early = run.fraction_and_left()[1]  # under 2 min of rate: the guess's rest
+    assert left_early == pytest.approx(300 * 60 * (1 - s.frac), rel=1e-6)
+    clock.now += 540
+    on_line(s, event("eval", answered=610, total=728))
+    assert run.fraction_and_left()[1] == pytest.approx((728 - 610) * 600 / 10)
+    assert "· eval 610/728" in run.line()
+    clock.now += 60
+    on_line(s, event("eval", answered=5, total=728))  # the next candidate in the same stage: a new count
+    assert s.counts == [5, clock.now, 5, 728] and "· eval 5/728" in run.line()
+    # A new part starts its own count.
+    s.minutes = {"eval": 300, "sandbox": 10}
+    on_line(s, event("sandbox", answered=1, total=50))
+    assert s.counts == [1, clock.now, 1, 50] and "· sandbox 1/50" in run.line()

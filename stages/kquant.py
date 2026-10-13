@@ -286,13 +286,19 @@ def _fp16(t: torch.Tensor) -> torch.Tensor:
 
 
 def _snap(d, s, dmin, m, g: Grid):
-    """fp16 d and dmin, integer scales and mins, and the per-sub-block d * sc and dmin * m."""
+    """fp16 d and dmin, integer scales and mins, and the per-sub-block d * sc and dmin * m.
+
+    + 0.0 turns round's -0.0 (a scale or min in (-0.5, 0)) into the +0.0 the int8 it is
+    packed as dequantizes from, as _code does for the codes. Without it d * sc is -0.0
+    where ggml has +0.0, every weight of that sub-block differs from the GGUF's in its
+    sign bit, and the bitwise export check fails. A Q3_K scale that shrinks past -0.5
+    stays there: its codes all round to 0 and its gradient is exactly 0."""
     k = QK_K // g.sub
-    dh, sc = _fp16(d), s.round().clamp(*g.sc)
+    dh, sc = _fp16(d), s.round().clamp(*g.sc) + 0.0
     dl = _sub_scale(dh, sc, k)
     if g.m is None:
         return dh, sc, dl, None, None, None
-    mh, mi = _fp16(dmin), m.round().clamp(*g.m)
+    mh, mi = _fp16(dmin), m.round().clamp(*g.m) + 0.0
     return dh, sc, dl, mh, mi, _sub_scale(mh, mi, k)
 
 

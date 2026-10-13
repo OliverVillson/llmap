@@ -115,7 +115,42 @@ def test_budget_stage_adds_scores_to_eval_json(tmp_path, monkeypatch):
     budget.run_stage(Job(tmp_path))
     b = json.loads((tmp_path / "out/eval.json").read_text())["candidates"][0]["code"]["budgets"]
     assert set(b) == {"16384", "32768", "65536"} and b["65536"]["mean_pass@1"] == 0.8
+    assert b["65536"]["all_samples_mean_pass@1"] == 0.8  # a dry run has no answers to score again
     assert b["16384"]["mean_pass@1"] < b["32768"]["mean_pass@1"] < 0.8
+
+
+def test_the_long_budget_is_scored_on_the_answers_the_short_ones_are(tmp_path, monkeypatch):
+    """The re-score covers sample 0 of each problem, so the long run's entry beside it
+    is those answers' own results, and the gap between the two is the budget's effect
+    alone. The eval's mean over every sample stays as all_samples_mean_pass@1. Here
+    sample 0 passes both problems and sample 1 neither: 1.0 on the same answers, 0.5
+    over all of them."""
+    monkeypatch.setattr(budget, "DRY_RUN", False)
+    (tmp_path / "config.json").write_text(json.dumps({"code_eval_budgets": [10], "code_eval_max_tokens": 100,
+                                                      "eval_candidates": {"m": str(tmp_path / "ckpt")}}))
+    (tmp_path / "taskspec.json").write_text((ROOT / "examples/python-utils.code.taskspec.json").read_text())
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/eval.json").write_text(json.dumps({"candidates": [
+        {"name": "m", "code": {"mean_pass@1": 0.5, "suites": {"livecodebench": {"n": 2, "pass@1": 0.5}}}}]}))
+    probs = [{"suite": "livecodebench", "id": f"p{i}", "language": "python", "prompt": "q", "stub": "", "entry": "",
+              "tests": [{"input": "", "output": ""}]} for i in range(2)]
+    rows = [{"suite": "livecodebench", "id": f"p{i}", "sample": s, "passed": s == 0, "reason": "" if s == 0 else "test_failed",
+             "forced": "length" if (i, s) == (1, 0) else None} for i in range(2) for s in range(2)]
+    (tmp_path / "work/code_eval").mkdir(parents=True)
+    (tmp_path / "work/code_eval/m.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    monkeypatch.setattr(ev, "code_problems", lambda job, held: probs)
+    monkeypatch.setattr(ev, "candidates_to_eval", lambda job: {"m": {"path": str(tmp_path / "ckpt")}})
+    monkeypatch.setattr(ev, "serve", lambda *a, **k: object())
+    monkeypatch.setattr(ev, "stop", lambda proc: None)
+    seen = []
+    monkeypatch.setattr(budget, "rescore", lambda job, name, rows, problems, budgets, release=None:
+                        seen.extend(rows) or {"10": {"mean_pass@1": 0.5}})
+    budget.run_stage(Job(tmp_path))
+    b = json.loads((tmp_path / "out/eval.json").read_text())["candidates"][0]["code"]["budgets"]
+    assert [(r["id"], r["sample"]) for r in seen] == [("p0", 0), ("p1", 0)]
+    assert b["100"]["mean_pass@1"] == 1.0 and b["100"]["all_samples_mean_pass@1"] == 0.5
+    assert b["100"]["suites"]["livecodebench"]["n"] == 2 and b["100"]["how"] == {"hit the cap": 1}
+    assert b["10"]["mean_pass@1"] == 0.5
 
 
 def test_kv_cache_type_reaches_llama_server(tmp_path):

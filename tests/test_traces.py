@@ -50,7 +50,7 @@ def test_split_is_by_problem_stable_across_processes_and_about_held_frac():
     held_ids = sorted({r["id"] for r in held})
     assert not {r["id"] for r in train} & set(held_ids)  # both samples of a problem on one side
     assert all(sum(r["id"] == i for r in held) == 2 for i in held_ids[:5])
-    assert 0.014 < len(held_ids) / 5000 < 0.026
+    assert abs(len(held_ids) / 5000 - T.HELD_FRAC) < 0.01
     code = ("import json, sys; sys.path.insert(0, '.'); from stages import traces as T; "
             "rows = [{'id': f'cc/{i // 2}'} for i in range(10000)]; "
             "print(json.dumps(sorted({r['id'] for r in T.split(rows)[1]})))")
@@ -59,8 +59,24 @@ def test_split_is_by_problem_stable_across_processes_and_about_held_frac():
                              env={**os.environ, "PYTHONHASHSEED": hash_seed}).stdout
         assert json.loads(out) == held_ids
     assert {r["id"] for r in T.split(rows, seed=1)[1]} != set(held_ids)
-    few = [row(f"cc/{i}", [1], [2]) for i in range(3)]
-    assert len(T.split(few)[1]) == 1  # too few problems for 2%: still one held out
+    few = [row(i, [1], [2]) for i in [f"cc/{i}" for i in range(20) if not T.is_held(f"cc/{i}")][:3]]
+    held = T.split(few)[1]  # too few problems for the fraction to pick one: still one held out
+    assert [r["id"] for r in held] == [min((r["id"] for r in few), key=T.bucket)]
+
+
+def test_held_out_share_gives_the_plans_problem_counts():
+    """The 8M-token training text is ~500 CodeContests problems (~8k tokens per
+    answer, 2 samples): the plan holds out ~32 of them, a few dozen for the two halves
+    to split. qat's on-policy held set takes 128 of a ~5000-problem pool's held ids.
+    At 2% these were ~10 and ~100."""
+    import random
+    assert T.HELD_FRAC == 0.06
+    rng = random.Random(0)  # ids as CodeContests has them: sources, contests, letters mixed
+    src = ["codeforces", "codechef", "atcoder", "aizu", "hackerearth", "codejam"]
+    ids = list(dict.fromkeys(f"{rng.choice(src)}/{rng.randint(1, 1700)}_{rng.choice('ABCDEFG')}" for _ in range(6000)))
+    held = [i for i in ids[:500] if T.is_held(i)]
+    assert 25 <= len(held) <= 45 and min(sum(T.half(i) == h for i in held) for h in (0, 1)) >= 12
+    assert sum(T.is_held(i) for i in ids[:5000]) >= 256
 
 
 def test_halves_and_other_seeds_are_independent_of_the_crc32_split():
@@ -73,7 +89,7 @@ def test_halves_and_other_seeds_are_independent_of_the_crc32_split():
     ids = [f"cc/{i}_{c}" for i in range(1000, 9000) for c in "AB"]
     assert all(T.bucket(i) == zlib.crc32(i.encode()) / 2 ** 32 for i in ids[:50])  # the split did not move
     held = [i for i in ids if T.is_held(i)]
-    assert 250 < len(held) < 400
+    assert abs(len(held) / len(ids) - T.HELD_FRAC) < 0.01
     halves = [T.half(i) for i in held]
     assert 0.4 < sum(halves) / len(held) < 0.6
     assert 0.4 < sum(T.bucket(i, 1) < 0.5 for i in held) / len(held) < 0.6

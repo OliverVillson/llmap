@@ -88,6 +88,7 @@ import statistics
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import zlib
 from collections.abc import Callable
@@ -96,7 +97,7 @@ from pathlib import Path
 
 import thinking_report as tr
 from blackhole import share_kept
-from runner import REPO, Skip, Step, above, evroc_ok, run_plan, sh
+from runner import REPO, Done, Skip, Step, above, evroc_ok, run_plan, sh
 
 SESSIONS = ("measure", "train", "read")
 NVME = Path(os.environ.get("NVME", "/mnt/nvme"))
@@ -107,14 +108,26 @@ LOGS = Path(os.environ.get("HORIZON_LOGS", Path.home() / "event-horizon-logs"))
 RUN_ID = os.environ.get("HORIZON_RUN", "eh1")
 BUCKET = "bucket://mugge-library"
 MODEL = "ibm-granite/granite-4.2-3b"
+# The revision `hf download` reads. TODO: session 1 records the commit "main" resolved to
+# (the summary's "Granite 4.2 3B at ..." line, each reading's provenance.json env,
+# choice.json); put that commit here before session 2, so every session trains and reads
+# the same weights.
+MODEL_REVISION = "main"
 HF_DIR = NVME / "models" / "granite-4.2-3b"
 BF16 = NVME / "models" / "gguf" / "granite-4.2-3b-BF16.gguf"
 LLAMA_CPP = NVME / "llama.cpp"
 LLAMA_CPP_SHA = os.environ.get("LLAMA_CPP_SHA", "af50f2f248b475d9760f8e67503d01c0f194f5f4")
 LLAMA_BINS = ("llama-server", "llama-quantize", "llama-imatrix", "llama-perplexity", "llama-tokenize")
 CODEBENCH = NVME / "codebench"
+SUITES = ("livecodebench", "codecontests", "apps")
 TASKSPEC = REPO / "examples" / "python-utils.code.taskspec.json"
 CHOICE = W / "choice.json"
+# Both venvs resolve as PyPI stood at this moment (uv's exclude-newer, after vllm 0.31.0's
+# upload), so every session's VM installs the same versions; from the second setup on they
+# also install with the first setup's freeze as constraints (pinned_venvs). The record's
+# verdict compares the readings' venv versions exactly (PROVENANCE_BLOCKING).
+UV_EXCLUDE_NEWER = "2026-10-12T00:00:00Z"
+VENVS = ("venv-vllm", "venv-train")
 
 # ---------- the goal, the budget and the gates ----------
 
@@ -144,9 +157,16 @@ EVAL = {
 }
 # Keys of config.effective.json that differ between readings by design.
 PER_READING = {"eval_candidates", "code_eval_ids", "code_eval_samples", "code_eval_samples_by_id",
-               "code_eval_seed_offset", "size_gb_override"}
+               "code_eval_seed_offset", "size_gb_override", "eval_model_fingerprint"}
+# The record harness in config.effective.json: EVAL's keys and every key in these
+# namespaces (new eval knobs follow them), less PER_READING. A difference there, or a key
+# one side lacks, blocks the verdict; any other Config field (a pipeline knob added
+# between sessions, say) is reported only.
+HARNESS_PREFIXES = ("code_eval_", "eval_", "lcb_", "vllm_", "thinking_")
 # provenance.json fields that must match the original's reading; the rest is reported.
-PROVENANCE_BLOCKING = ("gpu", "vllm_venv", "llama_cpp", "sandbox_workers", "nproc")
+# Both venvs are frozen across sessions (UV_EXCLUDE_NEWER, the first setup's freeze), so
+# a version difference here is real drift; code_suites is the suites' fetch records.
+PROVENANCE_BLOCKING = ("gpu", "vllm_venv", "eval_venv", "llama_cpp", "sandbox_workers", "nproc", "code_suites")
 DEV_PROBLEMS = 128
 SMOKE_PROBLEMS, SMOKE_TOKENS = 8, 4096
 
@@ -157,9 +177,19 @@ GEN_SAMPLES, GEN_PORT, SMOKE_PORT = 2, 8093, 8094
 IMATRIX_TOKENS = 1_500_000
 BLOCK = {"windows": 2048, "length": 2048, "epochs": 2, "lr": 1e-4}
 E2E = {"tokens": 40e6, "length": 16384, "max_minutes": 60}
-ONPOLICY = {"rounds": ROUNDS_MAX, "fresh": 250, "rollouts": 4, "held": 128}  # 2 held-out answers, 16k, 2 epochs: qat's
+ROLLOUT_TOKENS = 8000  # mean tokens of an on-policy answer, for the time guess
+# 2 held-out answers, 16k, 2 epochs: qat's. Each session is capped: its training at
+# max_minutes (the LR anneals by time, and the codes freeze before the cap), its fresh
+# rollouts at rollout_tokens_cap answer tokens (the guess's mean; a looping model would
+# otherwise double them). The held-out set is never cut: the keep rules pair it.
+ONPOLICY = {"rounds": ROUNDS_MAX, "fresh": 250, "rollouts": 4, "held": 128, "max_minutes": 25,
+            "rollout_tokens_cap": 250 * 4 * ROLLOUT_TOKENS}
 KLD = {"ctx": 8192, "chunks": 16}  # the parity KLD windows
-RATES = {"qat_tokens": 20 * 16384, "vllm_problems": 5}  # S2.2: 20 QAT steps at 16k, a few problems on vLLM
+# S2.2: a few problems on vLLM, 20 QAT steps at 16k with the codes never frozen (the e2e
+# step's own cost), and one tiny on-policy session (its serve dir on vLLM, rollouts,
+# labels, the judging and a training round in the trainer's own process).
+RATES = {"qat_tokens": 20 * 16384, "vllm_problems": 5,
+         "onpolicy": {"rounds": 1, "fresh": 2, "rollouts": 2, "held": 2, "max_minutes": 5}}
 
 # ---------- time guesses (minutes) ----------
 
@@ -168,17 +198,26 @@ RATES = {"qat_tokens": 20 * 16384, "vllm_problems": 5}  # S2.2: 20 QAT steps at 
 # and session train re-bases its guesses on what it measures (minutes()).
 L40S_ANSWERS_PER_MIN = 728 / 234
 LLAMA_ANSWERS_PER_MIN = 100 / 60  # llama-server on the L40S, ~100 answers an hour in run 2
-GUESS = {"setup": 45, "restore": 10, "download": 5, "gguf": 5, "smoke": 30, "gen-measure": 90, "vocab": 30,
-         "imatrix": 12, "ptq": 48, "blockap": 60, "upload": 10, "budgets": 12, "rates": 18, "gen-train": 36,
+# gen-measure: 8M tokens at run 2's ~500 tok/s (bf16 KV) times FP8_KV_GAIN for gen's fp8
+# KV cache, plus GEN_BOOT_MIN for the server; re-based on the original's reading (minutes()).
+FP8_KV_GAIN, GEN_BOOT_MIN = 2.0, 5
+GUESS = {"setup": 45, "restore": 10, "download": 5, "gguf": 5, "smoke": 30, "gen-measure": 130, "vocab": 30,
+         "imatrix": 12, "ptq": 48, "blockap": 60, "upload": 10, "budgets": 12, "rates": 30, "gen-train": 36,
          "e2e": 50, "onpolicy": 4 * 45, "onpolicy-judge": 15, "final": 24, "choice": 2, "rebuild": 10,
          "rescore": 18}
-ROLLOUT_TOKENS = 8000  # mean tokens of an on-policy answer, for the time guess
 
 
 def minutes() -> dict[str, float]:
-    """GUESS, with session train's times re-based on what it measured: QAT tokens/s from
-    S2.2's 20 steps, and the B200's answer tokens/s from the training text's gen."""
+    """GUESS, re-based on what the run measured: the training text's time from the
+    original's reference reading (its answer tokens/s on the L40S, times the fp8 KV gain);
+    session train's from QAT tokens/s in S2.2's 20 steps and the B200's answer tokens/s in
+    the training text's gen, with each on-policy session's caps."""
     m = dict(GUESS)
+    ref = reading_dir(READINGS["original-ref"])
+    cand = ((load(ref / "out" / "eval.json") if ref else None) or {}).get("candidates") or [{}]
+    tok_s = (cand[0].get("code") or {}).get("tok_s_total")
+    if tok_s:
+        m["gen-measure"] = GEN["measure"]["tokens"] / (tok_s * FP8_KV_GAIN) / 60 + GEN_BOOT_MIN
     r = load(rates_dir() / "rates.json") if rates_dir() else None
     c = load(traces_dir("train") / "traces.count") if traces_dir("train") else None
     qat, roll = (r or {}).get("qat_tok_s"), (c or {}).get("tok_s")
@@ -186,10 +225,11 @@ def minutes() -> dict[str, float]:
         m["e2e"] = min(E2E["tokens"] / qat / 60, E2E["max_minutes"]) + 5
     if qat and roll:
         a = ONPOLICY
-        answers = a["fresh"] * a["rollouts"] + a["held"] * 2
-        m["onpolicy"] = a["rounds"] * (answers * ROLLOUT_TOKENS / roll + 2 * a["fresh"] * a["rollouts"]
-                                       * ROLLOUT_TOKENS / qat) / 60 + a["rounds"] * 10
-        m["onpolicy-judge"] = a["held"] * 2 * ROLLOUT_TOKENS / roll / 60 + 10
+        fresh = min(a["fresh"] * a["rollouts"] * ROLLOUT_TOKENS, a["rollout_tokens_cap"] or math.inf)
+        held = a["held"] * 2 * ROLLOUT_TOKENS
+        train = min(2 * fresh / qat / 60, a["max_minutes"])
+        m["onpolicy"] = a["rounds"] * ((fresh + held) / roll / 60 + train + 10)
+        m["onpolicy-judge"] = held / roll / 60 + 10
     return m
 
 
@@ -313,11 +353,26 @@ def physical_cores() -> int:
     return max(1, (os.cpu_count() or 2) // 2)
 
 
+def nvme_env() -> dict:
+    """Temp files and the vLLM/torch compile caches on the NVMe, not the 14 GB root disk:
+    the sandbox writes each answer's cases.json under TMPDIR, and one problem's cases can
+    run to hundreds of MB. .env.vm sets the same for every stage; this covers a VM whose
+    .env.vm predates it."""
+    out = {"TMPDIR": NVME / "tmp", "XDG_CACHE_HOME": NVME / "cache", "VLLM_CACHE_ROOT": NVME / "cache" / "vllm",
+           "TRITON_CACHE_DIR": NVME / "cache" / "triton", "TORCHINDUCTOR_CACHE_DIR": NVME / "cache" / "torchinductor"}
+    for d in out.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return {k: str(v) for k, v in out.items()}
+
+
 def read_env() -> dict:
     """Every LiveCodeBench reading: as many answers in flight as the L40S's KV cache holds
-    at 16k (more only wait inside vLLM), and the sandbox on physical cores - 2."""
-    return {"LOBBOT_VLLM_SEQS": str(RECORD_SEQS), "LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2)),
-            "LOBBOT_VLLM_GPU_UTIL": "0.9"}
+    at 16k (more only wait inside vLLM), and the sandbox on physical cores - 2. The base's
+    revision and downloaded commit go into each reading's provenance.json (eval keeps the
+    LOBBOT_EVAL_* environment there)."""
+    return {**nvme_env(), "LOBBOT_VLLM_SEQS": str(RECORD_SEQS),
+            "LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2)), "LOBBOT_VLLM_GPU_UTIL": "0.9",
+            "LOBBOT_EVAL_BASE_REVISION": MODEL_REVISION, "LOBBOT_EVAL_BASE_COMMIT": download_commit() or ""}
 
 
 def vllm_script(model: Path, port: int, log: Path, then: str, seqs: int = 32) -> str:
@@ -565,10 +620,13 @@ def reading_dir(r: Reading) -> Path | None:
 
 
 def reading_config(r: Reading) -> dict:
-    win, (path, _, gb) = window(r.window), model_of(r.model)
+    win, (path, fp, gb) = window(r.window), model_of(r.model)
     name = reading_dir(r).name
+    # eval keys resumed answers by this content fingerprint, not the files' mtime: a new VM
+    # downloads, re-exports or rebuilds the same weights with new mtimes.
     cfg = {**EVAL, "lcb_since": win["since"], "lcb_until": win["until"], "code_eval_seed_offset": r.seed,
-           "eval_candidates": {name: str(path)}}
+           "eval_candidates": {name: str(path)},
+           "eval_model_fingerprint": original_fingerprint() if r.model == "original" else fp}
     if r.model != "original":
         cfg["size_gb_override"] = {name: round(gb, 6)}  # the shipped GGUF's bytes, not the bf16 checkpoint's
     if r.window == "dev":
@@ -911,7 +969,10 @@ class Art:
     sessions: tuple[str, ...]
     light: Callable[[], list[Path]] = list
     exclude: tuple[str, ...] = ()  # glob patterns of rebuildable files that are never uploaded
-    once: bool = False  # upload only if the bucket does not have it yet
+    # The run's pinned copy: uploaded once, complete, with each file's sha256; a disk that
+    # holds other files under its key is refused, not marked in sync (restore_art then
+    # replaces them with the bucket's).
+    once: bool = False
 
     def files(self) -> list[Path]:
         out: list[Path] = []
@@ -954,9 +1015,12 @@ def in_sync(art: Art) -> bool:
 
 def upload_art(art: Art, complete: bool = True) -> bool:
     """Uploads what the art has on disk: big files one by one, the rest as small.tar, then
-    the manifest last (its presence means the rest is there). False when there is nothing."""
+    the manifest last (its presence means the rest is there). False when there is nothing,
+    and for a once art that is not complete (a partial pin would be restored as the pin).
+    A once art the bucket already holds is marked in sync only when every file's sha256
+    is the manifest's; other files under its key raise."""
     key, files = art.key(), art.files()
-    if key is None or not files:
+    if key is None or not files or (art.once and not complete):
         return False
     fp = fingerprint(files)
     m = load(marker(art))
@@ -966,12 +1030,20 @@ def upload_art(art: Art, complete: bool = True) -> bool:
     tmp = W / ".uploads" / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     if art.once and get(f"{base}/manifest.json", tmp / f"{art.slug}.manifest.json"):
-        dump(marker(art), {"key": key, "fingerprint": fp, "complete": True, "note": "already in the bucket"})
+        man = json.loads((tmp / f"{art.slug}.manifest.json").read_text())
+        pinned = {f["path"]: f.get("sha256") for f in man["files"]}
+        here = {f.relative_to(NVME).as_posix(): sha256_file(f) for f in files}
+        if here != pinned:
+            differ = sorted(p for p in set(here) | set(pinned) if here.get(p) != pinned.get(p))
+            raise RuntimeError(f"{art.slug}: the files on this disk are not the ones {base} pins ({', '.join(differ)}); "
+                               "the restore step gets the bucket's copy")
+        dump(marker(art), {"key": key, "fingerprint": fp, "complete": True, "note": "the bucket's copy"})
         return True
     recs, small = [], []
     for f in files:
         rel, size = f.relative_to(NVME).as_posix(), f.stat().st_size
-        recs.append({"path": rel, "size": size, "big": size >= BIG_BYTES, "light": art.is_light(f)})
+        recs.append({"path": rel, "size": size, "big": size >= BIG_BYTES, "light": art.is_light(f),
+                     **({"sha256": sha256_file(f)} if art.once else {})})
         if size < BIG_BYTES:
             small.append((f, rel))
         elif not put(f, f"{base}/f/{rel}"):
@@ -1009,7 +1081,8 @@ def restore_art(art: Art, session: str) -> str | None:
     want = [f for f in man["files"] if full or f.get("light")]
     for f in (f for f in want if f["big"]):  # the big files first, so the small ones (results, metas) land last
         dst = NVME / f["path"]
-        if not (dst.exists() and dst.stat().st_size == f["size"]) and not get(f"{base}/f/{f['path']}", dst):
+        same = dst.exists() and dst.stat().st_size == f["size"] and (not f.get("sha256") or sha256_file(dst) == f["sha256"])
+        if not same and not get(f"{base}/f/{f['path']}", dst):
             raise RuntimeError(f"restore of {f['path']} from {base} failed")
     small = {f["path"] for f in want if not f["big"]}
     if small:
@@ -1048,11 +1121,13 @@ SHUTDOWN = False
 LOGIN_WAIT_MINUTES = float(os.environ.get("HORIZON_LOGIN_WAIT_MIN", "180"))  # with --shutdown
 
 
-def step(session: str, name: str, mins: dict[str, float], run: Callable[[Step], None], done: Callable[[], bool],
-         art: Art | None = None, gates: tuple[str, ...] = (), progress: Callable[[], float | None] | None = None
-         ) -> Step:
-    """A runner Step that re-checks done() (a restore can finish it), skips when a gate
-    before it failed, and whose outputs `art` the upload hook sends to the bucket."""
+def step(session: str, name: str, mins: dict[str, float] | Callable[[], dict[str, float]],
+         run: Callable[[Step], None], done: Callable[[], bool], art: Art | None = None, gates: tuple[str, ...] = (),
+         progress: Callable[[], float | None] | None = None) -> Step:
+    """A runner Step that re-checks done() (a restore can finish it: runner's Done, so its
+    ~0 s leave the speed alone), skips when a gate before it failed, and whose outputs
+    `art` the upload hook sends to the bucket. mins as a callable is a guess the run
+    re-bases (minutes()): the runner reads it again when a step starts."""
     def safe_done() -> bool:
         try:
             return bool(done())
@@ -1061,19 +1136,101 @@ def step(session: str, name: str, mins: dict[str, float], run: Callable[[Step], 
 
     def go(s: Step) -> None:
         if safe_done():
-            return
+            raise Done("done before it started: a restore or an earlier step finished it")
         why = stopped(gates)
         if why:
             raise Skip(why)
         run(s)
 
+    def guess() -> dict[str, float]:
+        return {k: round(v, 1) for k, v in (mins() if callable(mins) else mins).items()}
+
     STEP_ARTS[(session, name)] = art
-    return Step(name, {k: round(v, 1) for k, v in mins.items()}, go, safe_done, progress or (lambda: None))
+    return Step(name, guess(), go, safe_done, progress or (lambda: None), refresh=guess if callable(mins) else None)
 
 
 def run_setup(step: Step) -> None:
-    sh(step, f"SKIP_EXTRAS=1 NVME={NVME} TEACHER={MODEL} STUDENT= LLAMA_CPP_SHA={LLAMA_CPP_SHA} "
-             "bash scripts/setup_vm.sh")
+    """S1.1/S2.1/S3.1: setup_vm.sh. The run's pinned inputs come from the bucket when it
+    has them: the code suites (session 1's fetch; setup_vm.sh then skips its own, and the
+    bucket's copy replaces anything on the disk once the NVMe is mounted) and the first
+    setup's freeze of both venvs (installed as constraints). Only the first setup of a run
+    fetches the suites and freezes the venvs, and uploads them (the setup step's art, and
+    pin_venvs). Their bucket copies are looked up into a temp dir on the root disk: on a
+    new VM the NVMe is mounted only by setup_vm.sh."""
+    pins = Path(tempfile.mkdtemp(prefix="event-horizon-setup-"))
+    try:
+        cons = pins / "venvs"
+        have_venvs = pinned_venvs(cons)
+        have_bench = codebench_pinned(pins)
+        sh(step, f"SKIP_EXTRAS=1 NVME={NVME} TEACHER={MODEL} TEACHER_REVISION={MODEL_REVISION} STUDENT= "
+                 f"LLAMA_CPP_SHA={LLAMA_CPP_SHA} UV_EXCLUDE_NEWER={UV_EXCLUDE_NEWER} "
+                 f"SKIP_SUITES={'1' if have_bench else ''} CONSTRAINTS={cons if have_venvs else ''} "
+                 "bash scripts/setup_vm.sh")
+    finally:
+        shutil.rmtree(pins, ignore_errors=True)
+    if have_bench:
+        restore_codebench()
+    if not have_venvs:
+        pin_venvs()
+
+
+def codebench_pinned(tmp: Path) -> bool:
+    """The bucket holds the run's code suites, uploaded complete."""
+    man = tmp / "codebench.manifest.json"
+    return bool(evroc_ok() and get(bucket("codebench", "pinned", "manifest.json"), man)
+                and (load(man) or {}).get("complete", True))
+
+
+def restore_codebench() -> None:
+    """The bucket's code suites onto the NVMe (they replace whatever is there), checked
+    file by file against the manifest's sha256 and each JSONL against its meta's."""
+    art = codebench_art()
+    restore_art(art, SESSIONS[0])
+    bad = ([] if in_sync(art) else ["the files on the disk are not the bucket's"]) + codebench_problems()
+    if bad:
+        raise RuntimeError("the code suites restored from the bucket do not check out: " + "; ".join(bad))
+
+
+def codebench_problems() -> list[str]:
+    """Why the code suites on the disk are not whole: a meta without its JSONL, or a JSONL
+    whose sha256 is not the one its meta recorded when it was fetched."""
+    out = [] if (CODEBENCH / "livecodebench.meta.json").exists() else ["no livecodebench.meta.json"]
+    for s in SUITES:
+        meta, f = load(CODEBENCH / f"{s}.meta.json"), CODEBENCH / f"{s}.jsonl"
+        if meta is None:
+            continue
+        if not f.exists():
+            out.append(f"{s}.jsonl missing")
+        elif meta.get("file_sha256") and sha256_file(f) != meta["file_sha256"]:
+            out.append(f"{s}.jsonl is not the file its meta records (sha256)")
+    return out
+
+
+def venvs_dir() -> Path:
+    """setup_vm.sh's freeze of each venv: <venv>.txt, one name==version per line."""
+    return NVME / "venvs"
+
+
+def pinned_venvs(dst: Path) -> bool:
+    """The run's frozen venvs (the first setup's freeze) from the bucket into dst."""
+    if not evroc_ok():
+        return False
+    return all([get(bucket("venvs", f"{v}.txt"), dst / f"{v}.txt") for v in VENVS])
+
+
+def pin_venvs() -> bool:
+    """Uploads this VM's freeze of both venvs as the run's pins, unless the bucket has one
+    (the first setup's wins). VENVS[0] goes last, so its presence means all are there."""
+    files = [venvs_dir() / f"{v}.txt" for v in VENVS]
+    if not evroc_ok() or not all(f.exists() for f in files):
+        return False
+    if get(bucket("venvs", files[0].name), W / ".uploads" / "tmp" / f"pinned-{files[0].name}"):
+        return False
+    for f in reversed(files):
+        if not put(f, bucket("venvs", f.name)):
+            raise RuntimeError(f"upload of {f} to {bucket('venvs')} failed")
+    above(f"    pinned this VM's venvs for the later sessions: {bucket('venvs')}")
+    return True
 
 
 def llama_cpp_head() -> str | None:
@@ -1100,6 +1257,9 @@ def run_restore(step: Step, session: str) -> None:
         if how:
             got.append(f"{art.slug} ({how})")
     above("    restored: " + (", ".join(got) if got else "nothing"))
+    bad = codebench_problems()
+    if bad:
+        raise RuntimeError("the code suites on the NVMe are not whole: " + "; ".join(bad))
     missing = session_inputs(session)
     if missing:
         raise RuntimeError(f"session {session} cannot start: " + "; ".join(missing))
@@ -1137,18 +1297,116 @@ def session_inputs(session: str) -> list[str]:
     return out
 
 
-def download_done() -> bool:
+DOWNLOAD_RESTARTS = 3  # a download that stops without DOWNLOADS_DONE is started again this often
+
+
+def downloaded() -> bool:
     log = NVME / "download.log"
     return log.exists() and "DOWNLOADS_DONE" in log.read_text(errors="replace") and (HF_DIR / "config.json").exists()
 
 
+def download_done() -> bool:
+    return downloaded() and not base_problems()
+
+
+def download_command() -> str:
+    """setup_vm.sh's download of the base, in the background, appending to download.log
+    (sh() sources .env.vm, so HF_HOME and UV_CACHE_DIR are the NVMe's; uv lives in
+    ~/.local/bin, which a shell opened before the setup may not have on PATH)."""
+    return (f"export PATH=$HOME/.local/bin:$PATH; setsid nohup bash -c 'uv tool run --from huggingface_hub hf download "
+            f"{MODEL} --revision {MODEL_REVISION} --local-dir {HF_DIR} && echo DOWNLOADS_DONE' "
+            f">> {NVME / 'download.log'} 2>&1 < /dev/null &")
+
+
 def run_download(step: Step) -> None:
-    while not download_done():
+    """Waits for setup_vm.sh's background download, starting it again (up to
+    DOWNLOAD_RESTARTS times) when it stopped without finishing: the setup step that
+    started it is done, so a re-run alone would never restart it. Then the base must be
+    the architecture every stage assumes (base_problems), before any GPU step."""
+    restarts = 0
+    while not downloaded():
         if subprocess.run(["pgrep", "-f", "hf download"], stdout=subprocess.DEVNULL, check=False).returncode != 0:
             time.sleep(10)
-            if not download_done():
-                raise RuntimeError(f"the model download stopped; see {NVME / 'download.log'} and re-run")
+            if downloaded():
+                break
+            if restarts >= DOWNLOAD_RESTARTS:
+                raise RuntimeError(f"the model download stopped {restarts + 1} times; see {NVME / 'download.log'}. "
+                                   f"Start it by hand (source .env.vm; {download_command()}), then re-run")
+            restarts += 1
+            above(f"    the model download stopped without finishing; starting it again ({restarts} of "
+                  f"{DOWNLOAD_RESTARTS}, log: {NVME / 'download.log'})")
+            sh(step, download_command())
         time.sleep(5)
+    bad = base_problems()
+    if bad:
+        raise RuntimeError(f"{HF_DIR} is not the base every stage assumes (GraniteForCausalLM, llama-style): "
+                           + "; ".join(bad))
+
+
+# The downloaded base's shape. qheal's and gguf_build's tensor maps, the converter's scalar
+# head_count_kv and qat's mlp.gate_proj names all assume a llama-style GraniteForCausalLM;
+# a hybrid-style checkpoint (layer_types, other projections) would break the export or skip
+# tensors silently, so it is refused right after the download, in milliseconds.
+BASE_CONFIG = {"architectures": ["GraniteForCausalLM"], "model_type": "granite", "num_hidden_layers": 40,
+               "hidden_size": 2560, "intermediate_size": 8192, "num_attention_heads": 40, "num_key_value_heads": 8,
+               "vocab_size": 100352, "tie_word_embeddings": False}
+BASE_LINEARS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+def safetensors_shapes(p: Path) -> dict[str, list[int]]:
+    """{tensor: shape} from a safetensors file's header (8-byte length, then JSON)."""
+    with open(p, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        head = json.loads(f.read(n))
+    return {k: v.get("shape", []) for k, v in head.items() if k != "__metadata__"}
+
+
+def base_problems(hf_dir: Path = HF_DIR, want: dict | None = None) -> list[str]:
+    """Why hf_dir is not the base the stages assume, or []: its config.json against
+    BASE_CONFIG and no layer_types; its weights (the safetensors index, or the one file)
+    hold every layer's BASE_LINEARS and lm_head, and no other 2-D weight in a layer."""
+    want = BASE_CONFIG if want is None else want
+    try:
+        cfg = json.loads((hf_dir / "config.json").read_text())
+    except (OSError, ValueError) as e:
+        return [f"config.json unreadable ({e})"]
+    bad = [f"{k} is {cfg.get(k)!r}, expected {v!r}" for k, v in want.items() if cfg.get(k) != v]
+    if "layer_types" in cfg:
+        bad.append(f"config.json has layer_types ({sorted(set(map(str, cfg['layer_types'])))}): a hybrid-style config")
+    index = hf_dir / "model.safetensors.index.json"
+    try:
+        files = (sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists()
+                 else ["model.safetensors"])
+        shapes = {k: s for f in files for k, s in safetensors_shapes(hf_dir / f).items()}
+    except (OSError, ValueError, KeyError) as e:
+        return [*bad, f"the weights' headers are unreadable ({e})"]
+    n = cfg.get("num_hidden_layers") if isinstance(cfg.get("num_hidden_layers"), int) else 0
+    expect = {f"model.layers.{i}.{s}.weight" for i in range(n) for s in BASE_LINEARS}
+    miss = sorted(expect - set(shapes))
+    if miss:
+        bad.append(f"{len(miss)} expected projection weights missing, e.g. {miss[:2]}")
+    if "lm_head.weight" not in shapes:
+        bad.append("no lm_head.weight (an untied head is expected)")
+    other = sorted(k for k, s in shapes.items() if k.startswith("model.layers.") and len(s) == 2 and k not in expect)
+    if other:
+        bad.append(f"{len(other)} 2-D layer weights the stages do not map, e.g. {other[:3]}")
+    return bad
+
+
+def download_commit() -> str | None:
+    """The commit the base was downloaded at: `hf download --local-dir` records it as the
+    first line of each file's .cache/huggingface/download/<file>.metadata."""
+    line = (text(HF_DIR / ".cache" / "huggingface" / "download" / "config.json.metadata") or "").split("\n")[0]
+    return line if re.fullmatch(r"[0-9a-f]{40}", line) else None
+
+
+def original_fingerprint() -> str:
+    """The original's eval fingerprint (Config.eval_model_fingerprint): its id, the commit
+    it was downloaded at and its weight files' sizes, so its partial answers resume on a
+    new VM's fresh download of the same weights (eval otherwise keys them by mtime)."""
+    files = sorted(HF_DIR.glob("*.safetensors")) if HF_DIR.exists() else []
+    return f"{MODEL}@{download_commit() or MODEL_REVISION}:{h([(f.name, f.stat().st_size) for f in files])}"
 
 
 def download_progress() -> float:
@@ -1202,13 +1460,21 @@ def run_smoke(step: Step) -> None:
     py = "python scripts/event_horizon.py smoke"
     url = f"http://127.0.0.1:{SMOKE_PORT}"
 
-    def check(label: str, what: str, fn: Callable[[], None]) -> None:
+    def check(label: str, what: str, fn: Callable[[], dict | None]) -> None:
         if (res.get(label) or {}).get("ok"):
             return
         above(f"    smoke ({label}) {what}")
-        fn()
-        res[label] = {"ok": True, "what": what, "time": time.strftime("%F %T")}
+        found = fn() or {}
+        res[label] = {"ok": True, "what": what, "time": time.strftime("%F %T"), **found}
         dump(S / "smoke.json", res)
+
+    def template() -> dict:
+        sh(step, f"{py} template --hf {HF_DIR} --out {S}/template.json")
+        t = load(S / "template.json") or {}
+        if t.get("default_system_text"):
+            above(f"    smoke (b): with no system message the template adds {t['default_system_text'][:200]!r}; "
+                  "every prompt the run sends has codebench.SYSTEM, so it never reaches the model")
+        return {k: t.get(k) for k in ("default_system_text", "accepted") if t.get(k)}
 
     def eval_path() -> None:
         d = smoke_eval_job(SMOKE_PROBLEMS, SMOKE_TOKENS, "smoke-eval")
@@ -1245,8 +1511,9 @@ def run_smoke(step: Step) -> None:
         if not (put(probe, key) and get(key, back) and back.read_bytes() == probe.read_bytes()):
             raise RuntimeError("smoke (h): a 1 KB upload to the bucket and back failed (evroc login?)")
 
-    # (b) first: if the template hides a default system text, the prompt is fixed before any reading.
-    check("b", "chat template with and without codebench.SYSTEM", lambda: sh(step, f"{py} template --hf {HF_DIR}"))
+    # (b) first: if the template adds text next to our system message, or opens the answer
+    # differently without one, the prompt is fixed before any reading.
+    check("b", "chat template with and without codebench.SYSTEM", template)
     check("a+d", "render == vLLM /tokenize; gen on 16 prompts: int prompts, n rows each",
           lambda: sh(step, gpu(vllm_script(HF_DIR, SMOKE_PORT, S / "vllm.log",
                                            f"{py} render --hf {HF_DIR} --url {url} --bench {CODEBENCH} --n 16 "
@@ -1420,10 +1687,22 @@ def blockap_done() -> bool:
                 and ((B / "export" / "vllm" / "config.json").exists() or reading_done(READINGS["blockap-dev"])))
 
 
+def onpolicy_flags(a: dict) -> str:
+    """qat onpolicy's run settings (read when its work dir is new): counts and the caps."""
+    return (f" --rounds {a['rounds']} --fresh {a['fresh']} --rollouts {a['rollouts']} --held {a['held']}"
+            f" --max-minutes {a['max_minutes']} --rollout-tokens-cap {a.get('rollout_tokens_cap', 0):.0f}")
+
+
 def run_rates(step: Step) -> None:
-    """S2.2: vLLM on the B200 (a few dev problems x 1 at 16k, streaming, the sandbox) and
-    20 QAT steps at 16k windows; the end-to-end and on-policy guesses are re-based on
-    the QAT tokens/s and on the B200 gen's answer tokens/s (minutes())."""
+    """S2.2: vLLM on the B200 (a few dev problems x 1 at 16k, streaming, the sandbox); 20
+    QAT steps at 16k windows with the codes never frozen (so the step costs what the e2e
+    step costs), timed and with their peak memory; then the plan's on-policy steps: one
+    tiny qat onpolicy session from those steps' state in a throwaway work dir, which
+    writes the serve dir and serves it on vLLM (fp8 KV at 22.5k, as the rounds do), rolls
+    out, labels, judges the start model and trains a round in the trainer's own process.
+    So nothing of S2.5 first runs after the e2e step. The end-to-end and on-policy
+    guesses are re-based on the QAT tokens/s and on the B200 gen's answer tokens/s
+    (minutes())."""
     R, B = rates_dir(), blockap_dir()
     d = smoke_eval_job(RATES["vllm_problems"], LCB_TOKENS, "b200-smoke")
     if d is None:
@@ -1434,12 +1713,26 @@ def run_rates(step: Step) -> None:
         raise RuntimeError("vLLM smoke on the B200 failed: " + "; ".join(bad))
     sh(step, gpu(f"python -m stages.qat e2e --state {B}/state --teacher {HF_DIR} --traces {traces_file()}"
                  f"{vocab_flag()} --tokens {RATES['qat_tokens']} --length {E2E['length']} --eval-every 1000000 "
-                 f"--held-rows 1 --held-length 2048 --out {R}/qat"))
+                 f"--held-rows 1 --held-length 2048 --freeze-steps 0 --out {R}/qat"))
+    O = R / "onpolicy"
+    sh(step, gpu(f"python -m stages.qat onpolicy --work {O} --state {R}/qat/state --teacher {HF_DIR} "
+                 f"--problems {CODEBENCH} --traces {traces_file()}{vocab_flag()}{onpolicy_flags(RATES['onpolicy'])} "
+                 "--until-session 1"))
+    st = load(O / "state.json") or {}
+    train = load(O / "round1" / "train" / "train.json")
+    if not (st.get("trained") and train):
+        raise RuntimeError(f"the on-policy smoke trained no round: {O}/state.json says {st}")
+    rolls = [json.loads(x) for p in ("held.labelled.jsonl", "rollouts.labelled.jsonl")
+             for x in ((O / "round1" / p).read_text().splitlines() if (O / "round1" / p).exists() else []) if x.strip()]
     q = load(R / "qat" / "e2e.json") or {}
     ev = ((load(d / "out" / "eval.json") or {}).get("candidates") or [{}])[0].get("code") or {}
     dump(R / "rates.json", {"qat_tok_s": q["tokens"] / (q["minutes"] * 60) if q.get("minutes") else None,
-                            "qat_steps": q.get("steps"), "qat_minutes": q.get("minutes"),
-                            "vllm_smoke_tok_s": ev.get("tok_s_total"), "gpu": (gpu_info() or ("?",))[0]})
+                            "qat_steps": q.get("steps"), "qat_minutes": q.get("minutes"), "qat_peak_gb": q.get("peak_gb"),
+                            "vllm_smoke_tok_s": ev.get("tok_s_total"), "gpu": (gpu_info() or ("?",))[0],
+                            "onpolicy": {"rollouts": len(rolls), "steps": train.get("steps"),
+                                         "minutes": train.get("minutes"), "peak_gb": train.get("peak_gb"),
+                                         "longest_row": max((len(x.get("prompt") or []) + len(x.get("tokens") or [])
+                                                             for x in rolls), default=None)}})
 
 
 def rates_done() -> bool:
@@ -1465,12 +1758,13 @@ def run_onpolicy(step: Step, session: int) -> None:
     judge served alone, its held-out and fresh rollouts, their labels, then the judging
     against the last kept model on the same held-out problems and the next round's
     training. One step per session, so the upload hook sends each round to the bucket as
-    it ends (a session is ~45 min of B200 time). Once the rounds are done, every decision
-    is checked against the plan's rule (audit_rounds) before anything ships."""
+    it ends (a session is ~45 min of B200 time, bounded by ONPOLICY's caps). Once the
+    rounds are done, every decision is checked against the plan's rule (audit_rounds)
+    before anything ships."""
     O, a = onpolicy_dir(), ONPOLICY
     sh(step, gpu(f"python -m stages.qat onpolicy --work {O} --state {e2e_dir()}/state --teacher {HF_DIR} "
-                 f"--problems {CODEBENCH} --traces {traces_file('train')}{vocab_flag()} --rounds {a['rounds']} "
-                 f"--fresh {a['fresh']} --rollouts {a['rollouts']} --held {a['held']} --until-session {session}"))
+                 f"--problems {CODEBENCH} --traces {traces_file('train')}{vocab_flag()}{onpolicy_flags(a)} "
+                 f"--until-session {session}"))
     st = load(O / "state.json") or {}
     if not st.get("done"):
         if session < ONPOLICY_SESSIONS and st.get("session", 0) > session:
@@ -1544,12 +1838,23 @@ def run_choice(step: Step) -> None:
          "goal_pts_per_gb": GOAL_PTS_PER_GB, "gate2_pts_per_gb": GATE2_MIN_PTS_PER_GB, "verdict_rule": VERDICT_RULE,
          "R0": g0["R0"], "budget_gb": g0["budget_gb"], "test_ids_sha256": window("test")["ids_sha256"],
          "harness": EVAL, "harness_sha": h(EVAL), "run": RUN_ID,
+         "base": {"model": MODEL, "revision": MODEL_REVISION, "commit": download_commit()},
          "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    # The bucket's choice (one per run, whatever the hashes upstream) is checked before
+    # anything is written, and a new one is uploaded at once: a second VM, or a re-run
+    # after a change upstream of final_dir, cannot pre-register another GGUF.
+    if not evroc_ok() and not wait_for_login(LOGIN_WAIT_MINUTES if SHUTDOWN else 0):
+        raise RuntimeError("choice.json is checked against the bucket and uploaded before anything reads the model: "
+                           "log in (evroc login --oidc-port 8765) and re-run")
+    art = choice_art()
+    restore_art(art, "train")
     old = choice()
     if old and old.get("gguf_sha256") != sha:
-        raise RuntimeError(f"{CHOICE} already pre-registers {old['gguf']}; a new choice is a new run (HORIZON_RUN)")
+        raise RuntimeError(f"{CHOICE} (from {bucket('choice')}) already pre-registers {old['gguf']}; "
+                           "a new choice is a new run (HORIZON_RUN)")
     if not old:
         dump(CHOICE, c)
+    upload_art(art)
 
 
 def choice_done() -> bool:
@@ -1581,7 +1886,7 @@ def run_rescore(step: Step) -> None:
         d = reading_dir(READINGS[name])
         if d and (d / ".done" / "eval").exists():
             sh(step, f"python scripts/event_horizon.py rescore --job {d} --name {d.name} --max-cases 0",
-               {"LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2))})
+               {**nvme_env(), "LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2))})
 
 
 def rescore_files() -> list[Path]:
@@ -1648,6 +1953,7 @@ def run_upload(step: Step, session: str) -> None:
         raise Skip("no evroc login. Log in (evroc login --oidc-port 8765) and re-run to upload.")
     for art in session_arts(session):
         upload_art(art)
+    pin_venvs()  # when the setup had no login to pin them
     upload_extras(session)
     marks = load(W / ".uploaded") or {}
     marks[session] = {"fingerprint": session_fingerprint(session), "time": time.strftime("%F %T")}
@@ -1659,6 +1965,7 @@ def upload_extras(session: str, step: Step | None = None) -> None:
     if not put(write_summary(), bucket(f"summary-{session}.txt")):
         raise RuntimeError("upload of the summary failed")
     logs = [step.log] if step is not None and getattr(step, "log", None) else sorted((LOGS / session).glob("*.log"))
+    logs.append(NVME / "versions.txt")  # what this VM's setup installed (its venvs' freeze, nvcc, llama.cpp)
     for log in logs:
         if log and log.exists():
             put(log, bucket("logs", session, log.name))
@@ -1694,17 +2001,29 @@ def shutdown_after(code: int, session: str) -> None:
     if not uploaded(session):
         print("\nNot shutting down: the results on the NVMe are not the ones uploaded, and stopping the VM wipes them.")
         return
+    code = os.system("sudo shutdown -h +5")
+    if code != 0:
+        print(f"\n{'!' * 72}\nSHUTDOWN FAILED (`sudo shutdown -h +5` returned {code}): THE VM IS STILL UP AND BILLED.\n"
+              f"The results are uploaded; power it off by hand (sudo shutdown -h now) or in the evroc console.\n"
+              f"{'!' * 72}")
+        return
     print("\nResults uploaded. Shutting the VM down in 5 minutes (cancel with: sudo shutdown -c).")
-    os.system("sudo shutdown -h +5")
 
 
 # ---------- the sessions ----------
 
 def codebench_art() -> Art:
+    """The code suites as session 1 fetched them: the run's one copy (run_setup restores it
+    on every later VM before anything reads it)."""
     return Art("codebench", lambda: "pinned",
-               lambda: [CODEBENCH / f"{s}.{x}" for s in ("livecodebench", "codecontests", "apps") for x in ("jsonl", "meta.json")],
-               SESSIONS, light=lambda: [CODEBENCH / f"{s}.meta.json" for s in ("livecodebench", "codecontests", "apps")],
-               once=True)
+               lambda: [CODEBENCH / f"{s}.{x}" for s in SUITES for x in ("jsonl", "meta.json")],
+               SESSIONS, light=lambda: [CODEBENCH / f"{s}.meta.json" for s in SUITES], once=True)
+
+
+def choice_art() -> Art:
+    """choice.json under one key per run, whatever the hashes upstream of it: every
+    session's restore brings back the run's one pre-registration."""
+    return Art("choice", lambda: "run", lambda: [CHOICE], SESSIONS, light=lambda: [CHOICE])
 
 
 def reading_art(r: Reading) -> Art:
@@ -1759,7 +2078,7 @@ def steps(session: str) -> list[Step]:
                  dir_art("smoke", smoke_dir, ("measure",), ("smoke.json",), ("*.gguf", "*.kld", "vocab", "block"))),
             reading_step(session, "original-ref"),
             reading_step(session, "original-dev", G0),
-            step(session, "training text, 8M tokens", {"": m["gen-measure"]}, lambda s: run_gen(s, "measure"),
+            step(session, "training text, 8M tokens", lambda: {"": minutes()["gen-measure"]}, lambda s: run_gen(s, "measure"),
                  lambda: gen_done("measure"),
                  dir_art("traces", traces_dir, ("measure", "train"), ("traces.sha256", "traces.count", ".gen-done")),
                  G0, lambda: traces_progress("measure")),
@@ -1790,26 +2109,26 @@ def steps(session: str) -> list[Step]:
             step(session, "Granite 4.2 3B download", {"": m["download"]}, run_download, download_done,
                  progress=download_progress),
             step(session, "B200 smoke and rates", {"": m["rates"]}, run_rates, rates_done,
-                 dir_art("rates", rates_dir, ("train",), ("rates.json", "qat/e2e.json"), ("qat/state", "qat/ckpt.pt")),
-                 G1),
+                 dir_art("rates", rates_dir, ("train",), ("rates.json", "qat/e2e.json"),
+                         ("qat/state", "qat/ckpt.pt", "onpolicy/round*/train", "serve")), G1),
             step(session, "training text to 24M tokens", {"": m["gen-train"]}, lambda s: run_gen(s, "train"),
                  lambda: gen_done("train"),
                  dir_art("traces24", lambda: traces_dir("train"), ("train",), ("traces.sha256", "traces.count", ".gen-done")),
                  G1, lambda: traces_progress("train")),
-            step(session, "end-to-end KD", {"": m["e2e"]}, run_e2e, e2e_done,
+            step(session, "end-to-end KD", lambda: {"": minutes()["e2e"]}, run_e2e, e2e_done,
                  dir_art("e2e", e2e_dir, ("train",), ("e2e.json",), ("serve",)), G1),
             *[step(session, f"on-policy session {k} of up to {ONPOLICY_SESSIONS}"
                    + (" (judges the last round)" if k == ONPOLICY_SESSIONS else f" (round {k})"),
-                   {"": m["onpolicy"] / ROUNDS_MAX if k < ONPOLICY_SESSIONS else m["onpolicy-judge"]},
+                   lambda k=k: {"": minutes()["onpolicy"] / ROUNDS_MAX if k < ONPOLICY_SESSIONS
+                                else minutes()["onpolicy-judge"]},
                    lambda s, k=k: run_onpolicy(s, k), lambda k=k: onpolicy_session_done(k), onpolicy_art, G1)
               for k in range(1, ONPOLICY_SESSIONS + 1)],
             step(session, "final export and parity", {"": m["final"]}, run_final, final_done,
                  dir_art("final", final_dir, ("train", "read"),
                          ("export.json", "kld.json", "tokenize.json", "parity.json", "model.gguf.sha256"),
                          ("vllm", "dequant-bf16.gguf")), G1),
-            step(session, "choice.json pre-registration", {"": m["choice"]}, run_choice, choice_done,
-                 Art("choice", lambda: final_dir().name.rsplit("-", 1)[1] if final_dir() else None,
-                     lambda: [CHOICE], SESSIONS, light=lambda: [CHOICE]), (*G1, "parity")),
+            step(session, "choice.json pre-registration", {"": m["choice"]}, run_choice, choice_done, choice_art(),
+                 (*G1, "parity")),
             upload_step(session, m),
         ]
     if session == "read":
@@ -1833,13 +2152,33 @@ def f1(x: float | None, nd: int = 1) -> str:
     return "–" if x is None else f"{x:.{nd}f}"
 
 
-def settings_diff(d: Path, ref: Path) -> list[str]:
-    """The record harness settings in which a reading differs from its original's, read
-    back from both config.effective.json files."""
+def is_harness(key: str) -> bool:
+    return key in EVAL or key.startswith(HARNESS_PREFIXES)
+
+
+def config_diff(d: Path, ref: Path) -> tuple[list[str], list[str]] | None:
+    """(harness, other) keys whose values differ between two readings' config.effective.json
+    (a key one side lacks differs too), less PER_READING; None when one is missing."""
     a, b = load(d / "work" / "config.effective.json"), load(ref / "work" / "config.effective.json")
     if a is None or b is None:
-        return ["config.effective.json missing"]
-    return [f"{k}: {a.get(k)!r} vs {b.get(k)!r}" for k in sorted((set(a) | set(b)) - PER_READING) if a.get(k) != b.get(k)]
+        return None
+    keys = [k for k in sorted((set(a) | set(b)) - PER_READING) if k not in a or k not in b or a[k] != b[k]]
+    line = lambda k: f"{k}: {a.get(k, '(none)')!r} vs {b.get(k, '(none)')!r}"
+    return [line(k) for k in keys if is_harness(k)], [line(k) for k in keys if not is_harness(k)]
+
+
+def settings_diff(d: Path, ref: Path) -> list[str]:
+    """The record harness settings in which a reading differs from its original's, read
+    back from both config.effective.json files (these block the verdict)."""
+    diff = config_diff(d, ref)
+    return ["config.effective.json missing"] if diff is None else diff[0]
+
+
+def settings_reported(d: Path, ref: Path) -> list[str]:
+    """The other Config fields that differ (reported only): pipeline knobs that the code
+    may add or change between sessions do not touch a reading."""
+    diff = config_diff(d, ref)
+    return [] if diff is None else diff[1]
 
 
 def provenance_diff(d: Path, ref: Path) -> tuple[list[str], list[str]]:
@@ -1853,8 +2192,7 @@ def provenance_diff(d: Path, ref: Path) -> tuple[list[str], list[str]]:
         x, y = (gpu_name(a), gpu_name(b)) if k == "gpu" else (a.get(k), b.get(k))
         if x != y:
             block.append(f"{k}: {x!r} vs {y!r}")
-    other = [f"{k}: {a.get(k)!r} vs {b.get(k)!r}" for k in ("git_head", "git_dirty", "eval_venv")
-             if a.get(k) != b.get(k)]
+    other = [f"{k}: {a.get(k)!r} vs {b.get(k)!r}" for k in ("git_head", "git_dirty") if a.get(k) != b.get(k)]
     return block, other
 
 
@@ -1890,9 +2228,24 @@ def reading_lines(r: Reading) -> list[str]:
         if r.model != "final-gguf" and dr and dr.exists():
             diff = settings_diff(d, dr)
             block, other = provenance_diff(d, dr)
+            other = settings_reported(d, dr) + other
             out.append(f"  settings: {'same as ' + ref.name if not diff else 'differ from ' + ref.name + ': ' + '; '.join(diff)}"
                        + (f"; provenance differs: {'; '.join(block)}" if block else "")
                        + (f" (reported only: {'; '.join(other)})" if other else ""))
+    return out
+
+
+def pin_lines() -> list[str]:
+    """What the run is pinned to, for the TODOs that pin it in the code after session 1:
+    the base's downloaded commit (MODEL_REVISION) and the code suites' dataset commits
+    (fetch_codebench.REVISIONS)."""
+    out = []
+    if HF_DIR.exists():
+        out.append(f"Granite 4.2 3B at {download_commit() or 'an unknown commit'} (revision {MODEL_REVISION})")
+    metas = {s: load(CODEBENCH / f"{s}.meta.json") for s in SUITES}
+    if any(metas.values()):
+        out.append("Code suites at: " + ", ".join(f"{s} {(m or {}).get('repo', '?')}@{(m or {}).get('sha', '?')}"
+                                                   for s, m in metas.items() if m))
     return out
 
 
@@ -1959,7 +2312,9 @@ def record_checks() -> dict[str, bool]:
            == (window("test") or {}).get("ids_sha256"),
            "settings and provenance as the original's": bool(d and dr) and not settings_diff(d, dr) and not block,
            "parity gates pass": bool((gate("parity") or {}).get("pass")),
-           "the GGUF is choice.json's": bool(c) and text(final_hf() / "gguf.sha256") == c.get("gguf_sha256")}
+           "the GGUF is choice.json's": bool(c) and text(final_hf() / "gguf.sha256") == c.get("gguf_sha256"),
+           "the harness and seeds as pre-registered": bool(c) and c.get("harness_sha") == h(EVAL)
+           and (c.get("record") or {}).get("seed_offset") == rec.seed}
     lo = outcomes(rows_of(llama))
     p = paired(lo, outs) if lo else None
     out[f"llama-server within {LLAMA_CHECK_SE:.0f} SE of vLLM"] = bool(p and p[1] is not None
@@ -1998,7 +2353,7 @@ def summary() -> str:
            f"forced answer, temperature 1.0, top_p 0.95, vLLM with {RECORD_SEQS} in flight on the L40S)."]
     for r in READINGS.values():
         out += reading_lines(r)
-    gl, vl = gate_lines(), verdict_lines()
+    gl, vl = pin_lines() + gate_lines(), verdict_lines()
     if gl:
         out += ["", *gl]
     if vl:
@@ -2010,15 +2365,18 @@ def summary() -> str:
 
 # ---------- helpers that run in the training venv ----------
 
-def template_problems(render: Callable[[list[dict]], str], system: str, user: str, markup: list[str]) -> list[str]:
-    """S1.2(b): the chat template rendered with and without our system message must open
-    the answer the same way (the thinking switch), and add no text of its own: neither a
-    default system prompt when none is given nor anything next to ours."""
+def template_problems(render: Callable[[list[dict]], str], system: str, user: str, markup: list[str]
+                      ) -> tuple[list[str], str]:
+    """S1.2(b): (problems, the default system text). The chat template rendered with and
+    without our system message must open the answer the same way (the thinking switch)
+    and add no text next to ours. A default system text that it adds only when no system
+    message is given (Granite's templates do) is returned to be reported, not a problem:
+    every prompt the run sends carries codebench.SYSTEM (eval, gen, the rollouts, budget)."""
     with_sys = render([{"role": "system", "content": system}, {"role": "user", "content": user}])
     without = render([{"role": "user", "content": user}])
     i, j = with_sys.find(user), without.find(user)
     if i < 0 or j < 0:
-        return ["the user message is not in the rendered prompt"]
+        return ["the user message is not in the rendered prompt"], ""
     bad = []
     if with_sys[i + len(user):] != without[j + len(user):]:
         bad.append(f"the generation prompt differs with and without the system message: "
@@ -2034,9 +2392,7 @@ def template_problems(render: Callable[[list[dict]], str], system: str, user: st
     extra, default = words(with_sys[:i].replace(system, " ", 1)), words(without[:j])
     if extra:
         bad.append(f"the template adds text next to our system message: {' '.join(extra)[:300]!r}")
-    if default:
-        bad.append(f"the template adds a default system text when none is given: {' '.join(default)[:300]!r}")
-    return bad
+    return bad, " ".join(default)[:300]
 
 
 def smoke_main(argv: list[str]) -> int:
@@ -2044,6 +2400,7 @@ def smoke_main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("template")
     t.add_argument("--hf", required=True)
+    t.add_argument("--out", help="the result as JSON: problems, the default system text, accepted")
     r = sub.add_parser("render")
     r.add_argument("--hf", required=True)
     r.add_argument("--url", required=True)
@@ -2073,9 +2430,15 @@ def smoke_main(argv: list[str]) -> int:
         user = codebench.build_prompt({"language": "python", "prompt": "Read two integers and print their sum.",
                                        "tests": [], "id": "smoke"})
         markup = list(tok.all_special_tokens) + list(tok.get_added_vocab())
-        bad = template_problems(render, codebench.SYSTEM, user, markup)
+        bad, default = template_problems(render, codebench.SYSTEM, user, markup)
         print(render([{"role": "system", "content": codebench.SYSTEM}, {"role": "user", "content": user}]))
-        if bad and os.environ.get("HORIZON_TEMPLATE_OK") != "1":
+        if default:
+            print(f"(with no system message the template adds a default system text: {default!r}; reported only)")
+        accepted = bool(bad) and os.environ.get("HORIZON_TEMPLATE_OK") == "1"
+        if a.out:
+            Path(a.out).write_text(json.dumps({"problems": bad, "default_system_text": default,
+                                               "accepted": accepted}, indent=1) + "\n")
+        if bad and not accepted:
             print("smoke (b) failed: " + "\n  ".join(bad) + "\nFix the prompt before any reading, or, after "
                   "reviewing the rendering above, re-run with HORIZON_TEMPLATE_OK=1.", file=sys.stderr)
             return 1
@@ -2162,6 +2525,7 @@ def rescore_main(argv: list[str]) -> int:
     ap.add_argument("--name", required=True)
     ap.add_argument("--max-cases", type=int, default=0)
     ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument("--chunk", type=int, default=32, help="problems whose answers are graded together")
     a = ap.parse_args(argv)
     sys.path.insert(0, str(REPO))
     from stages import codebench, sandbox
@@ -2170,10 +2534,27 @@ def rescore_main(argv: list[str]) -> int:
     src = a.job / "work" / "code_eval" / f"{a.name}.jsonl"
     rows = [json.loads(x) for x in src.read_text().splitlines() if x.strip()]
     ids = {x["id"] for x in rows}
-    probs = {p["id"]: cap_cases(p, a.max_cases) for p in
-             codebench.load_suite("livecodebench", cfg["code_eval_dir"], cfg["lcb_since"], ids=ids)}
-    items = [codebench.job(probs[x["id"]], x["answer"], codebench.extract_code(x["answer"])) for x in rows]
-    results = sandbox.run_many(items, timeout=a.timeout)
+    probs = {p["id"]: p for p in codebench.load_suite("livecodebench", cfg["code_eval_dir"], cfg["lcb_since"], ids=ids)}
+    by_id: dict[str, list[int]] = {}
+    for k, x in enumerate(rows):
+        by_id.setdefault(x["id"], []).append(k)
+    # The items are built a few problems at a time and dropped once graded: each carries
+    # its problem's whole case list (hundreds of MB on LiveCodeBench's largest), up to 8
+    # answers a problem, and all at once they once held every copy in memory.
+    results: list = [None] * len(rows)
+    order, chunk = sorted(by_id), max(1, a.chunk)
+    for c in range(0, len(order), chunk):
+        ks = [k for i in order[c:c + chunk] for k in by_id[i]]
+        capped = {i: cap_cases(probs[i], a.max_cases) for i in order[c:c + chunk]}
+        items = [codebench.job(capped[rows[k]["id"]], rows[k]["answer"], codebench.extract_code(rows[k]["answer"]))
+                 for k in ks]
+        try:
+            got = sandbox.run_many(items, timeout=a.timeout)
+        except (OSError, MemoryError) as e:  # one bad problem is recorded, not the end of the step
+            got = [sandbox.Result(False, "grader_error", f"{type(e).__name__}: {e}") for _ in items]
+        for k, res in zip(ks, got, strict=True):
+            results[k] = res
+        del items, capped
     out = a.job / "work" / "code_eval" / f"{a.name}-allcases.jsonl"
     tmp = out.with_name(out.name + ".tmp")
     tmp.write_text("".join(json.dumps({"suite": x.get("suite", "livecodebench"), "id": x["id"], "sample": x["sample"],

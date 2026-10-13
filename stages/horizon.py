@@ -39,8 +39,13 @@ then bought by an exact knapsack:
 7. Verify. The chosen map is quantized by llama-quantize; every tensor's type and the
    file's size (exactly the table's) are checked, and every tensor's bytes must equal
    the PTQ file's of that type, so the sweep measured exactly the shipped weights. Its
-   true KL is measured on the sweep windows (against the additive prediction) and on
-   the check windows.
+   true KL is measured on the sweep windows and on the check windows. On the sweep
+   windows the gain it bought, KL(floor) - KL(map), paired by position with the floor's
+   own KL there, is held against the knapsack's prediction (the swaps' gains added up):
+   a map that does not beat the floor by GAIN_SE standard errors bought nothing for
+   its bytes, so the floor map is shipped instead (map.json and horizon.json say why);
+   one that gets under GAIN_SHORT of its predicted gain is shipped with a warning, the
+   swaps' gains did not add up.
 8. Ladder. llama-perplexity --kl-divergence of every PTQ file and the map against the
    BF16 GGUF on the check text, written to ladder.json (skipped when the binary is
    missing).
@@ -101,6 +106,13 @@ PROMPT_WEIGHT = 0.1  # as in training (traces.batches)
 LOGP_MIN = -1e4  # cached log-probs are clamped here, so a -inf never meets fp16
 MAX_STATES = 200_000  # knapsack capacity in cost units
 LADDER_CTX, LADDER_CHUNKS = 4096, 16
+# The verified map against its prediction (gain_check): it must beat the floor by
+# GAIN_SE standard errors of the paired difference, or the floor ships; a measured gain
+# under GAIN_SHORT of the predicted one is a warning. Both are relative to the gain the
+# bytes above the floor were to buy: the floor's KL itself is far larger than that gain
+# at ~2.6 bits, so a tolerance on the KL would never fire.
+GAIN_SE = 2.0
+GAIN_SHORT = 0.5
 KLD_TRIES = 3  # llama-perplexity runs per ladder rung when its summary is lost (see _kld_run)
 
 
@@ -612,7 +624,8 @@ def sweep(model, cache: Cache, held: Held, grp: dict[str, list[str]], choices: d
           base: dict[str, str], out: Path | None = None) -> dict:
     """KL of the floor map and of every single-group swap away from it, on the held-out
     windows. Appends each row to `out` (JSON lines after a header) and resumes from it.
-    Returns {base_kl, positions, rows: [{group, type, kl, gain, se}]}."""
+    Returns {base_kl, positions, rows: [{group, type, kl, gain, se}], base_kl_positions:
+    the floor's KL at each position (a tensor, for verify's paired gain; not saved)}."""
     params = dict(model.named_parameters())
     set_types(model, cache, {n: base[g] for g, names in grp.items() for n in names}, params)
     header = {"base": base, "choices": choices, "held": held.meta, "weights": getattr(cache, "key", None)}
@@ -642,7 +655,7 @@ def sweep(model, cache: Cache, held: Held, grp: dict[str, list[str]], choices: d
             eta = (time.time() - t0) / (len(rows) - len(done)) * (len(todo) - i - 1) / 60
             emit(STAGE, pct=100 * (i + 1) / len(todo), msg=f"sweep {i + 1}/{len(todo)}: {g} at {t} gains "
                  f"{row['gain']:.5f}, ~{eta:.0f} min left")
-    return {"base_kl": base_kl, "positions": len(w), "rows": rows}
+    return {"base_kl": base_kl, "positions": len(w), "rows": rows, "base_kl_positions": kl0}
 
 
 # ---------- the knapsack ----------
@@ -718,8 +731,11 @@ def knapsack_table(gbytes: dict[str, dict[str, int]], rows: list[dict], base: di
     return out
 
 
-def plan(out: Path, budget_bytes: int, head_min: str = HEAD_MIN) -> dict:
-    """The knapsack on out/bytes.json and out/sweep.jsonl; writes out/map.json."""
+def plan(out: Path, budget_bytes: int, head_min: str = HEAD_MIN, *, force: dict[str, str] | None = None,
+         note: dict | None = None) -> dict:
+    """The knapsack on out/bytes.json and out/sweep.jsonl; writes out/map.json. force
+    ({group: type}) is written instead of the knapsack's map, with note (why) under
+    "fallback": the floor map, when the knapsack's bought nothing measurable."""
     info = json.loads((out / "bytes.json").read_text())
     lines = [json.loads(x) for x in (out / "sweep.jsonl").read_text().splitlines() if x.strip()]
     head, rows = lines[0], [r for r in lines[1:] if "group" in r]
@@ -729,7 +745,7 @@ def plan(out: Path, budget_bytes: int, head_min: str = HEAD_MIN) -> dict:
         raise ValueError(f"the sweep is not finished: {len(missing)} of {len(want)} swaps not measured")
     grp = info["groups"]
     res = _knapsack(knapsack_table(info["group_bytes"], rows, base, head_min), budget_bytes - info["fixed"])
-    by_group = res["map"]
+    by_group = dict(force) if force else res["map"]
     types = {n: by_group[g] for g, names in grp.items() for n in names}
     gain = {(r["group"], r["type"]): r["gain"] for r in rows}
     pred = head["base_kl"] - sum(0.0 if t == base[g] else gain[(g, t)] for g, t in by_group.items())
@@ -745,6 +761,8 @@ def plan(out: Path, budget_bytes: int, head_min: str = HEAD_MIN) -> dict:
          "flags": flags(types),
          "curve": [{"gb": round((info["fixed"] + p["bytes"]) / 1e9, 6), "pred_kl": head["base_kl"] - p["gain"]}
                    for p in res["curve"]]}
+    if note:
+        m["fallback"] = note
     tmp = out / "map.json.tmp"
     tmp.write_text(json.dumps(m, indent=1))
     os.replace(tmp, out / "map.json")
@@ -769,11 +787,14 @@ def identical(path: Path, ptq_files: dict[str, Path], types: dict[str, str], ggu
 
 def verify(hf_dir: str, bf16: Path, types: dict[str, str], out_gguf: Path, llama_cpp, gguf, *,
            expect_bytes: int, held: dict[str, Held], imatrix: Path | None = None,
-           ptq_files: dict[str, Path] | None = None, workers: int | None = None) -> dict:
+           ptq_files: dict[str, Path] | None = None, workers: int | None = None,
+           base: dict[str, torch.Tensor] | None = None) -> dict:
     """Quantizes the map, checks every tensor's type and the exact size (and, given the
     PTQ files, that every tensor is byte-identical to the one the sweep used), then
     reads it into a fresh student (qheal.load_quantized: strict) and measures its true KL
-    on each of `held` ({name: Held})."""
+    on each of `held` ({name: Held}). base ({name: per-position KL of the floor on that
+    Held, sweep()'s base_kl_positions}) adds "paired": {name: {gain, se}}, the mean of
+    KL(floor) - KL(map) over the same positions and its standard error."""
     if not reusable(out_gguf, quant_key(bf16, types, llama_cpp, imatrix), types, gguf, expect_bytes):
         quantize(bf16, out_gguf, types, llama_cpp, imatrix=imatrix)
     rep = check(out_gguf, types, gguf, expect_bytes)
@@ -781,12 +802,49 @@ def verify(hf_dir: str, bf16: Path, types: dict[str, str], out_gguf: Path, llama
         rep["identical_tensors"] = identical(out_gguf, ptq_files, types, gguf)
     student = load_causal_lm(hf_dir).eval()
     rep["quant_rel_err"] = qheal.load_quantized(student, out_gguf, gguf, workers=workers)
-    rep["kl"] = {k: round(mean_kl(*kl_positions(student, h)), 7) for k, h in held.items()}
+    rep["kl"], paired = {}, {}
+    for k, h in held.items():
+        kl, w = kl_positions(student, h)
+        rep["kl"][k] = round(mean_kl(kl, w), 7)
+        if base is not None and k in base:
+            if base[k].shape != kl.shape:
+                raise ValueError(f"the floor's KL has {len(base[k])} positions on {k}, the map's {len(kl)}")
+            d = base[k] - kl
+            paired[k] = {"gain": round(mean_kl(d, w), 7), "se": round(weighted_se(d, w), 7)}
+    if paired:
+        rep["paired"] = paired
     del student
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # llama-perplexity runs next, on the same GPU
     return {"gguf": str(out_gguf), **rep}
+
+
+def gain_check(floor_kl: float, pred_kl: float, true_kl: float, se: float, *, is_floor: bool = False,
+               k: float = GAIN_SE, short: float = GAIN_SHORT) -> dict:
+    """The verified map against the knapsack's prediction, on the sweep windows. pred =
+    KL(floor) - the predicted KL (the swaps' gains added up), real = KL(floor) - the
+    map's measured KL, se = the standard error of their paired per-position difference.
+    verdict: "floor" when the map is the floor (nothing bought, nothing to check); "no
+    better" when real <= k x se, so the bytes above the floor bought nothing measurable
+    (run() ships the floor instead); "short" when real < short x pred, so the swaps did
+    not add up (a warning); "ok" otherwise. The tolerance is on the gain, not on the KL:
+    the floor's KL is many times the gain at ~2.6 bits."""
+    pred, real = floor_kl - pred_kl, floor_kl - true_kl
+    out = {"pred": round(pred, 7), "real": round(real, 7), "se": round(se, 7),
+           "ratio": round(real / pred, 4) if pred > 0 else None,
+           "rule": f"real > {k:g} x se, or the floor ships; real >= {short:g} x pred, or a warning"}
+    if is_floor:
+        verdict, why = "floor", "the map is the floor"
+    elif real <= k * se:
+        verdict, why = "no better", (f"the map's KL {true_kl:.5f} is within {k:g} SE ({k * se:.5f}) of the floor's "
+                                     f"{floor_kl:.5f}: its bytes above the floor bought nothing measurable")
+    elif real < short * pred:
+        verdict, why = "short", (f"the map gains {real:.5f} of the {pred:.5f} predicted ({real / pred:.0%}, under "
+                                 f"{short:.0%}): the swaps' gains did not add up")
+    else:
+        verdict, why = "ok", None
+    return {**out, "verdict": verdict, "why": why}
 
 
 # ---------- the llama-perplexity ladder ----------
@@ -954,9 +1012,27 @@ def run(hf_dir: str, bf16: Path, traces_path: Path, out: Path, llama_cpp, budget
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     m = plan(out, budget_bytes, head_min)
-    emit(STAGE, pct=100, msg=f"verifying the {m['gb']:.4f} GB map")
-    v = verify(hf_dir, bf16, m["types"], out / f"horizon-{m['sha256'][:8]}.gguf", llama_cpp, gguf,
-               expect_bytes=m["bytes"], held=held, imatrix=imatrix, ptq_files=ptq_files, workers=workers)
+
+    def verified(m: dict) -> dict:
+        emit(STAGE, pct=100, msg=f"verifying the {m['gb']:.4f} GB map")
+        return verify(hf_dir, bf16, m["types"], out / f"horizon-{m['sha256'][:8]}.gguf", llama_cpp, gguf,
+                      expect_bytes=m["bytes"], held=held, imatrix=imatrix, ptq_files=ptq_files, workers=workers,
+                      base={"sweep": sw["base_kl_positions"]})
+
+    v = verified(m)
+    gain = gain_check(sw["base_kl"], m["pred_kl"], v["kl"]["sweep"], v["paired"]["sweep"]["se"],
+                      is_floor=m["groups"] == base, k=GAIN_SE, short=GAIN_SHORT)
+    warnings, fallback = [], None
+    if gain["verdict"] == "no better":
+        fallback = {"why": gain["why"], "rejected": {"sha256": m["sha256"], "gguf": v["gguf"], "bytes": v["bytes"],
+                                                     "pred_kl": m["pred_kl"], "true_kl": v["kl"]["sweep"],
+                                                     "check_kl": v["kl"]["check"], "group_types": m["group_types"]}}
+        log(f"horizon: {gain['why']}; the floor map ships instead")
+        m = plan(out, budget_bytes, head_min, force=base, note=fallback)
+        v = verified(m)
+    elif gain["verdict"] == "short":
+        warnings.append(gain["why"])
+        log(f"horizon: warning: {gain['why']}")
     lad = None
     if do_ladder:
         text = ladder_text(traces_path, teacher, out / "ladder.txt")
@@ -964,13 +1040,15 @@ def run(hf_dir: str, bf16: Path, traces_path: Path, out: Path, llama_cpp, budget
                      ctx=ladder_window[0], chunks=ladder_window[1])
     summary = {"budget_bytes": budget_bytes, "gguf": v["gguf"], "bytes": v["bytes"], "gb": v["gb"],
                "floor_bytes": m["floor_bytes"], "floor_kl": sw["base_kl"], "pred_kl": m["pred_kl"],
-               "true_kl": v["kl"]["sweep"], "check_kl": v["kl"]["check"], "swaps": len(sw["rows"]),
+               "true_kl": v["kl"]["sweep"], "check_kl": v["kl"]["check"], "gain": gain, "fallback": fallback,
+               "warnings": warnings, "swaps": len(sw["rows"]),
                "positions": {k: h.positions for k, h in held.items()}, "group_types": m["group_types"],
                "map": str(out / "map.json"), "ladder": str(out / "ladder.json") if lad else None,
                "verify": v}
     (out / "horizon.json").write_text(json.dumps(summary, indent=1))
     emit(STAGE, "done", 100, f"{v['gb']:.4f} GB, KL {v['kl']['check']:.5f} on the check windows "
-         f"(predicted {m['pred_kl']:.5f} on the sweep's, measured {v['kl']['sweep']:.5f})")
+         f"(predicted {m['pred_kl']:.5f} on the sweep's, measured {v['kl']['sweep']:.5f}); gain {gain['verdict']}"
+         + (", the floor ships" if fallback else ""))
     return summary
 
 

@@ -13,8 +13,10 @@ answer's whole thinking kept (Config.code_eval_budgets), gives every shorter one
 
 Writes work/code_eval/<name>-<B>.jsonl per budget and adds code.budgets to
 out/eval.json: {"<B>": {"mean_pass@1", "suites", "how": {same, cut, truncated},
-"errors"}}, with the long run itself under its own budget ("how" there counts the
-answers whose thinking hit the cap). An answer the server never returned is tried
+"errors"}}, with the long run itself under its own budget, scored on the same
+answers ("how" there counts the answers whose thinking hit the cap, and
+"all_samples_mean_pass@1" is the eval's own number over every sample, see
+long_run). An answer the server never returned is tried
 once more, and if it still fails the step stops rather than score it ("errors" is
 0 in every written result); so does a server that died. Redone answers are kept
 in work/code_eval/<name>-<B>.redo.jsonl as they come, keyed by the long run's
@@ -172,6 +174,24 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
     return out
 
 
+def long_run(code: dict, rows: list[dict], problems: list[dict]) -> dict:
+    """The entry for the long run's own budget, scored on the same answers as the
+    shorter budgets (sample 0 of each problem, as rescore covers): its mean_pass@1 is
+    those answers' own results, so the gap to a shorter budget is the budget's effect
+    alone, not that plus sample 0's draw against the per-problem mean over every
+    sample. The eval's number over every sample stays beside it as
+    all_samples_mean_pass@1. A dry run has no rows and keeps the eval's number."""
+    if rows:
+        suites = codebench.summarize(problems, [[sandbox.Result(bool(r.get("passed")), r.get("reason") or "")]
+                                                for r in rows], [1])
+        mean = codebench.mean_pass1(suites)
+    else:
+        suites, mean = code.get("suites"), code.get("mean_pass@1")
+    return {"mean_pass@1": mean, "suites": suites, "all_samples_mean_pass@1": code.get("mean_pass@1"),
+            "how": {"hit the cap": sum(r.get("forced") == "length" for r in rows)},
+            "errors": sum(bool(r.get("error")) for r in rows)}
+
+
 def run_stage(job: Job) -> None:
     cfg = job.config
     budgets = sorted(b for b in set(cfg.code_eval_budgets) if b < cfg.code_eval_max_tokens)
@@ -189,7 +209,7 @@ def run_stage(job: Job) -> None:
             top = code.get("mean_pass@1") or 0.0
             scores = {str(b): {"mean_pass@1": round(top * (0.8 + 0.2 * b / cfg.code_eval_max_tokens), 4),
                                "how": {"same": 150, "cut": 20, "truncated": 2}} for b in budgets}
-            rows = []
+            rows, problems = [], []
         else:
             rows = [r for r in read_jsonl(job.path("work", "code_eval", f"{name}.jsonl")) if r.get("sample", 0) == 0]
             if any(r.get("reasoning_chars") and "reasoning" not in r for r in rows):
@@ -201,9 +221,7 @@ def run_stage(job: Job) -> None:
                 scores = rescore(job, name, rows, problems, budgets, release=lambda: ev.stop(proc))
             finally:
                 ev.stop(proc)
-        scores[str(cfg.code_eval_max_tokens)] = {"mean_pass@1": code.get("mean_pass@1"), "suites": code.get("suites"),
-                                                 "how": {"hit the cap": sum(r.get("forced") == "length" for r in rows)},
-                                                 "errors": sum(bool(r.get("error")) for r in rows)}
+        scores[str(cfg.code_eval_max_tokens)] = long_run(code, rows, problems)
         code["budgets"] = scores
         cand["code"] = code
     report_path.write_text(json.dumps(report, indent=2))
