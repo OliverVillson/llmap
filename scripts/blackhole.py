@@ -67,6 +67,16 @@ HEAL_CAP_MINUTES = 100
 MINUTES = {"setup": 45, "download": 5, "gguf": 5, "score": 40, "gen": 45, "quant": 20, "export": 5}
 
 
+# Every GPU job waits until the last one's memory is back (a stopped vLLM's engine
+# process lets go a little after the server; the second run's text vLLM crashed on it).
+GPU_FREE = ("for i in $(seq 120); do [ \"$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits "
+            "| head -1)\" -lt 2000 ] && break; sleep 5; done")
+
+
+def gpu(cmd: str) -> str:
+    return f"{GPU_FREE}\n{cmd}"
+
+
 def eval_job(key: str) -> Path:
     d = JOBS[key]
     if not (d / "config.json").exists():
@@ -85,15 +95,16 @@ def score(step: Step, key: str) -> None:
     """LiveCodeBench on vLLM with the whole GPU; for bh15 and bh15+repair the checkpoint
     is exported from the GGUF first."""
     if key != "original" and not (HF[key] / "config.json").exists():
-        sh(step, f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --llama-cpp {e5.NVME}/llama.cpp "
-                 f"--export {HF[key]}" + (f" --adapter {ADAPTER}" if key == "bh15+repair" else ""))
+        sh(step, gpu(f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --llama-cpp {e5.NVME}/llama.cpp "
+                     f"--export {HF[key]}" + (f" --adapter {ADAPTER}" if key == "bh15+repair" else "")))
     if not scored(key):
-        sh(step, f"python pipeline.py --job {eval_job(key)} --only eval", {"LOBBOT_VLLM_GPU_UTIL": "0.9"})
+        sh(step, gpu(f"python pipeline.py --job {eval_job(key)} --only eval"), {"LOBBOT_VLLM_GPU_UTIL": "0.9"})
 
 
 def gen_command() -> str:
     """A vLLM on the GPU for the original's thinking, then the text; it stops after."""
     return "\n".join([
+        GPU_FREE,
         "set -e",
         f"mkdir -p {W}",
         f"$LOBBOT_VLLM_PY -m vllm.entrypoints.openai.api_server --model {e5.HF_DIR} --served-model-name student "
@@ -131,7 +142,8 @@ def make_quant(step: Step) -> None:
     """Calibration answers, importance matrix and bh15, on llama.cpp."""
     e5.base_job()
     if not (e5.BASE / "work" / "calib-chat.txt").exists():
-        sh(step, f"python -m stages.dense calib --job {e5.BASE} --model {e5.BF16}", e5.env_for(e5.PORTS[1], e5.CALIB_SLOTS))
+        sh(step, gpu(f"python -m stages.dense calib --job {e5.BASE} --model {e5.BF16}"),
+           e5.env_for(e5.PORTS[1], e5.CALIB_SLOTS))
     if not (e5.BASE / "work" / "imatrix.gguf").exists():
         sh(step, f"python -m stages.dense imatrix --job {e5.BASE} --bf16 {e5.BF16}")
     if not (QUANT_JOB / "config.json").exists():
@@ -141,9 +153,9 @@ def make_quant(step: Step) -> None:
 
 
 def train_repair(step: Step) -> None:
-    sh(step, f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --traces {TRACES} "
-             f"--llama-cpp {e5.NVME}/llama.cpp --tokens {GEN_TOKENS:.0f} --max-minutes {HEAL_CAP_MINUTES} "
-             f"--out {HEAL}")
+    sh(step, gpu(f"python -m stages.qheal --hf {e5.HF_DIR} --gguf {QUANT} --traces {TRACES} "
+                 f"--llama-cpp {e5.NVME}/llama.cpp --tokens {GEN_TOKENS:.0f} --max-minutes {HEAL_CAP_MINUTES} "
+                 f"--out {HEAL}"))
 
 
 def run_upload(step: Step) -> None:

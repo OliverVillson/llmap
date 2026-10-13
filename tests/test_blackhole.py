@@ -58,7 +58,7 @@ def test_one_job_at_a_time_all_scored_on_vllm(tmp_path, monkeypatch):
         step.run(s)
         assert step.done(), step.name
     kinds = ["eval" if "--only eval" in c else "export" if "--export" in c else "gen" if "ternary gen" in c
-             else c.split()[2] for c, _ in calls]
+             else c.splitlines()[-1].split()[2] for c, _ in calls]
     assert kinds == ["eval", "gen", "stages.dense", "stages.dense", "stages.dense",
                      "export", "eval", "stages.qheal", "export", "eval"]
     assert all(e == {"LOBBOT_VLLM_GPU_UTIL": "0.9"} for c, e in calls if "--only eval" in c)
@@ -100,3 +100,14 @@ def test_shutdown_only_once_the_results_are_uploaded(tmp_path, monkeypatch):
     (bh.LOGS / ".uploaded").write_text("x")
     bh.shutdown_after()
     assert calls == ["sudo shutdown -h +5"]
+
+
+def test_every_gpu_job_waits_for_the_last_ones_memory(tmp_path, monkeypatch):
+    m = load(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(m, "sh", lambda step, cmd, env=None: calls.append(cmd))
+    s = m.Step("x", {"": 1}, None)
+    for run in (lambda: m.score(s, "original"), lambda: m.score(s, "bh15"), lambda: m.train_repair(s)):
+        run()
+    assert m.gen_command().startswith(m.GPU_FREE)
+    assert calls and all(c.startswith(m.GPU_FREE) for c in calls)
