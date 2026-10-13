@@ -65,6 +65,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))  # stages.data (dedupe), stages.codebench and sandbox (APPS check); stdlib only
+# The grading harness lifts Python's 4300-digit int limit to 50000, as lcb_runner does
+# (stages/codebench.py _DIGITS); APPS has cases with longer numbers (one has 9131 digits).
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(50000)
 
 MULTIPLE = {"py": "python", "js": "js", "ts": "ts", "cpp": "cpp"}
 LCB_REPO = "livecodebench/code_generation_lite"
@@ -316,7 +320,7 @@ def apps_rows(r: dict, split: str, max_cases: int = 0) -> list[dict]:
     [] for a stdin problem, or one whose starter code does not define its function."""
     try:
         io_ = json.loads(r.get("input_output") or "{}")
-    except json.JSONDecodeError:
+    except ValueError:  # bad JSON, or a number over the 50000-digit limit
         return []
     func, starter, question = io_.get("fn_name"), (r.get("starter_code") or "").rstrip(), (r.get("question") or "").strip()
     if not func or not question or not re.search(rf"\bdef\s+{re.escape(func)}\b", starter):
@@ -385,7 +389,7 @@ def fetch_apps(out: Path, max_cases: int = 50) -> dict:
                     continue
                 try:
                     s = json.loads(r.get("solutions") or "[]")
-                except json.JSONDecodeError:
+                except ValueError:
                     s = []
                 s = [c for c in s if isinstance(c, str) and c.strip()][:APPS_SOLUTIONS]
                 if not s:

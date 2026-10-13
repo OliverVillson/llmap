@@ -266,6 +266,17 @@ def test_apps_rows_take_values_out_of_one_item_lists_first():
                         "train") == []  # an input that is not an argument list
 
 
+def test_apps_rows_read_numbers_up_to_the_harness_digit_limit_and_drop_longer_ones():
+    r = json.loads(apps_files()["train.jsonl"].splitlines()[2])
+    big = "9" * 9131  # over Python's default 4300 digits, as in a real APPS problem
+    io_ = '{"fn_name": "first", "inputs": [[[%s]]], "outputs": [[%s]]}' % (big, big)
+    (row, _) = fc.apps_rows({**r, "input_output": io_}, "train")
+    assert row["tests"]["cases"] == [[f"[{big}]", big]]
+    huge = "9" * 50001
+    assert fc.apps_rows({**r, "input_output": '{"fn_name": "first", "inputs": [[[%s]]], "outputs": [[1]]}' % huge},
+                        "train") == []
+
+
 def test_fetch_apps_keeps_problems_a_reference_solution_passes_in_the_form_it_passes(monkeypatch, tmp_path):
     calls = fake_hub(monkeypatch, tmp_path, {fc.APPS_REPO: apps_files()})
     with pytest.raises(FileNotFoundError, match="livecodebench first"):
