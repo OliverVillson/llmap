@@ -143,14 +143,14 @@ fi
 mapfile -t VLLM_C < <(constraints_for venv-vllm)
 mapfile -t TRAIN_C < <(constraints_for venv-train)
 say "vLLM venv (data stage)${UV_EXCLUDE_NEWER:+, PyPI as of $UV_EXCLUDE_NEWER}${VLLM_C[1]:+, constraints $CONSTRAINTS}"
-uv venv -q --python 3.12 "$NVME/venv-vllm"
+uv venv -q --allow-existing --python 3.12 "$NVME/venv-vllm"  # a re-run keeps the venv and its packages
 uv pip install -q --python "$NVME/venv-vllm/bin/python" "${VLLM_C[@]}" \
   "vllm==0.31.0" pyyaml httpx  # the version exp04 was checked against
 uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 
 say "Training venv (reap, heal, quantize, eval, package, API)"
 # gguf comes from the pinned llama.cpp checkout below, not from PyPI.
-uv venv -q --python 3.12 "$NVME/venv-train"
+uv venv -q --allow-existing --python 3.12 "$NVME/venv-train"
 uv pip install -q --python "$NVME/venv-train/bin/python" "${TRAIN_C[@]}" \
   "torch==2.14.0" "transformers==5.17.0" "peft>=0.17" "accelerate==1.15.0" safetensors \
   anthropic httpx fastapi uvicorn sentencepiece protobuf

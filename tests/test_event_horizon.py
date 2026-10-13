@@ -699,6 +699,13 @@ def test_a_new_vm_gets_the_runs_code_suites_from_the_bucket_never_a_fresh_fetch(
     assert "SKIP_SUITES=1 " in shell.calls[-1]
 
 
+def test_setup_vm_reruns_keep_the_venvs_the_first_run_built():
+    """A failed setup step is re-run on the same VM (seen on the B200 2026-10-13): uv refuses
+    to create a venv over an existing one unless told to keep it."""
+    lines = [l for l in (ROOT / "scripts" / "setup_vm.sh").read_text().splitlines() if re.match(r"\s*uv venv\b", l)]
+    assert len(lines) == 2 and all("--allow-existing" in l for l in lines)
+
+
 @pytest.mark.parametrize("lost", ["livecodebench", "apps"])
 def test_a_partial_first_fetch_is_never_pinned_and_the_rerun_fetches_the_rest(tmp_path, monkeypatch, lost):
     """round 2, orchestration: setup_vm.sh only warns when a suite does not download. The
