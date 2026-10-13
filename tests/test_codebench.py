@@ -490,7 +490,8 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -518,7 +519,8 @@ def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monke
     good = lambda p: "```c\n" + p["canonical"] + "\n```"
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append(prompts)
         for _ in prompts:
             on_answer()
@@ -555,7 +557,8 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     probs = cb.load_suite("c-set", "/nonexistent", limit=1)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append((max_tokens, temperature, seed, thinking))
         on_answer()
         return [""], None
@@ -569,6 +572,7 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
     calls.clear()
     job.config.code_eval_samples = 2
+    (tmp_path / "work/code_eval/cand.partial.jsonl").unlink()  # a new reading, not a resumed one
     ev.code_eval(job, "cand", probs, "task system")
     assert sorted(calls) == [(24576, 0.6, 0, True), (24576, 0.6, 1, True)]
 
@@ -591,22 +595,47 @@ def test_examples_only_and_pick_at_examples():
     assert suites["livecodebench"]["pick@examples"] == 0.5  # 1 of the 2 problems with examples
 
 
-def test_generate_sends_thinking_flag(monkeypatch):
+def fake_server(monkeypatch, post):
+    """eval's requests go to post(url, json) -> the reply as one unstreamed body; a
+    streamed request gets it back as llama-server sends it (deltas, finish, usage)."""
     import httpx
     from stages import eval as ev
 
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200)
+        body = json.loads(request.content)
+        reply = post(str(request.url), body)
+        if not body.get("stream"):
+            return httpx.Response(200, json=reply)
+        if "choices" in reply:
+            c = reply["choices"][0]
+            events = [{"choices": [{"delta": c["message"], "finish_reason": None}]},
+                      {"choices": [{"delta": {}, "finish_reason": c.get("finish_reason") or "stop"}]},
+                      {"choices": [], "usage": reply.get("usage") or {}}]
+        else:
+            events = [{"content": reply["content"], "stop": False},
+                      {"content": "", "stop": True, "stop_type": "eos", "tokens_predicted": reply["tokens_predicted"]}]
+        return httpx.Response(200, content="".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n")
+
+    monkeypatch.setattr(ev, "_http", {"client": ev.make_client(httpx.MockTransport(handle))})
+    monkeypatch.setattr(ev, "VLLM", {})
+    monkeypatch.setattr(ev, "IN_FLIGHT", {})
+
+
+def test_generate_sends_thinking_flag(monkeypatch):
+    from stages import eval as ev
+
     sent = []
-
-    class R:
-        def raise_for_status(self): pass
-        def json(self): return {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]}
-
-    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: sent.append((timeout, json)) or R())
+    fake_server(monkeypatch, lambda url, body: sent.append(body) or
+                {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]})
     ev.generate("sys", ["a"], 24576, 0.6, 0, thinking=True)
     ev.generate("sys", ["b"], 2048)
-    (t1, on), (t2, off) = sent
-    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and t1 >= 24576 / 4
-    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off and t2 == 600
+    on, off = sent
+    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and on["max_tokens"] == 24576
+    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off
+    # streamed, so no limit on the whole answer; llama-server's own min_p (0.05) never applies
+    assert all(b["stream"] and b["min_p"] == 0.0 and b["repeat_penalty"] == 1.0 for b in sent)
 
 
 def test_eval_context_fits_code_answer_cap(monkeypatch):
@@ -663,29 +692,23 @@ def test_split_reasoning_handles_split_and_inline_tags():
 def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
     """A thinking that ends with no answer gets </think> appended (plus Qwen's
     early-stop line when it ran out of budget) and the model answers on top."""
-    import httpx
     from stages import eval as ev
 
     finish = {"a": "stop", "b": "length"}
     sent = []
 
-    class R:
-        def __init__(self, body): self.body = body
-        def raise_for_status(self): pass
-        def json(self): return self.body
-
-    def post(url, timeout, json):
-        sent.append((url.rsplit("/", 1)[1], json))
+    def post(url, body):
+        sent.append((url.rsplit("/", 1)[1], body))
         if url.endswith("/chat/completions"):
-            return R({"choices": [{"finish_reason": finish[json["messages"][1]["content"]],
-                                   "message": {"content": "", "reasoning_content": "plan it"}}],
-                      "usage": {"completion_tokens": 900}})
+            return {"choices": [{"finish_reason": finish[body["messages"][1]["content"]],
+                                 "message": {"content": "", "reasoning_content": "plan it"}}],
+                    "usage": {"completion_tokens": 900}}
         if url.endswith("/apply-template"):
-            assert json["chat_template_kwargs"] == {"enable_thinking": True}
-            return R({"prompt": "<|im_start|>assistant\n<think>\n"})
-        return R({"content": "```py\nx = 1\n```", "tokens_predicted": 12})
+            assert body["chat_template_kwargs"] == {"enable_thinking": True}
+            return {"prompt": "<|im_start|>assistant\n<think>\n"}
+        return {"content": "```py\nx = 1\n```", "tokens_predicted": 12}
 
-    monkeypatch.setattr(httpx, "post", post)
+    fake_server(monkeypatch, post)
     monkeypatch.setattr(ev, "SLOTS", 1)
     infos = []
     answers, _ = ev.generate("sys", ["a", "b"], 24576, 0.6, 0, thinking=True, infos=infos)
@@ -697,15 +720,11 @@ def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
 
 
 def test_thinking_off_never_forces_an_answer(monkeypatch):
-    import httpx
     from stages import eval as ev
 
-    class R:
-        def raise_for_status(self): pass
-        def json(self): return {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
-
     urls = []
-    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: urls.append(url) or R())
+    fake_server(monkeypatch, lambda url, body: urls.append(url) or
+                {"choices": [{"finish_reason": "length", "message": {"content": ""}}]})
     infos = []
     assert ev.generate("sys", ["a"], 4096, infos=infos)[0] == [""]
     assert len(urls) == 1 and infos[0]["forced"] is None and infos[0]["finish"] == "length"

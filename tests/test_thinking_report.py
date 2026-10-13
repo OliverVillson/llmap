@@ -1,5 +1,7 @@
-import io
+import gzip
 import json
+import random
+import statistics
 import sys
 import tarfile
 from pathlib import Path
@@ -53,7 +55,7 @@ def test_reads_a_tar_like_the_bucket(tmp_path, capsys):
         t.add(tmp_path / "jobs", arcname="jobs")
     assert tr.main([str(tar)]) == 0
     out = capsys.readouterr().out
-    assert "r50w95s-t vs ref-think on 4 shared problems: lost 2, gained 1" in out
+    assert "r50w95s-t vs ref-think on 4 shared answers: lost 2, gained 1" in out
 
 
 def test_plain_thinking_is_not_a_loop():
@@ -63,3 +65,119 @@ def test_plain_thinking_is_not_a_loop():
     text = " ".join(rng.choice(words) + str(rng.randint(0, 999)) for _ in range(300))
     assert not tr.looped({"reasoning_tail": text})
     assert tr.looped({"reasoning_tail": LOOP})
+
+
+def test_every_sample_counts_and_answers_pair_by_sample(tmp_path):
+    """Four samples per problem: the shares are over all 8 answers, and the comparison
+    pairs sample i of the model with sample i of the ref."""
+    ref = [{"suite": "livecodebench", "id": f"p{i}", "sample": k, "passed": True, "tokens": 1000, "finish": "stop"}
+           for i in range(2) for k in range(4)]
+    model = [dict(r, passed=r["sample"] != 3, tokens=2000) for r in ref]
+    model[0].update(finish="length", answer_cut=True, passed=False)
+    for name, rs in (("ref-think", ref), ("q2", model)):
+        d = tmp_path / f"jobs/{name}/work/code_eval"
+        d.mkdir(parents=True)
+        (d / f"{name}.jsonl").write_text("\n".join(map(json.dumps, rs)) + "\n")
+    out = tr.report(tmp_path / "jobs")
+    q = out["q2"]
+    assert q["n"] == 8 and q["pass%"] == 62.5 and q["cap%"] == 12.5 and q["answer_cut%"] == 12.5
+    assert q["forced%"] == 0.0 and q["loop_checked"] == 0 and q["loop_on"] is None
+    v = q["vs_ref"]
+    assert v["shared"] == 8 and v["lost"] == 3 and v["gained"] == 0
+    assert v["lost_by"] == {"wrong answer": 2, "answer cut": 1} and v["tokens_vs_ref"] == 2.0
+    assert "vs_ref" not in out["ref-think"]
+
+
+def test_a_reading_that_stopped_before_its_tests_reads_the_partial_file(tmp_path):
+    """Only the partial file: its answers count (an errored answer asked again counts
+    once, as its retry), with no pass rate. Next to the graded file it is ignored."""
+    d = tmp_path / "jobs/eh-q2/work/code_eval"
+    d.mkdir(parents=True)
+    base = {"suite": "livecodebench", "seed": 0, "run": "k", "prompt_sha": "s", "answer": "x", "reasoning_chars": 10}
+    rows = [dict(base, id="p0", sample=0, finish="error", error="timed out", forced=None),
+            dict(base, id="p1", sample=0, finish="length", tokens=16384, forced="length", reasoning_tail=LOOP),
+            dict(base, id="p0", sample=0, finish="stop", tokens=900, forced=None),
+            dict(base, id="p2", sample=0, finish="stop", tokens=800, forced=None, reason="case_timeout")]
+    (d / "eh-q2.partial.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n{\"cut by a st")
+    s = tr.report(tmp_path / "jobs")["eh-q2"]
+    assert s["n"] == 3 and s["pass%"] is None and s["error%"] == 0.0
+    assert s["cap%"] == 33.3 and s["forced%"] == 33.3 and s["forced_passed"] == "0/0"
+    assert s["loop%"] == 33.3 and s["loop_checked"] == 1 and s["loop_on"] == "text"
+    graded = [dict(r, passed=True, reason="passed") for r in rows[1:]]
+    (d / "eh-q2.jsonl").write_text("\n".join(map(json.dumps, graded)) + "\n")
+    s = tr.report(tmp_path / "jobs")["eh-q2"]
+    assert s["pass%"] == 100.0 and s["case_timeout%"] == 0.0
+
+
+def ids_natural(rng, n):
+    """Token ids that do not repeat in long runs: a heavy-tailed draw over a 100k vocab."""
+    return [min(100_000, int(rng.paretovariate(0.6))) + rng.randrange(50) for _ in range(n)]
+
+
+def test_loops_in_token_ids_without_a_tokenizer():
+    rng = random.Random(0)
+    cycle = ids_natural(rng, 23)
+    assert not tr.looped_ids(ids_natural(rng, 5000))
+    assert tr.looped_ids(ids_natural(rng, 3000) + cycle * 120)
+    # a loop the cap cut, then a forced answer of 3000 ids after it: still found
+    assert tr.looped_ids(ids_natural(rng, 2000) + cycle * 60 + ids_natural(rng, 3000))
+    assert not tr.looped_ids(cycle * 4)  # under a third of a window: too short to tell
+
+
+def rollouts(rng):
+    loop = ids_natural(rng, 17) * 100
+    return [{"id": "a", "prompt": [1, 2], "tokens": ids_natural(rng, 900), "finish": "stop", "passed": True,
+             "forced": None},
+            {"id": "a", "prompt": [1, 2], "tokens": ids_natural(rng, 300) + loop + ids_natural(rng, 200),
+             "finish": "length", "passed": False, "forced": "length"},
+            {"id": "b", "prompt": [1, 2], "tokens": ids_natural(rng, 2000), "finish": "length", "passed": False,
+             "forced": None},
+            {"id": "b", "prompt": [1, 2], "tokens": ids_natural(rng, 700), "finish": "stop", "passed": None,
+             "forced": "stop"}]
+
+
+def test_rollout_files_give_the_same_shares_as_json(tmp_path, capsys):
+    """Held-out on-policy rollouts (token ids, no suite): a cap hit after the thinking
+    closed is an answer cut, a forced one is not; --out keeps the JSON."""
+    rows = rollouts(random.Random(1))
+    f = tmp_path / "held-rollouts.jsonl"
+    f.write_text("\n".join(map(json.dumps, rows)) + "\n")
+    out_file = tmp_path / "W" / "held-thinking.json"
+    assert tr.main([str(f), "--json", "--out", str(out_file)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert json.loads(out_file.read_text()) == printed
+    s = printed["held-rollouts"]
+    assert s["n"] == 4 and s["pass%"] == 33.3  # the unlabelled answer is left out
+    assert s["cap%"] == 50.0 and s["forced%"] == 50.0 and s["answer_cut%"] == 25.0
+    assert s["loop%"] == 25.0 and s["loop_checked"] == 4 and s["loop_on"] == "ids"
+    assert s["tokens_median"] == round(statistics.median(len(r["tokens"]) for r in rows))
+    gz = tmp_path / "held-rollouts-2.jsonl.gz"
+    gz.write_bytes(gzip.compress(f.read_bytes()))
+    assert tr.report([f, gz], ref="held-rollouts")["held-rollouts-2"]["vs_ref"]["lost"] == 0
+
+
+class WordTok:
+    """A stand-in tokenizer: id i is word i."""
+
+    def __init__(self, words):
+        self.words = words
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.words[i] for i in ids)
+
+
+def test_with_a_tokenizer_the_thinking_is_read_as_text():
+    from stages.eval import EARLY_STOP
+    rng = random.Random(0)
+    vocab = "the array sum prefix bound check index left right mid case loop answer modulo pair count".split()
+    words = ["Wait, let me check again. ", "</think>", EARLY_STOP, "```python\nprint(1)\n```",
+             *(f"{rng.choice(vocab)}{rng.randint(0, 999)} " for _ in range(200))]
+    tok = WordTok(words)
+    plain = list(range(4, 204))
+    looping = plain[:20] + [0] * 80 + [2, 1, 3]  # loops, is cut, gets the forced answer
+    answer_after = plain + [1] + [3] * 300  # a long repetitive answer is not thinking
+    assert tr.thinking({"tokens": looping}, tok).endswith("Wait, let me check again.")
+    assert tr.looped({"tokens": looping}, tok) and not tr.looped({"tokens": answer_after}, tok)
+    assert tr.loop_check({"tokens": looping}, tok) == "text" and tr.loop_check({"tokens": looping}) == "ids"
+    assert tr.stats({("a", 0): {"tokens": looping, "finish": "length", "forced": "length", "passed": False}},
+                    tok)["loop%"] == 100.0

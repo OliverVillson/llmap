@@ -1,6 +1,11 @@
 """The one-command experiment runner: steps in order, a progress bar with the time
 left, logs per step, and resume (a step whose done() holds is skipped). Used by
-scripts/exp02.py and scripts/exp03.py; stdlib only, for the system python3.
+the scripts/exp*.py and scripts/blackhole*.py runs; stdlib only, for the system python3.
+
+run_plan takes an optional upload hook, called after every step that finishes and
+once more however the run ends (a failed step, Ctrl-C, or the last step done), so
+results reach the bucket as they are made: the NVMe they are written to is wiped
+when the VM stops, and a run that breaks at step 6 used to leave steps 1-5 there only.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ class Step:
     done: Callable[[], bool] = lambda: False
     progress: Callable[[], float | None] = lambda: None  # for steps that send no events
     # live state
-    state: str = "waiting"  # waiting, running, done, skipped, failed
+    state: str = "waiting"  # waiting, running, done, skipped, failed, stopped (Ctrl-C)
     part: str = ""
     frac: float = 0.0  # of the current part
     finished: set = field(default_factory=set)
@@ -106,6 +111,10 @@ def on_line(step: Step, line: str) -> None:
     stage, status = e["stage"], e["status"]
     with state_lock:
         if stage in step.minutes and stage not in step.finished:
+            # A step's eventless part ("": an export, say) comes before its pipeline stages,
+            # so the first event of one ends it, and its guessed minutes leave the time left.
+            if step.part == "" and "" in step.minutes:
+                step.finished.add("")
             if status in ("done", "skipped"):
                 step.finished.add(stage)
                 if status == "done":
@@ -130,6 +139,18 @@ def hm(seconds: float) -> str:
         return "<1m"
     h, m = divmod(int(seconds) // 60, 60)
     return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def clock_fill(steps: list[Step]) -> None:
+    """Moves the running steps that are in their eventless part: by their own progress
+    measure, else by the clock against that part's guess. A step whose pipeline is
+    sending events keeps the progress those set (the clock once overwrote an eval's
+    answered/total every second: 600 of 728 answers showed as 4%)."""
+    now = time.time()
+    for s in steps:
+        if s.state == "running" and s.part == "" and "" in s.minutes and "" not in s.finished:
+            p = s.progress()
+            s.frac = p if p is not None else min(0.95, (now - s.part_started) / max(1e-6, s.minutes[""] * 60))
 
 
 class Run:
@@ -175,8 +196,17 @@ class Run:
         return f"[{'█' * filled}{'░' * (WIDTH - filled)}] {frac:.0%}  {hm(time.time() - self.t0)} in, {eta}{what}"
 
 
-def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: list[str] | None = None) -> int:
-    """Runs the steps in order with the bar; --list prints them, `summary` the results."""
+def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: list[str] | None = None,
+             *, after_step: Callable[[Step | None, bool], None] | None = None) -> int:
+    """Runs the steps in order with the bar; --list prints them, `summary` the results.
+
+    after_step(step, final), when given, uploads what the run has made so far. It is
+    called as after_step(s, False) after each step s that finishes in this run, and
+    once as after_step(s, True) in a finally when the run ends, however it ends: s is
+    the step the run ended in (state "failed", or "stopped" for Ctrl-C), or None when
+    no step failed. A hook that raises is reported and the run goes on (the next call
+    tries again); its errors are listed at the end and leave the exit code alone, so
+    the caller decides what a missing upload means (e.g. no shutdown)."""
     argv = sys.argv if argv is None else argv
     if "--list" in argv:
         for i, s in enumerate(plan, 1):
@@ -198,10 +228,7 @@ def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: lis
     def draw():
         while not stop.wait(1):
             with state_lock:
-                for s in plan:  # steps without progress events: their own measure, else the clock
-                    if s.state == "running" and "" in s.minutes:
-                        p = s.progress()
-                        s.frac = p if p is not None else min(0.95, (time.time() - s.started) / (s.total * 60))
+                clock_fill(plan)
                 if TTY:
                     sys.stdout.write("\r\033[K" + run.line())
                     sys.stdout.flush()
@@ -210,52 +237,81 @@ def run_plan(plan: list[Step], summary: Callable[[], str], logs: Path, argv: lis
         while not stop.wait(300):
             above(run.line())
 
+    upload_failed: list[str] = []
+
+    def upload(s: Step | None, final: bool) -> None:
+        if after_step is None:
+            return
+        what = f"after {s.name}" if s and not final else "at the end"
+        try:
+            after_step(s, final)
+        except KeyboardInterrupt:
+            if not final:
+                raise
+            upload_failed.append(f"{what}: stopped with Ctrl-C")
+            above(f"  upload {what} stopped with Ctrl-C")
+        except Exception as e:  # noqa: BLE001  (the results stay on the disk; the next call retries)
+            upload_failed.append(f"{what}: {e}")
+            above(f"  upload {what} failed: {e}")
+
     threading.Thread(target=draw, daemon=True).start()
     if not TTY:
         threading.Thread(target=heartbeat, daemon=True).start()
     skipped, failed = [], None
-    for i, s in enumerate(plan, 1):
-        if s.state == "done":
-            above(f"✓ {i}. {s.name} (done before)")
-            continue
-        s.log = logs / f"{i:02d}-{re.sub(r'[^a-z0-9]+', '-', s.name.lower()).strip('-')}.log"
+    at: Step | None = None  # the step the run is in; left set when it fails or is stopped
+    try:
+        for i, s in enumerate(plan, 1):
+            if s.state == "done":
+                above(f"✓ {i}. {s.name} (done before)")
+                continue
+            s.log = logs / f"{i:02d}-{re.sub(r'[^a-z0-9]+', '-', s.name.lower()).strip('-')}.log"
+            with state_lock:
+                s.state, s.started, s.part_started = "running", time.time(), time.time()
+                s.part = "" if "" in s.minutes else next(iter(s.minutes))
+            above(f"▶ {i}. {s.name}  (log: {s.log})")
+            at = s
+            try:
+                s.run(s)
+                took = time.time() - s.started
+                with state_lock:
+                    s.state = "done"
+                    run.done_est += s.total
+                    run.done_real += took / 60
+                above(f"✓ {i}. {s.name} in {hm(took)}")
+            except Skip as e:
+                with state_lock:
+                    s.state = "skipped"
+                skipped.append(f"{s.name}: {e}")
+                above(f"– {i}. {s.name} skipped: {e}")
+            except Exception as e:  # noqa: BLE001
+                with state_lock:
+                    s.state = "failed"
+                failed = f"{s.name}: {e}"
+                above(f"✗ {i}. {s.name} failed: {e}\n  Full log: {s.log}")
+                break
+            at = None
+            if s.state == "done":
+                upload(s, False)
+    except KeyboardInterrupt:
+        above(f"\nStopped during {at.name if at else 'an upload'}. Re-run the same command to carry on from there.")
+        return 130
+    finally:
+        stop.set()
         with state_lock:
-            s.state, s.started, s.part_started = "running", time.time(), time.time()
-            s.part = "" if "" in s.minutes else next(iter(s.minutes))
-        above(f"▶ {i}. {s.name}  (log: {s.log})")
-        try:
-            s.run(s)
-            took = time.time() - s.started
-            with state_lock:
-                s.state = "done"
-                run.done_est += s.total
-                run.done_real += took / 60
-            above(f"✓ {i}. {s.name} in {hm(took)}")
-        except Skip as e:
-            with state_lock:
-                s.state = "skipped"
-            skipped.append(f"{s.name}: {e}")
-            above(f"– {i}. {s.name} skipped: {e}")
-        except KeyboardInterrupt:
-            stop.set()
-            above(f"\nStopped during {s.name}. Re-run the same command to carry on from there.")
-            return 130
-        except Exception as e:  # noqa: BLE001
-            with state_lock:
-                s.state = "failed"
-            failed = f"{s.name}: {e}"
-            above(f"✗ {i}. {s.name} failed: {e}\n  Full log: {s.log}")
-            break
-    stop.set()
+            if at is not None and at.state == "running":  # Ctrl-C, or anything else that is not an Exception
+                at.state = "stopped"
+        upload(at, True)
     time.sleep(0.1)
     if TTY:
         sys.stdout.write("\r\033[K" + run.line() + "\n")
     print("\n" + summary())
     if skipped:
         print("\nSkipped:\n" + "\n".join("  " + x for x in skipped))
+    if upload_failed:
+        print("\nUploads that failed (the results are still on this disk):\n"
+              + "\n".join("  " + x for x in upload_failed))
     if failed:
         print(f"\nStopped at {failed}\nSend Claude this output. Re-running the same command resumes.")
         return 1
     print(f"\nFinished in {hm(time.time() - run.t0)}. Send Claude the table above.")
     return 0
-

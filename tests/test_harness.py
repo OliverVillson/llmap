@@ -92,7 +92,8 @@ def test_code_eval_in_mugge_format(tmp_path, monkeypatch):
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append((system, prompts))
         if len(calls) == 1:
             return [harness.render_files({"prog.c": probs[0]["canonical"]}), harness.render_files({"prog.c": "int broken("})], None

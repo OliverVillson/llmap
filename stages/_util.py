@@ -154,7 +154,35 @@ class Config:
     # and extra `vllm serve` args, e.g. ["--speculative-config", "{...}"].
     eval_reasoning_parser: str = "qwen3"
     eval_vllm_args: list[str] = field(default_factory=list)
+    # vLLM's --max-num-seqs, which is also how many answers the eval keeps in flight;
+    # 0 = LOBBOT_VLLM_SEQS or 256. On an L40S with 16k thinking, ~96: past what the KV
+    # cache holds, requests only wait inside vLLM. A --max-num-seqs in eval_vllm_args wins.
+    vllm_seqs: int = 0
+    # min_p sent with every eval request, explicitly and with a repetition penalty of 1,
+    # so llama-server's own default (0.05) never applies and both engines sample alike.
+    eval_min_p: float = 0.0
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
+    # ... and on or before this one ("" = no end), so a later release cannot grow the window.
+    lcb_until: str = ""
+    # Test cases per LiveCodeBench problem: the first N (examples first), 0 = all.
+    # scripts/fetch_codebench.py stores every case; 50 is what readings so far used.
+    lcb_max_cases: int = 50
+    # Seed of answer i to a problem is code_eval_seed_offset + i, so a new reading of the
+    # same model draws fresh answers (e.g. 1000 for a record, 50 for a screen).
+    code_eval_seed_offset: int = 0
+    # Only these problem ids, from every suite ([] = all). An id missing from the suites
+    # is an error: a fixed problem set must be the one scored.
+    code_eval_ids: list[str] = field(default_factory=list)
+    # Answers per problem by id, e.g. 2/8/4 on problems the reference went 0/4, mixed, 4/4;
+    # ids not listed get code_eval_samples (at least max(code_eval_k)), and 0 leaves a
+    # problem out. pass@k is reported for the k every problem has answers for.
+    code_eval_samples_by_id: dict[str, int] = field(default_factory=dict)
+    # Size in GB (1e9 bytes) to report per candidate name in eval.json instead of its
+    # files' size: the shipped GGUF's bytes for a candidate scored as a bf16 checkpoint.
+    size_gb_override: dict[str, float] = field(default_factory=dict)
+    # A trimmed vocabulary's vocab_index.json (stages/vocab.py): {"kept": [old ids in new
+    # order], "old_to_new": {old: new}}, so training maps the original's ids. "" = none.
+    vocab_index: str = ""
     # Models to evaluate instead of work/allocation.json: {name: path}, a GGUF (served
     # with llama-server) or an HF checkpoint dir with a config.json (BF16 or
     # compressed-tensors, served with vLLM). Lets an eval-only job (pipeline.py

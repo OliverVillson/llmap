@@ -14,10 +14,18 @@ answer's whole thinking kept (Config.code_eval_budgets), gives every shorter one
 Writes work/code_eval/<name>-<B>.jsonl per budget and adds code.budgets to
 out/eval.json: {"<B>": {"mean_pass@1", "suites", "how": {same, cut, truncated},
 "errors"}}, with the long run itself under its own budget ("how" there counts the
-answers whose thinking hit the cap). "errors" counts answers the server never
-returned (each is retried once, then scored as a failure). Redone answers are kept
-in work/code_eval/<name>-<B>.redo.jsonl as they come, so a re-run after a stop
-only redoes the rest.
+answers whose thinking hit the cap). An answer the server never returned is tried
+once more, and if it still fails the step stops rather than score it ("errors" is
+0 in every written result); so does a server that died. Redone answers are kept
+in work/code_eval/<name>-<B>.redo.jsonl as they come, keyed by the long run's
+answer they were made from, so a re-run after a stop only redoes the rest.
+
+It covers the first answer to each problem (sample 0, seeded
+code_eval_seed_offset) of any eval that kept its thinking: set code_eval_budgets
+(e.g. [8192], the model card's cap) in every eval job, whatever its window, ids or
+answers per problem. Each candidate is served again (the forced answers need the
+GPU), so this is a GPU step; thinking is cut in tokens of the candidate's own HF
+tokenizer when vLLM serves it, and by llama-server's /tokenize for a GGUF.
 
     python -m stages.budget --job <job>    # after the eval stage
 """
@@ -25,6 +33,7 @@ only redoes the rest.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import threading
 from collections import Counter
@@ -50,30 +59,39 @@ def classify(row: dict, reasoning_tokens: int, budget: int) -> str:
     return "truncated"
 
 
-def _post(path: str, body: dict) -> dict:
-    import httpx
-
-    r = httpx.post(f"http://127.0.0.1:{ev.PORT}{path}", json=body, timeout=600)
-    r.raise_for_status()
-    return r.json()
-
-
 def tokenize(text: str) -> list[int]:
-    return _post("/tokenize", {"content": text})["tokens"] if text else []
+    """text's token ids by the served candidate's tokenizer: its own HF tokenizer when
+    vLLM serves a checkpoint dir, else llama-server's /tokenize."""
+    if not text:
+        return []
+    if ev.VLLM:
+        tok = ev.tokenizer(ev.VLLM["dir"])
+        with ev.tokenizer_lock:
+            return tok.encode(text, add_special_tokens=False)
+    return ev.request("/tokenize", {"content": text})["tokens"]
 
 
 def detokenize(tokens: list[int]) -> str:
-    return _post("/detokenize", {"tokens": tokens})["content"] if tokens else ""
+    if not tokens:
+        return ""
+    if ev.VLLM:
+        tok = ev.tokenizer(ev.VLLM["dir"])
+        with ev.tokenizer_lock:
+            return tok.decode(tokens)
+    return ev.request("/detokenize", {"tokens": tokens})["content"]
 
 
-def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets: list[int]) -> dict:
-    """{str(B): scores} for each budget; needs this candidate's llama-server running."""
+def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets: list[int],
+            release=None) -> dict:
+    """{str(B): scores} for each budget; needs this candidate's server running until every
+    budget's answers are redone, then calls release() (run_stage stops the server there)
+    before the sandbox runs, as the eval does."""
     cfg = job.config
     from stages.data import system_prompt
 
     system_of, prompt, code_of = ev.prompting(cfg, system_prompt(job.spec))
-    sampling = ev.sampling_params(0, True)
-    with ThreadPoolExecutor(ev.SLOTS) as ex:
+    sampling = ev.sampling_params(cfg.code_eval_seed_offset, True)  # sample 0's seed
+    with ThreadPoolExecutor(ev.workers()) as ex:
         toks = list(ex.map(lambda r: tokenize(r.get("reasoning") or ""), rows))
     how = {b: [classify(r, len(t), b) for r, t in zip(rows, toks)] for b in budgets}
     total = sum(h != "same" for b in budgets for h in how[b])
@@ -95,15 +113,23 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
             return answer
         return detokenize(tokenize(r.get("answer") or "")[:max(0, b - len(toks[j]) - CLOSE_TOKENS)])
 
+    def key_of(r: dict) -> str:
+        """The long run's answer a redone one is made from: its problem and a hash of its
+        thinking and answer, so a re-run of the eval never reuses answers redone before it."""
+        made = hashlib.sha256(f"{r.get('reasoning') or ''}\0{r.get('answer') or ''}".encode()).hexdigest()[:16]
+        return f"{r['suite']}|{r['id']}|{made}"
+
     def redo(b: int, j: int) -> str:
         nonlocal done
-        key = f"{rows[j]['suite']}|{rows[j]['id']}"
+        key = key_of(rows[j])
         answer = cached[b].get(key)
         for attempt in range(2 if answer is None else 0):
             try:
                 answer = answer_at(b, j)
                 break
-            except Exception as e:  # e.g. a timeout under load: once more, then it counts as failed
+            except ev.ServerDead:
+                raise
+            except Exception as e:  # e.g. a 5xx under load: once more, then the step stops
                 print(f"[{STAGE}] {key} at {b} tokens, try {attempt + 1}: {e}", flush=True)
         with lock:
             if answer is None:
@@ -115,25 +141,30 @@ def rescore(job: Job, name: str, rows: list[dict], problems: list[dict], budgets
             emit(STAGE, msg=f"{name}: {done}/{total} redone", answered=done, total=total)
         return answer or ""
 
-    out = {}
+    redone: dict[int, dict[int, str]] = {}
     for b in budgets:
         todo = [j for j, h in enumerate(how[b]) if h != "same"]
-        with ThreadPoolExecutor(ev.SLOTS) as ex:
-            redone = dict(zip(todo, ex.map(lambda j: redo(b, j), todo)))
+        with ThreadPoolExecutor(ev.workers()) as ex:
+            redone[b] = dict(zip(todo, ex.map(lambda j: redo(b, j), todo)))
+    if any(errors.values()):
+        raise RuntimeError(f"{name}: {sum(errors.values())} answers failed twice (by budget: {errors}); the others "
+                           "redone are kept, and a re-run asks only for the rest")
+    if release:
+        release()
+    out = {}
+    for b in budgets:
+        todo = list(redone[b])
         results = [sandbox.Result(bool(r.get("passed")), r.get("reason") or "", r.get("output") or "") for r in rows]
         by_timeout: dict[float, list[int]] = {}
         for j in todo:
             by_timeout.setdefault(ev.SUITE_TIMEOUT.get(problems[j]["suite"], sandbox.TIMEOUT), []).append(j)
         for timeout, idx in by_timeout.items():
-            items = []
-            for j in idx:
-                code, tests = codebench.assemble(problems[j], redone[j], code_of(problems[j], redone[j]))
-                items.append((problems[j]["language"], code, tests, codebench.time_limit(problems[j])))
+            items = [codebench.job(problems[j], redone[b][j], code_of(problems[j], redone[b][j])) for j in idx]
             for j, res in zip(idx, sandbox.run_many(items, timeout=timeout)):
                 results[j] = res
         write_jsonl(job.path("work", "code_eval", f"{name}-{b}.jsonl"),
                     [{"suite": r["suite"], "id": r["id"], "how": how[b][j], "passed": results[j].passed,
-                      "reason": results[j].reason, **({"answer": redone[j]} if j in redone else {})}
+                      "reason": results[j].reason, **({"answer": redone[b][j]} if j in redone[b] else {})}
                      for j, r in enumerate(rows)])
         suites = codebench.summarize(problems, [[x] for x in results], [1])
         out[str(b)] = {"mean_pass@1": codebench.mean_pass1(suites), "suites": suites, "how": dict(Counter(how[b])),
@@ -167,7 +198,7 @@ def run_stage(job: Job) -> None:
             emit(STAGE, pct=100 * i / len(cands), msg=f"{name}: thinking cut at {', '.join(map(str, budgets))} tokens")
             proc = ev.serve(job, c["path"], f"{name}-budgets")
             try:
-                scores = rescore(job, name, rows, problems, budgets)
+                scores = rescore(job, name, rows, problems, budgets, release=lambda: ev.stop(proc))
             finally:
                 ev.stop(proc)
         scores[str(cfg.code_eval_max_tokens)] = {"mean_pass@1": code.get("mean_pass@1"), "suites": code.get("suites"),
@@ -188,4 +219,5 @@ def run_stage(job: Job) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True)
+    ev.raise_on_sigterm()
     run_stage(Job(ap.parse_args().job))
