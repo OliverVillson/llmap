@@ -97,6 +97,22 @@ if [ -n "${SETUP_VM_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
 # evroc's GPU image installs the NVIDIA driver on first boot and then reboots.
 command -v cloud-init >/dev/null && sudo cloud-init status --wait >/dev/null || true
 
+if ! command -v nvidia-smi >/dev/null; then
+  # No driver from the image: NVIDIA's Ubuntu route (driver-installation-guide/ubuntu.html),
+  # the open kernel modules, which Blackwell requires. Fabric Manager only on NVSwitch boards.
+  say "No NVIDIA driver: installing nvidia-open"
+  . /etc/os-release
+  KR="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/$(uname -m | sed s/aarch64/sbsa/)"
+  curl -fsSL -o /tmp/cuda-keyring.deb "$KR/cuda-keyring_1.1-1_all.deb"
+  sudo dpkg -i /tmp/cuda-keyring.deb && sudo apt-get update -q
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$(uname -r)" nvidia-open
+  if lspci 2>/dev/null | grep -qi nvswitch; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-fabricmanager && sudo systemctl enable nvidia-fabricmanager
+  fi
+  echo "NVIDIA driver installed: reboot (sudo reboot), SSH back in and re-run."
+  exit 3
+fi
+
 say "GPU"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
@@ -114,6 +130,9 @@ fi
 sudo chown "$(id -u):$(id -g)" "$NVME"
 df -h "$NVME"
 mkdir -p "$NVME/models" "$NVME/jobs"
+# .env.vm (sourced before this script) points TMPDIR and the caches here; after a stop
+# they were made on the root disk under the mountpoint, now hidden by the mount.
+mkdir -p "$NVME/tmp" "$NVME/cache/vllm" "$NVME/cache/triton" "$NVME/cache/torchinductor"
 export HF_HOME="$NVME/hf-cache"
 # The root disk is 14 GB, too small for the torch and vLLM wheels in uv's cache.
 export UV_CACHE_DIR="$NVME/uv-cache"
@@ -180,7 +199,7 @@ ENV
 if [ -n "${UV_EXCLUDE_NEWER:-}" ]; then echo "export UV_EXCLUDE_NEWER=$UV_EXCLUDE_NEWER" >> "$REPO/.env.vm"; fi
 
 say "vLLM smoke test"
-"$NVME/venv-vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda ok:', torch.cuda.is_available())" || echo 'WARNING: vLLM import failed; the data stage will not run'
+"$NVME/venv-vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda ok:', torch.cuda.is_available()); assert torch.cuda.is_available(), 'vLLM venv torch sees no GPU'"
 
 say "llama.cpp with CUDA at $LLAMA_CPP_SHA"
 if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
@@ -215,7 +234,7 @@ MISSING=$(missing_suites "$NVME/codebench" $SUITES | tr '\n' ' ')
 if [ -n "$SKIP_SUITES" ]; then
   echo "not fetched (SKIP_SUITES=1): the caller restores them from the bucket"
 elif [ -n "${MISSING// }" ]; then
-  uv run -q --python 3.12 --with datasets --with huggingface_hub \
+  uv run --no-project -q --python 3.12 --with datasets --with huggingface_hub \
     python "$REPO/scripts/fetch_codebench.py" --out "$NVME/codebench" --only $MISSING \
     || echo "WARNING: not every code suite downloaded ($MISSING): code eval fails without livecodebench, trace generation without codecontests"
 else

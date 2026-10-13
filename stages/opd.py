@@ -43,6 +43,7 @@ import random
 import shutil
 import threading
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -306,6 +307,7 @@ def render(tok, p: dict) -> list[int]:
         try:
             ids = tok.apply_chat_template(messages(p), enable_thinking=True, **kw)
         except TypeError:
+            print("render(): apply_chat_template refused enable_thinking; rendering without it", file=sys.stderr)
             ids = tok.apply_chat_template(messages(p), **kw)
     if hasattr(ids, "keys"):
         ids = ids["input_ids"]
@@ -315,12 +317,27 @@ def render(tok, p: dict) -> list[int]:
     return ids
 
 
-def render_remote(url: str, model: str, p: dict) -> list[int]:
+def render_remote(url: str, model: str, p: dict, token_strs: bool = False):
     """The ids the server's own chat template gives the same messages (vLLM's /tokenize,
-    as /v1/chat/completions renders them for the eval)."""
-    return _post(url, "/tokenize", {"model": model, "messages": messages(p), "add_generation_prompt": True,
-                                    "add_special_tokens": False,
-                                    "chat_template_kwargs": {"enable_thinking": True}})["tokens"]
+    as /v1/chat/completions renders them for the eval). With token_strs, (ids, the
+    server's token strings or None)."""
+    body = {"model": model, "messages": messages(p), "add_generation_prompt": True, "add_special_tokens": False,
+            "chat_template_kwargs": {"enable_thinking": True}}
+    if token_strs:
+        body["return_token_strs"] = True
+    r = _post(url, "/tokenize", body)
+    return (r["tokens"], r.get("token_strs")) if token_strs else r["tokens"]
+
+
+def render_diff(tok, local: list[int], remote: list[int], remote_strs: list[str] | None = None) -> str:
+    """Where two renderings of one prompt part: first differing index, both lengths,
+    the text around it on each side, and both tails."""
+    i = next((k for k, (x, y) in enumerate(zip(local, remote)) if x != y), min(len(local), len(remote)))
+    lo, hi = max(0, i - 5), i + 10
+    rs = remote_strs[lo:hi] if remote_strs else tok.convert_ids_to_tokens(remote[lo:hi])
+    return (f"first diff at {i} (local {len(local)} ids, vLLM {len(remote)}); "
+            f"local[{lo}:{hi}]={tok.decode(local[lo:hi])!r} {local[lo:hi]}; "
+            f"vLLM[{lo}:{hi}]={rs!r} {remote[lo:hi]}; tails local {local[-8:]} vLLM {remote[-8:]}")
 
 
 def answer_text(tok, toks: list[int]) -> str | None:

@@ -386,3 +386,15 @@ def test_rounds_train_toward_the_teacher_and_reload_the_adapter(tmp_path, monkey
     assert (out / "config.json").exists() and not (tmp_path / "work" / "opd.adapters").exists()
     merged = transformers.AutoModelForCausalLM.from_pretrained(out)
     assert not any("lora" in n for n, _ in merged.named_parameters())
+
+
+def test_render_diff_reports_first_divergence():
+    from stages import opd
+
+    class Tok:
+        decode = staticmethod(lambda ids: " ".join(map(str, ids)))
+        convert_ids_to_tokens = staticmethod(lambda ids: [f"t{i}" for i in ids])
+
+    d = opd.render_diff(Tok(), list(range(30)), list(range(20)) + [99] + list(range(21, 31)))
+    assert "first diff at 20" in d and "local 30 ids, vLLM 31" in d and "t99" in d
+    assert "first diff at 3" in opd.render_diff(Tok(), [1, 2, 3], [1, 2, 3, 4], ["a", "b", "c", "d"])

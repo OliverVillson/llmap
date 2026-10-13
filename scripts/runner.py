@@ -84,8 +84,11 @@ def write(p: Path, d: dict) -> None:
 def evroc_ok() -> bool:
     if not shutil.which("evroc"):
         return False
-    return subprocess.run("evroc storage bucket get-s3-credentials", shell=True,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    r = subprocess.run("evroc storage bucket get-s3-credentials", shell=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True)
+    if r.returncode:
+        print(f"evroc get-s3-credentials -> exit {r.returncode}: {r.stderr.strip()[-600:]}", file=sys.stderr)
+    return r.returncode == 0
 
 
 

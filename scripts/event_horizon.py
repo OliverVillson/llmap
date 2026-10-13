@@ -472,8 +472,9 @@ def machine_problem(session: str) -> str | None:
     (gpu_mismatch()). Full-weight QAT needs a B200's memory."""
     g = gpu_info()
     if g is None:
-        return ("nvidia-smi found no GPU. On a new VM the driver may still be installing: wait for the reboot, "
-                "SSH back in and re-run.")
+        return ("nvidia-smi found no GPU. On a new VM the driver may still be installing (wait for cloud-init "
+                "and its reboot). If none is coming, run `bash scripts/setup_vm.sh`: it installs NVIDIA's "
+                "nvidia-open driver (Blackwell needs the open modules), then reboot and re-run.")
     name, gib = g
     if session in ("train", ALL) and gib < 150:
         return (f"session {session} trains every weight and needs a B200 (~180 GB); this GPU is {name} with "
@@ -1181,10 +1182,26 @@ def evroc_copy(src: str, dst: str) -> bool:
     """One `evroc storage bucket copy` (either way), after refreshing the S3 credentials,
     which last about an hour."""
     if not shutil.which("evroc"):
+        print("evroc: CLI not on PATH", file=sys.stderr)
         return False
-    run = lambda *a: subprocess.run(["evroc", "storage", "bucket", *a], stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, check=False).returncode == 0
-    return run("get-s3-credentials") and run("copy", "--from", src, "--to", dst)
+
+    def run(*a) -> bool:
+        # stdout is dropped (get-s3-credentials may print secrets); stderr's tail is shown.
+        r = subprocess.run(["evroc", "storage", "bucket", *a], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, check=False)
+        if r.returncode:
+            print(f"evroc storage bucket {a[0]} {' '.join(a[1:])} -> exit {r.returncode}: "
+                  f"{r.stderr.strip()[-600:]}", file=sys.stderr)
+        return r.returncode == 0
+
+    # A read from the bucket doubles as an existence probe, so only uploads are retried.
+    tries = 1 if src.startswith("bucket://") else 3
+    for k in range(tries):
+        if run("get-s3-credentials") and run("copy", "--from", src, "--to", dst):
+            return True
+        if k + 1 < tries:
+            time.sleep(10 * (k + 1))
+    return False
 
 
 def put(src: Path, key: str) -> bool:
@@ -1693,7 +1710,12 @@ def run_bf16(step: Step) -> None:
 # S1.2: every check must pass, or the run stops here.
 
 def smoke_dir() -> Path:
-    return W / f"smoke-{h(MODEL, LLAMA_CPP_SHA, EVAL, SMOKE_PROBLEMS, SMOKE_TOKENS)}"
+    """Keyed by the vLLM and training stacks too (venv freezes, attention backend, sampler),
+    so a pass restored from the bucket is not reused after either changes."""
+    venvs = [(NVME / "venvs" / f).read_text() if (NVME / "venvs" / f).exists() else "" for f in
+             ("venv-vllm.txt", "venv-train.txt")]
+    env = [os.environ.get(k, "") for k in ("LOBBOT_VLLM_ATTN_BACKEND", "VLLM_USE_FLASHINFER_SAMPLER")]
+    return W / f"smoke-{h(MODEL, LLAMA_CPP_SHA, EVAL, SMOKE_PROBLEMS, SMOKE_TOKENS, *venvs, *env)}"
 
 
 def smoke_done() -> bool:
@@ -2817,8 +2839,17 @@ def smoke_main(argv: list[str]) -> int:
             ids = opd.render(tok, prob)
             if n == 0:
                 print("first prompt:\n" + tok.decode(ids))
-            if ids != opd.render_remote(a.url, opd.STUDENT, prob):
-                bad.append(f"{prob['id']}: render() != vLLM /tokenize")
+            remote, strs = opd.render_remote(a.url, opd.STUDENT, prob, token_strs=True)
+            if ids != remote:
+                if not any("vLLM /tokenize" in b for b in bad):
+                    import tokenizers
+                    import transformers
+                    pins = [ln for f in ("venv-vllm.txt", "venv-train.txt") if (NVME / "venvs" / f).exists()
+                            for ln in [f + ": " + " ".join(x for x in (NVME / "venvs" / f).read_text().split()
+                                                           if x.split("==")[0] in ("transformers", "tokenizers"))]]
+                    print(f"render() here: transformers {transformers.__version__}, tokenizers "
+                          f"{tokenizers.__version__}; " + "; ".join(pins), file=sys.stderr)
+                bad.append(f"{prob['id']}: render() != vLLM /tokenize: " + opd.render_diff(tok, ids, remote, strs))
             got = opd.sample(a.url, opd.STUDENT, ids, 2, a.max_tokens)
             if len(got) != 2 or not all(g["tokens"] and all(type(x) is int for x in g["tokens"]) for g in got):
                 bad.append(f"{prob['id']}: gen gave {len(got)} rows, not 2 of token ids")

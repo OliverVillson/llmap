@@ -938,12 +938,15 @@ def _kld_run(cmd: list[str], tries: int = KLD_TRIES) -> dict:
 
 
 def ladder_text(traces_path: str | Path, tokenizer_dir: str, path: Path, role: str = "check") -> Path:
-    """The held-out rows of one half as text (prompt and answer, special tokens kept),
-    for llama-perplexity, which tokenizes it with the GGUF's own vocab."""
+    """The held-out rows of one half as text (prompt and answer) for llama-perplexity,
+    which tokenizes it with the GGUF's own vocab but without parsing special tokens
+    (perplexity.cpp: common_tokenize(ctx, prompt, true), parse_special false, no flag).
+    So the special-token strings are left out: kept, they would be scored as runs of
+    plain pieces the model never sees. The KLD/top-1 gate measures content tokens."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tokenizer_dir)
     rows = held_rows(traces_path, role)
-    path.write_text("\n\n".join(tok.decode(r["prompt"] + r["tokens"], skip_special_tokens=False) for r in rows))
+    path.write_text("\n\n".join(tok.decode(r["prompt"] + r["tokens"], skip_special_tokens=True) for r in rows))
     return path
 
 
