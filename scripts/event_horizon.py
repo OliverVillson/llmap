@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Event Horizon QAT: Granite 4.2 3B at 40 LiveCodeBench points per GB of its shipped
-GGUF, on our own harness readings, in three sessions (plan:
-/mnt/project-files/plan/event-horizon-qat.md, sections 3 and 5).
+GGUF, on our own harness readings, on one B200 or in three sessions (plan:
+/mnt/project-files/plan/event-horizon-qat.md, sections 3 and 5; runbook:
+/mnt/project-files/plan/event-horizon.md).
 
-    python3 scripts/event_horizon.py --session measure   # L40S: R0, training text, vocab trim, PTQ, Block-AP, Gate 1
+    python3 scripts/event_horizon.py --session all       # one B200: measure, train and read back to back
+    python3 scripts/event_horizon.py --session all --shutdown  # ... then power off once the results are uploaded
+    python3 scripts/event_horizon.py --session measure   # L40S/B200: R0, training text, trim, PTQ, Block-AP, Gate 1
     python3 scripts/event_horizon.py --session train     # B200: end-to-end KD, on-policy rounds, export, choice.json
-    python3 scripts/event_horizon.py --session read      # L40S: Gate 2, the pre-registered record reading, the verdict
-    python3 scripts/event_horizon.py --session read --shutdown  # ... then power off once the results are uploaded
+    python3 scripts/event_horizon.py --session read      # L40S/B200: Gate 2, the pre-registered record, the verdict
     python3 scripts/event_horizon.py --list [--session S]  # the steps and their time guesses (no GPU needed)
     python3 scripts/event_horizon.py summary             # every reading, the gates and the verdict
 
-Re-run the same command after a stop: finished steps are skipped, and a fresh VM gets
-back from the bucket whatever matches its hashes.
+Session all is the three sessions' steps on one VM: the setup, the restore, the download
+and the measure smoke tests run once (train's own smoke and rates step still runs), with
+one upload step at the end. Re-run the same command after a stop: finished steps are
+skipped, and a fresh VM gets back from the bucket whatever matches its hashes.
 
 Goal: points/GB = our harness pass@1 (0-100) / (shipped GGUF bytes / 1e9), at least
 GOAL_PTS_PER_GB. There is no adapter: the file is the whole artifact. The largest file
@@ -23,7 +27,7 @@ Gates, coded as rules (gate0(), preflight(), screen_gate(), round_rule(), parity
 written before any reading:
   Gate 0  after the original's reading: R0 >= 52, else stop
   Gate 1  after the Block-AP dev screen: R0 x (dev retention) / GB >= 32, else stop
-          before the B200 and publish the curve
+          before any training and publish the curve
   rounds  an on-policy round is kept only if its held-out on-policy KL drops >= 5%,
           loop% and cap% rise by at most 2 SE, and paired held-out pass@1 falls by at
           most 2 SE; rounds stop after 2 in a row not kept, or after 4 (qat onpolicy
@@ -34,12 +38,14 @@ written before any reading:
           the estimate, llama.cpp KLD <= 0.01 nats/token and top-1 >= 98% against a
           BF16 GGUF of the same weights, llama-tokenize == HF
   Gate 2  after the final dev screen: predicted R0 x retention / GB >= 38, else no record
-A stopped gate skips the GPU steps after it; the upload still runs, so the curve is
-published and --shutdown can power off.
+A failed gate (or preflight, or parity) skips every step after it but the upload, which
+still runs: the run ends cleanly (exit 0), the summary says where and why it stopped
+(stop_line()), the curve is published, and --shutdown powers off under the same
+fingerprint rule as after a full run.
 
 Pre-registration: the reference reading writes the K_i file (answers per problem in the
-record: 2 / 8 / 4 on problems the original went 0/4 / mixed / 4/4); session train
-writes choice.json (GGUF sha256 and bytes, record seeds 1000.., the K_i file's sha256,
+record: 2 / 8 / 4 on problems the original went 0/4 / mixed / 4/4); the train steps
+write choice.json (GGUF sha256 and bytes, record seeds 1000.., the K_i file's sha256,
 the verdict rule, the Gate 2 threshold) before any reading of the final model. The
 record then reads exactly that file once. Its verdict (summary()):
   reached              (R - 1.645 SE) / GB >= 40, with SE = 100 sqrt(sum_i p_i(1-p_i)/(K_i-1)) / N
@@ -52,11 +58,18 @@ record then reads exactly that file once. Its verdict (summary()):
 Each reading's harness settings are read back from its config.effective.json and
 provenance.json and compared with the original's; nothing is assumed "the same".
 
-Every LiveCodeBench reading runs on the L40S with LOBBOT_VLLM_SEQS=96 (what its KV
-cache holds at 16k thinking) and the sandbox on physical cores - 2, keeps its thinking
-for the 8k re-scoring (stages/budget.py) and gets a thinking report
-(scripts/thinking_report.py). Every GPU job first waits for the last one's memory and
-fails, listing the processes holding it, if it is not freed.
+Every LiveCodeBench reading runs on one GPU, an L40S or a B200: the one the original's
+reference reading ran on, as its provenance.json records. That GPU defines the harness:
+a later reading on another GPU name blocks the verdict (provenance_diff, for the dev
+screens and the llama-server check too), and is refused before it starts
+(gpu_mismatch()). So comparability holds within a run, all of whose readings are on one
+GPU. Each reading keeps RECORD_SEQS of that GPU in flight (Config.vllm_seqs and
+LOBBOT_VLLM_SEQS): the reference reading is given its GPU's value, and every later one
+reads it back from the reference's config.json (record_seqs()). The sandbox runs on
+physical cores - 2. Each reading keeps its thinking for the 8k re-scoring
+(stages/budget.py) and gets a thinking report (scripts/thinking_report.py). Every GPU
+job first waits for the last one's memory and fails, listing the processes holding it,
+if it is not freed.
 
 Artifacts: each step's outputs live on the NVMe in dirs named by hashes of what they
 were made from (map, args, imatrix sha, traces sha and held-out split, vocab sha, eval
@@ -71,7 +84,8 @@ refuses to start without one) and the last step waits a bounded time for one.
 The stages run through their CLIs (python -m stages.X), in the training venv that
 .env.vm puts first on PATH; this script itself is stdlib only, and its `smoke` and
 `rescore` helpers are the venv-side parts (python scripts/event_horizon.py smoke ...).
-Logs are in ~/event-horizon-logs/<session> (HORIZON_LOGS), and in the bucket.
+Logs are in ~/event-horizon-logs/<session> (HORIZON_LOGS; session all's in .../all), and
+in the bucket.
 """
 
 from __future__ import annotations
@@ -101,7 +115,11 @@ import thinking_report as tr
 from blackhole import share_kept
 from runner import REPO, Done, Skip, Step, above, evroc_ok, run_plan, sh
 
-SESSIONS = ("measure", "train", "read")
+SESSIONS = ("measure", "train", "read")  # the three-session mode: L40S (or B200), B200, L40S (or B200)
+ALL = "all"  # the three sessions' steps on one B200, back to back
+READS = ("measure", "read", ALL)  # the sessions that read LiveCodeBench
+GPUS = ("L40S", "B200")  # the GPUs the run knows: readings on either, training on the B200
+MACHINE = {"measure": "L40S", "train": "B200", "read": "L40S", ALL: "B200"}  # each session's GPU when none is found
 NVME = Path(os.environ.get("NVME", "/mnt/nvme"))
 J = Path(os.environ.get("LOBBOT_JOBS", NVME / "jobs"))
 W = J / "event-horizon"  # everything this run writes, on the NVMe
@@ -153,12 +171,37 @@ BOOT_DRAWS = 4000
 # ---------- the record harness (section 5), frozen after S1.2 ----------
 
 LCB_TOKENS, BUDGETS, LCB_MAX_CASES = 16384, [8192], 50
-RECORD_SEQS = 96
+# Answers in flight in every reading (vLLM's --max-num-seqs: Config.vllm_seqs, and
+# LOBBOT_VLLM_SEQS), per GPU. All of a run's readings use one value: the reference
+# reading is given its GPU's, and every later reading reads it back from the reference's
+# config.json (record_seqs()), so the original's reading and the record agree by
+# construction; settings_diff checks it with the rest of the harness (vllm_seqs).
+#   L40S  96: past what its KV cache holds on average at 16k thinking; the rest only wait
+#         inside vLLM.
+#   B200 192, from its KV budget. Granite 4.2 3B's KV cache is 40 layers x 8 KV heads x
+#         64 x 2 (K, V) x 2 bytes = 80 KiB a token in bf16. vLLM gets READ_GPU_UTIL of the
+#         B200's 179 GiB (LOBBOT_VLLM_GPU_UTIL) = 161 GiB; less the bf16 weights (6.8 GiB) and
+#         ~4 GiB of activations and CUDA graphs, ~150 GiB of KV cache: ~1.97M tokens. An
+#         answer holds up to 24,576 (eval's --max-model-len: 16,384 thinking + 4,096 forced
+#         answer + 4,096 for the prompt), so 80 fit at their longest; but a live answer
+#         holds ~8k on average (run 2's answers averaged ~9.6k tokens, and the long ones
+#         hold their slots longest: prompt + E[L^2] / 2E[L]), so ~245 fit on average. 192
+#         fill ~78% of the cache on average (1.54M tokens): room for long answers to bunch
+#         up, and for a quantized model whose loops hit the cap more (~10k a live answer:
+#         1.92M), without heavy preemption; 256 would fill it on average and preempt all
+#         along. And 192 keep the B200 busy: each decode step reads every live answer's KV
+#         (~0.6 GiB at 8k) and the weights once, so past ~12 answers the steps are bound by
+#         reading the KV cache, which 192 answers keep streaming.
+RECORD_SEQS = {"L40S": 96, "B200": 192}
+READ_GPU_UTIL = 0.9  # vLLM's --gpu-memory-utilization in every reading
+# The record harness, less vllm_seqs (per GPU: harness_settings() adds the run's). The
+# readings' keys hash EVAL, so the reference reading's key does not move with the GPU a
+# later session runs on.
 EVAL = {
     "teacher": MODEL, "code_eval_suites": ["livecodebench"], "code_eval_ref": "",
     "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0, "thinking_top_k": 0, "eval_min_p": 0.0,
     "code_eval_max_tokens": LCB_TOKENS, "code_eval_budgets": BUDGETS, "lcb_max_cases": LCB_MAX_CASES,
-    "eval_kv_type": "", "eval_vllm_args": [], "eval_reasoning_parser": "qwen3", "vllm_seqs": RECORD_SEQS,
+    "eval_kv_type": "", "eval_vllm_args": [], "eval_reasoning_parser": "qwen3",
 }
 # Keys of config.effective.json that differ between readings by design.
 PER_READING = {"eval_candidates", "code_eval_ids", "code_eval_samples", "code_eval_samples_by_id",
@@ -177,7 +220,8 @@ SMOKE_PROBLEMS, SMOKE_TOKENS = 8, 4096
 
 # ---------- what each step makes ----------
 
-GEN = {"measure": {"tokens": 8e6, "seqs": 160}, "train": {"tokens": 24e6, "seqs": 384}}  # seqs: ternary.SEQS
+GEN = {"measure": {"tokens": 8e6}, "train": {"tokens": 24e6}}
+GEN_SEQS = {"L40S": 160, "B200": 384}  # ternary.SEQS: gen's --max-num-seqs on the GPU it runs on (fp8 KV)
 GEN_SAMPLES, GEN_PORT, SMOKE_PORT = 2, 8093, 8094
 IMATRIX_TOKENS = 1_500_000
 BLOCK = {"windows": 2048, "length": 2048, "epochs": 2, "lr": 1e-4}
@@ -199,10 +243,20 @@ RATES = {"qat_tokens": 20 * 16384, "vllm_problems": 5,
 # ---------- time guesses (minutes) ----------
 
 # Measured: run 2 read 728 LiveCodeBench answers (16k thinking, vLLM, bf16) on the L40S
-# in 3h54m. Every reading's guess comes from that rate; everything else is an estimate,
-# and session train re-bases its guesses on what it measures (minutes()).
-L40S_ANSWERS_PER_MIN = 728 / 234
-LLAMA_ANSWERS_PER_MIN = 100 / 60  # llama-server on the L40S, ~100 answers an hour in run 2
+# in 3h54m, at ~500 answer tokens/s. Estimate: a B200 reads B200_READ_GAIN times as fast
+# (decode is bound by reading the KV cache: ~8 TB/s against the L40S's 864 GB/s, taken
+# at well under its 9x; never measured on the B200). Once the original's reference
+# reading has ended, every later reading's guess is re-based on the answers a minute it
+# measured on the run's one reading GPU (reference_rate()), plus READ_BOOT_MIN for the
+# server's start and the sandbox after the answers; everything else is an estimate, and
+# the training steps re-base theirs on what they measure (minutes()).
+L40S_ANSWERS_PER_MIN, RUN2_TOK_S = 728 / 234, 500
+B200_READ_GAIN = 4.0
+ANSWERS_PER_MIN = {"L40S": L40S_ANSWERS_PER_MIN, "B200": B200_READ_GAIN * L40S_ANSWERS_PER_MIN}
+# llama-server on the L40S, ~100 answers an hour in run 2; elsewhere, and once re-based,
+# in that proportion to vLLM's rate
+LLAMA_ANSWERS_PER_MIN = 100 / 60
+READ_BOOT_MIN = 5
 # gen-measure: 8M tokens at run 2's ~500 tok/s (bf16 KV) times FP8_KV_GAIN for gen's fp8
 # KV cache, plus GEN_BOOT_MIN for the server; re-based on the original's reading (minutes()).
 FP8_KV_GAIN, GEN_BOOT_MIN = 2.0, 5
@@ -210,14 +264,25 @@ GUESS = {"setup": 45, "restore": 10, "download": 5, "gguf": 5, "smoke": 30, "gen
          "imatrix": 12, "ptq": 48, "blockap": 60, "upload": 10, "budgets": 12, "rates": 30, "gen-train": 36,
          "e2e": 50, "onpolicy": 4 * 45, "onpolicy-judge": 15, "final": 24, "choice": 2, "rebuild": 10,
          "rescore": 18}
+# Estimates for the measure steps when they run on a B200 (session all; none of them ever
+# ran there): the GPU work at about the readings' B200_READ_GAIN, the CPU work as on the
+# L40S. gen: 8M tokens at run 2's rate x the gain x the fp8 KV gain, plus the server's
+# start; smoke: mostly vLLM starts and llama-quantize; vocab: the BPE rewrite (CPU) and
+# the gates' held-out forward passes; imatrix: 1.5M tokens through llama-imatrix and the
+# trimmed BF16 GGUF; PTQ: three llama-quantize runs and the dequantization cache (CPU),
+# then ~320 delta-KL swaps; Block-AP: 2 epochs of 2048 x 2048-token windows, then the
+# export; budgets: the 8k re-scoring's forced answers, mostly the server's start.
+GUESS_B200 = {"smoke": 25, "gen-measure": GEN["measure"]["tokens"] / (RUN2_TOK_S * B200_READ_GAIN * FP8_KV_GAIN) / 60
+              + GEN_BOOT_MIN, "vocab": 20, "imatrix": 5, "ptq": 30, "blockap": 20, "budgets": 6}
 
 
-def minutes() -> dict[str, float]:
-    """GUESS, re-based on what the run measured: the training text's time from the
-    original's reference reading (its answer tokens/s on the L40S, times the fp8 KV gain);
-    session train's from QAT tokens/s in S2.2's 20 steps and the B200's answer tokens/s in
-    the training text's gen, with each on-policy session's caps."""
-    m = dict(GUESS)
+def minutes(kind: str = "L40S") -> dict[str, float]:
+    """GUESS on kind's GPU (GUESS_B200's estimates on a B200), re-based on what the run
+    measured: the training text's time from the original's reference reading (its answer
+    tokens/s, on the GPU gen runs on too, times the fp8 KV gain); the training steps' from
+    QAT tokens/s in S2.2's 20 steps and the B200's answer tokens/s in the training text's
+    gen, with each on-policy session's caps. The readings' guesses: reading_minutes()."""
+    m = {**GUESS, **(GUESS_B200 if kind == "B200" else {})}
     ref = reading_dir(READINGS["original-ref"])
     cand = ((load(ref / "out" / "eval.json") if ref else None) or {}).get("candidates") or [{}]
     tok_s = (cand[0].get("code") or {}).get("tok_s_total")
@@ -242,11 +307,59 @@ def minutes() -> dict[str, float]:
     return m
 
 
-def measured() -> str:
+def reference_rate() -> float | None:
+    """Answers a minute the original's reference reading wrote on the run's reading GPU:
+    its answer tokens/s (eval.json's tok_s_total, forced answers in) over its mean tokens
+    an answer, the same way. None until it has ended."""
+    r = READINGS["original-ref"]
+    d = reading_dir(r)
+    if not (d and (d / ".done" / "eval").exists()):
+        return None
+    try:
+        cand = ((load(d / "out" / "eval.json") or {}).get("candidates") or [{}])[0]
+        tok_s = (cand.get("code") or {}).get("tok_s_total")
+        rows = rows_of(r)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    per = statistics.fmean((x.get("tokens") or 0) + (x.get("forced_tokens") or 0) for x in rows) if rows else 0
+    return 60 * tok_s / per if tok_s and per else None
+
+
+def read_rate(kind: str) -> tuple[float, bool]:
+    """(vLLM answers a minute, measured): the reference reading's once it has ended (every
+    later reading runs on its GPU), else kind's ANSWERS_PER_MIN (the B200's an estimate)."""
+    got = reference_rate()
+    return (got, True) if got else (ANSWERS_PER_MIN[kind], False)
+
+
+def reading_minutes(r: Reading, kind: str) -> dict[str, float]:
+    """A reading's guess: its answers at read_rate (llama-server's in run 2's proportion to
+    vLLM's), plus READ_BOOT_MIN once that rate is measured, and the 8k re-scoring."""
+    rate, measured_rate = read_rate(kind)
+    if r.model == "final-gguf":
+        rate *= LLAMA_ANSWERS_PER_MIN / L40S_ANSWERS_PER_MIN
+    return {"eval": expected_answers(r) / rate + (READ_BOOT_MIN if measured_rate else 0),
+            **({"budgets": minutes(kind)["budgets"]} if r.budgets else {})}
+
+
+def measured(kind: str) -> str:
+    """Where the time guesses on kind's GPU come from."""
     r = load(rates_dir() / "rates.json") if rates_dir() else None
-    return ("Times: LiveCodeBench readings from the L40S's measured 728 answers in 3h54m on vLLM (~100 an "
-            "hour on llama-server)"
-            + ("; B200 training from the rates S2.2 measured" if r else "; B200 times are estimates until S2.2 measures them")
+    rate = reference_rate()
+    if rate:
+        reads = (f"LiveCodeBench readings from the original's reference reading, measured on the "
+                 f"{harness_gpu() or 'reading GPU'}: {rate:.1f} answers a minute on vLLM (llama-server in run 2's "
+                 "proportion)")
+    elif kind == "B200":
+        reads = (f"LiveCodeBench readings at {B200_READ_GAIN:g}x the L40S's measured 728 answers in 3h54m, an "
+                 "ESTIMATE (never read on a B200) until the original's reference reading measures the rate")
+    else:
+        reads = ("LiveCodeBench readings from the L40S's measured 728 answers in 3h54m on vLLM (~100 an hour on "
+                 "llama-server)")
+    return (f"Times on the {kind}: {reads}"
+            + ("; gen, vocab trim, imatrix, PTQ and Block-AP are B200 estimates" if kind == "B200" else "")
+            + ("; training from the rates S2.2 measured" if r else "; training times are estimates until S2.2 "
+               "measures them")
             + "; the rest are estimates.")
 
 
@@ -333,21 +446,54 @@ def gpu_info() -> tuple[str, float] | None:
         return None
 
 
+def gpu_kind(name: str | None) -> str | None:
+    """Which of GPUS a GPU name is, or None."""
+    return next((k for k in GPUS if name and k in name), None)
+
+
+@functools.cache
+def this_gpu() -> str | None:
+    """This machine's GPU, as one of GPUS (None without a GPU, or with another)."""
+    g = gpu_info()
+    return gpu_kind(g[0]) if g else None
+
+
+def machine(session: str) -> str:
+    """The GPU a session runs on, for its time guesses, gen's and the readings' answers in
+    flight: this machine's, else (--list without a GPU, say) the one it is planned for."""
+    return this_gpu() or MACHINE[session]
+
+
 def machine_problem(session: str) -> str | None:
-    """Why this machine cannot run the session, or None. Readings are defined on the
-    L40S (HORIZON_ANY_GPU=1 allows another, and the provenance check then blocks the
-    verdict); full-weight QAT needs a B200's memory."""
+    """Why this machine cannot run the session, or None. Readings run on an L40S or a B200,
+    the GPUs RECORD_SEQS has a value for (HORIZON_ANY_GPU=1 allows another, at its
+    session's planned GPU's value); which of them is the one the original's reference
+    reading ran on, and run_restore checks that once the reading is back from the bucket
+    (gpu_mismatch()). Full-weight QAT needs a B200's memory."""
     g = gpu_info()
     if g is None:
         return ("nvidia-smi found no GPU. On a new VM the driver may still be installing: wait for the reboot, "
                 "SSH back in and re-run.")
     name, gib = g
-    if session == "train" and gib < 150:
-        return f"session train needs a B200 (~180 GB); this GPU is {name} with {gib:.0f} GiB"
-    if session in ("measure", "read") and "L40S" not in name and os.environ.get("HORIZON_ANY_GPU") != "1":
-        return (f"session {session} reads LiveCodeBench, and the record harness is defined on the L40S; this GPU "
-                f"is {name}. HORIZON_ANY_GPU=1 runs it anyway (the provenance check will then block the verdict).")
+    if session in ("train", ALL) and gib < 150:
+        return (f"session {session} trains every weight and needs a B200 (~180 GB); this GPU is {name} with "
+                f"{gib:.0f} GiB")
+    if session in READS and gpu_kind(name) is None and os.environ.get("HORIZON_ANY_GPU") != "1":
+        return (f"session {session} reads LiveCodeBench on an L40S or a B200 (RECORD_SEQS has their answers in "
+                f"flight); this GPU is {name}. HORIZON_ANY_GPU=1 runs it anyway, at the {MACHINE[session]}'s value.")
     return None
+
+
+def gpu_mismatch() -> str | None:
+    """Why this machine must not read: the original's reference reading, which defines the
+    harness, ran on another GPU (a reading there would block the verdict). None when the
+    names match, when either is unknown, or with HORIZON_ANY_GPU=1."""
+    want, here = harness_gpu(), (gpu_info() or (None, 0))[0]
+    if not want or not here or want == here or os.environ.get("HORIZON_ANY_GPU") == "1":
+        return None
+    return (f"the original's reference reading, which defines the record harness, ran on {want}; this GPU is {here}. "
+            f"Every reading of a run must be on one GPU (provenance blocks the verdict otherwise): use a {want}, or "
+            "start a new run (HORIZON_RUN). HORIZON_ANY_GPU=1 reads anyway.")
 
 
 def physical_cores() -> int:
@@ -374,13 +520,13 @@ def nvme_env() -> dict:
     return {k: str(v) for k, v in out.items()}
 
 
-def read_env() -> dict:
-    """Every LiveCodeBench reading: as many answers in flight as the L40S's KV cache holds
-    at 16k (more only wait inside vLLM), and the sandbox on physical cores - 2. The base's
-    revision and downloaded commit go into each reading's provenance.json (eval keeps the
-    LOBBOT_EVAL_* environment there)."""
-    return {**nvme_env(), "LOBBOT_VLLM_SEQS": str(RECORD_SEQS),
-            "LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2)), "LOBBOT_VLLM_GPU_UTIL": "0.9",
+def read_env(seqs: int) -> dict:
+    """Every LiveCodeBench reading: seqs answers in flight (the job's vllm_seqs, its GPU's
+    RECORD_SEQS), vLLM on READ_GPU_UTIL of the GPU, and the sandbox on physical cores - 2.
+    The base's revision and downloaded commit go into each reading's provenance.json (eval
+    keeps the LOBBOT_EVAL_* environment there)."""
+    return {**nvme_env(), "LOBBOT_VLLM_SEQS": str(seqs),
+            "LOBBOT_SANDBOX_WORKERS": str(max(1, physical_cores() - 2)), "LOBBOT_VLLM_GPU_UTIL": str(READ_GPU_UTIL),
             "LOBBOT_EVAL_BASE_REVISION": MODEL_REVISION, "LOBBOT_EVAL_BASE_COMMIT": download_commit() or ""}
 
 
@@ -627,6 +773,9 @@ def k_alloc() -> dict[str, int] | None:
 
 
 def reading_key(r: Reading) -> str | None:
+    """The hash a reading's job dir is named by: the harness (EVAL: its answers in flight,
+    the reference reading's by construction, are left out, so a later session finds the
+    reference reading whatever GPU it runs on), the problems, seeds, answers and model."""
     meta, win, m = lcb_meta(), window(r.window), model_of(r.model)
     if not (meta and win and m and m[1]):
         return None
@@ -644,12 +793,46 @@ def reading_dir(r: Reading) -> Path | None:
     return JOBS / f"{r.name}-{key}" if key else None
 
 
-def reading_config(r: Reading) -> dict:
+def record_seqs(kind: str | None = None) -> int | None:
+    """Answers in flight in every reading of the run: the value the original's reference
+    reading was given, read back from its config.json, so that every later reading has
+    it by construction; before that reading exists, kind's RECORD_SEQS (the GPU it will
+    be read on), or None without a kind."""
+    d = reading_dir(READINGS["original-ref"])
+    n = (load(d / "config.json") or {}).get("vllm_seqs") if d else None
+    return n or (RECORD_SEQS[kind] if kind else None)
+
+
+def harness_settings() -> dict:
+    """The record harness as the run reads it: EVAL and its answers in flight."""
+    return {**EVAL, "vllm_seqs": record_seqs()}
+
+
+def gpu_names(prov: dict | None) -> list[str]:
+    """The GPU names in a provenance.json ("NVIDIA B200, 183359 MiB, 580.95" -> its name)."""
+    return [g.split(",")[0].strip() for g in ((prov or {}).get("gpu") or [])]
+
+
+def reading_gpu(r: Reading) -> str | None:
+    """The GPU a reading ran on, from its provenance.json (eval writes it as it starts)."""
+    d = reading_dir(r)
+    names = gpu_names(load(d / "work" / "provenance.json")) if d else []
+    return names[0] if names else None
+
+
+def harness_gpu() -> str | None:
+    """The GPU the record harness is defined on: the one the original's reference reading
+    ran on. Every later reading must run on the same GPU name."""
+    return reading_gpu(READINGS["original-ref"])
+
+
+def reading_config(r: Reading, kind: str) -> dict:
     win, (path, fp, gb) = window(r.window), model_of(r.model)
     name = reading_dir(r).name
     # eval keys resumed answers by this content fingerprint, not the files' mtime: a new VM
     # downloads, re-exports or rebuilds the same weights with new mtimes.
-    cfg = {**EVAL, "lcb_since": win["since"], "lcb_until": win["until"], "code_eval_seed_offset": r.seed,
+    cfg = {**EVAL, "vllm_seqs": record_seqs(kind), "lcb_since": win["since"], "lcb_until": win["until"],
+           "code_eval_seed_offset": r.seed,
            "eval_candidates": {name: str(path)},
            "eval_model_fingerprint": original_fingerprint() if r.model == "original" else fp}
     if r.model != "original":
@@ -679,19 +862,25 @@ def reading_done(r: Reading) -> bool:
 
 
 def run_eval(step: Step, d: Path, budgets: bool = True) -> None:
-    """The eval stage on d (served on vLLM or llama-server by eval.py), then the 8k re-scoring."""
-    env = read_env()
+    """The eval stage on d (served on vLLM or llama-server by eval.py), then the 8k
+    re-scoring, with the job's own answers in flight (its config's vllm_seqs)."""
+    env = read_env(load(d / "config.json")["vllm_seqs"])
     if not (d / ".done" / "eval").exists():
         sh(step, gpu(f"python pipeline.py --job {d} --only eval"), env)
     if budgets and not (d / ".done" / "budgets").exists():
         sh(step, gpu(f"python -m stages.budget --job {d}"), env)
 
 
-def run_reading(step: Step, r: Reading) -> None:
+def run_reading(step: Step, r: Reading, kind: str) -> None:
+    """A reading on this machine's GPU (kind), which must be the original's reference
+    reading's once that has one (gpu_mismatch())."""
     d = reading_dir(r)
     if d is None:
         raise RuntimeError(f"{r.name}: its inputs are not there yet (problem set, model or K_i file)")
-    make_job(d, reading_config(r))
+    why = gpu_mismatch()
+    if why:
+        raise RuntimeError(f"{r.name} is not read here: {why}")
+    make_job(d, reading_config(r, kind))
     run_eval(step, d, r.budgets)
     ref = reading_dir(READINGS[r.ref])
     srcs = f"{d}" + (f" {ref}" if ref and ref != d and ref.exists() else "")
@@ -929,6 +1118,29 @@ def stopped(names: tuple[str, ...]) -> str | None:
     return None
 
 
+# Every gate a run can stop at, in the order the steps decide them: (name, what, where).
+STOPS = (("gate0", "Gate 0", "after the original's reference reading"), ("preflight", "the preflight", "after PTQ"),
+         ("gate1", "Gate 1", "after the Block-AP dev screen"), ("parity", "the parity gates", "after the final export"),
+         ("gate2", "Gate 2", "after the final dev screen"))
+
+
+def stop_line() -> str | None:
+    """Where and why the run stopped, when a gate failed: the first one, with its numbers."""
+    for name, what, where in STOPS:
+        g = gate(name)
+        if g is None or g.get("pass"):
+            continue
+        if name == "gate0":
+            why = f"R0 {g['R0']:.1f} < {GATE0_MIN_R0}"
+        elif name in ("gate1", "gate2"):
+            why = (f"R0 {g['R0']:.1f} x retention {g['retention']:.1%} / {g['gb']:.3f} GB = "
+                   f"{g['predicted_pts_per_gb']:.1f}/GB < {g['threshold']}")
+        else:
+            why = g.get("why") or "see below"
+        return f"STOPPED at {what}, {where}: {why}. Every step after it is skipped; the upload still runs."
+    return None
+
+
 def write_gate0() -> None:
     r = READINGS["original-ref"]
     outs = outcomes(rows_of(r))
@@ -988,8 +1200,9 @@ def get(key: str, dst: Path) -> bool:
 @dataclass
 class Art:
     """A step's outputs: uploaded to horizon/<run>/<slug>/<key>/ and restored from there.
-    A session in `sessions` gets all of it back; the others only the `light` files
-    (results and hash sidecars, for the summary and the keys downstream)."""
+    A session in `sessions` gets all of it back, and so does session all (every step is
+    its own); the others only the `light` files (results and hash sidecars, for the
+    summary and the keys downstream)."""
     slug: str
     key: Callable[[], str | None]
     paths: Callable[[], list[Path]]
@@ -1099,7 +1312,8 @@ def upload_art(art: Art, complete: bool = True) -> bool:
 
 def restore_art(art: Art, session: str) -> str | None:
     """Gets the art back from the bucket under its current key: all of it in its own
-    sessions, its light files elsewhere. None when there is nothing to get."""
+    sessions (session all's are every art), its light files elsewhere. None when there
+    is nothing to get."""
     key = art.key()
     if key is None or in_sync(art):
         return None
@@ -1108,7 +1322,7 @@ def restore_art(art: Art, session: str) -> str | None:
     if not get(f"{base}/manifest.json", man_path):
         return None
     man = json.loads(man_path.read_text())
-    full = session in art.sessions
+    full = session in art.sessions or session == ALL
     want = [f for f in man["files"] if full or f.get("light")]
     for f in (f for f in want if f["big"]):  # the big files first, so the small ones (results, metas) land last
         dst = NVME / f["path"]
@@ -1288,9 +1502,10 @@ def setup_done() -> bool:
 
 
 def run_restore(step: Step, session: str) -> None:
-    """Whatever the bucket holds under the current hashes, for this session and those before."""
+    """Whatever the bucket holds under the current hashes, for this session and those
+    before (session all: everything), then what the session needs checked."""
     if not evroc_ok():
-        if session == "measure":
+        if session in ("measure", ALL):  # the first session's steps: there is nothing before them
             above("    no evroc login: nothing restored. Log in (evroc login) before the uploads.")
             return
         raise RuntimeError(f"no evroc login: session {session} needs the earlier sessions' results from the bucket. "
@@ -1311,8 +1526,13 @@ def run_restore(step: Step, session: str) -> None:
 
 
 def session_inputs(session: str) -> list[str]:
-    """What a session needs from the ones before it, or why it must not run."""
+    """What a session needs from the ones before it, or why it must not run: a session
+    that reads must run on the GPU the original's reference reading ran on, when that
+    reading is back (gpu_mismatch())."""
     out = []
+    why = gpu_mismatch() if session in READS else None
+    if why:
+        out.append(why)
     if session == "train":
         for g in ("gate0", "preflight", "gate1"):
             s = gate(g)
@@ -1476,15 +1696,16 @@ def smoke_done() -> bool:
     return bool((load(smoke_dir() / "smoke.json") or {}).get("ok"))
 
 
-def smoke_eval_job(n: int, max_tokens: int, name: str) -> Path | None:
-    """A few dev problems x 1 through the whole eval path (vLLM, streaming, the sandbox)."""
+def smoke_eval_job(n: int, max_tokens: int, name: str, kind: str) -> Path | None:
+    """A few dev problems x 1 through the whole eval path (vLLM, streaming, the sandbox),
+    with kind's answers in flight."""
     ids, win = dev_ids(), window("dev")
     if not ids:
         return None
     d = JOBS / f"{name}-{h(EVAL, ids[:n], max_tokens)}"
-    return make_job(d, {**EVAL, "lcb_since": win["since"], "lcb_until": win["until"], "code_eval_ids": ids[:n],
-                        "code_eval_samples": 1, "code_eval_max_tokens": max_tokens, "code_eval_budgets": [],
-                        "eval_candidates": {d.name: str(HF_DIR)}})
+    return make_job(d, {**EVAL, "vllm_seqs": RECORD_SEQS[kind], "lcb_since": win["since"], "lcb_until": win["until"],
+                        "code_eval_ids": ids[:n], "code_eval_samples": 1, "code_eval_max_tokens": max_tokens,
+                        "code_eval_budgets": [], "eval_candidates": {d.name: str(HF_DIR)}})
 
 
 def check_eval_rows(d: Path, n: int) -> list[str]:
@@ -1497,7 +1718,7 @@ def check_eval_rows(d: Path, n: int) -> list[str]:
     return bad
 
 
-def run_smoke(step: Step) -> None:
+def run_smoke(step: Step, kind: str) -> None:
     S = smoke_dir()
     S.mkdir(parents=True, exist_ok=True)
     res = load(S / "smoke.json") or {}
@@ -1521,7 +1742,7 @@ def run_smoke(step: Step) -> None:
         return {k: t.get(k) for k in ("default_system_text", "accepted") if t.get(k)}
 
     def eval_path() -> None:
-        d = smoke_eval_job(SMOKE_PROBLEMS, SMOKE_TOKENS, "smoke-eval")
+        d = smoke_eval_job(SMOKE_PROBLEMS, SMOKE_TOKENS, "smoke-eval", kind)
         if d is None:
             raise RuntimeError("no LiveCodeBench dev window in livecodebench.meta.json")
         run_eval(step, d, budgets=False)
@@ -1570,11 +1791,12 @@ def run_smoke(step: Step) -> None:
     dump(S / "smoke.json", {**res, "ok": True})
 
 
-def run_gen(step: Step, session: str) -> None:
+def run_gen(step: Step, session: str, kind: str) -> None:
     """The original's thinking on clean CodeContests (+ ~20% APPS functional) problems:
-    ternary.gen_command's server (fp8 KV, its own process group) and gen, which writes
-    traces.count as it goes and validates the file before it says done."""
-    T, tokens, seqs = traces_dir(session), GEN[session]["tokens"], GEN[session]["seqs"]
+    ternary.gen_command's server (fp8 KV, its own process group, kind's GEN_SEQS) and gen,
+    which writes traces.count as it goes and validates the file before it says done.
+    session: which traces (measure's 8M, or train's 24M from them)."""
+    T, tokens, seqs = traces_dir(session), GEN[session]["tokens"], GEN_SEQS[kind]
     T.mkdir(parents=True, exist_ok=True)
     out = T / "traces.jsonl"
     if session == "train" and not out.exists():  # the 8M from session measure, extended
@@ -1759,7 +1981,7 @@ def onpolicy_flags(a: dict) -> str:
             f" --max-minutes {a['max_minutes']} --rollout-tokens-cap {a.get('rollout_tokens_cap', 0):.0f}")
 
 
-def run_rates(step: Step) -> None:
+def run_rates(step: Step, kind: str) -> None:
     """S2.2: vLLM on the B200 (a few dev problems x 1 at 16k, streaming, the sandbox); 20
     QAT steps at 16k windows with the codes never frozen (so the step costs what the e2e
     step costs; fit would not freeze a 20-step run at the default anyway, --freeze-steps 0
@@ -1772,7 +1994,7 @@ def run_rates(step: Step) -> None:
     guesses are re-based on the QAT tokens/s and on the B200 gen's answer tokens/s
     (minutes())."""
     R, B = rates_dir(), blockap_dir()
-    d = smoke_eval_job(RATES["vllm_problems"], LCB_TOKENS, "b200-smoke")
+    d = smoke_eval_job(RATES["vllm_problems"], LCB_TOKENS, "b200-smoke", kind)
     if d is None:
         raise RuntimeError("no LiveCodeBench dev window in livecodebench.meta.json")
     run_eval(step, d, budgets=False)
@@ -1905,7 +2127,7 @@ def run_choice(step: Step) -> None:
                                                      "k_rule": K_BY_OUTCOME},
          "goal_pts_per_gb": GOAL_PTS_PER_GB, "gate2_pts_per_gb": GATE2_MIN_PTS_PER_GB, "verdict_rule": VERDICT_RULE,
          "R0": g0["R0"], "budget_gb": g0["budget_gb"], "test_ids_sha256": window("test")["ids_sha256"],
-         "harness": EVAL, "harness_sha": h(EVAL), "run": RUN_ID,
+         "harness": harness_settings(), "harness_sha": h(harness_settings()), "gpu": harness_gpu(), "run": RUN_ID,
          "base": {"model": MODEL, "revision": MODEL_REVISION, "commit": download_commit()},
          "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     # The bucket's choice (one per run, whatever the hashes upstream) is checked before
@@ -1998,6 +2220,9 @@ def session_arts(session: str) -> list[Art]:
 
 
 def arts_through(session: str) -> list[Art]:
+    """The arts of this session and the ones before it (session all's own are all)."""
+    if session == ALL:
+        return session_arts(ALL)
     out: list[Art] = []
     for s in SESSIONS[: SESSIONS.index(session) + 1]:
         out += [a for a in session_arts(s) if a.slug not in {x.slug for x in out}]
@@ -2015,8 +2240,9 @@ def uploaded(session: str) -> bool:
 
 
 def run_upload(step: Step, session: str) -> None:
-    """S1.11 / S2.7 / S3.5: every result of the session, the summary and the logs; then
-    W/.uploaded with their fingerprint. Waits a bounded time for a login with --shutdown."""
+    """S1.11 / S2.7 / S3.5 (session all: once, at its end): every result of the session,
+    the summary and the logs; then W/.uploaded with their fingerprint. Waits a bounded
+    time for a login with --shutdown."""
     if not evroc_ok() and not wait_for_login(LOGIN_WAIT_MINUTES if SHUTDOWN else 0):
         raise Skip("no evroc login. Log in (evroc login --oidc-port 8765) and re-run to upload.")
     for art in session_arts(session):
@@ -2062,7 +2288,9 @@ def make_hook(session: str) -> Callable[[Step | None, bool], None]:
 
 def shutdown_after(code: int, session: str) -> None:
     """Powers the VM off, but only after a run that exited 0 and whose results are in the
-    bucket as they are on the disk: the NVMe is wiped when the VM stops."""
+    bucket as they are on the disk: the NVMe is wiped when the VM stops. A run a gate
+    stopped is such a run too (the steps after the gate are skipped, the upload step
+    runs and the run exits 0), so a B200 never idles after a decided stop."""
     if code != 0:
         print(f"\nNot shutting down: the run did not finish (exit code {code}), and stopping the VM wipes the NVMe.")
         return
@@ -2116,11 +2344,12 @@ def dir_art(slug: str, where: Callable[[], Path | None], sessions: tuple[str, ..
     return Art(slug, key, lambda: [where()] if where() else [], sessions, light=lights, exclude=exclude)
 
 
-def reading_step(session: str, name: str, gates: tuple[str, ...] = ()) -> Step:
+def reading_step(session: str, name: str, kind: str, gates: tuple[str, ...] = ()) -> Step:
+    """A reading's step on kind's GPU; its guess is re-based once the reference reading has
+    measured the rate (reading_minutes(), read again as each step starts)."""
     r = READINGS[name]
-    rate = LLAMA_ANSWERS_PER_MIN if r.model == "final-gguf" else L40S_ANSWERS_PER_MIN
-    mins = {"eval": expected_answers(r) / rate, **({"budgets": GUESS["budgets"]} if r.budgets else {})}
-    return step(session, r.title, mins, lambda s: run_reading(s, r), lambda: reading_done(r), reading_art(r), gates)
+    return step(session, r.title, lambda: reading_minutes(r, kind), lambda s: run_reading(s, r, kind),
+                lambda: reading_done(r), reading_art(r), gates)
 
 
 def common_start(session: str, m: dict) -> list[Step]:
@@ -2129,90 +2358,123 @@ def common_start(session: str, m: dict) -> list[Step]:
                  lambda: False)]
 
 
+def download_step(session: str, m: dict) -> Step:
+    return step(session, "Granite 4.2 3B download", {"": m["download"]}, run_download, download_done,
+                progress=download_progress)
+
+
 def upload_step(session: str, m: dict) -> Step:
     return step(session, "upload, then stop", {"": m["upload"]}, lambda s: run_upload(s, session),
                 lambda: uploaded(session))
 
 
+# The gates each part's steps run behind: a failed one skips them.
+G0 = ("gate0",)
+PRE = (*G0, "preflight")
+G1 = (*PRE, "gate1")
+CHOSEN = (*G1, "parity")  # choice.json is written
+
+
+def measure_steps(session: str, m: dict, kind: str) -> list[Step]:
+    """Session measure's work (S1.1's download to S1.10): the base, the smoke tests, the
+    original's readings (Gate 0), the training text, the trim, the imatrix, PTQ (the
+    preflight), Block-AP and its dev screen (Gate 1)."""
+    return [
+        download_step(session, m),
+        step(session, "BF16 GGUF", {"gguf": m["gguf"]}, run_bf16, BF16.exists),
+        step(session, "GPU smoke (a)-(h)", {"": m["smoke"]}, lambda s: run_smoke(s, kind), smoke_done,
+             dir_art("smoke", smoke_dir, ("measure",), ("smoke.json",), ("*.gguf", "*.kld", "vocab", "block"))),
+        reading_step(session, "original-ref", kind),
+        reading_step(session, "original-dev", kind, G0),
+        step(session, "training text, 8M tokens", lambda: {"": minutes(kind)["gen-measure"]},
+             lambda s: run_gen(s, "measure", kind), lambda: gen_done("measure"),
+             dir_art("traces", traces_dir, ("measure", "train"), ("traces.sha256", "traces.count", ".gen-done")),
+             G0, lambda: traces_progress("measure")),
+        step(session, "vocab trim and its gates", {"": m["vocab"]}, run_vocab, vocab_done,
+             dir_art("vocab", vocab_dir, ("measure", "train"), ("vocab.json", "vocab.sha256", "hf.report.json")),
+             G0),
+        step(session, "imatrix on the trimmed BF16", {"": m["imatrix"]}, run_imatrix, imatrix_done,
+             dir_art("imatrix", imatrix_dir, ("measure",), ("work/imatrix.sha256", "work/imatrix.json"),
+                     ("model-bf16.gguf",)), G0),
+        step(session, "PTQ, sensitivity, knapsack, preflight", {"": m["ptq"]}, run_ptq, ptq_done,
+             dir_art("ptq", ptq_dir, ("measure",),
+                     ("map.json", "horizon.json", "preflight.json", "floor.json", "bytes.json", "ladder.json",
+                      "ladder.txt"),
+                     ("cache", "teacher-*.pt", "horizon-*.gguf")), G0),
+        step(session, "Block-AP and its export", {"": m["blockap"]}, run_blockap, blockap_done,
+             dir_art("blockap", blockap_dir, ("measure", "train"),
+                     ("block.json", "export/export.json", "export/model.gguf.sha256"),
+                     ("export/vllm", "export/model-hf", "layers")), PRE),
+        reading_step(session, "blockap-dev", kind, PRE),
+    ]
+
+
+def train_steps(session: str, m: dict, kind: str) -> list[Step]:
+    """Session train's work (S2.2 to S2.7's choice.json), behind Gate 1."""
+    onpolicy_art = dir_art("onpolicy", onpolicy_dir, ("train",),
+                           ("state.json", "onpolicy.json", "audit.json", "config.json", "held.json",
+                            "round*/judge.json", "round*/held.metrics.json"), ("serve",))
+    return [
+        step(session, "B200 smoke and rates", {"": m["rates"]}, lambda s: run_rates(s, kind), rates_done,
+             dir_art("rates", rates_dir, ("train",), ("rates.json", "qat/e2e.json"),
+                     ("qat/state", "qat/ckpt.pt", "onpolicy/round*/train", "serve")), G1),
+        step(session, "training text to 24M tokens", {"": m["gen-train"]}, lambda s: run_gen(s, "train", kind),
+             lambda: gen_done("train"),
+             dir_art("traces24", lambda: traces_dir("train"), ("train",),
+                     ("traces.sha256", "traces.count", ".gen-done")),
+             G1, lambda: traces_progress("train")),
+        step(session, "end-to-end KD", lambda: {"": minutes(kind)["e2e"]}, run_e2e, e2e_done,
+             dir_art("e2e", e2e_dir, ("train",), ("e2e.json",), ("serve",)), G1),
+        *[step(session, f"on-policy session {k} of up to {ONPOLICY_SESSIONS}"
+               + (" (judges the last round)" if k == ONPOLICY_SESSIONS else f" (round {k})"),
+               lambda k=k: {"": minutes(kind)["onpolicy"] / ROUNDS_MAX if k < ONPOLICY_SESSIONS
+                            else minutes(kind)["onpolicy-judge"]},
+               lambda s, k=k: run_onpolicy(s, k), lambda k=k: onpolicy_session_done(k), onpolicy_art, G1)
+          for k in range(1, ONPOLICY_SESSIONS + 1)],
+        step(session, "final export and parity", {"": m["final"]}, run_final, final_done,
+             dir_art("final", final_dir, ("train", "read"),
+                     ("export.json", "kld.json", "tokenize.json", "parity.json", "model.gguf.sha256"),
+                     ("vllm", "dequant-bf16.gguf")), G1),
+        step(session, "choice.json pre-registration", {"": m["choice"]}, run_choice, choice_done, choice_art(),
+             CHOSEN),
+    ]
+
+
+def read_steps(session: str, m: dict, kind: str, before: tuple[str, ...] = ()) -> list[Step]:
+    """Session read's work (S3.1's rebuild to S3.5's rescore), behind the gates `before`:
+    none in session read (its restore checks choice.json), every one before choice.json in
+    session all, where a stop at Gate 2 skips the rescore too (session read rescores the
+    original's answers whatever Gate 2 says)."""
+    return [
+        step(session, "final checkpoint from the shipped GGUF", {"": m["rebuild"]}, run_rebuild, rebuild_done,
+             gates=before),
+        reading_step(session, "final-dev", kind, before),
+        reading_step(session, "final-record", kind, (*before, "gate2")),
+        reading_step(session, "final-llama", kind, (*before, "gate2")),
+        step(session, "all-cases CPU rescore", {"": m["rescore"]}, run_rescore, rescore_done,
+             Art("rescore", lambda: h([p.name for p in rescore_files()]) if rescore_files() else None,
+                 rescore_files, ("read",), light=rescore_files), (*before, "gate2") if before else ()),
+    ]
+
+
 def steps(session: str) -> list[Step]:
-    m = minutes()
-    G0, PRE, G1 = ("gate0",), ("gate0", "preflight"), ("gate0", "preflight", "gate1")
+    """A session's steps. Session all is one B200 VM: the setup, the restore and the
+    download once, then measure's, train's and read's work back to back (train's own
+    smoke and rates step in it), each part behind every gate before it, and one upload at
+    the end (the hook uploads after every step as in any session)."""
+    kind = machine(session)
+    m = minutes(kind)
     if session == "measure":
-        return [
-            *common_start(session, m),
-            step(session, "Granite 4.2 3B download", {"": m["download"]}, run_download, download_done,
-                 progress=download_progress),
-            step(session, "BF16 GGUF", {"gguf": m["gguf"]}, run_bf16, BF16.exists),
-            step(session, "GPU smoke (a)-(h)", {"": m["smoke"]}, run_smoke, smoke_done,
-                 dir_art("smoke", smoke_dir, ("measure",), ("smoke.json",), ("*.gguf", "*.kld", "vocab", "block"))),
-            reading_step(session, "original-ref"),
-            reading_step(session, "original-dev", G0),
-            step(session, "training text, 8M tokens", lambda: {"": minutes()["gen-measure"]}, lambda s: run_gen(s, "measure"),
-                 lambda: gen_done("measure"),
-                 dir_art("traces", traces_dir, ("measure", "train"), ("traces.sha256", "traces.count", ".gen-done")),
-                 G0, lambda: traces_progress("measure")),
-            step(session, "vocab trim and its gates", {"": m["vocab"]}, run_vocab, vocab_done,
-                 dir_art("vocab", vocab_dir, ("measure", "train"), ("vocab.json", "vocab.sha256", "hf.report.json")),
-                 G0),
-            step(session, "imatrix on the trimmed BF16", {"": m["imatrix"]}, run_imatrix, imatrix_done,
-                 dir_art("imatrix", imatrix_dir, ("measure",), ("work/imatrix.sha256", "work/imatrix.json"),
-                         ("model-bf16.gguf",)), G0),
-            step(session, "PTQ, sensitivity, knapsack, preflight", {"": m["ptq"]}, run_ptq, ptq_done,
-                 dir_art("ptq", ptq_dir, ("measure",),
-                         ("map.json", "horizon.json", "preflight.json", "floor.json", "bytes.json", "ladder.json",
-                          "ladder.txt"),
-                         ("cache", "teacher-*.pt", "horizon-*.gguf")), G0),
-            step(session, "Block-AP and its export", {"": m["blockap"]}, run_blockap, blockap_done,
-                 dir_art("blockap", blockap_dir, ("measure", "train"),
-                         ("block.json", "export/export.json", "export/model.gguf.sha256"),
-                         ("export/vllm", "export/model-hf", "layers")), PRE),
-            reading_step(session, "blockap-dev", PRE),
-            upload_step(session, m),
-        ]
+        return [*common_start(session, m), *measure_steps(session, m, kind), upload_step(session, m)]
     if session == "train":
-        onpolicy_art = dir_art("onpolicy", onpolicy_dir, ("train",),
-                               ("state.json", "onpolicy.json", "audit.json", "config.json", "held.json",
-                                "round*/judge.json", "round*/held.metrics.json"), ("serve",))
-        return [
-            *common_start(session, m),
-            step(session, "Granite 4.2 3B download", {"": m["download"]}, run_download, download_done,
-                 progress=download_progress),
-            step(session, "B200 smoke and rates", {"": m["rates"]}, run_rates, rates_done,
-                 dir_art("rates", rates_dir, ("train",), ("rates.json", "qat/e2e.json"),
-                         ("qat/state", "qat/ckpt.pt", "onpolicy/round*/train", "serve")), G1),
-            step(session, "training text to 24M tokens", {"": m["gen-train"]}, lambda s: run_gen(s, "train"),
-                 lambda: gen_done("train"),
-                 dir_art("traces24", lambda: traces_dir("train"), ("train",), ("traces.sha256", "traces.count", ".gen-done")),
-                 G1, lambda: traces_progress("train")),
-            step(session, "end-to-end KD", lambda: {"": minutes()["e2e"]}, run_e2e, e2e_done,
-                 dir_art("e2e", e2e_dir, ("train",), ("e2e.json",), ("serve",)), G1),
-            *[step(session, f"on-policy session {k} of up to {ONPOLICY_SESSIONS}"
-                   + (" (judges the last round)" if k == ONPOLICY_SESSIONS else f" (round {k})"),
-                   lambda k=k: {"": minutes()["onpolicy"] / ROUNDS_MAX if k < ONPOLICY_SESSIONS
-                                else minutes()["onpolicy-judge"]},
-                   lambda s, k=k: run_onpolicy(s, k), lambda k=k: onpolicy_session_done(k), onpolicy_art, G1)
-              for k in range(1, ONPOLICY_SESSIONS + 1)],
-            step(session, "final export and parity", {"": m["final"]}, run_final, final_done,
-                 dir_art("final", final_dir, ("train", "read"),
-                         ("export.json", "kld.json", "tokenize.json", "parity.json", "model.gguf.sha256"),
-                         ("vllm", "dequant-bf16.gguf")), G1),
-            step(session, "choice.json pre-registration", {"": m["choice"]}, run_choice, choice_done, choice_art(),
-                 (*G1, "parity")),
-            upload_step(session, m),
-        ]
+        return [*common_start(session, m), download_step(session, m), *train_steps(session, m, kind),
+                upload_step(session, m)]
     if session == "read":
-        return [
-            *common_start(session, m),
-            step(session, "final checkpoint from the shipped GGUF", {"": m["rebuild"]}, run_rebuild, rebuild_done),
-            reading_step(session, "final-dev"),
-            reading_step(session, "final-record", ("gate2",)),
-            reading_step(session, "final-llama", ("gate2",)),
-            step(session, "all-cases CPU rescore", {"": m["rescore"]}, run_rescore, rescore_done,
-                 Art("rescore", lambda: h([p.name for p in rescore_files()]) if rescore_files() else None,
-                     rescore_files, ("read",), light=rescore_files)),
-            upload_step(session, m),
-        ]
-    raise ValueError(f"no session {session!r}; one of {', '.join(SESSIONS)}")
+        return [*common_start(session, m), *read_steps(session, m, kind), upload_step(session, m)]
+    if session == ALL:
+        return [*common_start(session, m), *measure_steps(session, m, kind), *train_steps(session, m, kind),
+                *read_steps(session, m, kind, CHOSEN), upload_step(session, m)]
+    raise ValueError(f"no session {session!r}; one of {', '.join((*SESSIONS, ALL))}")
 
 
 # ---------- summary ----------
@@ -2255,14 +2517,28 @@ def provenance_diff(d: Path, ref: Path) -> tuple[list[str], list[str]]:
     a, b = load(d / "work" / "provenance.json"), load(ref / "work" / "provenance.json")
     if a is None or b is None:
         return ["provenance.json missing"], []
-    gpu_name = lambda p: [g.split(",")[0].strip() for g in (p.get("gpu") or [])]
     block = []
     for k in PROVENANCE_BLOCKING:
-        x, y = (gpu_name(a), gpu_name(b)) if k == "gpu" else (a.get(k), b.get(k))
+        x, y = (gpu_names(a), gpu_names(b)) if k == "gpu" else (a.get(k), b.get(k))
         if x != y:
             block.append(f"{k}: {x!r} vs {y!r}")
     other = [f"{k}: {a.get(k)!r} vs {b.get(k)!r}" for k in ("git_head", "git_dirty") if a.get(k) != b.get(k)]
     return block, other
+
+
+def off_gpu() -> list[str]:
+    """The readings made on another GPU name than the original's reference reading, which
+    defines the harness (provenance_diff's gpu, against the reference for every reading:
+    the dev screens, Gate 2's, the record and the llama-server check). Each blocks the
+    verdict."""
+    ref = reading_dir(READINGS["original-ref"])
+    out = []
+    for r in READINGS.values():
+        d = reading_dir(r)
+        if r.name == "original-ref" or not (ref and d and (d / "work" / "provenance.json").exists()):
+            continue
+        out += [f"{r.name}: {b}" for b in provenance_diff(d, ref)[0] if b.startswith("gpu:")]
+    return out
 
 
 def ids_sha(r: Reading) -> str | None:
@@ -2302,6 +2578,9 @@ def reading_lines(r: Reading) -> list[str]:
             out.append(f"  settings: {'same as ' + ref.name if not diff else 'differ from ' + ref.name + ': ' + '; '.join(diff)}"
                        + (f"; provenance differs: {'; '.join(block)}" if block else "")
                        + (f" (reported only: {'; '.join(other)})" if other else ""))
+    off = [x.split(": ", 1)[1] for x in off_gpu() if x.startswith(f"{r.name}: ")]
+    if off:
+        out.append(f"  not on the original reference reading's GPU ({off[0]}): blocks the verdict")
     return out
 
 
@@ -2386,7 +2665,8 @@ def record_checks() -> dict[str, bool]:
            "settings and provenance as the original's": bool(d and dr) and not settings_diff(d, dr) and not block,
            "parity gates pass": bool((gate("parity") or {}).get("pass")),
            "the GGUF is choice.json's": bool(c) and text(final_hf() / "gguf.sha256") == c.get("gguf_sha256"),
-           "the harness and seeds as pre-registered": bool(c) and c.get("harness_sha") == h(EVAL)
+           "every reading on the original's GPU": bool(harness_gpu()) and not off_gpu(),
+           "the harness and seeds as pre-registered": bool(c) and c.get("harness_sha") == h(harness_settings())
            and (c.get("record") or {}).get("seed_offset") == rec.seed}
     lo = outcomes(rows_of(llama))
     p = paired(lo, outs) if lo else None
@@ -2421,9 +2701,16 @@ def verdict_lines() -> list[str]:
 
 
 def summary() -> str:
+    g, n = harness_gpu(), record_seqs()
+    engine = (f"vLLM with {n} in flight on the {g}, every reading on that one GPU" if g and n else
+              "vLLM on the GPU of the original's reference reading, with its RECORD_SEQS in flight, every reading "
+              "on that one GPU")
     out = [f"Event Horizon, run {RUN_ID}. Goal: >= {GOAL_PTS_PER_GB} LiveCodeBench points per GB of the shipped "
            f"GGUF (bytes / 1e9), on our harness (LiveCodeBench v6 2025-01..04, thinking on, {LCB_TOKENS} tokens + "
-           f"forced answer, temperature 1.0, top_p 0.95, vLLM with {RECORD_SEQS} in flight on the L40S)."]
+           f"forced answer, temperature 1.0, top_p 0.95, {engine})."]
+    stop = stop_line()
+    if stop:
+        out.append(stop)
     for r in READINGS.values():
         out += reading_lines(r)
     gl, vl = pin_lines() + gate_lines(), verdict_lines()
@@ -2650,21 +2937,24 @@ def main(argv: list[str] | None = None) -> int:
         return HELPERS[argv[0]](argv[1:])
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], add_help=True)
     ap.add_argument("what", nargs="?", choices=["summary"])
-    ap.add_argument("--session", choices=SESSIONS)
+    ap.add_argument("--session", choices=(*SESSIONS, ALL))
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--shutdown", action="store_true")
     a = ap.parse_args(argv)
     if a.list:
-        print(measured())
-        for s in [a.session] if a.session else SESSIONS:
-            print(f"\nsession {s}:")
+        sessions = [a.session] if a.session else [*SESSIONS, ALL]
+        for kind in dict.fromkeys(machine(s) for s in sessions):
+            print(measured(kind))
+        for s in sessions:
+            print(f"\nsession {s}: on the {machine(s)}")
             run_plan(steps(s), summary, LOGS / s, ["--list"])
         return 0
     if a.what == "summary":
         print(summary())
         return 0
     if not a.session:
-        print("Name the session: --session measure (L40S), train (B200) or read (L40S). --list shows the steps.")
+        print("Name the session: --session all (one B200), or measure (L40S or B200), train (B200) and read (L40S or "
+              "B200). --list shows the steps.")
         return 2
     SHUTDOWN = a.shutdown
     if a.shutdown and not evroc_ok():

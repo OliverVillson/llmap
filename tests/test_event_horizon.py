@@ -1,6 +1,6 @@
 """event_horizon's sessions without a GPU: the rules (budget, gates, keep rule, parity,
-verdict), the three sessions end to end on a fake shell, the bucket round trip and the
-upload hook, the fingerprinted shutdown, and --list on a machine with no nvidia-smi."""
+verdict), the three sessions and session all end to end on a fake shell, the bucket round
+trip and the upload hook, the fingerprinted shutdown, and --list on a machine with no nvidia-smi."""
 
 import argparse
 import contextlib
@@ -123,11 +123,20 @@ def arg(cmd: str, flag: str) -> Path:
     return Path(re.search(rf"{flag} (\S+)", cmd)[1])
 
 
-class Shell:
-    """Stands in for runner.sh: records each command and writes what the real one would."""
+L40S = "NVIDIA L40S, 46068 MiB, 550.1"
+B200 = "NVIDIA B200, 183359 MiB, 580.95"
 
-    def __init__(self, m):
-        self.m, self.calls = m, []
+
+class Shell:
+    """Stands in for runner.sh: records each command and writes what the real one would,
+    its readings' provenance on `gpu`."""
+
+    def __init__(self, m, gpu=L40S):
+        self.m, self.calls, self.gpu = m, [], gpu
+
+    def passed(self, name: str, pid: str, sample: int) -> bool:
+        """Whether answer `sample` to problem pid passes in the reading (job) `name`."""
+        return passes(pid, sample)
 
     def __call__(self, step, cmd, env=None):
         self.calls.append((cmd, env or {}))
@@ -236,13 +245,13 @@ class Shell:
         cfg = json.loads((d / "config.json").read_text())
         ids = cfg.get("code_eval_ids") or TEST_IDS
         by_id = cfg.get("code_eval_samples_by_id") or {}
-        rows = [{"suite": "livecodebench", "id": i, "sample": s, "seed": cfg.get("code_eval_seed_offset", 0) + s,
-                 "passed": passes(i, s), "finish": "stop", "tokens": 900, "reasoning_chars": 4000}
-                for i in ids for s in range(by_id.get(i, cfg["code_eval_samples"]))]
         name = d.name
+        rows = [{"suite": "livecodebench", "id": i, "sample": s, "seed": cfg.get("code_eval_seed_offset", 0) + s,
+                 "passed": self.passed(name, i, s), "finish": "stop", "tokens": 900, "reasoning_chars": 4000}
+                for i in ids for s in range(by_id.get(i, cfg["code_eval_samples"]))]
         self.write(d / "work" / "code_eval" / f"{name}.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
         self.write(d / "work" / "config.effective.json", {**cfg, "llama_cpp": "/mnt/nvme/llama.cpp"})
-        self.write(d / "work" / "provenance.json", {"gpu": ["NVIDIA L40S, 46068, 550.1"], "vllm_venv": {"vllm": "0.31.0"},
+        self.write(d / "work" / "provenance.json", {"gpu": [self.gpu], "vllm_venv": {"vllm": "0.31.0"},
                                                     "llama_cpp": "af50f2f", "sandbox_workers": 4, "nproc": 8,
                                                     "git_head": "abc"})
         self.write(d / "out" / "eval.json", {"candidates": [{"name": name, "code": {
@@ -258,6 +267,25 @@ def kinds(calls) -> list[str]:
              else re.search(r"(stages\.\w+ \w+|smoke \w+|llama-quantize|convert_hf_to_gguf)", c)[1])
         out.append(k)
     return out
+
+
+# What each session's steps run on the fake shell, in order, with nothing done before.
+MEASURE_KINDS = ["stages.dense gguf",
+                 "smoke template", "smoke render", "eval", "llama-quantize", "smoke pack", "smoke map", "stages.qat block",
+                 "stages.vocab smoke", "smoke text", "stages.horizon ladder",
+                 "eval", "budget", "thinking",  # original reference reading, Gate 0
+                 "eval", "budget", "thinking",  # original dev
+                 "gen", "stages.vocab run", "stages.vocab register",
+                 "stages.dense gguf", "stages.dense calib", "stages.dense imatrix",
+                 "stages.horizon run",
+                 "stages.qat block", "stages.qat export",
+                 "eval", "budget", "thinking"]  # Block-AP dev screen, Gate 1
+TRAIN_KINDS = ["eval", "stages.qat e2e", "stages.qat onpolicy",  # S2.2: rates, on-policy smoke
+               "gen", "stages.qat e2e", "stages.qat onpolicy",
+               "stages.qat export", "stages.vocab register", "convert_hf_to_gguf",
+               "stages.horizon ladder", "stages.vocab tokcheck"]
+READ_KINDS = ["stages.gguf_build vllm", "eval", "budget", "thinking",  # final dev screen, Gate 2
+              "eval", "budget", "thinking", "eval", "thinking", "rescore", "rescore"]
 
 
 def run_steps(m, session):
@@ -428,11 +456,17 @@ def test_gpu_free_fails_naming_the_processes_that_hold_it(tmp_path, monkeypatch)
 
 
 def test_machine_check(tmp_path, monkeypatch):
+    """Readings run on an L40S or a B200 (RECORD_SEQS has each one's value); training, and
+    so session all, needs a B200's memory; another GPU reads only with HORIZON_ANY_GPU=1."""
     m = load(tmp_path, monkeypatch)
     monkeypatch.setenv("PATH", f"{fake_smi(tmp_path, 0)}:/usr/bin:/bin")
-    assert m.machine_problem("measure") is None and "B200" in m.machine_problem("train")
+    assert m.machine_problem("measure") is None and m.machine_problem("read") is None
+    assert "B200" in m.machine_problem("train") and "B200" in m.machine_problem("all")
     fake_smi(tmp_path, 0, "NVIDIA B200", 183359)
-    assert m.machine_problem("train") is None and "L40S" in m.machine_problem("read")
+    for s in ("measure", "train", "read", "all"):  # a B200 is accepted for readings
+        assert m.machine_problem(s) is None, s
+    fake_smi(tmp_path, 0, "NVIDIA H100 80GB HBM3", 81559)
+    assert "L40S or a B200" in m.machine_problem("read") and "B200" in m.machine_problem("train")
     monkeypatch.setenv("HORIZON_ANY_GPU", "1")
     assert m.machine_problem("read") is None
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
@@ -726,7 +760,7 @@ def test_settings_block_on_the_harness_namespace_and_report_the_rest(tmp_path, m
     version or the suites' records in provenance."""
     m = load(tmp_path, monkeypatch)
     a, b = tmp_path / "a", tmp_path / "b"
-    base = {**m.EVAL, "code_eval_dir": "/mnt/nvme/codebench", "heal_lr": 1e-4}
+    base = {**m.EVAL, "vllm_seqs": m.RECORD_SEQS["L40S"], "code_eval_dir": "/mnt/nvme/codebench", "heal_lr": 1e-4}
     for d in (a, b):
         (d / "work").mkdir(parents=True)
         (d / "work" / "provenance.json").write_text(json.dumps({"gpu": ["NVIDIA L40S, 1, 2"], "eval_venv": {"torch": "2.14.0"}}))
@@ -914,17 +948,7 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
 
     shell.calls.clear()
     run_steps(m, "measure")
-    k = kinds(shell.calls)
-    assert k == ["stages.dense gguf",
-                 "smoke template", "smoke render", "eval", "llama-quantize", "smoke pack", "smoke map", "stages.qat block",
-                 "stages.vocab smoke", "smoke text", "stages.horizon ladder",
-                 "eval", "budget", "thinking",  # original reference reading, Gate 0
-                 "eval", "budget", "thinking",  # original dev
-                 "gen", "stages.vocab run", "stages.vocab register",
-                 "stages.dense gguf", "stages.dense calib", "stages.dense imatrix",
-                 "stages.horizon run",
-                 "stages.qat block", "stages.qat export",
-                 "eval", "budget", "thinking"]  # Block-AP dev screen, Gate 1
+    assert kinds(shell.calls) == MEASURE_KINDS
     gpu_jobs = [c for c, _ in shell.calls if any(x in c for x in ("--only eval", "stages.budget", "stages.qat",
                                                                   "horizon run", "vocab run", "dense imatrix"))]
     assert gpu_jobs and all(c.startswith("set -e\n" + m.GPU_FREE) for c in gpu_jobs)
@@ -966,10 +990,7 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
 
     shell.calls.clear()
     run_steps(m, "train")
-    assert kinds(shell.calls) == ["eval", "stages.qat e2e", "stages.qat onpolicy",  # S2.2: rates, on-policy smoke
-                                  "gen", "stages.qat e2e", "stages.qat onpolicy",
-                                  "stages.qat export", "stages.vocab register", "convert_hf_to_gguf",
-                                  "stages.horizon ladder", "stages.vocab tokcheck"]
+    assert kinds(shell.calls) == TRAIN_KINDS
     gen = next(c for c, _ in shell.calls if "gen_command(" in c)
     assert "seqs=384" in gen and "24000000.0" in gen
     rate_e2e, smoke_op, op = (c for c, _ in shell.calls if "stages.qat e2e" in c or "stages.qat onpolicy" in c
@@ -1002,8 +1023,7 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
 
     shell.calls.clear()
     run_steps(m, "read")
-    assert kinds(shell.calls) == ["stages.gguf_build vllm", "eval", "budget", "thinking",
-                                  "eval", "budget", "thinking", "eval", "thinking", "rescore", "rescore"]
+    assert kinds(shell.calls) == READ_KINDS
     rec = json.loads((m.reading_dir(m.READINGS["final-record"]) / "config.json").read_text())
     assert rec["code_eval_samples_by_id"] == kal and rec["code_eval_seed_offset"] == 1000
     llama = json.loads((m.reading_dir(m.READINGS["final-llama"]) / "config.json").read_text())
@@ -1027,6 +1047,165 @@ def test_three_sessions_end_to_end(tmp_path, monkeypatch):
     (m.final_dir() / "model.gguf.sha256").write_text("other\n")
     with pytest.raises(RuntimeError, match="already pre-registers"):
         m.run_choice(m.Step("x", {"": 1}, None))
+
+
+# ---------- one B200: session all ----------
+
+class GateShell(Shell):
+    """The fake shell with one gate failing: the original's reference reading at R0 50
+    (Gate 0), or every answer of a dev screen wrong (Gate 1 after Block-AP, Gate 2 after
+    the final model)."""
+
+    def __init__(self, m, stop, gpu=B200):
+        super().__init__(m, gpu)
+        self.stop = stop
+
+    def passed(self, name, pid, sample):
+        if self.stop == "gate0" and name.startswith("original-ref-"):
+            return int(pid[1:]) % 2 == 0  # 91 of the 182 problems: R0 50.0
+        if name.startswith({"gate1": "blockap-dev-", "gate2": "final-dev-"}.get(self.stop, "-")):
+            return False
+        return super().passed(name, pid, sample)
+
+
+def one_b200(m, tmp_path, monkeypatch, shell=None):
+    """A B200 VM for session all: the bucket, the problem sets and the base, an nvidia-smi
+    that names a B200, the fake shell (its readings' provenance on the B200), and a
+    shutdown that is only recorded. Returns (bucket root, shell, shutdowns, restores)."""
+    root = fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    monkeypatch.setenv("PATH", f"{fake_smi(tmp_path, 0, 'NVIDIA B200', 183359)}:/usr/bin:/bin")
+    shell = shell or Shell(m, B200)
+    monkeypatch.setattr(m, "sh", shell)
+    downs, restores = [], []
+    monkeypatch.setattr(m.os, "system", lambda c: downs.append(c) or 0)
+    real = m.run_restore
+    monkeypatch.setattr(m, "run_restore", lambda s, session: restores.append(session) or real(s, session))
+    return root, shell, downs, restores
+
+
+def test_all_runs_the_three_sessions_on_one_b200(tmp_path, monkeypatch, capsys):
+    """--session all on a fake shell: measure's, train's and read's commands back to back,
+    with the setup, the restore and the download once (train's own smoke and rates step
+    still runs); every reading on the B200 with its RECORD_SEQS, the original's reading and
+    the record agreeing by construction; the upload after every step; the verdict; the
+    later readings' guesses re-based on the reference reading; and a re-run redoes nothing."""
+    m = load(tmp_path, monkeypatch)
+    root, shell, downs, restores = one_b200(m, tmp_path, monkeypatch)
+    names = [s.name for s in m.steps("all")]
+    assert len(names) == len(set(names)) == 29
+    assert names == ([s.name for s in m.steps("measure")][:-1] + [s.name for s in m.steps("train")][3:-1]
+                     + [s.name for s in m.steps("read")][2:])
+    for once in ("VM setup", "restore from the bucket", "Granite 4.2 3B download", "GPU smoke (a)-(h)",
+                 "B200 smoke and rates", "upload, then stop"):
+        assert names.count(once) == 1, once
+
+    assert m.main(["--session", "all"]) == 0
+    assert restores == ["all"]  # train's and read's restores are not run
+    assert kinds(shell.calls) == ["setup", *MEASURE_KINDS, *TRAIN_KINDS, *READ_KINDS]
+    evals = [e for c, e in shell.calls if "--only eval" in c or "stages.budget" in c]
+    assert len(evals) == 1 + 6 + 5 + 1  # smoke (c), six readings, five re-scorings, S2.2's vLLM smoke
+    assert all(e["LOBBOT_VLLM_SEQS"] == "192" and e["LOBBOT_SANDBOX_WORKERS"] == "4" for e in evals)
+    for r in m.READINGS.values():  # the B200's RECORD_SEQS in every reading
+        d = m.reading_dir(r)
+        assert json.loads((d / "config.json").read_text())["vllm_seqs"] == m.RECORD_SEQS["B200"] == 192, r.name
+        assert json.loads((d / "work" / "config.effective.json").read_text())["vllm_seqs"] == 192, r.name
+    gens = [c for c, _ in shell.calls if "gen_command(" in c]
+    assert len(gens) == 2 and all("seqs=384, samples=2" in c for c in gens)  # gen on the B200, both times
+    rec, ref = m.READINGS["final-record"], m.READINGS["original-ref"]
+    assert m.reading_config(rec, "L40S")["vllm_seqs"] == 192 == m.record_seqs("L40S")  # the reference's, wherever
+    assert m.settings_diff(m.reading_dir(rec), m.reading_dir(ref)) == [] and m.off_gpu() == []
+    c = m.choice()
+    assert c["harness"]["vllm_seqs"] == 192 and c["gpu"] == "NVIDIA B200" and c["harness_sha"] == m.h(m.harness_settings())
+    assert all(m.gate(g)["pass"] for g in ("gate0", "preflight", "gate1", "parity", "gate2"))
+    assert all(m.record_checks().values())
+    out = capsys.readouterr().out
+    assert "Verdict (pre-registered in choice.json, one look): REACHED" in out and "STOPPED" not in out
+    assert "vLLM with 192 in flight on the NVIDIA B200, every reading on that one GPU" in out
+    assert "Finished in" in out and downs == []  # no --shutdown
+    assert m.uploaded("all") and (root / "summary-all.txt").exists()
+    for slug in ("codebench", "smoke", "reading-original-ref", "reading-original-dev", "traces", "vocab", "imatrix",
+                 "ptq", "blockap", "reading-blockap-dev", "rates", "traces24", "e2e", "onpolicy", "final", "choice",
+                 "reading-final-dev", "reading-final-record", "reading-final-llama", "rescore"):
+        man = next((root / slug).glob("*/manifest.json"))
+        assert json.loads(man.read_text())["complete"], slug
+    # the readings after the reference re-based on its answers a minute: 1500 tok/s over 900 tokens an answer
+    assert m.reference_rate() == pytest.approx(100.0) and "100.0 answers a minute" in m.measured("B200")
+    assert m.reading_minutes(m.READINGS["final-dev"], "B200")["eval"] == pytest.approx(256 / 100 + m.READ_BOOT_MIN)
+    assert m.reading_minutes(rec, "B200")["eval"] == pytest.approx(802 / 100 + m.READ_BOOT_MIN)
+    assert m.minutes("B200")["gen-measure"] == pytest.approx(8e6 / 3000 / 60 + 5)
+
+    shell.calls.clear()  # the same command again: nothing is redone (the setup checks itself, the trim is registered)
+    assert m.main(["--session", "all"]) == 0
+    assert kinds(shell.calls) == ["setup", "stages.vocab register"] and restores == ["all", "all"]
+
+
+@pytest.mark.parametrize("stop", ["gate0", "gate1", "gate2"])
+def test_a_gate_stop_on_one_b200_is_a_clean_finish_that_powers_off(tmp_path, monkeypatch, capsys, stop):
+    """A failed gate in session all skips every step after it but the upload; the run
+    exits 0, the summary says where and why it stopped, everything is in the bucket as it
+    is on the disk, and --shutdown powers the B200 off under the fingerprint rule."""
+    m = load(tmp_path, monkeypatch)
+    root, shell, downs, _ = one_b200(m, tmp_path, monkeypatch, GateShell(m, stop))
+    assert m.main(["--session", "all", "--shutdown"]) == 0
+    ran = {"gate0": MEASURE_KINDS[:14], "gate1": MEASURE_KINDS, "gate2": [*MEASURE_KINDS, *TRAIN_KINDS, *READ_KINDS[:4]]}
+    assert kinds(shell.calls) == ["setup", *ran[stop]]
+    assert not m.gate(stop)["pass"] and all(m.gate(g)["pass"] for g in ("gate0", "gate1", "gate2")[:int(stop[-1])])
+    plan = [s.name for s in m.steps("all")]
+    at = plan.index(next(r.title for r in m.READINGS.values() if r.gate == stop))
+    out = capsys.readouterr().out
+    assert out.count(f"skipped: {stop} did not pass") == len(plan) - at - 2  # every step after it but the upload
+    label = f"STOPPED at Gate {stop[-1]}, after the "
+    assert label in out and label in (root / "summary-all.txt").read_text() and "Finished in" in out
+    assert m.uploaded("all") and all(m.in_sync(a) for a in m.session_arts("all") if a.key() and a.files())
+    assert downs == ["sudo shutdown -h +5"] and "Shutting the VM down in 5 minutes" in out
+
+
+def test_list_all_needs_no_gpu(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no nvidia-smi, no evroc
+    m = load(tmp_path, monkeypatch)
+    assert m.main(["--list", "--session", "all"]) == 0
+    out = capsys.readouterr().out
+    assert "session all: on the B200" in out and "session measure" not in out
+    assert "at 4x the L40S's measured 728 answers in 3h54m, an ESTIMATE" in out and "B200 estimates" in out
+    lines = [x for x in out.splitlines() if re.match(r"\s*\d+\. ", x)]
+    assert len(lines) == 29 and sum(" VM setup " in x for x in lines) == 1
+    assert "original reference reading, 182 x 4 (Gate 0) ~ 1h04m" in out  # 728 answers at 4x the L40S's rate + 6
+    assert "record reading, 182 x K_i              ~ 1h16m" in out  # ~880 answers until the K_i file exists
+    assert "total ~13h46m (guesses)" in out
+
+
+def test_a_reading_on_another_gpu_blocks_the_verdict_and_is_refused(tmp_path, monkeypatch):
+    """The harness is the GPU of the original's reference reading: a dev screen, the record
+    or the llama-server check on another GPU name blocks the verdict, and a machine with
+    another GPU is refused before it reads (HORIZON_ANY_GPU=1 reads anyway)."""
+    m = load(tmp_path, monkeypatch)
+    one_b200(m, tmp_path, monkeypatch)
+    assert m.main(["--session", "all"]) == 0
+    check = "every reading on the original's GPU"
+    assert m.harness_gpu() == "NVIDIA B200" and m.record_checks()[check]
+    for name in ("final-dev", "final-record", "final-llama"):
+        p = m.reading_dir(m.READINGS[name]) / "work" / "provenance.json"
+        prov = json.loads(p.read_text())
+        p.write_text(json.dumps({**prov, "gpu": [L40S]}))
+        assert m.off_gpu() == [f"{name}: gpu: ['NVIDIA L40S'] vs ['NVIDIA B200']"]
+        checks = m.record_checks()
+        assert not checks[check] and m.verdict(60.0, 1.0, 1.0, checks).startswith("blocked (")
+        assert check in m.verdict(60.0, 1.0, 1.0, checks)
+        out = m.summary()
+        assert "Verdict (pre-registered in choice.json, one look): BLOCKED" in out
+        assert "not on the original reference reading's GPU (gpu: ['NVIDIA L40S'] vs ['NVIDIA B200'])" in out
+        p.write_text(json.dumps(prov))
+    assert all(m.record_checks().values())
+
+    monkeypatch.setenv("PATH", f"{fake_smi(tmp_path, 0)}:/usr/bin:/bin")  # an L40S
+    assert "ran on NVIDIA B200; this GPU is NVIDIA L40S" in m.gpu_mismatch()
+    assert any("this GPU is NVIDIA L40S" in x for x in m.session_inputs("read"))
+    assert m.session_inputs("train") == []  # training reads nothing
+    with pytest.raises(RuntimeError, match="final-dev is not read here"):
+        m.run_reading(m.Step("x", {"": 1}, None), m.READINGS["final-dev"], "L40S")
+    monkeypatch.setenv("HORIZON_ANY_GPU", "1")
+    assert m.gpu_mismatch() is None
 
 
 def test_onpolicy_runs_one_session_per_step_and_uploads_each(tmp_path, monkeypatch):

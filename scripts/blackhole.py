@@ -12,7 +12,7 @@ also uploaded only at the very end, marked the upload in the home dir (which out
 the NVMe it described), and judged a share kept rather than a lower bound on the
 reading itself; Event Horizon fixes those.
 
-    python3 scripts/event_horizon.py --list    # the three sessions and their steps
+    python3 scripts/event_horizon.py --list    # the sessions and their steps
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def share_kept(model: dict[str, float], ref: dict[str, float], n: int = 4000, se
 
 def main() -> int:
     print("blackhole is retired: its 1.5 GB route cannot reach 40 points per GB. Use scripts/event_horizon.py "
-          "(--list shows its sessions; --session measure starts on the L40S).", file=sys.stderr)
+          "(--list shows its sessions; --session all runs them on one B200).", file=sys.stderr)
     return 2
 
 
