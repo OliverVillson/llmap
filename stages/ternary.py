@@ -212,6 +212,8 @@ def gen_command(model_dir: str, problems: str, out: Path, tokens: float, *, port
     return "\n".join([
         "set -e",
         f"mkdir -p {w}",
+        # The vLLM venv's bin first on PATH: FlashInfer JIT-builds kernels with its ninja.
+        f'PATH="$(dirname "{python}"):$PATH" '
         f"setsid {python} -m vllm.entrypoints.openai.api_server --model {model_dir} "
         f"--served-model-name {STUDENT} --host 127.0.0.1 --port {port} --max-model-len {MAX_MODEL_LEN} "
         f"--max-num-seqs {seqs} --kv-cache-dtype fp8 --gpu-memory-utilization {gpu_util} "

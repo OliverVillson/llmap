@@ -532,8 +532,11 @@ def read_env(seqs: int) -> dict:
 
 def vllm_script(model: Path, port: int, log: Path, then: str, seqs: int = 32) -> str:
     """Shell that serves model on vLLM in its own process group, waits up to 20 minutes for
-    it to be healthy, runs `then`, and stops the whole group however that ends."""
+    it to be healthy, runs `then`, and stops the whole group however that ends. The vLLM
+    venv's bin goes first on PATH, as eval.vllm_command does for the readings: FlashInfer
+    JIT-builds its B200 kernels with that venv's ninja (seen 2026-10-13: 'ninja' not found)."""
     return "\n".join([
+        'PATH="$(dirname "$LOBBOT_VLLM_PY"):$PATH" '
         f"setsid $LOBBOT_VLLM_PY -m vllm.entrypoints.openai.api_server --model {model} --served-model-name student "
         f"--host 127.0.0.1 --port {port} --max-model-len 22528 --max-num-seqs {seqs} "
         f"--gpu-memory-utilization 0.9 > {log} 2>&1 & srv=$!",
