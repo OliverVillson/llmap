@@ -337,14 +337,25 @@ def vllm_command(model_dir: str) -> tuple[list[str], dict]:
     with its bin first on PATH and no PYTHONPATH, so the training venv's packages
     don't leak in. Without LOBBOT_VLLM_PY, vllm from PATH."""
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")  # see VLLM_JIT_FREE
     py = os.environ.get("LOBBOT_VLLM_PY")
     if not py:
-        return [shutil.which("vllm") or "vllm", "serve", model_dir], env
+        return [shutil.which("vllm") or "vllm", "serve", model_dir, *attention_flags()], env
     bin_dir = Path(py).parent
     env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
     if (bin_dir / "vllm").exists():
-        return [str(bin_dir / "vllm"), "serve", model_dir], env
-    return [py, "-m", "vllm.entrypoints.openai.api_server", "--model", model_dir], env
+        return [str(bin_dir / "vllm"), "serve", model_dir, *attention_flags()], env
+    return [py, "-m", "vllm.entrypoints.openai.api_server", "--model", model_dir, *attention_flags()], env
+
+
+# VLLM_JIT_FREE: FlashInfer JIT-builds its kernels with nvcc on first use, and the VMs
+# carry only a minimal CUDA toolkit (no curand.h: the B200's smoke test failed on it
+# 2026-10-13). So vLLM's FlashInfer sampler is off everywhere, and on a GPU where vLLM
+# would pick FlashInfer attention (the B200) LOBBOT_VLLM_ATTN_BACKEND names a prebuilt
+# one (event_horizon sets FLASH_ATTN there). Readings record it in provenance (LOBBOT_VLLM_*).
+def attention_flags() -> list[str]:
+    backend = os.environ.get("LOBBOT_VLLM_ATTN_BACKEND", "")
+    return ["--attention-backend", backend] if backend else []
 
 
 def vllm_seqs(cfg) -> int:
@@ -1073,7 +1084,8 @@ def run_key(cfg, path: str, temperature: float, keep_reasoning: bool) -> str:
            "max_tokens": cfg.code_eval_max_tokens, "thinking": cfg.code_eval_thinking, "temperature": temperature,
            "top_k": cfg.thinking_top_k, "min_p": cfg.eval_min_p, "format": cfg.code_eval_format, "kv": cfg.eval_kv_type,
            "lora": cfg.eval_lora, "vllm_args": list(cfg.eval_vllm_args), "parser": cfg.eval_reasoning_parser,
-           "experts": cfg.eval_experts_used, "keep_reasoning": keep_reasoning}
+           "experts": cfg.eval_experts_used, "keep_reasoning": keep_reasoning,
+           "attention": os.environ.get("LOBBOT_VLLM_ATTN_BACKEND", "")}
     return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 

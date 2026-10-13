@@ -532,13 +532,14 @@ def read_env(seqs: int) -> dict:
 
 def vllm_script(model: Path, port: int, log: Path, then: str, seqs: int = 32) -> str:
     """Shell that serves model on vLLM in its own process group, waits up to 20 minutes for
-    it to be healthy, runs `then`, and stops the whole group however that ends. The vLLM
-    venv's bin goes first on PATH, as eval.vllm_command does for the readings: FlashInfer
-    JIT-builds its B200 kernels with that venv's ninja (seen 2026-10-13: 'ninja' not found)."""
+    it to be healthy, runs `then`, and stops the whole group however that ends. Started as
+    gen's server is (ternary.gen_command: fp8 KV, the vLLM venv's bin first on PATH, no
+    FlashInfer JIT, see eval.VLLM_JIT_FREE), so the smoke test tries gen's settings."""
     return "\n".join([
-        'PATH="$(dirname "$LOBBOT_VLLM_PY"):$PATH" '
+        'PATH="$(dirname "$LOBBOT_VLLM_PY"):$PATH" VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0} '
         f"setsid $LOBBOT_VLLM_PY -m vllm.entrypoints.openai.api_server --model {model} --served-model-name student "
-        f"--host 127.0.0.1 --port {port} --max-model-len 22528 --max-num-seqs {seqs} "
+        f"--host 127.0.0.1 --port {port} --max-model-len 22528 --max-num-seqs {seqs} --kv-cache-dtype fp8 "
+        "${LOBBOT_VLLM_ATTN_BACKEND:+--attention-backend $LOBBOT_VLLM_ATTN_BACKEND} "
         f"--gpu-memory-utilization 0.9 > {log} 2>&1 & srv=$!",
         "trap 'kill -TERM -- -$srv 2>/dev/null; for i in $(seq 30); do kill -0 $srv 2>/dev/null || break; sleep 1; "
         "done; kill -KILL -- -$srv 2>/dev/null; true' EXIT",
@@ -2960,6 +2961,10 @@ def main(argv: list[str] | None = None) -> int:
               "B200). --list shows the steps.")
         return 2
     SHUTDOWN = a.shutdown
+    # Every vLLM this run starts inherits these (eval.VLLM_JIT_FREE): no FlashInfer JIT build.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    if this_gpu() == "B200":
+        os.environ.setdefault("LOBBOT_VLLM_ATTN_BACKEND", "FLASH_ATTN")
     if a.shutdown and not evroc_ok():
         print("Refusing to start with --shutdown: there is no evroc login, so the results could not be uploaded "
               "before the VM powers off. Log in (evroc login --oidc-port 8765) and re-run.")

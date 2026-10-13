@@ -212,11 +212,12 @@ def gen_command(model_dir: str, problems: str, out: Path, tokens: float, *, port
     return "\n".join([
         "set -e",
         f"mkdir -p {w}",
-        # The vLLM venv's bin first on PATH: FlashInfer JIT-builds kernels with its ninja.
-        f'PATH="$(dirname "{python}"):$PATH" '
+        # The vLLM venv's bin first on PATH, and no FlashInfer JIT build (eval.VLLM_JIT_FREE).
+        f'PATH="$(dirname "{python}"):$PATH" VLLM_USE_FLASHINFER_SAMPLER=${{VLLM_USE_FLASHINFER_SAMPLER:-0}} '
         f"setsid {python} -m vllm.entrypoints.openai.api_server --model {model_dir} "
         f"--served-model-name {STUDENT} --host 127.0.0.1 --port {port} --max-model-len {MAX_MODEL_LEN} "
         f"--max-num-seqs {seqs} --kv-cache-dtype fp8 --gpu-memory-utilization {gpu_util} "
+        "${LOBBOT_VLLM_ATTN_BACKEND:+--attention-backend $LOBBOT_VLLM_ATTN_BACKEND} "
         f"--enable-prefix-caching > {log_path} 2>&1 & gen=$!",
         "trap 'kill -TERM -- -$gen 2>/dev/null; for i in $(seq 30); do kill -0 $gen 2>/dev/null || break; sleep 1; "
         "done; kill -KILL -- -$gen 2>/dev/null; true' EXIT",
