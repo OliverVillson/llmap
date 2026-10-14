@@ -21,8 +21,7 @@ needs = lambda *tools: pytest.mark.skipif(any(not shutil.which(t) for t in tools
 
 
 def run(p, answer):
-    code, tests = cb.assemble(p, answer)
-    return sandbox.run_tests(p["language"], code, tests)
+    return sandbox.run_many([cb.job(p, answer)])[0]
 
 
 def test_pass_at_k():
@@ -34,10 +33,22 @@ def test_pass_at_k():
         cb.pass_at_k(1, 1, 5)
 
 
-def test_extract_code():
-    assert cb.extract_code("Here:\n```python\nx = 1\n```\nand\n```\ny = 22222\n```") == "y = 22222"
-    assert cb.extract_code("<think>hm</think>```js\nf()\n```") == "f()"
+def test_extract_code_takes_the_last_complete_block():
+    """As lcb_runner does: the last block, not the longest; an opening fence that is
+    never closed (an answer cut off at the cap) does not count. stages/data.py takes
+    code out of teacher answers the same way."""
+    from stages import data
+
+    for extract in (cb.extract_code, data.extract_code):
+        assert extract("Here:\n```python\nx = 1\n```\nand\n```\ny = 22222\n```") == "y = 22222"
+        assert extract("```python\nlong_answer = 1\n```\nUsage:\n```python\nf()\n```") == "f()"
+        assert extract("```python\nx = 1\n```\nNow a test:\n```python\nassert f(") == "x = 1"
+        assert extract("<think>```python\nscratch = 1\n```</think>```js\nf()\n```") == "f()"
+        assert extract("Here it is: ```c\nint f(void) { return 1; }\n```") == "int f(void) { return 1; }"
+    assert cb.extract_code("```python\n    return x\n```") == "    return x"  # a body keeps its indent
     assert cb.extract_code("def f(): pass") == "def f(): pass"
+    assert cb.extract_code("```python\ndef f(): pass") == "def f(): pass"  # no complete block: the answer
+    assert cb.last_block("```python\nx = 1") is None and cb.last_block("```\n```") == ""
 
 
 @needs("cc")
@@ -104,6 +115,26 @@ def test_stdin_problems_run_through_a_harness():
 
 
 @needs("python3")
+def test_cases_travel_as_a_file_and_assemble_still_writes_them_in():
+    """job() hands the cases to the sandbox as cases.json, so the program stays small;
+    assemble() keeps its (code, tests) for callers that pass no files."""
+    big = "9" * 100_000
+    stdio = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "Echo.",
+             "tests": [{"input": big + "\n", "output": big + "\n"}, {"input": "7\n", "output": "7\n"}]}
+    func = {**stdio, "tests": fc.functional_tests("f", [{"input": "[1, 2]", "output": "3"}])}
+    lang, code, tests, limit, files = cb.job(stdio, "```python\nprint(input())\n```")
+    assert (lang, tests, limit) == ("python", "", cb.time_limit(stdio)) and len(code) < 10_000
+    assert json.loads(files[cb.CASES_FILE]) == [[big + "\n", big + "\n"], ["7\n", "7\n"]]
+    assert sandbox.run_many([(lang, code, tests, limit, files)])[0].passed
+    assert not sandbox.run_tests(lang, code, tests).passed  # without its cases.json the harness cannot run
+    assert sandbox.run_tests("python", *cb.assemble(stdio, "```python\nprint(input())\n```")).passed
+    answer = "```python\ndef f(xs):\n    return sum(xs)\n```"
+    assert json.loads(cb.job(func, answer)[4][cb.CASES_FILE]) == [["[1, 2]", "3"]]
+    assert run(func, answer).passed and sandbox.run_tests("python", *cb.assemble(func, answer)).passed
+    assert cb.job(MPE_PY, "    return sum(xs)\n")[3:] == (None, {})  # tests that are code need no files
+
+
+@needs("python3")
 def test_livecodebench_functional_tests():
     tests = fc.functional_tests("twoSum", [{"input": "[2, 7, 11]\n9", "output": "[0, 1]"}])
     p = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x", "tests": tests}
@@ -128,14 +159,211 @@ def test_livecodebench_limits_each_case_not_the_whole_problem(monkeypatch):
          "tests": [{"input": f"{i}\n", "output": f"{2 * i}\n"} for i in range(3)]}
     assert cb.time_limit(p) == 13.0
     assert sandbox.run_many([("python", *cb.assemble(p, slow), cb.time_limit(p))], timeout=1.5)[0].passed
+    assert sandbox.run_many([cb.job(p, slow)], timeout=1.5)[0].passed
     stuck = "```python\ntry:\n    while True:\n        pass\nexcept Exception:\n    print(0)\n```"
-    r = sandbox.run_many([("python", *cb.assemble(p, stuck), cb.time_limit(p))])[0]
-    assert not r.passed and "case 0: over the 1 s time limit" in r.output
+    r = sandbox.run_many([cb.job(p, stuck)])[0]
+    assert not r.passed and r.reason == "case_timeout" and "case 0: over the 1 s time limit" in r.output
     f = {"suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
          "tests": fc.functional_tests("f", [{"input": "1", "output": "1"}])}
     spin = "```python\nclass Solution:\n    def f(self, x):\n        while True:\n            pass\n```"
-    r = sandbox.run_many([("python", *cb.assemble(f, spin), cb.time_limit(f))])[0]
-    assert not r.passed and "over the 1 s time limit" in r.output
+    r = sandbox.run_many([cb.job(f, spin)])[0]
+    assert not r.passed and r.reason == "case_timeout" and "over the 1 s time limit" in r.output
+
+
+# LiveCodeBench parity: each answer as graded by lcb_runner's own run_test (LiveCodeBench
+# evaluation/testing_util.py at commit 28fef95, run as its check_correctness runs it, with
+# the runner's stdin at /dev/null) and by ours: (name, code, cases, func or None for a stdin
+# program, lcb_runner passes, we pass). The rows where the two differ are the differences
+# stages/codebench.py documents. test_lcb_runner_agrees_with_the_parity_table re-runs the
+# lcb_runner column against a LiveCodeBench checkout.
+ADD = [("1 2\n", "3\n"), ("5 5\n", "10\n")]
+BIG = "1" + "0" * 4999  # a 5000-digit int, past Python's default 4300-digit str limit
+LCB_PARITY = [
+    # how a stdin program reads its input
+    ("input()", "a, b = map(int, input().split())\nprint(a + b)", ADD, None, True, True),
+    ("sys.stdin.readline", "import sys\na, b = map(int, sys.stdin.readline().split())\nprint(a + b)", ADD, None, True, True),
+    ("sys.stdin.read", "import sys\na, b = map(int, sys.stdin.read().split())\nprint(a + b)", ADD, None, True, True),
+    ("sys.stdin.buffer.read", "import sys\na, b = map(int, sys.stdin.buffer.read().split())\nprint(a + b)", ADD, None, True, True),
+    ("sys.stdin.readlines", "import sys\nprint(sum(int(l) for l in sys.stdin.readlines() if l.strip()))",
+     [("1\n2\n", "3\n")], None, True, True),
+    ("input = sys.stdin.readline", "import sys\ninput = sys.stdin.readline\nprint(int(input()) + int(input()))",
+     [("1\n2\n", "3\n")], None, True, True),
+    ("from sys import stdin", "from sys import stdin\na, b = map(int, stdin.readline().split())\nprint(a + b)", ADD, None, True, True),
+    ("bare stdin from the prelude", "a, b = map(int, stdin.readline().split())\nprint(a + b)", ADD, None, True, True),
+    ("builtins.open(0)", "import builtins\na, b = map(int, builtins.open(0).read().split())\nprint(a + b)", ADD, None, True, True),
+    ("open(0).read", "a, b = map(int, open(0).read().split())\nprint(a + b)", ADD, None, False, True),
+    ("open(0).readline", "a, b = map(int, open(0).readline().split())\nprint(a + b)", ADD, None, False, True),
+    ("open('/dev/stdin')", "a, b = map(int, open('/dev/stdin').read().split())\nprint(a + b)", ADD, None, False, True),
+    ("open(sys.stdin.fileno())", "import sys\na, b = map(int, open(sys.stdin.fileno()).read().split())\nprint(a + b)",
+     ADD, None, False, True),
+    ("for line in sys.stdin", "import sys\nfor line in sys.stdin:\n    a, b = map(int, line.split())\n    print(a + b)",
+     ADD, None, False, True),
+    ("sys.stdin.buffer.readline twice", "import sys\nprint(int(sys.stdin.buffer.readline()) + int(sys.stdin.buffer.readline()))",
+     [("1\n2\n", "3\n")], None, False, True),
+    # how a stdin program is run
+    ("main guard", "def main():\n    a, b = map(int, input().split())\n    print(a + b)\nif __name__ == '__main__':\n    main()",
+     ADD, None, True, True),
+    ("main guard, not last", "def main():\n    a, b = map(int, input().split())\n    print(a + b)\n"
+     "if __name__ == '__main__':\n    main()\nx = 0", ADD, None, False, True),
+    ("star import in the main guard", "if __name__ == '__main__':\n    from operator import add as plus\n"
+     "    from math import *\n    print(plus(*map(int, input().split())) + floor(0.5))", ADD, None, True, True),
+    # top-level statements run inside wrapped_function (make_function), so their names are locals
+    ("top-level names are locals", "x = 1\nprint('x' in globals())", [("", "False\n")], None, True, True),
+    ("global statement", "n = 0\ndef f():\n    global n\n    n += 1\na, b = map(int, input().split())\nf()\nprint(a + b + n - 1)",
+     ADD, None, False, False),
+    ("global statement inside main", "def main():\n    global n\n    n = sum(map(int, input().split()))\n    show()\n"
+     "def show():\n    print(n)\nmain()", ADD, None, True, True),
+    ("top-level return", "a, b = map(int, input().split())\nprint(a + b)\nif a:\n    return\nprint('more')",
+     ADD, None, True, True),
+    ("sys.exit(0) after printing", "import sys\nprint(sum(map(int, input().split())))\nsys.exit(0)", ADD, None, True, True),
+    ("sys.exit(1) after printing", "import sys\nprint(sum(map(int, input().split())))\nsys.exit(1)", ADD, None, True, True),
+    ("exit('bye') after printing", "print(sum(map(int, input().split())))\nexit('bye')", ADD, None, True, True),
+    ("no import of defaultdict", "d = defaultdict(int)\nd[0] += sum(map(int, input().split()))\nprint(d[0])", ADD, None, True, True),
+    ("recursion 3000 deep", "def f(n):\n    return 0 if n == 0 else 1 + f(n - 1)\nprint(f(int(input())))",
+     [("3000\n", "3000\n")], None, True, True),
+    ("@cache recursion 3000 deep", "from functools import cache\n@cache\ndef f(n):\n    return 0 if n == 0 else 1 + f(n - 1)\n"
+     "print(f(int(input())))", [("3000\n", "3000\n")], None, True, True),
+    ("5000-digit output", "print(10 ** 4999)", [("", BIG + "\n")], None, True, True),
+    ("late __future__ import", "from __future__ import annotations\nprint(3)", [("", "3\n")], None, False, False),
+    ("threaded main, joined", "import threading\ndef main():\n    print(sum(map(int, input().split())))\n"
+     "threading.stack_size(1 << 26)\nt = threading.Thread(target=main)\nt.start()\nt.join()", ADD, None, True, True),
+    ("threaded main, not joined", "import threading, time\ndef main():\n    a, b = map(int, input().split())\n"
+     "    time.sleep(0.3)\n    print(a + b)\nthreading.stack_size(1 << 26)\nthreading.Thread(target=main).start()",
+     ADD, None, False, False),
+    # how stdout is compared
+    ("0.500000 for 0.5", "print('0.500000')", [("", "0.5\n")], None, True, True),
+    ("1.50 for 1.5", "print('1.50')", [("", "1.5\n")], None, True, True),
+    ("1e3 for 1000", "print('1e3')", [("", "1000\n")], None, True, True),
+    ("-0 for 0", "print('-0')", [("", "0\n")], None, True, True),
+    ("'1  2' for '1 2'", "print('1  2')", [("", "1 2\n")], None, True, True),
+    ("leading space on line 2", "print('a')\nprint(' b')", [("", "a\nb\n")], None, True, True),
+    ("trailing blank lines", "print(3)\nprint()\nprint()", [("", "3\n")], None, True, True),
+    ("1/3 at 16 digits for 18", "print('0.3333333333333333')", [("", "0.333333333333333333\n")], None, False, False),
+    ("'a  b' for 'a b'", "print('a  b')", [("", "a b\n")], None, False, False),
+    ("Yes for yes", "print('Yes')", [("", "yes\n")], None, False, False),
+    ("a blank line between", "print(1)\nprint()\nprint(2)", [("", "1\n2\n")], None, False, False),
+    ("wrong answer", "print(4)", [("1 2\n", "3\n")], None, False, False),
+    # functional (LeetCode-style) answers
+    ("class Solution", "class Solution:\n    def f(self, x: List[int]) -> int:\n        return sum(x)", [("[1, 2]", "3")], "f", True, True),
+    ("top-level function", "def f(x):\n    return sum(x)", [("[1, 2]", "3")], "f", True, True),
+    ("bare inf, gcd, deepcopy", "class Solution:\n    def f(self, x):\n        y = deepcopy(x)\n        return gcd(y[0], y[1]) if inf > 0 else 0",
+     [("[4, 6]", "2")], "f", True, True),
+    ("bare comb, isqrt, ascii_lowercase", "class Solution:\n    def f(self, n):\n        return comb(n, 2) + isqrt(n) + len(ascii_lowercase)",
+     [("4", "34")], "f", True, True),
+    ("@cache recursion 3000 deep (functional)", "class Solution:\n    def f(self, n):\n        @cache\n        def g(k):\n"
+     "            return 0 if k == 0 else 1 + g(k - 1)\n        return g(n)", [("3000", "3000")], "f", True, True),
+    ("5000-digit result", "class Solution:\n    def f(self, n):\n        return 10 ** n", [("4999", BIG)], "f", True, True),
+    ("tuple for a list", "class Solution:\n    def f(self, n):\n        return (n, n)", [("1", "[1, 1]")], "f", True, True),
+    ("main guard (functional)", "class Solution:\n    def f(self, n):\n        return n\nif __name__ == '__main__':\n"
+     "    print(Solution().f(int(input())))", [("1", "1")], "f", True, True),
+    ("0.5000001 for 0.5 (functional)", "class Solution:\n    def f(self, n):\n        return 0.5000001", [("1", "0.5")], "f", False, False),
+]
+
+
+def lcb_problem(cases, func=None):
+    tests = fc.functional_tests(func, [{"input": i, "output": o} for i, o in cases]) if func else \
+        [{"input": i, "output": o} for i, o in cases]
+    return {"id": "atcoder/x", "suite": "livecodebench", "language": "python", "stub": "", "entry": "", "prompt": "x",
+            "tests": tests}
+
+
+@needs("python3")
+def test_lcb_parity_table():
+    """Our verdict on every answer in LCB_PARITY. The C22 list is in it: bare
+    inf/gcd/deepcopy, @cache recursion 3000 deep, a stdin answer that never imports
+    defaultdict, a 5000-digit result, 0.5 vs 0.500000 and '1  2' vs '1 2' pass; 1/3
+    at 16 vs 18 digits and 'a  b' vs 'a b' still fail; open(0) and a top-level
+    function pass; a threaded main is not waited for."""
+    items = [cb.job(lcb_problem(cases, func), f"```python\n{code}\n```") for _, code, cases, func, _, _ in LCB_PARITY]
+    wrong = {row[0]: (r.passed, r.output[-300:]) for row, r in zip(LCB_PARITY, sandbox.run_many(items))
+             if r.passed != row[5]}
+    assert not wrong
+
+
+LCB_RUN = """
+import json, multiprocessing, sys
+sys.path.insert(0, sys.argv[1])
+sys.set_int_max_str_digits(50000)  # as compute_code_generation_metrics.py does
+from lcb_runner.evaluation.testing_util import run_test
+
+
+def child(sample, code, conn):
+    res, _ = run_test(sample, test=code, timeout=6)
+    conn.send([r is True for r in res])  # a failed case is a negative error code
+
+
+if __name__ == "__main__":
+    ctx, verdicts = multiprocessing.get_context("fork"), []
+    for code, io in json.load(open(sys.argv[2])):
+        recv, send = ctx.Pipe(False)
+        p = ctx.Process(target=child, args=({"input_output": json.dumps(io)}, code, send))
+        p.start()
+        got = recv.recv() if recv.poll(7 * len(io["inputs"]) + 5) else []
+        p.join(1)
+        if p.is_alive():
+            p.kill()
+        verdicts.append(bool(got) and all(got))
+    print(json.dumps(verdicts))
+"""
+
+
+@pytest.mark.skipif(not os.environ.get("LOBBOT_LCB_RUNNER"), reason="set LOBBOT_LCB_RUNNER to a LiveCodeBench checkout")
+def test_lcb_runner_agrees_with_the_parity_table(tmp_path):
+    """lcb_runner's own verdicts on LCB_PARITY, so the table's lcb_runner column (and
+    with it our differences) stays true for the checkout at LOBBOT_LCB_RUNNER."""
+    pytest.importorskip("numpy")  # testing_util imports it
+    rows = []
+    for _, code, cases, func, _, _ in LCB_PARITY:
+        io = {"inputs": [i for i, _ in cases], "outputs": [o for _, o in cases], **({"fn_name": func} if func else {})}
+        rows.append((code, io))
+    (tmp_path / "rows.json").write_text(json.dumps(rows))
+    (tmp_path / "lcb_run.py").write_text(LCB_RUN)
+    p = subprocess.run([sys.executable, "-I", str(tmp_path / "lcb_run.py"), os.environ["LOBBOT_LCB_RUNNER"],
+                        str(tmp_path / "rows.json")], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
+    assert p.returncode == 0, p.stderr[-2000:]
+    verdicts = json.loads(p.stdout.strip().splitlines()[-1])
+    assert dict(zip([r[0] for r in LCB_PARITY], verdicts)) == {r[0]: r[4] for r in LCB_PARITY}
+
+
+@needs("python3")
+def test_threaded_main_is_not_waited_for_as_in_lcb_runner():
+    """A program that starts main() in a thread and returns ends its case there: the
+    thread's output misses the comparison and the case fails, as under lcb_runner
+    (the answers that join their thread pass). Kept for parity, not fixed."""
+    p = lcb_problem([("1 2\n", "3\n")])
+    main = "import threading, time\ndef main():\n    a, b = map(int, input().split())\n    time.sleep(0.3)\n    print(a + b)\n"
+    r = run(p, f"```python\n{main}threading.Thread(target=main).start()\n```")
+    assert not r.passed and r.reason == "test_failed" and "case 0: expected '3\\n', got ''" in r.output
+    assert run(p, f"```python\n{main}t = threading.Thread(target=main)\nt.start()\nt.join()\n```").passed
+
+
+@needs("python3")
+def test_exits_never_skip_the_remaining_cases():
+    """An exit ends a stdin program's case and its output is still compared (lcb_runner
+    catches SystemExit too); os._exit counts as one, so it cannot end the harness with
+    exit code 0 before every case is checked. A functional answer that exits fails."""
+    p = lcb_problem(ADD)
+    assert run(p, "```python\nimport os\nprint(sum(map(int, input().split())))\nos._exit(0)\n```").passed
+    assert not run(p, "```python\nimport os\nos._exit(0)\n```").passed
+    f = lcb_problem([("[1, 2]", "3")], "f")
+    r = run(f, "```python\nimport sys\nsys.exit(0)\ndef f(x):\n    return sum(x)\n```")
+    assert not r.passed and "the answer ended before its tests ran" in r.output
+    r = run(f, "```python\nimport os\nos._exit(0)\ndef f(x):\n    return sum(x)\n```")
+    assert not r.passed and "the answer ended before its tests ran" in r.output
+    for body in ("exit()", "import os; os._exit(0)"):
+        r = run(f, f"```python\nclass Solution:\n    def f(self, x):\n        {body}\n```")
+        assert not r.passed and "case 0: the answer exited" in r.output
+
+
+@needs("python3")
+def test_open_mock_hands_out_the_case_input_only():
+    """open(0) and friends read the case's input, text or bytes, fresh for each case;
+    any other file opens for real."""
+    p = lcb_problem([("1 2\n", "3\n"), ("5 5\n", "10\n")])
+    assert run(p, "```python\nprint(sum(map(int, open(0, 'rb').read().split())))\n```").passed
+    assert run(p, "```python\nwith open(0) as f:\n    print(sum(int(t) for line in f for t in line.split()))\n```").passed
+    assert run(p, "```python\nimport json\njson.load(open('cases.json'))\nprint(sum(map(int, input().split())))\n```").passed
+    assert not run(p, "```python\nopen('missing.txt')\nprint(sum(map(int, input().split())))\n```").passed
 
 
 def test_decode_cases_refuses_pickled_objects():
@@ -164,6 +392,17 @@ def test_lcb_row_shapes():
     assert r["tests"] == {"func": "f", "cases": [["1", "1"]]} and "starter code" in r["prompt"]
 
 
+def test_codecontests_row_keeps_examples_first_and_drops_huge_cases():
+    t = lambda ins, outs: {"input": ins, "output": outs}
+    r = fc.codecontests_row({"name": "1000_A. Sum", "description": "Add them.", "source": 2, "difficulty": 7,
+                             "public_tests": t(["1 2\n"], ["3\n"]), "private_tests": t(["2 2\n", "x" * 30000], ["4\n", "y"]),
+                             "generated_tests": t(["5 5\n"], ["10\n"])}, 50)
+    assert r["id"] == "codeforces/1000_A" and r["public"] == 1 and r["prompt"] == "Add them."
+    assert [c["input"] for c in r["tests"]] == ["1 2\n", "2 2\n", "5 5\n"]
+    assert fc.codecontests_row({"name": "x", "description": "d", "public_tests": t(["1"], ["1"]),
+                                "private_tests": t([], []), "generated_tests": t([], [])}, 50) is None
+
+
 def test_load_suite_filters_by_date_and_limit(tmp_path):
     rows = [{"id": str(i), "language": "py", "prompt": "", "tests": "", "date": d}
             for i, d in enumerate(["2025-12-01", "2026-05-01", "2026-07-01"])]
@@ -173,6 +412,24 @@ def test_load_suite_filters_by_date_and_limit(tmp_path):
     assert len(cb.load_suite("livecodebench", tmp_path, limit=1)) == 1
     with pytest.raises(FileNotFoundError):
         cb.load_suite("multipl-e-js", tmp_path)
+
+
+def test_load_suite_streams_and_filters_row_by_row(tmp_path, monkeypatch):
+    """A LiveCodeBench fetch with every case stored is gigabytes: load_suite reads it a
+    line at a time (never the whole file), filters each row as it goes, keeps only the
+    fields asked for and stops at the limit."""
+    rows = [{"id": str(i), "language": "py", "prompt": f"p{i}", "tests": {"cases": "x" * 1000}, "date": d}
+            for i, d in enumerate(["2024-12-31", "2025-01-01", "2025-03-01", "2025-04-30", "2025-05-01", ""])]
+    path = tmp_path / "livecodebench.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows) + "{not json\n")
+    monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("load_suite read the whole file"))
+    window = cb.load_suite("livecodebench", tmp_path, "2025-01-01", 4, until="2025-04-30")
+    assert [r["id"] for r in window] == ["1", "2", "3", "5"]  # undated rows are kept, as with since
+    assert [r["id"] for r in cb.load_suite("livecodebench", tmp_path, limit=2, ids={"2", "4", "9"})] == ["2", "4"]
+    slim = cb.load_suite("livecodebench", tmp_path, limit=1, fields=("id", "prompt"))
+    assert slim == [{"id": "0", "prompt": "p0", "language": "python", "suite": "livecodebench"}]
+    with pytest.raises(json.JSONDecodeError):  # without a limit the broken last line is reached
+        cb.load_suite("livecodebench", tmp_path, ids={"0"})
 
 
 def test_heldout_rows_from_code_taskspecs():
@@ -261,7 +518,8 @@ def test_code_eval_runs_answers_and_writes_per_answer_rows(tmp_path, monkeypatch
     probs = cb.load_suite("c-set", "/nonexistent", limit=2)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append((system, temperature, seed))
         good = "```c\n" + probs[0]["canonical"] + "\n```"
         return [good if seed == 0 else "```c\nint nope;\n```", "no code here"], 50.0
@@ -289,7 +547,8 @@ def test_code_eval_fix_turn_gets_the_failure_and_scores_fix_at_1(tmp_path, monke
     good = lambda p: "```c\n" + p["canonical"] + "\n```"
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append(prompts)
         for _ in prompts:
             on_answer()
@@ -326,7 +585,8 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     probs = cb.load_suite("c-set", "/nonexistent", limit=1)
     calls = []
 
-    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None):
+    def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False, on_answer=None, infos=None,
+                      **kw):
         calls.append((max_tokens, temperature, seed, thinking))
         on_answer()
         return [""], None
@@ -340,6 +600,7 @@ def test_code_eval_thinking_samples_and_asks_for_thinking(tmp_path, monkeypatch)
     assert [(e["answered"], e["total"]) for e in events if "answered" in e] == [(0, 1), (1, 1)]
     calls.clear()
     job.config.code_eval_samples = 2
+    (tmp_path / "work/code_eval/cand.partial.jsonl").unlink()  # a new reading, not a resumed one
     ev.code_eval(job, "cand", probs, "task system")
     assert sorted(calls) == [(24576, 0.6, 0, True), (24576, 0.6, 1, True)]
 
@@ -362,22 +623,47 @@ def test_examples_only_and_pick_at_examples():
     assert suites["livecodebench"]["pick@examples"] == 0.5  # 1 of the 2 problems with examples
 
 
-def test_generate_sends_thinking_flag(monkeypatch):
+def fake_server(monkeypatch, post):
+    """eval's requests go to post(url, json) -> the reply as one unstreamed body; a
+    streamed request gets it back as llama-server sends it (deltas, finish, usage)."""
     import httpx
     from stages import eval as ev
 
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200)
+        body = json.loads(request.content)
+        reply = post(str(request.url), body)
+        if not body.get("stream"):
+            return httpx.Response(200, json=reply)
+        if "choices" in reply:
+            c = reply["choices"][0]
+            events = [{"choices": [{"delta": c["message"], "finish_reason": None}]},
+                      {"choices": [{"delta": {}, "finish_reason": c.get("finish_reason") or "stop"}]},
+                      {"choices": [], "usage": reply.get("usage") or {}}]
+        else:
+            events = [{"content": reply["content"], "stop": False},
+                      {"content": "", "stop": True, "stop_type": "eos", "tokens_predicted": reply["tokens_predicted"]}]
+        return httpx.Response(200, content="".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n")
+
+    monkeypatch.setattr(ev, "_http", {"client": ev.make_client(httpx.MockTransport(handle))})
+    monkeypatch.setattr(ev, "VLLM", {})
+    monkeypatch.setattr(ev, "IN_FLIGHT", {})
+
+
+def test_generate_sends_thinking_flag(monkeypatch):
+    from stages import eval as ev
+
     sent = []
-
-    class R:
-        def raise_for_status(self): pass
-        def json(self): return {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]}
-
-    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: sent.append((timeout, json)) or R())
+    fake_server(monkeypatch, lambda url, body: sent.append(body) or
+                {"choices": [{"message": {"content": "```py\nx = 1\n```"}}]})
     ev.generate("sys", ["a"], 24576, 0.6, 0, thinking=True)
     ev.generate("sys", ["b"], 2048)
-    (t1, on), (t2, off) = sent
-    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and t1 >= 24576 / 4
-    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off and t2 == 600
+    on, off = sent
+    assert on["chat_template_kwargs"] == {"enable_thinking": True} and on["top_k"] == 20 and on["max_tokens"] == 24576
+    assert off["chat_template_kwargs"] == {"enable_thinking": False} and "top_k" not in off
+    # streamed, so no limit on the whole answer; llama-server's own min_p (0.05) never applies
+    assert all(b["stream"] and b["min_p"] == 0.0 and b["repeat_penalty"] == 1.0 for b in sent)
 
 
 def test_eval_context_fits_code_answer_cap(monkeypatch):
@@ -434,29 +720,23 @@ def test_split_reasoning_handles_split_and_inline_tags():
 def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
     """A thinking that ends with no answer gets </think> appended (plus Qwen's
     early-stop line when it ran out of budget) and the model answers on top."""
-    import httpx
     from stages import eval as ev
 
     finish = {"a": "stop", "b": "length"}
     sent = []
 
-    class R:
-        def __init__(self, body): self.body = body
-        def raise_for_status(self): pass
-        def json(self): return self.body
-
-    def post(url, timeout, json):
-        sent.append((url.rsplit("/", 1)[1], json))
+    def post(url, body):
+        sent.append((url.rsplit("/", 1)[1], body))
         if url.endswith("/chat/completions"):
-            return R({"choices": [{"finish_reason": finish[json["messages"][1]["content"]],
-                                   "message": {"content": "", "reasoning_content": "plan it"}}],
-                      "usage": {"completion_tokens": 900}})
+            return {"choices": [{"finish_reason": finish[body["messages"][1]["content"]],
+                                 "message": {"content": "", "reasoning_content": "plan it"}}],
+                    "usage": {"completion_tokens": 900}}
         if url.endswith("/apply-template"):
-            assert json["chat_template_kwargs"] == {"enable_thinking": True}
-            return R({"prompt": "<|im_start|>assistant\n<think>\n"})
-        return R({"content": "```py\nx = 1\n```", "tokens_predicted": 12})
+            assert body["chat_template_kwargs"] == {"enable_thinking": True}
+            return {"prompt": "<|im_start|>assistant\n<think>\n"}
+        return {"content": "```py\nx = 1\n```", "tokens_predicted": 12}
 
-    monkeypatch.setattr(httpx, "post", post)
+    fake_server(monkeypatch, post)
     monkeypatch.setattr(ev, "SLOTS", 1)
     infos = []
     answers, _ = ev.generate("sys", ["a", "b"], 24576, 0.6, 0, thinking=True, infos=infos)
@@ -468,15 +748,11 @@ def test_thinking_without_an_answer_is_closed_and_answered(monkeypatch):
 
 
 def test_thinking_off_never_forces_an_answer(monkeypatch):
-    import httpx
     from stages import eval as ev
 
-    class R:
-        def raise_for_status(self): pass
-        def json(self): return {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
-
     urls = []
-    monkeypatch.setattr(httpx, "post", lambda url, timeout, json: urls.append(url) or R())
+    fake_server(monkeypatch, lambda url, body: urls.append(url) or
+                {"choices": [{"finish_reason": "length", "message": {"content": ""}}]})
     infos = []
     assert ev.generate("sys", ["a"], 4096, infos=infos)[0] == [""]
     assert len(urls) == 1 and infos[0]["forced"] is None and infos[0]["finish"] == "length"

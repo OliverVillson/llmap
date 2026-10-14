@@ -19,8 +19,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(autouse=True)
 def llama_by_default(monkeypatch):
-    """serve() rebinds ev.VLLM; this puts the default back after each test."""
+    """serve() rebinds ev.VLLM and the answers in flight; this puts the defaults back after
+    each test."""
     monkeypatch.setattr(ev, "VLLM", {})
+    monkeypatch.setattr(ev, "IN_FLIGHT", {})
+    monkeypatch.setattr(ev, "_http", {})
+
+
+def sse(reply: dict) -> bytes:
+    """A whole reply as a server streams it: chat deltas, then the finish and the usage;
+    a text completion's text; llama-server's /completion content and its last event."""
+    choice = (reply.get("choices") or [{}])[0]
+    if "message" in choice:
+        events = [{"choices": [{"index": 0, "delta": choice["message"], "finish_reason": None}]},
+                  {"choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}]}]
+    elif "text" in choice:
+        events = [{"choices": [{"index": 0, "text": choice["text"], "finish_reason": choice.get("finish_reason") or "stop"}]}]
+    else:
+        events = [{"content": reply.get("content", ""), "stop": False},
+                  {"content": "", "stop": True, "stop_type": "eos", "tokens_predicted": reply.get("tokens_predicted", 0)}]
+    if reply.get("usage"):
+        events.append({"choices": [], "usage": reply["usage"]})
+    return "".join(f"data: {json.dumps(e)}\n\n" for e in events).encode() + b"data: [DONE]\n\n"
+
+
+def fake_http(monkeypatch, post=None):
+    """The eval's requests go to post(url, timeout, json), which returns the reply as an
+    unstreamed body (or an R); a streamed request gets it back as events. /health is up."""
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200)
+        body = json.loads(request.content)
+        reply = post(str(request.url), None, body)
+        reply = getattr(reply, "body", reply)
+        if body.get("stream"):
+            return httpx.Response(200, content=sse(reply), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=reply)
+
+    monkeypatch.setattr(ev, "_http", {"client": ev.make_client(httpx.MockTransport(handle))})
 
 
 def checkpoint(path: Path, **config) -> Path:
@@ -36,8 +72,9 @@ class R:
 
 
 class FakeProc:
-    def __init__(self, cmd, stdout=None, stderr=None, env=None):
+    def __init__(self, cmd, stdout=None, stderr=None, env=None, start_new_session=False):
         self.cmd, self.env, self.stopped = cmd, env, False
+        assert start_new_session  # stop() reaches every process it starts
         FakeProc.started.append(self)
 
     def poll(self): return None
@@ -49,7 +86,9 @@ class FakeProc:
 def fake_servers(monkeypatch) -> list:
     FakeProc.started = []
     monkeypatch.setattr(ev.subprocess, "Popen", FakeProc)
-    monkeypatch.setattr(httpx, "get", lambda url, timeout: type("H", (), {"status_code": 200})())
+    monkeypatch.setattr(ev, "stop", lambda proc, wait=None: proc.terminate())  # no process group to signal
+    monkeypatch.setattr(ev, "port_taken", lambda: False)
+    fake_http(monkeypatch)
     return FakeProc.started
 
 
@@ -148,7 +187,7 @@ def test_generate_on_vllm_names_the_model_and_keeps_seqs_in_flight(monkeypatch):
         return R({"choices": [{"finish_reason": "stop", "message": {"content": "x = 1", field: "hmm"}}],
                   "usage": {"completion_tokens": 50}})
 
-    monkeypatch.setattr(httpx, "post", post)
+    fake_http(monkeypatch, post)
     infos = []
     answers, tps = ev.generate("sys", ["a", "b"], 4096, 0.6, 0, thinking=True, infos=infos)
     assert answers == ["x = 1", "x = 1"] and [i["reasoning_chars"] for i in infos] == [3, 3]
@@ -181,7 +220,7 @@ def test_force_answer_on_vllm_uses_the_checkpoint_tokenizer(tmp_path, monkeypatc
             return R({"choices": [{"finish_reason": finish, "message": message}], "usage": {"completion_tokens": 900}})
         return R({"choices": [{"text": "```py\nx = 1\n```"}], "usage": {"completion_tokens": 12}})
 
-    monkeypatch.setattr(httpx, "post", post)
+    fake_http(monkeypatch, post)
     infos = []
     answers, _ = ev.generate("sys", ["a", "b"], 24576, 0.6, 0, thinking=True, infos=infos)
     assert answers == ["```py\nx = 1\n```"] * 2 and loads == [str(tmp_path)]
@@ -212,7 +251,7 @@ def test_force_answer_reopens_gemma4_thought_channel(tmp_path, monkeypatch):
         sent.append(json)
         return R({"choices": [{"text": "x = 1"}], "usage": {"completion_tokens": 3}})
 
-    monkeypatch.setattr(httpx, "post", post)
+    fake_http(monkeypatch, post)
     msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "a"}]
     assert ev.force_answer(msgs, "plan it", "length", 1.0, {}) == ("x = 1", 3)
     assert sent[0]["prompt"] == ("<bos><|turn>system\n<|think|>\nsys<turn|>\n<|turn>user\na<turn|>\n<|turn>model\n"
@@ -221,7 +260,7 @@ def test_force_answer_reopens_gemma4_thought_channel(tmp_path, monkeypatch):
 
 def fake_tests(monkeypatch):
     """Answers starting with "good" pass, without a compiler."""
-    monkeypatch.setattr(ev.codebench, "assemble", lambda p, a, code=None: (a, ""))
+    monkeypatch.setattr(ev.codebench, "job", lambda p, a, code=None: (p["language"], a, "", None, {}))
     monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
         sandbox.Result(code.startswith("good"), "" if code.startswith("good") else "test_failed")
         for _, code, *_ in items])
@@ -243,7 +282,7 @@ def test_sampled_passes_run_at_once_and_give_the_rows_of_one_after_another(tmp_p
         meet = threading.Barrier(3, timeout=10)
 
         def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False,
-                          on_answer=None, infos=None):
+                          on_answer=None, infos=None, **kw):
             if together:
                 meet.wait()  # every pass is in at once, or this breaks
                 time.sleep(0.05 * (3 - seed))
@@ -255,6 +294,7 @@ def test_sampled_passes_run_at_once_and_give_the_rows_of_one_after_another(tmp_p
             return [f"good {seed}" if k else "bad" for k in ok], 40.0
 
         monkeypatch.setattr(ev, "generate", fake_generate)
+        (tmp_path / "work/code_eval/cand.partial.jsonl").unlink(missing_ok=True)  # a reading of its own
         out = ev.code_eval(job, "cand", PROBS, "task system")
         rows = [json.loads(l) for l in (tmp_path / "work/code_eval/cand.jsonl").read_text().splitlines()]
         return out, rows
@@ -272,7 +312,7 @@ def test_sampled_passes_run_at_once_and_give_the_rows_of_one_after_another(tmp_p
     assert rows == seq_rows and out["suites"] == seq_out["suites"]
     assert [(r["sample"], r["id"]) for r in rows] == [(i, p["id"]) for i in range(3) for p in PROBS]
     assert [r["answer"] for r in rows[:4]] == ["good 0", "bad", "good 0", "bad"]
-    assert out["tokens_mean"] == 200 and out["hit_cap_share"] == 0.5 and out["forced_share"] == 0.5
+    assert out["tokens_mean"] == 200 and out["cap_hit_share"] == 0.5 and out["forced_share"] == 0.5
     assert out["tok_s_total"] > 0 and out["answer_s"] > 0 and out["tok_s_vm"] == 40.0
 
 
@@ -285,13 +325,13 @@ def test_sampled_lcb_answers_are_checked_on_the_examples(tmp_path, monkeypatch):
     probs = [{"suite": "livecodebench", "id": i, "language": "python", "prompt": f"q{i}", "stub": "", "entry": "",
               "tests": cases, "public": 1} for i in "ab"]
     plan = {"qa": ["bad", "examples", "good"], "qb": ["bad", "good", "bad"]}  # "examples" passes only the first case
-    monkeypatch.setattr(ev.codebench, "assemble", lambda p, a, code=None: (a, json.dumps(p["tests"])))
+    monkeypatch.setattr(ev.codebench, "job", lambda p, a, code=None: (p["language"], a, json.dumps(p["tests"]), None, {}))
     monkeypatch.setattr(sandbox, "run_many", lambda items, timeout=0: [
         sandbox.Result(ok, "" if ok else "test_failed")
         for ok in (code == "good" or code == "examples" and len(json.loads(tests)) == 1 for _, code, tests, *_ in items)])
 
     def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False,
-                      on_answer=None, infos=None):
+                      on_answer=None, infos=None, **kw):
         infos.extend({} for _ in prompts)
         for _ in prompts:
             on_answer()
@@ -311,8 +351,10 @@ def test_answer_stats():
             {"tokens": 300, "finish": "length", "forced": "length", "forced_tokens": 50},
             {"tokens": 200, "finish": "stop", "forced": None},
             {"finish": "error", "forced": None, "error": "timeout"}]
-    assert ev.answer_stats(rows, 10.0) == {"tokens_mean": 200, "tokens_median": 200, "hit_cap_share": 0.25,
-                                           "forced_share": 0.25, "tok_s_total": 65.0, "answer_s": 10.0}
+    assert ev.answer_stats(rows, 10.0) == {"tokens_mean": 200, "tokens_median": 200, "error_share": 0.25,
+                                           "cap_hit_share": 0.25, "forced_share": 0.25, "answer_cut_share": 0.0,
+                                           "timeout_share": 0.0, "case_timeout_share": 0.0, "tok_s_total": 65.0,
+                                           "answer_s": 10.0}
     assert ev.answer_stats([], 0.0)["tok_s_total"] is None
 
 
@@ -361,11 +403,12 @@ def test_eval_stage_serves_a_mixed_candidate_list(tmp_path, monkeypatch):
         "code_eval_dir": str(bench)}))
     monkeypatch.delenv("LOBBOT_VLLM_PY", raising=False)
     started = fake_servers(monkeypatch)
+    monkeypatch.setattr(ev, "provenance", lambda cfg: {"gpu": None})  # its commands would meet FakeProc
     fake_tests(monkeypatch)
     served = []
 
     def fake_generate(system, prompts, max_tokens, temperature=0.0, seed=None, thinking=False,
-                      on_answer=None, infos=None):
+                      on_answer=None, infos=None, **kw):
         served.append(dict(ev.VLLM))
         infos.extend({"finish": "stop", "tokens": 10, "forced": None} for _ in prompts)
         return ["good"] * len(prompts), None

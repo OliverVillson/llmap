@@ -596,7 +596,7 @@ def run_upload(step: Step) -> None:
 
 
 # "polyglot" is the transcripts run; "" covers Polyglot on the 4-bit model and the two Mugge-format evals
-BUILD_MINUTES = {"polyglot": 40, "data": 15, "reap": 10, "heal": 90, "quantize": 20, "eval": 10, "package": 1, "": 70}
+BUILD_MINUTES = {"polyglot": 40, "data": 15, "reap": 20, "heal": 90, "quantize": 30, "eval": 25, "package": 1, "": 70}
 
 
 def steps() -> list[Step]:

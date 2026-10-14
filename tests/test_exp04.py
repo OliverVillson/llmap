@@ -84,7 +84,8 @@ def test_build_configs_are_valid(exp04):
         assert cfg.data_extra_weight == 2 and cfg.calib_extra_share == 0.5
         assert cfg.quant_format == "w4a16" and cfg.quant_fp8_attention and cfg.code_eval_thinking
         assert cfg.eval_reasoning_parser == m.PARSER[key] and cfg.data_extra_rows == str(m.rows_file(key))
-        assert cfg.code_eval_samples == 1 and cfg.lcb_since > cfg.data_contest_before
+        assert cfg.code_eval_samples == 1 and cfg.data_contest_source == "codecontests"  # no LCB v6 problems in training
+        assert cfg.heal_kd_weight == 0.5 and cfg.code_eval_max_tokens == 65536 and cfg.reap_max_seq == 16384
         assert (cfg.data_thinking_temperature, cfg.thinking_top_k) == ((1.0, 64) if key == "gemma" else (0.6, 20))
         assert cfg.code_eval_thinking_temperature == cfg.data_thinking_temperature
 

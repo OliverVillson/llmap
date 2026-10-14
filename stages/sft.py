@@ -14,6 +14,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from stages import moe_utils as mu
 from stages.taskdata import tokenize_example
@@ -28,6 +29,61 @@ LINEAR_ATTN = ["in_proj_qkv", "in_proj_z", "out_proj"]
 
 class NonFiniteTraining(RuntimeError):
     """Training produced NaN/inf losses or weights; nothing was saved."""
+
+
+# Answer positions per KD chunk: each chunk's fp32 softmaxes are tokens x vocab x 4 bytes
+# (2 GB for 2048 positions of a 248k vocab), so a long thinking answer is never all in memory.
+KD_CHUNK = 2048
+
+
+def kd_kl(s_logits, t_logits, temp: float = 1.0, chunk: int = KD_CHUNK, *, weights=None, index=None,
+          reverse: bool = False, return_dropped: bool = False):
+    """KL(teacher || student) per answer position, averaged ("batchmean"), times temp^2,
+    computed chunk by chunk. Each chunk is recomputed in the backward pass (checkpoint)
+    instead of keeping its softmaxes, so memory stays at one chunk whatever the length.
+
+    weights: one weight per position (N,); the result is then the weighted mean
+    sum(w * KL) / sum(w). Trace batches (stages/traces.py) give 0 to padding and to
+    targets a trimmed vocab dropped, and a small weight to prompt tokens.
+    index: the teacher ids a trimmed student keeps, in the student's order (LongTensor of
+    the student's vocab size). The teacher's logits are sliced to them, so its
+    distribution is renormalised over the kept ids and the two vocabs line up.
+    reverse: KL(student || teacher) instead, the mode-seeking direction used on the
+    student's own rollouts.
+    return_dropped: also return the teacher's probability on the ids index leaves out,
+    per position (N,), detached, at temperature 1 (zeros without index); the vocab trim's
+    gate reads it."""
+    if index is not None and s_logits.shape[-1] != index.numel():
+        raise ValueError(f"student vocab {s_logits.shape[-1]} != {index.numel()} kept teacher ids")
+
+    def part(s, t, w):
+        ls, lt = F.log_softmax(s.float() / temp, -1), F.log_softmax(t.float() / temp, -1)
+        kl = (ls.exp() * (ls - lt)).sum(-1) if reverse else (lt.exp() * (lt - ls)).sum(-1)
+        return kl.sum() if w is None else (kl * w).sum()
+
+    n = s_logits.shape[0]
+    total = s_logits.new_zeros((), dtype=torch.float32)
+    dropped = torch.zeros(n, dtype=torch.float32, device=s_logits.device)
+    drop_ids = None
+    if index is not None:
+        index = index.to(t_logits.device)
+        keep = torch.zeros(t_logits.shape[-1], dtype=torch.bool, device=t_logits.device)
+        keep[index] = True
+        drop_ids = (~keep).nonzero().squeeze(-1)
+    for i in range(0, n, chunk):
+        t = t_logits[i:i + chunk]
+        if index is not None:
+            if return_dropped:
+                with torch.no_grad():
+                    tf = t.float()
+                    dropped[i:i + chunk] = (torch.logsumexp(tf.index_select(-1, drop_ids), -1)
+                                            - torch.logsumexp(tf, -1)).exp().to(dropped.device)
+            t = t.index_select(-1, index)
+        w = None if weights is None else weights[i:i + chunk].to(s_logits.device).float()
+        total = total + checkpoint(part, s_logits[i:i + chunk], t.to(s_logits.device), w, use_reentrant=False)
+    norm = max(n, 1) if weights is None else weights.to(s_logits.device).float().sum().clamp_min(1e-12)
+    loss = total / norm * temp ** 2
+    return (loss, dropped) if return_dropped else loss
 
 
 def log(msg: str) -> None:
@@ -97,6 +153,36 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
         if p.requires_grad and p.dtype != torch.float32:
             p.data = p.data.float()
     return pm
+
+
+def check_finite(model) -> None:
+    """Never hand quantize NaN/inf weights. Only the trained tensors can have gone bad
+    (some base tensors are legitimately inf, e.g. Gemma 4's audio clipping bounds)."""
+    bad_w = [n for n, p in model.named_parameters() if p.requires_grad and not torch.isfinite(p).all()]
+    if bad_w:
+        raise NonFiniteTraining(f"{len(bad_w)} trained tensors are not finite, e.g. {bad_w[0]}")
+
+
+def save_merged(model, tok, out_dir: Path) -> None:
+    """Merges the LoRA and saves a plain bf16 HF checkpoint at out_dir."""
+    save_checkpoint(model.merge_and_unload(), tok, out_dir)
+
+
+def save_checkpoint(model, tok, out_dir: Path) -> None:
+    """Saves a plain HF checkpoint at out_dir (bf16 when on the GPU), via a .tmp dir so
+    a stop never leaves half a model there."""
+    device = next(model.parameters()).device
+    if device.type == "cuda":
+        model.to(torch.bfloat16)
+    model.config.use_cache = True
+    tmp = out_dir.parent / (out_dir.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
+    tok.save_pretrained(tmp)
+    mu.fix_saved_config(tmp)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    tmp.rename(out_dir)
 
 
 def _batches(data: list[dict], max_tokens: int, max_bs: int, seed: int):
@@ -197,12 +283,11 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
                 ce = F.cross_entropy(logits, tgt[mask])
                 loss = ce
                 if teacher is not None:
-                    with torch.no_grad():
+                    with torch.no_grad():  # bf16, half the size of an fp32 copy
                         t_logits = teacher(input_ids=ids.to(teacher.device), attention_mask=att.to(teacher.device)
-                                           ).logits[:, :-1][mask.to(teacher.device)].float().to(device)
-                    s = F.log_softmax(logits / kd_temp, -1)
-                    t = F.log_softmax(t_logits / kd_temp, -1)
-                    kl = F.kl_div(s, t, log_target=True, reduction="batchmean") * kd_temp ** 2
+                                           ).logits[:, :-1][mask.to(teacher.device)].to(device)
+                    kl = kd_kl(logits, t_logits, kd_temp)
+                    del t_logits
                     loss = (1 - kd_weight) * ce + kd_weight * kl
             # One inf/NaN gradient is enough to turn every LoRA weight into NaN
             # (clip_grad_norm_ scales by a NaN norm), so a bad batch skips the
@@ -244,26 +329,10 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
 
     if ema is None:
         raise NonFiniteTraining("no finite training step")
-    # Never hand quantize NaN/inf weights. Only the trained tensors can have
-    # gone bad (some base tensors are legitimately inf, e.g. Gemma 4's audio
-    # clipping bounds).
-    bad_w = [n for n, p in model.named_parameters() if p.requires_grad and not torch.isfinite(p).all()]
-    if bad_w:
-        raise NonFiniteTraining(f"{len(bad_w)} trained tensors are not finite, e.g. {bad_w[0]}")
+    check_finite(model)
     progress(92, "merging LoRA and saving")
     del teacher, opt
-    model = model.merge_and_unload()
-    if device.type == "cuda":
-        model.to(torch.bfloat16)
-    model.config.use_cache = True
-    tmp = out_dir.parent / (out_dir.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    model.save_pretrained(tmp, safe_serialization=True, max_shard_size="5GB")
-    tok.save_pretrained(tmp)
-    mu.fix_saved_config(tmp)
-    shutil.rmtree(out_dir, ignore_errors=True)
-    tmp.rename(out_dir)
+    save_merged(model, tok, out_dir)
     log(f"sft: saved merged model to {out_dir} (final loss {ema:.3f}"
         + (f", {skipped} non-finite steps skipped)" if skipped else ")"))
     return out_dir

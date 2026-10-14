@@ -369,7 +369,7 @@ def test_contest_problems_date_guard(tmp_path):
     from stages import data
     from stages._util import Config
 
-    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01")
+    cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01", data_contest_source="livecodebench")
     got = data.contest_problems(cfg)
     assert len(got) == 12 and all(p["prompt"].startswith("Old problem") for p in got)
     cfg.data_contest_before = "2025-01-01"  # the latest allowed: everything before the eval's problems
@@ -386,11 +386,62 @@ def test_contest_cutoff_after_the_eval_stops_the_stage_early(tmp_path, monkeypat
     job = code_job(tmp_path, "python")
     (job / "config.json").write_text(json.dumps({
         "n_generate": 120, "n_heldout": 10, "code_eval_dir": str(write_lcb(tmp_path / "bench")),
-        "data_contest_rows": 5, "data_contest_before": "2025-03-01", "lcb_since": "2025-01-01"}))
+        "data_contest_rows": 5, "data_contest_before": "2025-03-01", "lcb_since": "2025-01-01",
+        "data_contest_source": "livecodebench"}))
     monkeypatch.setattr(data, "DRY_RUN", False)
     monkeypatch.setattr(data, "Teacher", lambda *a, **k: pytest.fail("teacher loaded before the date check"))
     with pytest.raises(ValueError, match="after lcb_since"):
         data.run_stage(Job(job))
+
+
+def write_codecontests(d, n=12):
+    """n CodeContests-shaped problems (add two integers, from stdin), one of them the same
+    statement as a LiveCodeBench problem in d (written by write_lcb first) with a new title."""
+    d.mkdir(exist_ok=True)
+    rows = []
+    for i in range(n):
+        p = lcb_problem(f"Contest problem {i}", None, False)
+        p.pop("date")
+        p["id"] = f"codeforces/{1000 + i}A"
+        rows.append(p)
+    rows[0]["prompt"] = ("Codeforces 1000A. Given two integers A and B on one line, separated by a space, print their sum "
+                         "A plus B on a single line of standard output, with no extra spaces or text at all.")
+    lcb = d / "livecodebench.jsonl"
+    leaked = lcb_problem("Old problem leaked", "2024-01-15", False)
+    leaked["prompt"] = "AtCoder ABC 1. " + rows[0]["prompt"].split(". ", 1)[1]
+    lcb.write_text((lcb.read_text() if lcb.exists() else "") + json.dumps(leaked) + "\n")
+    (d / "codecontests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return d
+
+
+def test_codecontests_is_the_default_and_drops_problems_lcb_shares(tmp_path, capsys):
+    from stages import data
+    from stages._util import Config
+
+    cfg = Config(code_eval_dir=str(write_codecontests(write_lcb(tmp_path))), lcb_since="2025-01-01")
+    assert cfg.data_contest_source == "codecontests"
+    got = data.contest_problems(cfg)
+    assert len(got) == 11 and {p["suite"] for p in got} == {"codecontests"}
+    assert "codeforces/1000A" not in {p["id"] for p in got}  # its statement is in LiveCodeBench
+    assert "11 of 12 CodeContests problems kept" in capsys.readouterr().out
+    cfg.data_contest_source = "lcb"
+    with pytest.raises(ValueError, match="data_contest_source"):
+        data.contest_problems(cfg)
+
+
+def test_dry_run_adds_codecontests_rows(tmp_path):
+    job = code_job(tmp_path, "python")
+    bench = write_codecontests(tmp_path / "bench", n=20)
+    (job / "config.json").write_text(json.dumps({
+        "n_generate": 120, "n_heldout": 10, "data_thinking": True, "code_eval_dir": str(bench),
+        "data_contest_rows": 10, "data_contest_harness_share": 0.5}))
+    p = run_data(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    train = read(job / "data/train.jsonl")
+    contest = [r for r in train if "Contest problem" in r["messages"][1]["content"]]
+    assert len(contest) == 10 and "from 15 CodeContests problems" in p.stdout
+    assert any(r["messages"][1]["content"].startswith("Ticket: codecontests-") for r in contest)
+    assert "Old problem" not in json.dumps(train)
 
 
 class ScriptedTeacher:
@@ -425,7 +476,7 @@ def test_contest_rows_keep_the_shortest_passing_answer(tmp_path):
     from stages._util import Config
 
     cfg = Config(code_eval_dir=str(write_lcb(tmp_path)), lcb_since="2025-01-01", data_thinking=True,
-                 data_contest_rows=8, data_contest_samples=5, data_contest_harness_share=0.5)
+                 data_contest_source="livecodebench", data_contest_rows=8, data_contest_samples=5, data_contest_harness_share=0.5)
     stats: dict = {}
     rows = data.contest_rows(cfg, ScriptedTeacher(), random.Random(0), data.contest_problems(cfg), stats)
     assert len(rows) == 8  # 12 asked (1.5x), all solved, stopped at data_contest_rows
@@ -455,7 +506,8 @@ def test_dry_run_adds_contest_rows(tmp_path):
     bench = write_lcb(tmp_path / "bench", old=20)
     (job / "config.json").write_text(json.dumps({
         "n_generate": 120, "n_heldout": 10, "data_thinking": True, "code_eval_dir": str(bench),
-        "lcb_since": "2025-01-01", "data_contest_rows": 10, "data_contest_harness_share": 0.5}))
+        "lcb_since": "2025-01-01", "data_contest_rows": 10, "data_contest_harness_share": 0.5,
+        "data_contest_source": "livecodebench"}))
     p = run_data(job)
     assert p.returncode == 0, p.stdout + p.stderr
     train = read(job / "data/train.jsonl")

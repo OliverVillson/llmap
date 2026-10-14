@@ -8,9 +8,9 @@ then drops bad answers (empty, truncated, invalid JSON when the output format
 is JSON) and splits off a held-out set. Code TaskSpecs (task_type "code") differ:
 the teacher writes each new input together with its tests, and an answer is kept only
 when it builds and passes those tests in stages/sandbox.py. Seeds must pass their own
-tests first. Code specs can add contest rows (Config.data_contest_rows): LiveCodeBench
-problems released before data_contest_before, so older than the ones the eval scores
-(lcb_since), each answered data_contest_samples times by the teacher; the shortest answer
+tests first. Code specs can add contest rows (Config.data_contest_rows): CodeContests
+problems from before 2022 (Config.data_contest_source; LiveCodeBench problems older than
+the eval's are the legacy option), each answered data_contest_samples times by the teacher; the shortest answer
 that passes every test becomes a train row (never held out). Code specs can also add ready
 rows from a file (Config.data_extra_rows), train only, data_extra_weight times each and marked
 "meta": {"extra": true} so calibration can pick them (Config.calib_extra_share). Writes:
@@ -235,15 +235,12 @@ def expects_json(spec) -> bool:
     return not spec.is_code and "json" in f"{spec.output_format} {spec.eval_criteria}".lower()
 
 
-_CODE_BLOCK = re.compile(r"```[\w+#-]*[ \t]*\n(.*?)```", re.S)
-
-
 def extract_code(text: str) -> str:
-    """The code in an answer: the longest fenced block if there is one ("Here it is: ```c ...```"),
-    else the cleaned text."""
+    """The code in an answer: its last complete fenced block if it has one, as the eval
+    takes it (codebench.extract_code), else the cleaned text."""
     text = _THINK.sub("", text).strip()
-    blocks = _CODE_BLOCK.findall(text)
-    return max(blocks, key=len).strip() if blocks else clean(text)
+    block = codebench.last_block(text)
+    return block.strip() if block is not None else clean(text)
 
 
 def check_answer(text: str, finished: bool, want_json: bool, want_code: bool = False) -> tuple[str | None, str]:
@@ -334,7 +331,7 @@ class DryRunTeacher:
         prompt = conv[-1]["content"]
         if "real-world scenarios" in prompt:
             return Gen(json.dumps([f"scenario number {i}" for i in range(N_SCENARIOS)]), True)
-        if conv[0]["content"] == codebench.SYSTEM or prompt.startswith("Ticket: livecodebench-"):
+        if conv[0]["content"] == codebench.SYSTEM or prompt.startswith(("Ticket: livecodebench-", "Ticket: codecontests-")):
             return self._contest(prompt)
         if self.spec.is_code:
             return self._code(prompt)
@@ -369,7 +366,7 @@ class DryRunTeacher:
         return Gen(f"Here is the code:\n```\n{own.output}\n```", True)
 
     def _contest(self, prompt: str) -> Gen:
-        """LiveCodeBench problems (contest_rows). The dry-run ones (tests/test_data.py) all add
+        """Contest problems (contest_rows). The dry-run ones (tests/test_data.py) all add
         two integers, read from stdin or passed to a Solution method; answers are right, some
         with an extra comment line, wrong (they subtract) or truncated."""
         m = re.search(r"def (\w+)\(self", prompt)
@@ -636,10 +633,35 @@ def harness_rows(spec, cfg, teacher, rng, train, failed, tests_of, held, stats) 
     return out
 
 
+# Statements sharing a run of this many words with a LiveCodeBench problem count as the same problem.
+DEDUPE_WORDS = 13
+
+
+def _shingles(text: str) -> set[int]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {hash(" ".join(words[i:i + DEDUPE_WORDS])) for i in range(len(words) - DEDUPE_WORDS + 1)}
+
+
 def contest_problems(cfg) -> list[dict]:
-    """LiveCodeBench problems (every release, from code_eval_dir) released before
-    data_contest_before. The eval scores the ones released on or after lcb_since and the
-    undated ones, so a cut-off after lcb_since is refused and both are dropped here."""
+    """The contest problems for contest_rows, from data_contest_source (see Config).
+    codecontests: every problem in code_eval_dir's codecontests.jsonl whose statement shares
+    no DEDUPE_WORDS-word run with a LiveCodeBench problem (when livecodebench.jsonl is there).
+    livecodebench: problems released before data_contest_before. The eval scores the ones
+    released on or after lcb_since and the undated ones, so a cut-off after lcb_since is
+    refused and both are dropped here."""
+    if cfg.data_contest_source == "codecontests":
+        rows = codebench.load_suite("codecontests", cfg.code_eval_dir)
+        lcb = codebench.suite_path("livecodebench", cfg.code_eval_dir)
+        seen = set().union(*(_shingles(p["prompt"]) for p in codebench.load_suite(
+            "livecodebench", cfg.code_eval_dir, fields=("id", "prompt")))) if lcb.exists() else set()
+        out = [p for p in rows if len(p["prompt"]) <= MAX_INPUT_CHARS and not (_shingles(p["prompt"]) & seen)]
+        print(f"[data] contest: {len(out)} of {len(rows)} CodeContests problems kept "
+              f"({len(rows) - len(out)} too long or overlapping LiveCodeBench)", flush=True)
+        if not out:
+            raise RuntimeError(f"no usable CodeContests problems in {cfg.code_eval_dir}")
+        return out
+    if cfg.data_contest_source != "livecodebench":
+        raise ValueError(f'data_contest_source must be "codecontests" or "livecodebench", not {cfg.data_contest_source!r}')
     before, since = cfg.data_contest_before, cfg.lcb_since
     if before > since:
         raise ValueError(f"data_contest_before {before} is after lcb_since {since}: contest rows would "
@@ -685,7 +707,7 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
             continue
         note = harness.parse_files(text, [sandbox.layout(p["language"])[0]])[1] if mugge else ""
         cands.append((k // n, code, note, reasoning))
-        items.append((p["language"], *codebench.assemble(p, text, code), codebench.time_limit(p)))
+        items.append(codebench.job(p, text, code))
     emit(STAGE, pct=99, msg=f"running tests for {len(items)} contest answers")
     best: dict[int, tuple] = {}  # problem index -> (code, note, thinking) of its shortest passing answer
     for (i, code, note, reasoning), r in zip(cands, sandbox.run_many(items)):
@@ -707,8 +729,10 @@ def contest_rows(cfg, teacher, rng, problems, stats) -> list[dict]:
     if think:
         stats["contest_thinking_chars_median"] = statistics.median(
             len(r["messages"][-1].get("reasoning_content", "")) for r in out) if out else 0
-    print(f"[data] contest: {len(out)} rows ({n_ticket} as tickets) from {len(asks)} LiveCodeBench problems "
-          f"released before {cfg.data_contest_before}, {len(best)} solved, dropped {drops}", flush=True)
+    where = ("CodeContests" if cfg.data_contest_source == "codecontests"
+             else f"LiveCodeBench released before {cfg.data_contest_before}")
+    print(f"[data] contest: {len(out)} rows ({n_ticket} as tickets) from {len(asks)} {where} problems, "
+          f"{len(best)} solved, dropped {drops}", flush=True)
     return out
 
 
