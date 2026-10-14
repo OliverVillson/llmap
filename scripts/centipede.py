@@ -447,8 +447,21 @@ def fix1(name: str, cand: str) -> float | None:
     return (scores(name).get(cand) or {}).get("mean_fix@1")
 
 
+def broken_tickets() -> set[str]:
+    """Bench tickets that fail even with their reference answer (step 2's check): no
+    model can solve them, so the Mugge score leaves them out."""
+    return {r["key"] for r in read_rows(W / "bench-preflight" / "results.jsonl") if not r.get("solved")}
+
+
 def mugge(name: str, cand: str) -> float | None:
-    return ((scores(name).get(cand) or {}).get("mugge") or {}).get("score")
+    """The share of bench runs solved over the tickets a reference answer passes; None
+    when MuggeBench did not run."""
+    if not (scores(name).get(cand) or {}).get("mugge"):
+        return None
+    broken = broken_tickets()
+    rows = [r for r in read_rows(eval_dir(name) / "work" / "mugge_bench" / cand / "results.jsonl")
+            if r["key"] not in broken]
+    return round(100 * sum(bool(r.get("solved")) for r in rows) / len(rows), 1) if rows else None
 
 
 def run_pick(step: Step) -> None:
@@ -639,7 +652,8 @@ def pct(x) -> str:
 
 
 def summary() -> str:
-    out = ["Agent eval: MuggeBench score (Mugge tickets through the engine's loop, hidden tests, 3 seeds); "
+    out = ["Agent eval: Mugge score (MuggeBench tickets a reference answer passes, through the engine's loop, "
+           "hidden tests, 3 seeds); "
            f"pass@1 / fix@1 (one fix call), thinking capped at {AGENT_TOKENS} tokens, every problem as a Mugge "
            "ticket", ""]
     rows = [("base", "granite-3b", "3B as released"), ("base", "granite-30b", "30B teacher"), ("sft", "sft", "SFT"),
@@ -652,7 +666,7 @@ def summary() -> str:
         if not c:
             continue
         per = [((c.get("suites") or {}).get(s) or {}) for s in suites]
-        m = (c.get("mugge") or {}).get("score")
+        m = mugge(job, cand)
         out.append(f"{label:16} {c.get('size_gb') or 0:6.2f}  {'  –  ' if m is None else f'{m:5.1f}'}  "
                    f"{pct(c.get('mean_pass@1'))}/{pct(c.get('mean_fix@1'))}  "
                    + "  ".join(f"{pct(p.get('pass@1'))}/{pct(p.get('fix@1'))}" for p in per))

@@ -20,7 +20,7 @@ TASK = "Write a Python function `double(x)` that returns twice x."
 TESTS = "assert double(2) == 4"
 GOOD = "prog.py\n```python\ndef double(x):\n    return 2 * x\n```"
 FIX1 = {"sft": 0.50, "round": 0.60, "granite-3b": 0.30, "granite-30b": 0.70, "agent": 0.58}
-MUGGE = {"sft": 41.0, "round": 47.5, "granite-3b": 20.0, "granite-30b": 70.0, "agent": 45.0}
+MUGGE = {"sft": 45.0, "round": 55.0, "granite-3b": 20.0, "granite-30b": 70.0, "agent": 45.0}  # of 20 good runs
 
 
 def bench_tar(path: Path) -> None:
@@ -98,8 +98,13 @@ def fake_stages(m, commands: list[str]):
                 write(d / "out" / "eval.json", {"candidates": [
                     {"name": n, "size_gb": 1.0, "code": {"mean_pass@1": FIX1[n] - 0.1, "mean_fix@1": FIX1[n],
                                                          "suites": {"c-set": {"pass@1": 0.4, "fix@1": 0.5}}},
-                     "mugge_bench": {"score": MUGGE[n], "tickets": 3, "seeds": 3}}
+                     "mugge_bench": {"score": 1.0, "tickets": 3, "seeds": 3}}  # the runner's, broken tickets in
                     for n in cfg["eval_candidates"]]})
+                for n in cfg["eval_candidates"]:  # 20 runs of a good ticket, 5 of one no answer passes
+                    good = round(MUGGE[n] / 5)
+                    write(d / "work" / "mugge_bench" / n / "results.jsonl", "\n".join(
+                        [json.dumps({"key": "spike/c-hash", "solved": k < good}) for k in range(20)]
+                        + [json.dumps({"key": "logpipe/lp-1", "solved": False})] * 5))
             write(d / ".done" / a[-1], "{}")
         elif a[:3] == ["python", "-m", "stages.agent"] and a[3] in ("pool", "round"):
             agent.main(a[3:])
@@ -175,7 +180,7 @@ def test_the_whole_plan_with_stand_in_stages(cp, monkeypatch):
                for src, dst in copies if dst != cp.BENCH_KEY)
     s = cp.summary()
     assert "SFT + round" in s and "60.0" in s and "40 agents x 16384 tokens" in s and "31000 MiB" in s
-    assert " 47.5 " in s and "MuggeBench: 3 tickets" in s and "(not: logpipe/lp-1)" in s
+    assert " 55.0 " in s and "MuggeBench: 3 tickets" in s and "(not: logpipe/lp-1)" in s
     # a re-run finds every step done
     commands.clear()
     assert run_plan(cp.steps(), cp.summary, cp.LOGS, ["run"]) == 0 and commands == []
