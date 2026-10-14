@@ -68,6 +68,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from common.progress import emit
@@ -183,8 +184,8 @@ def limits(cfg) -> tuple[int, int]:
     code = call_max_tokens(cfg)
     longest = max(max_tokens, code if cfg.code_eval_suites else 0)
     ctx = longest + 4096
-    if cfg.mugge_bench_dir:  # a MuggeBench call: a ticket with its project's files, then its answer
-        ctx = max(ctx, code + BENCH_PROMPT_TOKENS)
+    if cfg.mugge_bench_dir:  # a MuggeBench call: a ticket with its project's files, its answer, a forced one
+        ctx = max(ctx, code + (ANSWER_TOKENS if cfg.code_eval_thinking else 0) + BENCH_PROMPT_TOKENS)
     return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", ctx))
 
 
@@ -195,8 +196,8 @@ BENCH_PROMPT_TOKENS = 16384
 
 def call_max_tokens(cfg) -> int:
     """Most tokens one code answer may write: the code eval's cap, plus the forced
-    answer's when thinking. A MuggeBench call gets the same (the engine forces no
-    answer, so a call that is still thinking there writes no file)."""
+    answer's when thinking. A MuggeBench call gets the same, and a forced answer
+    after it when it is still thinking there (bench_answer)."""
     return cfg.code_eval_max_tokens + (ANSWER_TOKENS if cfg.code_eval_thinking else 0)
 
 
@@ -1330,13 +1331,13 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str, *, st
 MUGGE_DIR = Path(__file__).resolve().parent.parent / "mugge"
 
 
-def mugge_bench_command(job: Job, name: str, out: Path) -> list[str]:
-    """`bun mugge/bench/run.ts` against the candidate served on PORT, with the eval's
-    thinking and sampling settings."""
+def mugge_bench_command(job: Job, name: str, out: Path, url: str = "") -> list[str]:
+    """`bun mugge/bench/run.ts` against url (default: the candidate served on PORT), with
+    the eval's thinking and sampling settings."""
     cfg = job.config
     thinking = cfg.code_eval_thinking
     cmd = ["bun", str(MUGGE_DIR / "bench" / "run.ts"), "--bench", cfg.mugge_bench_dir, "--out", str(out),
-           "--url", f"http://127.0.0.1:{PORT}/v1", "--model", name, "--name", name,
+           "--url", url or f"http://127.0.0.1:{PORT}/v1", "--model", name, "--name", name,
            "--seeds", str(cfg.mugge_bench_seeds), "--concurrency", str(cfg.mugge_bench_concurrency),
            "--sandbox", cfg.mugge_bench_sandbox, "--thinking", "on" if thinking else "off",
            "--temperature", str(cfg.code_eval_thinking_temperature if thinking else cfg.code_eval_temperature),
@@ -1357,16 +1358,102 @@ def mugge_bench(job: Job, name: str) -> dict | None:
     out = job.path("work", "mugge_bench", name)
     out.mkdir(parents=True, exist_ok=True)
     log = job.path("work", f"mugge-bench-{name}.log")
-    with open(log, "w") as f:
-        code = subprocess.run(mugge_bench_command(job, name, out), stdout=f, stderr=subprocess.STDOUT, cwd=MUGGE_DIR).returncode
+    env = {**os.environ, "MUGGE_TIMEOUT_S": "3600"}  # a call may wait for a slot, then think, then answer
+    with open(log, "w") as f, bench_proxy() as (url, calls):
+        code = subprocess.run(mugge_bench_command(job, name, out, url), stdout=f, stderr=subprocess.STDOUT,
+                              cwd=MUGGE_DIR, env=env).returncode
+        f.write(f"\nmodel calls {calls['calls']}, answers forced after the thinking {calls['forced']}, "
+                f"failed calls {calls['errors']}\n")
+    if calls["dead"]:  # every call after it failed: no score, and run_candidate serves it again
+        raise ServerDead(f"{name}: the server died during MuggeBench ({calls['dead']})")
     report = out / "report.json"
     if code != 0 or not report.exists():
         emit(STAGE, msg=f"{name}: MuggeBench failed (exit {code}); see {log}")
         return None
     r = json.loads(report.read_text())
     emit(STAGE, msg=f"{name}: Mugge score {r['score']}% ({r['tickets']} tickets x {r['seeds']} seeds), "
-                    f"{r.get('solvedPerGpuHour')} solved per GPU-hour")
+                    f"{r.get('solvedPerGpuHour')} solved per GPU-hour, {calls['forced']} of {calls['calls']} "
+                    f"answers forced after the thinking")
     return r
+
+
+_bench_lock = threading.Lock()
+
+
+def bench_answer(body: dict, calls: dict) -> dict:
+    """One MuggeBench model call (an OpenAI chat request from the engine), answered as the
+    code eval answers (generate): a thinking that ends without an answer, out of the
+    call's cap or stopped inside it, is closed and the answer forced on top of it with up
+    to ANSWER_TOKENS more. The engine reads only the reply's content, so without this a
+    call still thinking at its cap writes no file. Sampling is the eval's own, which
+    mugge_bench_command also passes."""
+    messages = body["messages"]
+    thinking = bool((body.get("chat_template_kwargs") or {}).get("enable_thinking"))
+    temperature = float(body.get("temperature", 0.6))
+    sampling = sampling_params(body.get("seed"), thinking)
+    with gate():
+        got = chat(messages, int(body["max_tokens"]), temperature, sampling, thinking)
+        finish = got["finish_reason"]
+        reasoning, answer = split_reasoning(got["message"], cut=bool(VLLM) and thinking and finish == "length")
+        tokens = got["usage"].get("completion_tokens") or 0
+        forced = thinking and not answer
+        if forced:
+            why = "no_reasoning" if not reasoning else "length" if finish == "length" else "stop"
+            answer, more = force_answer(messages, reasoning, why, temperature, sampling)
+            tokens += more or 0
+    with _bench_lock:
+        calls["calls"] += 1
+        calls["forced"] += forced
+    return {"choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": got["usage"].get("prompt_tokens") or 0, "completion_tokens": tokens}}
+
+
+@contextmanager
+def bench_proxy():
+    """A local OpenAI-style endpoint in front of the running server for MuggeBench: each
+    chat call goes through bench_answer. Yields (its /v1 URL, call counts: calls,
+    forced, errors, and dead, the ServerDead message once the server is gone)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    calls = {"calls": 0, "forced": 0, "errors": 0, "dead": ""}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                if not self.path.rstrip("/").endswith("/chat/completions"):
+                    raise LookupError(f"no endpoint {self.path}")
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)))
+                status, reply = 200, bench_answer(body, calls)
+            except Exception as e:  # noqa: BLE001 - the engine counts it as a failed model call and goes on
+                with _bench_lock:
+                    calls["errors"] += 1
+                    if isinstance(e, ServerDead):
+                        calls["dead"] = calls["dead"] or str(e)[:300]
+                status, reply = 404 if isinstance(e, LookupError) else 502, {"error": f"{type(e).__name__}: {e}"[:500]}
+            data = json.dumps(reply).encode()
+            try:
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except OSError:  # the engine gave up on this call
+                pass
+
+        def log_message(self, *args):  # a line per call would bury the bench's own log
+            pass
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 256  # every ticket in flight may connect at once
+
+    server = Server(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v1", calls
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def answer_stats(rows: list[dict], seconds: float, timed: list[dict] | None = None) -> dict:

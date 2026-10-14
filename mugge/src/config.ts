@@ -7,6 +7,7 @@
  *   MUGGE_MODELS          JSON map ticket model → served name, e.g. {"coder-ts":"coder-ts-lora"}
  *   MUGGE_GUIDED          response_format | guided_json | none
  *   MUGGE_API_KEY         bearer token, for hosted endpoints
+ *   MUGGE_TIMEOUT_S       most seconds one model call may take (default 600)
  *   MUGGE_CONCURRENCY     tickets at once (default 12)
  *   MUGGE_SANDBOX         local | podman | docker (see engine/sandbox.ts)
  */
@@ -29,6 +30,7 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
     models,
     guided,
     apiKey: env.MUGGE_API_KEY || undefined,
+    timeoutMs: Number(env.MUGGE_TIMEOUT_S) > 0 ? Number(env.MUGGE_TIMEOUT_S) * 1000 : undefined,
   };
 }
 
