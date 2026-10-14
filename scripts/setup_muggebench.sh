@@ -16,24 +16,38 @@ if ! command -v docker >/dev/null; then
   sudo apt-get update -qq
   apt_install docker.io
 fi
+# Images on the NVMe: data-root there, and the classic image store, since Docker's
+# containerd store (the default on new installs) keeps every image under
+# /var/lib/containerd on the root disk whatever data-root says.
 sudo mkdir -p /etc/docker
-changed=$(sudo python3 - "$NVME/docker" <<'EOF'
+conf=$(sudo python3 - "$NVME/docker" <<'EOF'
 import json, sys
 from pathlib import Path
 p = Path("/etc/docker/daemon.json")
 conf = json.loads(p.read_text() or "{}") if p.exists() else {}
-if conf.get("data-root") != sys.argv[1]:
-    conf["data-root"] = sys.argv[1]  # merged into what is there (an NVIDIA runtime, say)
-    p.write_text(json.dumps(conf, indent=2) + "\n")
-    print("changed")
+want = {**conf, "data-root": sys.argv[1], "features": {**conf.get("features", {}), "containerd-snapshotter": False}}
+if want != conf:  # merged into what is there (an NVIDIA runtime, say)
+    print(json.dumps(want, indent=2))
 EOF
 )
+if [ -n "$conf" ]; then
+  # what the old stores hold is on the root disk and is rebuilt on the NVMe: drop it first,
+  # since a full root disk cannot even take the new daemon.json
+  sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+  sudo rm -rf /var/lib/docker /var/lib/containerd
+  echo "$conf" | sudo tee /etc/docker/daemon.json >/dev/null
+  sudo systemctl start containerd
+fi
 sudo systemctl enable --now docker
-if [ "$changed" = changed ]; then sudo systemctl restart docker; fi
 for i in $(seq 30); do sudo docker info >/dev/null 2>&1 && break; sleep 2; done
 sudo usermod -aG docker "$(id -un)"  # for later logins
 sudo chmod 666 /var/run/docker.sock  # for this one, without a new login
-docker info >/dev/null
+root=$(docker info --format '{{.DockerRootDir}}')
+store=$(docker info --format '{{json .DriverStatus}}')
+if [ "$root" != "$NVME/docker" ] || [[ "$store" == *containerd.snapshotter* ]]; then
+  echo "Docker keeps its images at $root ($store), not on the NVMe at $NVME/docker"; exit 1
+fi
+df -h / "$NVME" | sed 's/^/  /'
 
 if [ "$("$HOME/.bun/bin/bun" --version 2>/dev/null)" != "$BUN_VERSION" ]; then
   command -v unzip >/dev/null || apt_install unzip
