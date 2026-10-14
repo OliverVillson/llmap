@@ -1,0 +1,7 @@
+{
+  "files": {
+    "calc/add.py": "def add(a, b):\n    return a + b\n"
+  },
+  "note": "reference",
+  "canary": "MUGGE-BENCH-TEST-FIXTURE"
+}

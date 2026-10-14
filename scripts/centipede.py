@@ -12,27 +12,31 @@ The agent's job is Mugge's harness loop (stages/harness.py): a ticket in, each o
 in full out, and after a failed check one fix call with the failing output. Thinking is
 on but short, AGENT_TOKENS per call (then the answer is forced), so 40 agents stay fast.
 
-  1-3  VM setup (scripts/setup_vm.sh without Aider Polyglot), both models, and the
-       teacher's rows from the bucket when an earlier VM made them
-  4    agent eval of the 3B as released and of the 30B teacher (the ceiling)
-  5-8  teacher data, one job per language (stages/data.py): the 30B writes tasks with
+  1    VM setup (scripts/setup_vm.sh without Aider Polyglot)
+  2    MuggeBench: Docker, Bun and the sandbox images (scripts/setup_muggebench.sh), the
+       bench (the public spike plus the private dev set from ~/muggebench-dev.tar.gz or
+       the bucket), every ticket once with its reference answer to check the containers
+  3-4  both models, and the teacher's rows from the bucket when an earlier VM made them
+  5    agent eval of the 3B as released and of the 30B teacher (the ceiling)
+  6-9  teacher data, one job per language (stages/data.py): the 30B writes tasks with
        tests in Python, C, JavaScript and TypeScript, answers each as a Mugge ticket with
        short thinking and fixes failing drafts; the Python job adds CodeContests problems.
        Only answers that pass their tests are kept
-  9    the rows merged, and the tasks with tests as the loop round's problem set
-  10-11 SFT of the 3B on the rows (LoRA on every projection, merged; stages/heal.py), eval
-  12-14 one round in the loop: the SFT model answers each task 4 times, its shortest
+  10   the rows merged, and the tasks with tests as the loop round's problem set
+  11-12 SFT of the 3B on the rows (LoRA on every projection, merged; stages/heal.py), eval
+  13-15 one round in the loop: the SFT model answers each task 4 times, its shortest
        passing answer per task joins the teacher's rows, SFT again from the 3B, eval
-  15   the agent: the better of the two by mean fix@1; its training rows as trace text
-  16-19 compression with Event Horizon's stages: BF16 GGUF and imatrix, the horizon PTQ
+  16   the agent: the better of the two by Mugge score; its training rows as trace text
+  17-20 compression with Event Horizon's stages: BF16 GGUF and imatrix, the horizon PTQ
        map at BUDGET_GB, Block-AP, end-to-end KD from the bf16 agent, export
-  20   agent eval of the shipped GGUF on llama-server
-  21   40 agents at once on one llama-server (16k context each, 8-bit KV cache)
-  22   upload
+  21   agent eval of the shipped GGUF on llama-server
+  22   40 agents at once on one llama-server (16k context each, 8-bit KV cache)
+  23   upload
 
-Agent eval: MultiPL-E (Python, JS, TS, C++), our C set and LiveCodeBench 2025-01..04, every
-problem asked as a Mugge ticket: one answer (pass@1), and one fix call with the failing
-output (fix@1, the loop's score).
+Agent eval: MuggeBench (every bench ticket through the Mugge engine's own write, check
+and fix loop, graded on hidden tests, 3 seeds: the Mugge score), then MultiPL-E (Python,
+JS, TS, C++), our C set and LiveCodeBench 2025-01..04, every problem asked as a Mugge
+ticket: one answer (pass@1), and one fix call with the failing output (fix@1).
 
 Results go to bucket://mugge-library/centipede/<run>/ after every step (CENTIPEDE_RUN names
 the run): results.tar (every result and log), the teacher's rows and the round's tasks
@@ -74,13 +78,21 @@ LANGS = {"python": "python-utils", "c": "c-strings", "javascript": "javascript-u
 BUDGET_GB = 1.5  # the shipped GGUF, in 1e9 bytes
 SLOTS, SLOT_CTX = 40, 16384  # the serving check: 40 agents with 16k tokens each
 ROUND_PER_LANGUAGE, ROUND_SAMPLES = 600, 4
+BENCH = NVME / "muggebench"  # MuggeBench's projects: the public spike and the private dev set
+BENCH_TAR = Path.home() / "muggebench-dev.tar.gz"  # the dev set (bench-staging), copied here once
+BENCH_KEY = f"{BUCKET}/bench/muggebench-dev.tar.gz"  # the dev set in the bucket, for later VMs
+SANDBOX_IMAGES = ("c", "node", "python", "web", "dotnet")
 
 EVAL = {"teacher": STUDENT, "models_dir": str(MODELS), "code_eval_dir": str(CODEBENCH),
         "code_eval_suites": ["multipl-e-py", "multipl-e-js", "multipl-e-ts", "multipl-e-cpp", "c-set", "livecodebench"],
         "lcb_since": "2025-01-01", "lcb_until": "2025-04-30", "lcb_max_cases": 50,
         "code_eval_format": "harness", "code_eval_fix": True, "code_eval_samples": 1,
         "code_eval_thinking": True, "code_eval_thinking_temperature": 1.0, "thinking_top_k": 0, "eval_min_p": 0.0,
-        "code_eval_max_tokens": AGENT_TOKENS, "eval_reasoning_parser": "qwen3"}
+        "code_eval_max_tokens": AGENT_TOKENS, "eval_reasoning_parser": "qwen3",
+        # MuggeBench: every bench ticket through the Mugge engine's own write-check-fix loop
+        # (4 attempts), graded on hidden tests; 3 seeds, 40 tickets at once, as the agents run
+        "mugge_bench_dir": str(BENCH), "mugge_bench_seeds": 3, "mugge_bench_concurrency": SLOTS,
+        "mugge_bench_split": "", "mugge_bench_sandbox": "docker"}
 # Granite's card sampling for thinking (temperature 1.0, top_p 0.95, no top_k), as the eval
 DATA = {"teacher": TEACHER, "models_dir": str(MODELS), "code_eval_dir": str(CODEBENCH),
         "n_generate": 800, "n_heldout": 40, "data_thinking": True, "data_thinking_temperature": 1.0,
@@ -172,6 +184,62 @@ def setup_missing() -> list[str]:
 
 def setup_done() -> bool:
     return not setup_missing()
+
+
+def run_bench_setup(step: Step) -> None:
+    """Docker, Bun and the sandbox images (scripts/setup_muggebench.sh); the bench: the
+    public spike and the dev set from BENCH_TAR (or the bucket); then every ticket once
+    with its reference answer, in the containers, so a broken image shows here and not
+    in the first eval."""
+    sh(step, f"NVME={NVME} bash scripts/setup_muggebench.sh {' '.join(SANDBOX_IMAGES)}")
+    if not bench_tar():
+        raise RuntimeError(BENCH_MISSING)
+    tmp = BENCH.with_name(BENCH.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    sh(step, f"tar xzf {BENCH_TAR} -C {tmp}")
+    shutil.copytree(REPO / "mugge" / "spike", tmp / "spike")
+    projects = sorted(d.name for d in tmp.iterdir() if (d / "plan.json").exists())
+    if len(projects) < 2:
+        raise RuntimeError(f"{BENCH_TAR} holds no bench project (a folder with a plan.json): {projects}")
+    out = W / "bench-preflight"
+    shutil.rmtree(out, ignore_errors=True)
+    sh(step, f"cd mugge && bun bench/run.ts --bench {tmp} --out {out} --fake --seeds 1 --sandbox docker --concurrency 16")
+    rep = load(out / "report.json") or {}
+    if not rep.get("score"):
+        raise RuntimeError(f"no bench ticket passes with its reference answer in the containers; see {out}")
+    if evroc_ok() and not (W / ".uploaded" / "muggebench-dev.tar.gz").exists() and evroc_copy(str(BENCH_TAR), BENCH_KEY):
+        (W / ".uploaded").mkdir(parents=True, exist_ok=True)
+        (W / ".uploaded" / "muggebench-dev.tar.gz").write_text("ok")
+    shutil.rmtree(BENCH, ignore_errors=True)
+    tmp.replace(BENCH)
+
+
+BENCH_MISSING = (f"MuggeBench's dev set is neither at {BENCH_TAR} nor in {BENCH_KEY}. Copy it from your Mac first:\n"
+                 f"    scp ~/Downloads/muggebench-dev.tar.gz evroc:~/")
+
+
+def bench_tar() -> bool:
+    """BENCH_TAR is here, fetched from the bucket when it is not."""
+    if BENCH_TAR.exists():
+        return True
+    tmp = BENCH_TAR.with_name(BENCH_TAR.name + ".part")
+    if evroc_ok() and evroc_copy(BENCH_KEY, str(tmp)) and tmp.exists():
+        tmp.replace(BENCH_TAR)
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
+
+
+def bench_ready() -> bool:
+    """The bench is unpacked and every sandbox image answers (a reboot resets the docker
+    socket this user reaches it through, and a VM stop wipes the images with the NVMe)."""
+    return (W / "bench-preflight" / "report.json").exists() and BENCH.exists() and images_ok()
+
+
+def images_ok() -> bool:
+    return subprocess.run(["docker", "image", "inspect", *(f"mugge-{i}" for i in SANDBOX_IMAGES)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
 
 
 DOWNLOAD_RESTARTS = 3
@@ -269,9 +337,11 @@ def evaled(name: str) -> bool:
 
 
 def scores(name: str) -> dict[str, dict]:
-    """{candidate: its code results} from an eval job, {} before it ran."""
+    """{candidate: its code results, its MuggeBench report under "mugge"} from an eval
+    job, {} before it ran."""
     rep = load(eval_dir(name) / "out" / "eval.json") or {}
-    return {c["name"]: {**(c.get("code") or {}), "size_gb": c.get("size_gb")} for c in rep.get("candidates", [])}
+    return {c["name"]: {**(c.get("code") or {}), "size_gb": c.get("size_gb"), "mugge": c.get("mugge_bench")}
+            for c in rep.get("candidates", [])}
 
 
 # ---------- teacher data ----------
@@ -359,6 +429,7 @@ def run_round(step: Step) -> None:
     d = make_job(ROUND / "answers", {**EVAL, "code_eval_dir": str(POOL.parent), "code_eval_suites": [POOL.stem],
                                      "code_eval_fix": False, "code_eval_samples": ROUND_SAMPLES,
                                      "code_eval_budgets": [AGENT_TOKENS],  # keeps each answer's thinking
+                                     "mugge_bench_dir": "",
                                      "eval_candidates": {"sft": str(sft_model("sft"))}})
     if not (d / ".done" / "eval").exists():
         sh(step, gpu(f"python pipeline.py --job {d} --only eval"))
@@ -376,15 +447,22 @@ def fix1(name: str, cand: str) -> float | None:
     return (scores(name).get(cand) or {}).get("mean_fix@1")
 
 
+def mugge(name: str, cand: str) -> float | None:
+    return ((scores(name).get(cand) or {}).get("mugge") or {}).get("score")
+
+
 def run_pick(step: Step) -> None:
-    """The agent is the round model when its mean fix@1 is at least the SFT model's;
-    its training rows, tokenized as at inference, are the compression's trace text."""
-    sft, rnd = fix1("sft", "sft"), fix1("round", "round")
+    """The agent is the round model when its Mugge score is at least the SFT model's
+    (mean fix@1 when MuggeBench failed on either); its training rows, tokenized as at
+    inference, are the compression's trace text."""
+    by = "mugge" if mugge("sft", "sft") is not None and mugge("round", "round") is not None else "fix@1"
+    get_score = mugge if by == "mugge" else fix1
+    sft, rnd = get_score("sft", "sft"), get_score("round", "round")
     if sft is None or rnd is None:
-        raise RuntimeError(f"no mean fix@1 to pick by (sft {sft}, round {rnd})")
+        raise RuntimeError(f"no Mugge score or mean fix@1 to pick by (sft {sft}, round {rnd})")
     name = "round" if rnd >= sft else "sft"
-    dump(PICK, {"agent": name, "dir": str(sft_model(name)), "rows": str(sft_rows(name)),
-                "fix@1": {"sft": sft, "round": rnd}})
+    dump(PICK, {"agent": name, "dir": str(sft_model(name)), "rows": str(sft_rows(name)), "by": by,
+                "scores": {"sft": sft, "round": rnd}})
     C.mkdir(parents=True, exist_ok=True)
     sh(step, f"python -m stages.agent traces --hf {sft_model(name)} --rows {sft_rows(name)} --out {C / 'traces.jsonl'}")
 
@@ -496,6 +574,13 @@ def upload(step: Step | None, final: bool) -> None:
     STATE["final_upload"] = final
 
 
+def read_rows(p: Path) -> list[dict]:
+    try:
+        return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+    except (OSError, ValueError):
+        return []
+
+
 def sh_quiet(cmd: str) -> None:
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, check=False)
     if r.returncode:
@@ -514,9 +599,10 @@ def run_upload(step: Step) -> None:
 def steps() -> list[Step]:
     s = [
         Step("VM setup", {"": 45}, run_setup, setup_done),
+        Step("MuggeBench: Docker, Bun, sandbox images, bench", {"": 25}, run_bench_setup, bench_ready),
         Step("Granite 3B and 30B download", {"": 15}, run_download, downloaded, download_progress),
         Step("the teacher's rows from the bucket", {"": 2}, run_restore, lambda: (W / ".restored").exists()),
-        Step("agent eval: the 3B and the 30B", {"eval": 40},
+        Step("agent eval: the 3B and the 30B", {"eval": 105},
              lambda st: run_eval(st, "base", {"granite-3b": STUDENT_DIR, "granite-30b": TEACHER_DIR}),
              lambda: evaled("base")),
     ]
@@ -526,19 +612,19 @@ def steps() -> list[Step]:
     s += [
         Step("rows merged, the round's tasks", {"": 2}, run_merge, merged),
         Step("SFT of the 3B", {"heal": 45}, lambda st: run_sft(st, "sft"), lambda: sft_done("sft")),
-        Step("agent eval: SFT", {"eval": 20}, lambda st: run_eval(st, "sft", {"sft": sft_model("sft")}),
+        Step("agent eval: SFT", {"eval": 45}, lambda st: run_eval(st, "sft", {"sft": sft_model("sft")}),
              lambda: evaled("sft")),
         Step("loop round: the SFT model's own answers", {"eval": 25}, run_round, round_done),
         Step("SFT with the round's rows", {"heal": 45}, lambda st: run_sft(st, "round", ROUND / "rows.jsonl"),
              lambda: sft_done("round")),
-        Step("agent eval: round", {"eval": 20}, lambda st: run_eval(st, "round", {"round": sft_model("round")}),
+        Step("agent eval: round", {"eval": 45}, lambda st: run_eval(st, "round", {"round": sft_model("round")}),
              lambda: evaled("round")),
         Step("pick the agent, its trace text", {"": 5}, run_pick, pick_done),
         Step(f"imatrix and PTQ map at {BUDGET_GB} GB", {"": 40}, run_imatrix_ptq, ptq_done),
         Step("Block-AP", {"": 20}, run_blockap, blockap_done),
         Step("end-to-end KD", {"": E2E["max_minutes"] + 5}, run_e2e, e2e_done),
         Step("export the GGUF", {"": 10}, run_export, export_done),
-        Step(f"agent eval: the {BUDGET_GB} GB GGUF", {"eval": 30},
+        Step(f"agent eval: the {BUDGET_GB} GB GGUF", {"eval": 55},
              lambda st: run_eval(st, "agent", {"agent": FINAL}), lambda: evaled("agent")),
         Step(f"{SLOTS} agents on one llama-server", {"": 10}, run_serve, SERVE.exists),
         Step("upload", {"": 10}, run_upload, lambda: (W / ".uploaded" / "done.json").exists()),
@@ -553,19 +639,28 @@ def pct(x) -> str:
 
 
 def summary() -> str:
-    out = ["Agent eval: pass@1 / fix@1 (one fix call), thinking capped at "
-           f"{AGENT_TOKENS} tokens, every problem as a Mugge ticket", ""]
+    out = ["Agent eval: MuggeBench score (Mugge tickets through the engine's loop, hidden tests, 3 seeds); "
+           f"pass@1 / fix@1 (one fix call), thinking capped at {AGENT_TOKENS} tokens, every problem as a Mugge "
+           "ticket", ""]
     rows = [("base", "granite-3b", "3B as released"), ("base", "granite-30b", "30B teacher"), ("sft", "sft", "SFT"),
             ("round", "round", "SFT + round"), ("agent", "agent", "agent GGUF")]
     suites = EVAL["code_eval_suites"]
-    out.append(f"{'model':16} {'GB':>6}  {'mean':>11}  " + "  ".join(f"{s.replace('multipl-e-', 'mpl-'):>11}" for s in suites))
+    out.append(f"{'model':16} {'GB':>6}  {'Mugge':>5}  {'mean':>11}  "
+               + "  ".join(f"{s.replace('multipl-e-', 'mpl-'):>11}" for s in suites))
     for job, cand, label in rows:
         c = scores(job).get(cand)
         if not c:
             continue
         per = [((c.get("suites") or {}).get(s) or {}) for s in suites]
-        out.append(f"{label:16} {c.get('size_gb') or 0:6.2f}  {pct(c.get('mean_pass@1'))}/{pct(c.get('mean_fix@1'))}  "
+        m = (c.get("mugge") or {}).get("score")
+        out.append(f"{label:16} {c.get('size_gb') or 0:6.2f}  {'  –  ' if m is None else f'{m:5.1f}'}  "
+                   f"{pct(c.get('mean_pass@1'))}/{pct(c.get('mean_fix@1'))}  "
                    + "  ".join(f"{pct(p.get('pass@1'))}/{pct(p.get('fix@1'))}" for p in per))
+    pre = load(W / "bench-preflight" / "report.json")
+    if pre:
+        bad = [r["key"] for r in read_rows(W / "bench-preflight" / "results.jsonl") if not r.get("solved")]
+        out.append(f"MuggeBench: {pre['tickets']} tickets; with reference answers {pre['score']}% pass in the containers"
+                   + (f" (not: {', '.join(bad)})" if bad else ""))
     for lang in LANGS:
         st = load(data_dir(lang) / "data" / "stats.json")
         if st:
@@ -576,7 +671,7 @@ def summary() -> str:
         out.append(f"loop round: {len((ROUND / 'rows.jsonl').read_text().splitlines())} rows from the SFT model's own answers")
     p = load(PICK)
     if p:
-        out.append(f"agent: the {p['agent']} model (mean fix@1 SFT {p['fix@1']['sft']}, round {p['fix@1']['round']})")
+        out.append(f"agent: the {p['agent']} model (by {p['by']}: SFT {p['scores']['sft']}, round {p['scores']['round']})")
     m = load(C / "ptq" / "map.json")
     if m:
         out.append(f"PTQ map: {m['bytes'] / 1e9:.3f} GB of a {BUDGET_GB} GB budget")
@@ -604,6 +699,10 @@ def main(argv: list[str] | None = None) -> int:
     if not evroc_ok():
         print("WARNING: no evroc login. Nothing is restored or uploaded until there is one; the results stay on "
               "the NVMe, which a VM stop wipes.")
+    if not BENCH.exists() and not bench_tar():
+        print(BENCH_MISSING)
+        return 2
+    os.environ["PATH"] = f"{Path.home() / '.bun' / 'bin'}:{os.environ['PATH']}"  # MuggeBench's runner
     # Every vLLM this run starts: no FlashInfer JIT build (the VMs have a minimal CUDA
     # toolkit), and on the B200 a prebuilt attention backend (stages/eval.py VLLM_JIT_FREE).
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")

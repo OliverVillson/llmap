@@ -140,6 +140,15 @@ class Config:
     # "plain": benchmark prompts as published. "harness": every problem is asked the way
     # Mugge's harness asks (stages/harness.py: a ticket in, files out), fixes too.
     code_eval_format: str = "plain"
+    # MuggeBench (mugge/bench/, plan/mugge-bench.md): Mugge tickets through the engine's
+    # own write-check-fix loop, graded on hidden tests. A folder of bench projects (a
+    # checkout of the private llmap-bench repo); "" = off. Runs on every served
+    # candidate next to the code eval, and reports in eval.json under "mugge_bench".
+    mugge_bench_dir: str = os.environ.get("LOBBOT_MUGGE_BENCH", "")
+    mugge_bench_seeds: int = 3
+    mugge_bench_concurrency: int = 16
+    mugge_bench_split: str = "test"  # "dev" while debugging the runner; "" = every project
+    mugge_bench_sandbox: str = "podman"  # podman | docker | local
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
     # so a top-k test needs no rebuild.

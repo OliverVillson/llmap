@@ -180,9 +180,24 @@ def limits(cfg) -> tuple[int, int]:
     The context also fits the code eval's answer cap (code_eval_max_tokens), plus
     the forced answer after it when thinking."""
     max_tokens = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.answer_max_tokens(cfg))))
-    code = cfg.code_eval_max_tokens + (ANSWER_TOKENS if cfg.code_eval_thinking else 0)
+    code = call_max_tokens(cfg)
     longest = max(max_tokens, code if cfg.code_eval_suites else 0)
-    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", longest + 4096))
+    ctx = longest + 4096
+    if cfg.mugge_bench_dir:  # a MuggeBench call: a ticket with its project's files, then its answer
+        ctx = max(ctx, code + BENCH_PROMPT_TOKENS)
+    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", ctx))
+
+
+# The longest MuggeBench dev prompt is ~35k characters (a fix call with the project's
+# files), ~10k tokens; this leaves room over that.
+BENCH_PROMPT_TOKENS = 16384
+
+
+def call_max_tokens(cfg) -> int:
+    """Most tokens one code answer may write: the code eval's cap, plus the forced
+    answer's when thinking. A MuggeBench call gets the same (the engine forces no
+    answer, so a call that is still thinking there writes no file)."""
+    return cfg.code_eval_max_tokens + (ANSWER_TOKENS if cfg.code_eval_thinking else 0)
 
 
 def gguf_arch(path: str) -> str:
@@ -1312,6 +1327,46 @@ def code_eval(job: Job, name: str, problems: list[dict], task_system: str, *, st
             **answer_stats(rows, seconds, [rows[k] for k, pair in enumerate(pairs) if pair in fresh])}
 
 
+MUGGE_DIR = Path(__file__).resolve().parent.parent / "mugge"
+
+
+def mugge_bench_command(job: Job, name: str, out: Path) -> list[str]:
+    """`bun mugge/bench/run.ts` against the candidate served on PORT, with the eval's
+    thinking and sampling settings."""
+    cfg = job.config
+    thinking = cfg.code_eval_thinking
+    cmd = ["bun", str(MUGGE_DIR / "bench" / "run.ts"), "--bench", cfg.mugge_bench_dir, "--out", str(out),
+           "--url", f"http://127.0.0.1:{PORT}/v1", "--model", name, "--name", name,
+           "--seeds", str(cfg.mugge_bench_seeds), "--concurrency", str(cfg.mugge_bench_concurrency),
+           "--sandbox", cfg.mugge_bench_sandbox, "--thinking", "on" if thinking else "off",
+           "--temperature", str(cfg.code_eval_thinking_temperature if thinking else cfg.code_eval_temperature),
+           "--top-p", "0.95", "--max-tokens", str(call_max_tokens(cfg))]
+    if thinking:
+        cmd += ["--top-k", str(cfg.thinking_top_k)]
+    if cfg.mugge_bench_split:
+        cmd += ["--split", cfg.mugge_bench_split]
+    return cmd
+
+
+def mugge_bench(job: Job, name: str) -> dict | None:
+    """Runs MuggeBench on the running server; its report.json, or None when it failed.
+    Per-run rows stay in work/mugge_bench/<name>/results.jsonl for paired comparisons
+    (bun mugge/bench/report.ts <run> --ref <ref run>)."""
+    out = job.path("work", "mugge_bench", name)
+    out.mkdir(parents=True, exist_ok=True)
+    log = job.path("work", f"mugge-bench-{name}.log")
+    with open(log, "w") as f:
+        code = subprocess.run(mugge_bench_command(job, name, out), stdout=f, stderr=subprocess.STDOUT, cwd=MUGGE_DIR).returncode
+    report = out / "report.json"
+    if code != 0 or not report.exists():
+        emit(STAGE, msg=f"{name}: MuggeBench failed (exit {code}); see {log}")
+        return None
+    r = json.loads(report.read_text())
+    emit(STAGE, msg=f"{name}: Mugge score {r['score']}% ({r['tickets']} tickets x {r['seeds']} seeds), "
+                    f"{r.get('solvedPerGpuHour')} solved per GPU-hour")
+    return r
+
+
 def answer_stats(rows: list[dict], seconds: float, timed: list[dict] | None = None) -> dict:
     """How the code answers ran: completion tokens per answer (thinking in, a forced
     answer not); the shares that errored, hit the cap, needed a forced answer, were
@@ -1440,16 +1495,19 @@ def provenance(cfg) -> dict:
 
 
 def run_candidate(job: Job, name: str, path: str, inputs: list[str], problems: list[dict],
-                  system: str) -> tuple[list[str], float | None, dict | None, dict]:
-    """(answers to the held-out inputs, their tok/s, code results, GPU record) for one
-    candidate. Its server starts when the first answer is asked (none when the partial
-    file holds every code answer and there are no held-out inputs), stops once every
-    answer is in (before the sandbox), and is started again RESTARTS times if it dies;
-    code answers made before resume from the partial file."""
+                  system: str) -> tuple[list[str], float | None, dict | None, dict, dict | None]:
+    """(answers to the held-out inputs, their tok/s, code results, GPU record, MuggeBench
+    report) for one candidate. Its server starts when the first answer is asked (none when
+    the partial file holds every code answer and there are no held-out inputs), stops once
+    every answer is in (before the sandbox), and is started again RESTARTS times if it
+    dies; code answers made before resume from the partial file. MuggeBench runs once,
+    before the code eval, while the server is up."""
     cfg = job.config
     answers: list[str] = []
     tps = None
     gpu: dict = {}
+    bench: dict | None = None
+    benched = not cfg.mugge_bench_dir
     for attempt in range(RESTARTS + 1):
         server: dict = {}
 
@@ -1468,12 +1526,16 @@ def run_candidate(job: Job, name: str, path: str, inputs: list[str], problems: l
             if inputs and not answers:
                 start()
                 answers, tps = answer_all(system, inputs, limits(cfg)[0])
+            if not benched:
+                start()
+                emit(STAGE, msg=f"{name}: running MuggeBench")
+                bench, benched = mugge_bench(job, name), True
             code = None
             if problems:
                 emit(STAGE, msg=f"{name}: answering {len(problems)} code problems")
                 code = code_eval(job, name, problems, system, start=start, release=release, path=path)
             release()
-            return answers, tps, code, gpu
+            return answers, tps, code, gpu, bench
         except ServerDead as e:
             if attempt == RESTARTS:
                 raise
@@ -1497,7 +1559,7 @@ def run_stage(job: Job) -> None:
     system = system_prompt(spec)
     teacher_name = cfg.teacher.split("/")[-1]
     problems = code_problems(job, held) if cfg.code_eval_suites else []
-    if not inputs and not problems:
+    if not inputs and not problems and not cfg.mugge_bench_dir:
         raise RuntimeError("nothing to evaluate: no data/heldout.jsonl and no code_eval_suites")
     use_judge = bool(inputs) and bool(judge_key(cfg.judge_model)) and not DRY_RUN
     if inputs and not use_judge and not DRY_RUN:
@@ -1534,7 +1596,7 @@ def run_stage(job: Job) -> None:
         n = len(cands)
         for i, (name, c) in enumerate(cands.items()):
             emit(STAGE, pct=10 + 85 * i / n, msg=f"running {name}")
-            answers, tps, code, gpu = run_candidate(job, name, c["path"], inputs, problems, system)
+            answers, tps, code, gpu, bench = run_candidate(job, name, c["path"], inputs, problems, system)
             tps = tps or (code or {}).get("tok_s_vm")
             agree = score = None
             if inputs:
@@ -1545,7 +1607,7 @@ def run_stage(job: Job) -> None:
                 per = ", ".join(f"{k} {v['pass@1']:.0%}" for k, v in code["suites"].items() if "pass@1" in v)
                 emit(STAGE, pct=10 + 85 * (i + 0.9) / n, msg=f"{name}: pass@1 {per}")
             results[name] = {
-                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code, "gpu": gpu,
+                "agreement": agree, "judge": score, "tok_s_vm": tps, "code": code, "gpu": gpu, "mugge_bench": bench,
                 "samples": [{"input": a, "output": b, "reference": r} for a, b, r in list(zip(inputs, answers, refs))[:3]],
             }
 
@@ -1565,6 +1627,7 @@ def run_stage(job: Job) -> None:
         candidates.append({
             "name": name, "size_gb": c["size_gb"], "score": score,
             "agreement": r["agreement"], "judge_score": r["judge"], "code": r["code"],
+            "mugge_bench": r.get("mugge_bench"),
             "tok_s_est": tok_s_est, "tok_s_vm": r["tok_s_vm"], "gpu": r["gpu"],
             "meets_target": c["size_gb"] <= spec.target.max_size_gb and (tok_s_est or 0) >= spec.target.min_tok_s,
         })
