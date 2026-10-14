@@ -30,7 +30,7 @@ on but short, AGENT_TOKENS per call (then the answer is forced), so 40 agents st
   17-20 compression with Event Horizon's stages: BF16 GGUF and imatrix, the horizon PTQ
        map at BUDGET_GB, Block-AP, end-to-end KD from the bf16 agent, export
   21   agent eval of the shipped GGUF on llama-server
-  22   40 agents at once on one llama-server (16k context each, 8-bit KV cache)
+  22   40 agents at once on one llama-server (24k context each, 8-bit KV cache)
   23   upload
 
 Agent eval: MuggeBench (every bench ticket through the Mugge engine's own write, check
@@ -73,10 +73,10 @@ CODEBENCH = NVME / "codebench"
 SETUP_SUITES = ("livecodebench", "codecontests", "apps")  # each with its meta; multipl-e is checked by file
 LLAMA_BINS = ("llama-server", "llama-quantize", "llama-imatrix", "llama-perplexity", "libllama-perplexity-impl.so")
 
-AGENT_TOKENS = 4096  # thinking plus answer per call; a longer thinking is closed and the answer forced
+AGENT_TOKENS = 8192  # thinking plus answer per call; a longer thinking is closed and the answer forced
 LANGS = {"python": "python-utils", "c": "c-strings", "javascript": "javascript-utils", "typescript": "typescript-utils"}
 BUDGET_GB = 1.5  # the shipped GGUF, in 1e9 bytes
-SLOTS, SLOT_CTX = 40, 16384  # the serving check: 40 agents with 16k tokens each
+SLOTS, SLOT_CTX = 40, 24576  # the serving check: 40 agents with 24k tokens each (a ticket, then 8k of work)
 ROUND_PER_LANGUAGE, ROUND_SAMPLES = 600, 4
 BENCH = NVME / "muggebench"  # MuggeBench's projects: the public spike and the private dev set
 BENCH_TAR = Path.home() / "muggebench-dev.tar.gz"  # the dev set (bench-staging), copied here once
@@ -96,13 +96,13 @@ EVAL = {"teacher": STUDENT, "models_dir": str(MODELS), "code_eval_dir": str(CODE
 # Granite's card sampling for thinking (temperature 1.0, top_p 0.95, no top_k), as the eval
 DATA = {"teacher": TEACHER, "models_dir": str(MODELS), "code_eval_dir": str(CODEBENCH),
         "n_generate": 800, "n_heldout": 40, "data_thinking": True, "data_thinking_temperature": 1.0,
-        "thinking_top_k": 0, "data_answer_max_tokens": AGENT_TOKENS, "data_max_len": 12288,
+        "thinking_top_k": 0, "data_answer_max_tokens": AGENT_TOKENS, "data_max_len": AGENT_TOKENS + 8192,
         "data_harness_share": 1.0, "data_fix_rows": 300}
 CONTEST = {"data_contest_rows": 300, "data_contest_samples": 2, "data_contest_source": "codecontests",
            "data_contest_harness_share": 1.0}  # the Python job only
 SFT = {"teacher": TEACHER, "student": str(STUDENT_DIR), "models_dir": str(MODELS), "student_epochs": 2.0,
-       "student_lr": 1e-4, "heal_max_len": 8192, "student_max_minutes": 90}
-BLOCK = {"windows": 4096, "length": 1024, "epochs": 2, "lr": 1e-4}  # the agent's rows are ~1-4k tokens
+       "student_lr": 1e-4, "heal_max_len": AGENT_TOKENS + 8192, "student_max_minutes": 120}
+BLOCK = {"windows": 4096, "length": 1024, "epochs": 2, "lr": 1e-4}  # the agent's rows are ~1-12k tokens
 E2E = {"tokens": 20e6, "length": 8192, "max_minutes": 60}
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
                    "chat_template.json", "generation_config.json", "vocab.json", "merges.txt")
@@ -477,7 +477,8 @@ def run_pick(step: Step) -> None:
     dump(PICK, {"agent": name, "dir": str(sft_model(name)), "rows": str(sft_rows(name)), "by": by,
                 "scores": {"sft": sft, "round": rnd}})
     C.mkdir(parents=True, exist_ok=True)
-    sh(step, f"python -m stages.agent traces --hf {sft_model(name)} --rows {sft_rows(name)} --out {C / 'traces.jsonl'}")
+    sh(step, f"python -m stages.agent traces --hf {sft_model(name)} --rows {sft_rows(name)} "
+             f"--max-len {SFT['heal_max_len']} --out {C / 'traces.jsonl'}")
 
 
 def pick() -> dict:
@@ -615,29 +616,29 @@ def steps() -> list[Step]:
         Step("MuggeBench: Docker, Bun, sandbox images, bench", {"": 25}, run_bench_setup, bench_ready),
         Step("Granite 3B and 30B download", {"": 15}, run_download, downloaded, download_progress),
         Step("the teacher's rows from the bucket", {"": 2}, run_restore, lambda: (W / ".restored").exists()),
-        Step("agent eval: the 3B and the 30B", {"eval": 105},
+        Step("agent eval: the 3B and the 30B", {"eval": 130},
              lambda st: run_eval(st, "base", {"granite-3b": STUDENT_DIR, "granite-30b": TEACHER_DIR}),
              lambda: evaled("base")),
     ]
     for lang in LANGS:
-        s.append(Step(f"teacher data: {lang}", {"data": 40 if lang == "python" else 25},
+        s.append(Step(f"teacher data: {lang}", {"data": 60 if lang == "python" else 35},
                       lambda st, lang=lang: run_data(st, lang), lambda lang=lang: data_done(lang)))
     s += [
         Step("rows merged, the round's tasks", {"": 2}, run_merge, merged),
-        Step("SFT of the 3B", {"heal": 45}, lambda st: run_sft(st, "sft"), lambda: sft_done("sft")),
-        Step("agent eval: SFT", {"eval": 45}, lambda st: run_eval(st, "sft", {"sft": sft_model("sft")}),
+        Step("SFT of the 3B", {"heal": 60}, lambda st: run_sft(st, "sft"), lambda: sft_done("sft")),
+        Step("agent eval: SFT", {"eval": 55}, lambda st: run_eval(st, "sft", {"sft": sft_model("sft")}),
              lambda: evaled("sft")),
-        Step("loop round: the SFT model's own answers", {"eval": 25}, run_round, round_done),
-        Step("SFT with the round's rows", {"heal": 45}, lambda st: run_sft(st, "round", ROUND / "rows.jsonl"),
+        Step("loop round: the SFT model's own answers", {"eval": 35}, run_round, round_done),
+        Step("SFT with the round's rows", {"heal": 60}, lambda st: run_sft(st, "round", ROUND / "rows.jsonl"),
              lambda: sft_done("round")),
-        Step("agent eval: round", {"eval": 45}, lambda st: run_eval(st, "round", {"round": sft_model("round")}),
+        Step("agent eval: round", {"eval": 55}, lambda st: run_eval(st, "round", {"round": sft_model("round")}),
              lambda: evaled("round")),
         Step("pick the agent, its trace text", {"": 5}, run_pick, pick_done),
         Step(f"imatrix and PTQ map at {BUDGET_GB} GB", {"": 40}, run_imatrix_ptq, ptq_done),
         Step("Block-AP", {"": 20}, run_blockap, blockap_done),
         Step("end-to-end KD", {"": E2E["max_minutes"] + 5}, run_e2e, e2e_done),
         Step("export the GGUF", {"": 10}, run_export, export_done),
-        Step(f"agent eval: the {BUDGET_GB} GB GGUF", {"eval": 55},
+        Step(f"agent eval: the {BUDGET_GB} GB GGUF", {"eval": 70},
              lambda st: run_eval(st, "agent", {"agent": FINAL}), lambda: evaled("agent")),
         Step(f"{SLOTS} agents on one llama-server", {"": 10}, run_serve, SERVE.exists),
         Step("upload", {"": 10}, run_upload, lambda: (W / ".uploaded" / "done.json").exists()),

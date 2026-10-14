@@ -207,7 +207,7 @@ def test_the_list_and_the_time(cp, capsys):
     assert cp.main(["--list"]) == 0
     out = capsys.readouterr().out
     assert out.count("\n") == len(cp.steps()) + 1 and "40 agents on one llama-server" in out
-    assert sum(s.total for s in cp.steps()) < 13 * 60
+    assert sum(s.total for s in cp.steps()) < 15 * 60
 
 
 def test_no_dev_set_on_the_vm_or_in_the_bucket_stops_the_run_before_it_starts(cp, monkeypatch, capsys):
