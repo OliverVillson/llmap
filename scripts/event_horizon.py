@@ -26,8 +26,7 @@ preflight (its file within the budget, and 40 x its size <= R0) before Block-AP.
 Gates, coded as rules (gate0(), preflight(), screen_gate(), round_rule(), parity()) and
 written before any reading:
   Gate 0  after the original's reading: R0 >= 52, else stop
-  Gate 1  after the Block-AP dev screen: R0 x (dev retention) / GB >= 32, else stop
-          before any training and publish the curve
+  Gate 1  after the Block-AP dev screen: R0 x (dev retention) / GB, reported (no stop)
   rounds  an on-policy round is kept only if its held-out on-policy KL drops >= 5%,
           loop% and cap% rise by at most 2 SE, and paired held-out pass@1 falls by at
           most 2 SE; rounds stop after 2 in a row not kept, or after 4 (qat onpolicy
@@ -37,7 +36,7 @@ written before any reading:
   parity  the final export: bit-exact pack, every type as mapped, size within 0.5% of
           the estimate, llama.cpp KLD <= 0.01 nats/token and top-1 >= 98% against a
           BF16 GGUF of the same weights, llama-tokenize == HF
-  Gate 2  after the final dev screen: predicted R0 x retention / GB >= 38, else no record
+  Gate 2  after the final dev screen: predicted R0 x retention / GB, reported (no stop)
 A failed gate (or preflight, or parity) skips every step after it but the upload, which
 still runs: the run ends cleanly (exit 0), the summary says where and why it stopped
 (stop_line()), the curve is published, and --shutdown powers off under the same
@@ -157,8 +156,10 @@ VENVS = ("venv-vllm", "venv-train")
 GOAL_PTS_PER_GB = 40
 P1_GB, BUDGET_MAX_GB, BUDGET_KEPT = 1.172, 1.25, 0.85  # budget = max(P1, min(MAX, KEPT x R0 / 40))
 GATE0_MIN_R0 = 52.0
-GATE1_MIN_PTS_PER_GB = 32.0
-GATE2_MIN_PTS_PER_GB = 38.0
+# Gates 1 and 2 report their numbers but never stop the run (Oliver 2026-10-14: a lower
+# result per GB is fine; the run goes to the end). The verdict still holds it against 40.
+GATE1_MIN_PTS_PER_GB = 0.0
+GATE2_MIN_PTS_PER_GB = 0.0
 Z_ONE_SIDED = 1.645  # one-sided 95%
 K_BY_OUTCOME = {"none": 2, "mixed": 8, "all": 4}  # record answers by the original's 0/4, mixed, 4/4
 KEEP_KL_DROP, KEEP_SE = 0.05, 2.0

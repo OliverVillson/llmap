@@ -340,10 +340,11 @@ def test_screen_gates_bootstrap_and_paired(tmp_path, monkeypatch):
     m = load(tmp_path, monkeypatch)
     orig = {f"p{i}": [i % 3 != 0] * 2 for i in range(30)}
     half = {k: [v[0], False] for k, v in orig.items()}
-    g = m.screen_gate("gate1", 56.0, half, orig, 1.2, m.GATE1_MIN_PTS_PER_GB)
+    g = m.screen_gate("gate1", 56.0, half, orig, 1.2, 32.0)
     assert g["retention"] == pytest.approx(0.5) and g["predicted_pts_per_gb"] == pytest.approx(56 * 0.5 / 1.2, abs=1e-3)
     assert not g["pass"]
-    assert m.screen_gate("gate2", 56.0, orig, orig, 1.2, m.GATE2_MIN_PTS_PER_GB)["pass"]  # 46.7/GB
+    assert m.screen_gate("gate2", 56.0, orig, orig, 1.2, 38.0)["pass"]  # 46.7/GB
+    assert m.screen_gate("gate1", 56.0, half, orig, 1.2, m.GATE1_MIN_PTS_PER_GB)["pass"]  # report only
     lo, hi = m.bootstrap(orig)
     assert lo < m.score(orig) < hi and m.bootstrap(orig) == (lo, hi)  # seeded
     diff, se, n = m.paired(half, orig)
@@ -1205,6 +1206,8 @@ def test_a_gate_stop_on_one_b200_is_a_clean_finish_that_powers_off(tmp_path, mon
     exits 0, the summary says where and why it stopped, everything is in the bucket as it
     is on the disk, and --shutdown powers the B200 off under the fingerprint rule."""
     m = load(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "GATE1_MIN_PTS_PER_GB", 32.0)  # the stop thresholds, report-only since 2026-10-14
+    monkeypatch.setattr(m, "GATE2_MIN_PTS_PER_GB", 38.0)
     root, shell, downs, _ = one_b200(m, tmp_path, monkeypatch, GateShell(m, stop))
     assert m.main(["--session", "all", "--shutdown"]) == 0
     ran = {"gate0": MEASURE_KINDS[:14], "gate1": MEASURE_KINDS, "gate2": [*MEASURE_KINDS, *TRAIN_KINDS, *READ_KINDS[:4]]}
