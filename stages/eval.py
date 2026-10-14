@@ -1345,6 +1345,8 @@ def mugge_bench_command(job: Job, name: str, out: Path) -> list[str]:
         cmd += ["--top-k", str(cfg.thinking_top_k)]
     if cfg.mugge_bench_split:
         cmd += ["--split", cfg.mugge_bench_split]
+    if cfg.mugge_bench_tickets:
+        cmd += ["--tickets", str(cfg.mugge_bench_tickets)]
     return cmd
 
 

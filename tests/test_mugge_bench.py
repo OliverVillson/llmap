@@ -32,7 +32,9 @@ def test_command_targets_the_served_candidate_with_the_eval_sampling(tmp_path):
     assert flags["--bench"] == "/bench" and flags["--seeds"] == "2" and flags["--split"] == "dev"
     assert flags["--thinking"] == "on" and flags["--temperature"] == "1.0" and flags["--top-k"] == "64"
     # each call is capped as a code answer is, and the server's context fits a bench prompt over that
-    assert flags["--max-tokens"] == str(ev.call_max_tokens(j.config))
+    assert flags["--max-tokens"] == str(ev.call_max_tokens(j.config)) and "--tickets" not in cmd
+    quick = ev.mugge_bench_command(job(tmp_path / "q", mugge_bench_tickets=20), "x", tmp_path)
+    assert quick[quick.index("--tickets") + 1] == "20"
     assert ev.limits(j.config)[1] >= ev.call_max_tokens(j.config) + ev.BENCH_PROMPT_TOKENS
     off = ev.mugge_bench_command(job(tmp_path / "b", code_eval_temperature=0.2), "x", tmp_path)
     assert "--top-k" not in off and off[off.index("--thinking") + 1] == "off" and off[off.index("--temperature") + 1] == "0.2"

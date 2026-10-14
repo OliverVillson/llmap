@@ -17,7 +17,7 @@ on but short, AGENT_TOKENS per call (then the answer is forced), so 40 agents st
        bench (the public spike plus the private dev set from ~/muggebench-dev.tar.gz or
        the bucket), every ticket once with its reference answer to check the containers
   3-4  both models, and the teacher's rows from the bucket when an earlier VM made them
-  5    agent eval of the 3B as released and of the 30B teacher (the ceiling)
+  5    the 30B teacher (the ceiling) on 20 bench tickets, once
   6-9  teacher data, one job per language (stages/data.py): the 30B writes tasks with
        tests in Python, C, JavaScript and TypeScript, answers each as a Mugge ticket with
        short thinking and fixes failing drafts; the Python job adds CodeContests problems.
@@ -326,8 +326,8 @@ def eval_dir(name: str) -> Path:
     return W / "eval" / name
 
 
-def run_eval(step: Step, name: str, models: dict[str, Path]) -> None:
-    d = make_job(eval_dir(name), {**EVAL, "eval_candidates": {k: str(v) for k, v in models.items()}})
+def run_eval(step: Step, name: str, models: dict[str, Path], **over) -> None:
+    d = make_job(eval_dir(name), {**EVAL, **over, "eval_candidates": {k: str(v) for k, v in models.items()}})
     if not (d / ".done" / "eval").exists():
         sh(step, gpu(f"python pipeline.py --job {d} --only eval"))
 
@@ -616,8 +616,11 @@ def steps() -> list[Step]:
         Step("MuggeBench: Docker, Bun, sandbox images, bench", {"": 25}, run_bench_setup, bench_ready),
         Step("Granite 3B and 30B download", {"": 15}, run_download, downloaded, download_progress),
         Step("the teacher's rows from the bucket", {"": 2}, run_restore, lambda: (W / ".restored").exists()),
-        Step("agent eval: the 3B and the 30B", {"eval": 130},
-             lambda st: run_eval(st, "base", {"granite-3b": STUDENT_DIR, "granite-30b": TEACHER_DIR}),
+        # the teacher's ceiling, quickly: 20 bench tickets once, no code suites (Oliver: the
+        # unmodified models' own scores are not the point)
+        Step("agent eval: the 30B on 20 bench tickets", {"eval": 30},
+             lambda st: run_eval(st, "base", {"granite-30b": TEACHER_DIR}, code_eval_suites=[],
+                                 mugge_bench_seeds=1, mugge_bench_tickets=20),
              lambda: evaled("base")),
     ]
     for lang in LANGS:

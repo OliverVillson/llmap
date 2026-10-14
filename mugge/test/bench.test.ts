@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { checkBench } from '../bench/check.ts';
 import { findProjects, loadProject } from '../bench/load.ts';
 import { compare, summarize, type Row } from '../bench/report.ts';
-import { runBench } from '../bench/run.ts';
+import { firstTickets, runBench } from '../bench/run.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { OpenAICompatible } from '../src/engine/inference.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
@@ -136,4 +136,11 @@ describe('bench report', () => {
     const a = compare(runs(100).build, runs(100).ref), b = compare(runs(100).build, runs(100).ref);
     expect(a.ratioCI).toEqual(b.ratioCI);
   });
+});
+
+test('a quick run takes tickets in turn from each project, in plan order', () => {
+  const p = (name: string, ids: string[]) => ({ ...loadProject(join(MINI, 'calc'), name), tickets: ids.map((id) => ({ ...loadProject(join(MINI, 'calc')).tickets[0], key: `${name}/${id}` })) });
+  const got = firstTickets([p('a', ['1', '2', '3']), p('b', ['1']), p('c', ['1', '2'])], 5);
+  expect(got.flatMap((x) => x.tickets.map((t) => t.key))).toEqual(['a/1', 'a/2', 'a/3', 'b/1', 'c/1', 'c/2'].filter((k) => k !== 'a/3'));
+  expect(firstTickets([p('a', ['1'])], 9).flatMap((x) => x.tickets).length).toBe(1);
 });

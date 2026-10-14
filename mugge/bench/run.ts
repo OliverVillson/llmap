@@ -9,7 +9,7 @@
  *   options: --seeds 3, --concurrency 16, --sandbox local|podman|docker, --temperature 0.6,
  *            --top-p 0.95, --top-k 20, --thinking on|off, --gpus 1, --name <label>,
  *            --filter <text in project/ticket>, --split dev|test, --transcripts, --fake,
- *            --max-tokens <most tokens one model call may write>
+ *            --max-tokens <most tokens one model call may write>, --tickets <n: a quick run on n tickets>
  *
  * Writes <out>/results.jsonl (one row per ticket and seed), <out>/report.json and, with
  * --transcripts, <out>/transcripts.jsonl.
@@ -145,6 +145,14 @@ function fakeSolutions(projects: BenchProject[]): Record<string, WorkerOutput> {
   return out;
 }
 
+/** n tickets taken in turn from each project, in plan order: a quick run that still spans every project. */
+export function firstTickets(projects: BenchProject[], n: number): BenchProject[] {
+  const keep = new Set<string>();
+  for (let i = 0; keep.size < n && projects.some((p) => i < p.tickets.length); i++)
+    for (const p of projects) if (i < p.tickets.length && keep.size < n) keep.add(p.tickets[i].key);
+  return projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => keep.has(t.key)) })).filter((p) => p.tickets.length);
+}
+
 if (import.meta.main) {
   const { values } = parseArgs({
     options: {
@@ -153,7 +161,7 @@ if (import.meta.main) {
       temperature: { type: 'string' }, 'top-p': { type: 'string' }, 'top-k': { type: 'string' },
       thinking: { type: 'string' }, gpus: { type: 'string' }, name: { type: 'string' }, filter: { type: 'string' },
       split: { type: 'string' }, transcripts: { type: 'boolean' }, fake: { type: 'boolean' }, timeout: { type: 'string' },
-      'max-tokens': { type: 'string' },
+      'max-tokens': { type: 'string' }, tickets: { type: 'string' },
     },
   });
   if (!values.bench || !values.out) {
@@ -166,6 +174,7 @@ if (import.meta.main) {
     const f = values.filter;
     projects = projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.key.includes(f)) })).filter((p) => p.tickets.length);
   }
+  if (values.tickets) projects = firstTickets(projects, Number(values.tickets));
   const fake = values.fake ? startFakeModel({ solutions: fakeSolutions(projects) }) : null;
   const cfg = inferenceFromEnv();
   const thinking = values.thinking ?? 'on';

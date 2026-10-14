@@ -149,6 +149,7 @@ class Config:
     mugge_bench_concurrency: int = 16
     mugge_bench_split: str = "test"  # "dev" while debugging the runner; "" = every project
     mugge_bench_sandbox: str = "podman"  # podman | docker | local
+    mugge_bench_tickets: int = 0  # > 0: a quick run on that many tickets, taken in turn from each project
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
     # so a top-k test needs no rebuild.
