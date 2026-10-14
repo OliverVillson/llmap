@@ -55,6 +55,7 @@ def fake_bucket(m, tmp_path, monkeypatch, login=True):
 
     monkeypatch.setattr(m, "evroc_copy", copy)
     monkeypatch.setattr(m, "evroc_ok", lambda: login)
+    monkeypatch.setattr(m, "GET_RETRY_S", 0)
     return root / "mugge-library" / "horizon" / "t1"
 
 
@@ -697,6 +698,57 @@ def test_a_new_vm_gets_the_runs_code_suites_from_the_bucket_never_a_fresh_fetch(
     with pytest.raises(RuntimeError, match="do not check out"):
         m.run_setup(m.Step("VM setup", {"": 1}, None))
     assert "SKIP_SUITES=1 " in shell.calls[-1]
+
+
+def test_restore_puts_the_pinned_suites_back_when_a_flaky_read_kept_a_fresh_fetch(tmp_path, monkeypatch):
+    """2026-10-14 (mighty-fox-wsze): the setup's read of the pin failed, so the VM fetched
+    its own suites, which the pin refuses. The restore step leaves the run's pinned copy on
+    the disk even when its own first read of the pin fails too, and the setup's read of the
+    pin is tried again before it gives up."""
+    m = load(tmp_path, monkeypatch)
+    fake_bucket(m, tmp_path, monkeypatch)
+    bench(m)
+    data = b'{"id": "session 1"}\n'
+    (m.CODEBENCH / "livecodebench.jsonl").write_bytes(data)
+    meta = json.loads((m.CODEBENCH / "livecodebench.meta.json").read_text())
+    (m.CODEBENCH / "livecodebench.meta.json").write_text(json.dumps({**meta, "file_sha256": hashlib.sha256(data).hexdigest()}))
+    assert m.upload_art(m.codebench_art())
+
+    new_vm(m)
+    shell = SetupShell(m)
+    monkeypatch.setattr(m, "sh", shell)
+    copy, reads = m.evroc_copy, []
+
+    def flaky_copy(src, dst):  # the pin's manifest reads as a 500 twice, then comes back
+        if src.endswith("codebench/pinned/manifest.json"):
+            reads.append(src)
+            if len(reads) <= 2:
+                return False
+        return copy(src, dst)
+
+    monkeypatch.setattr(m, "evroc_copy", flaky_copy)
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert len(reads) >= 3 and "SKIP_SUITES=1 " in shell.calls[-1] and m.lcb_meta()["sha"] == "lcbsha"
+    monkeypatch.setattr(m, "evroc_copy", copy)
+
+    new_vm(m)
+    pinned = m.codebench_pinned
+    monkeypatch.setattr(m, "codebench_pinned", lambda tmp: False)  # every read failed at setup
+    m.run_setup(m.Step("VM setup", {"": 1}, None))
+    assert m.lcb_meta()["sha"] == "lcbsha-NEW"
+    monkeypatch.setattr(m, "codebench_pinned", pinned)
+    restore, flaked = m.restore_art, []
+
+    def flaky(art, session):
+        if art.slug == "codebench" and not flaked:
+            flaked.append(art.slug)
+            return None
+        return restore(art, session)
+
+    monkeypatch.setattr(m, "restore_art", flaky)
+    m.run_restore(m.Step("restore", {"": 1}, None), "measure")
+    assert flaked and m.lcb_meta()["sha"] == "lcbsha"
+    assert (m.CODEBENCH / "livecodebench.jsonl").read_bytes() == data and m.in_sync(m.codebench_art())
 
 
 def test_setup_vm_reruns_keep_the_venvs_the_first_run_built():

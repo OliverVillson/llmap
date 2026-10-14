@@ -409,7 +409,7 @@ def _slice_weights(src: Path, out: Path, kept: list[int], old_v: int, tied: bool
     else:
         raise FileNotFoundError(f"no safetensors weights in {src} (only safetensors checkpoints can be trimmed)")
     rows = torch.tensor(kept, dtype=torch.long)
-    sliced, total = [], 0
+    sliced, total, where = [], 0, {}
     for shard in shards:
         tensors = {}
         with safe_open(src / shard, "pt") as f:
@@ -424,13 +424,15 @@ def _slice_weights(src: Path, out: Path, kept: list[int], old_v: int, tied: bool
                 elif t.dim() and t.shape[0] == old_v:
                     raise ValueError(f"{name} has vocab-sized rows ({old_v}) and is not a known vocab tensor")
                 tensors[name] = t
+                where[name] = shard
                 total += t.numel() * t.element_size()
         save_file(tensors, str(out / shard), metadata=meta)
     if not any(n.endswith("embed_tokens.weight") for n in sliced) or \
             (not tied and not any(n.endswith("lm_head.weight") for n in sliced)):
         raise ValueError(f"expected the embedding{'' if tied else ' and the head'} among the cut tensors, got {sliced}")
     if idx is not None:
-        idx = {**idx, "metadata": {**idx.get("metadata", {}), "total_size": total}}
+        # the map of where each tensor went, not the source's: a Hub index can be wrong
+        idx = {**idx, "metadata": {**idx.get("metadata", {}), "total_size": total}, "weight_map": dict(sorted(where.items()))}
         (out / index.name).write_text(json.dumps(idx, indent=2) + "\n")
     return sliced
 

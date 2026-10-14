@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from stages import kquant
+from stages._util import weight_files
 from stages.sft import log
 
 SIZE_TOL = 0.005  # |file - estimate| / estimate allowed by expect_gb
@@ -106,14 +107,7 @@ class _HF:
     """Tensors of an HF checkpoint's safetensors, read one at a time as float32 numpy."""
 
     def __init__(self, hf_dir: Path):
-        index = hf_dir / "model.safetensors.index.json"
-        if index.exists():
-            self.file = {k: hf_dir / v for k, v in json.loads(index.read_text())["weight_map"].items()}
-        else:
-            from safetensors import safe_open
-            one = hf_dir / "model.safetensors"
-            with safe_open(str(one), "pt") as f:
-                self.file = {k: one for k in f.keys()}
+        self.file = weight_files(hf_dir)  # from the shards' headers: a Hub index can be wrong
 
     def __contains__(self, name: str) -> bool:
         return name in self.file

@@ -260,3 +260,29 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def safetensors_keys(path: Path) -> list[str]:
+    """The tensor names in a safetensors file's header (8-byte length, then JSON)."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        head = json.loads(f.read(n))
+    return [k for k in head if k != "__metadata__"]
+
+
+def weight_files(hf_dir: str | Path) -> dict[str, Path]:
+    """{tensor name: the safetensors file holding it}, from each file's own header. The
+    index only names the files: its name -> file map is not used, because the Hub's for
+    Granite 4.2 3B puts model.layers.4.self_attn.k_proj.weight in a shard that does not
+    hold it (2026-10-14; convert_hf_to_gguf, vLLM and transformers read every shard's keys
+    and never notice)."""
+    d = Path(hf_dir)
+    index = d / "model.safetensors.index.json"
+    files = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else ["model.safetensors"]
+    where: dict[str, Path] = {}
+    for f in files:
+        for k in safetensors_keys(d / f):
+            if k in where:
+                raise ValueError(f"{k} is in both {where[k].name} and {f} of {d}")
+            where[k] = d / f
+    return where

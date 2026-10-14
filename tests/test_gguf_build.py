@@ -187,6 +187,41 @@ def test_llama_quantize_output_read_back_and_rebuilt_is_the_same_bytes(tiny, tmp
     assert abs(rep["bytes"] - q.stat().st_size) < 0.01 * q.stat().st_size
 
 
+def _reshard(hf: Path, out: Path, lie: bool) -> Path:
+    """hf's weights in two shards; with lie, an index that puts every layer-1 tensor in the
+    wrong shard (the names it lists are right), as the Hub's index for Granite 4.2 3B did."""
+    import json
+
+    from safetensors.torch import load_file, save_file
+    shutil.copytree(hf, out)
+    w = load_file(str(out / "model.safetensors"))
+    (out / "model.safetensors").unlink()
+    names = sorted(w)
+    files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    where = {n: files[i % 2] for i, n in enumerate(names)}
+    for f in files:
+        save_file({n: w[n] for n in names if where[n] == f}, str(out / f), metadata={"format": "pt"})
+    told = {n: (files[1 - files.index(f)] if lie and ".layers.1." in n else f) for n, f in where.items()}
+    (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": told}))
+    return out
+
+
+def test_weights_are_found_by_the_shards_headers_not_the_index(tiny, tmp_path):
+    """A wrong index (2026-10-14: the shard it named lacked blk.4.attn_k) no longer stops
+    read_kq or build: tensors are looked up where the shards say they are."""
+    from stages._util import weight_files
+    hf = _reshard(tiny["hf"], tmp_path / "lying", lie=True)
+    where = weight_files(hf)
+    assert {n: p.name for n, p in where.items()} != __import__("json").loads(
+        (hf / "model.safetensors.index.json").read_text())["weight_map"]
+    q = llama_quantize(tiny["hf"], tmp_path, tiny["llama_cpp"], imatrix=False)
+    want = GB.read_kq(q, tiny["hf"], gguf)
+    got = GB.read_kq(q, hf, gguf)
+    assert set(got) == set(want)
+    for name in want:
+        assert torch.equal(K.dequant(got[name]), K.dequant(want[name])), name
+
+
 def test_build_refuses_a_partial_or_wrong_replacement(tiny, tmp_path, fast_convert):
     hf, lc = tiny["hf"], tiny["llama_cpp"]
     good = packed(tiny["kqs"])

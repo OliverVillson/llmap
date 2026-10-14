@@ -312,6 +312,28 @@ def test_trimmed_model_logits_equal_the_originals_on_kept_ids(tmp_path, tie):
     assert abs(nll - direct) < 1e-3
 
 
+def test_trim_writes_where_each_tensor_is_not_the_sources_index(tmp_path):
+    """A source index that names the wrong shard (the Hub's Granite 4.2 3B index did) is
+    not copied: the trimmed checkpoint's index says where each tensor was written."""
+    from safetensors.torch import load_file, save_file
+
+    from stages._util import weight_files
+    src, out = tmp_path / "src", tmp_path / "out"
+    toy(src, tie=False)
+    w = load_file(str(src / "model.safetensors"))
+    (src / "model.safetensors").unlink()
+    names = sorted(w)
+    files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for i, f in enumerate(files):
+        save_file({n: w[n] for n in names[i::2]}, str(src / f), metadata={"format": "pt"})
+    lie = {n: files[(i + 1) % 2] for i, n in enumerate(names)}  # every tensor in the other shard
+    (src / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": lie}))
+    vocab.trim(src, out, code_kept(src))
+    told = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+    assert told == {n: p.name for n, p in weight_files(out).items()}
+    assert told == {n: files[i % 2] for i, n in enumerate(names)}
+
+
 # ---------- usage counts and the model gates ----------
 
 def write_bench(d, tok):

@@ -1220,6 +1220,20 @@ def get(key: str, dst: Path) -> bool:
     return True
 
 
+GET_RETRY_S = 10  # get_tries waits this, then twice this, between its tries
+
+
+def get_tries(key: str, dst: Path, tries: int = 3) -> bool:
+    """get, tried again on a failure: for reads whose answer decides what the run uses
+    (evroc answers some reads of a present key with a 500, as it does a missing key)."""
+    for k in range(tries):
+        if get(key, dst):
+            return True
+        if k + 1 < tries:
+            time.sleep(GET_RETRY_S * (k + 1))
+    return False
+
+
 @dataclass
 class Art:
     """A step's outputs: uploaded to horizon/<run>/<slug>/<key>/ and restored from there.
@@ -1456,7 +1470,7 @@ def run_setup(step: Step) -> None:
 def codebench_pinned(tmp: Path) -> bool:
     """The bucket holds the run's code suites, uploaded complete."""
     man = tmp / "codebench.manifest.json"
-    return bool(evroc_ok() and get(bucket("codebench", "pinned", "manifest.json"), man)
+    return bool(evroc_ok() and get_tries(bucket("codebench", "pinned", "manifest.json"), man)
                 and (load(man) or {}).get("complete", True))
 
 
@@ -1539,6 +1553,12 @@ def run_restore(step: Step, session: str) -> None:
         if how:
             got.append(f"{art.slug} ({how})")
     above("    restored: " + (", ".join(got) if got else "nothing"))
+    # Every reading must score the run's one copy of the suites: when the bucket pins one
+    # and the disk does not hold it (a flaky read in run_setup or above kept this VM's own
+    # fetch, 2026-10-14), it is restored again, or the step fails.
+    if not in_sync(codebench_art()) and codebench_pinned(W / ".uploads" / "tmp"):
+        restore_codebench()
+        above("    restored: the run's pinned code suites over this VM's own fetch")
     bad = codebench_problems()
     if bad:
         raise RuntimeError("the code suites on the NVMe are not whole: " + "; ".join(bad))
