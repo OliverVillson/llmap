@@ -9,6 +9,7 @@
 # SKIP_EXTRAS=1 leaves out Node/TypeScript, llm-compressor and Aider Polyglot, and
 # fetches only the livecodebench, codecontests and apps suites: ~15-20 minutes less
 # per boot, which a B200 pays for by the minute.
+# SKIP_POLYGLOT=1 keeps the extras but leaves out Aider Polyglot (its Docker image build).
 # SKIP_SUITES=1 fetches no code suite: the caller restores them from the bucket once the
 # NVMe is mounted (scripts/event_horizon.py, after the first session's fetch).
 # TEACHER_REVISION: the revision the teacher is downloaded at (default: the hub's main).
@@ -27,6 +28,7 @@ STUDENT=${STUDENT-google/gemma-4-E4B-it}  # STUDENT= (empty) skips it
 TEACHER_REVISION=${TEACHER_REVISION:-}
 SKIP_EXTRAS=${SKIP_EXTRAS:-}
 SKIP_SUITES=${SKIP_SUITES:-}
+SKIP_POLYGLOT=${SKIP_POLYGLOT:-}
 CONSTRAINTS=${CONSTRAINTS:-}
 if [ -n "${UV_EXCLUDE_NEWER:-}" ]; then export UV_EXCLUDE_NEWER; fi
 # The llama.cpp commit everything GGUF comes from: llama-quantize's formats and type
@@ -285,8 +287,10 @@ say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"
 
 if [ -z "$SKIP_EXTRAS" ]; then
-  say "Aider Polyglot: docker, the pinned aider and polyglot-benchmark, aider's benchmark image"
-  # scripts/polyglot.py setup is idempotent; the image build takes ~15 minutes the first time.
-  NVME="$NVME" "$NVME/venv-train/bin/python" "$REPO/scripts/polyglot.py" setup \
-    || echo 'WARNING: Polyglot setup failed; re-run `python scripts/polyglot.py setup` before `polyglot.py run`'
+  if [ -z "$SKIP_POLYGLOT" ]; then
+    say "Aider Polyglot: docker, the pinned aider and polyglot-benchmark, aider's benchmark image"
+    # scripts/polyglot.py setup is idempotent; the image build takes ~15 minutes the first time.
+    NVME="$NVME" "$NVME/venv-train/bin/python" "$REPO/scripts/polyglot.py" setup \
+      || echo 'WARNING: Polyglot setup failed; re-run `python scripts/polyglot.py setup` before `polyglot.py run`'
+  fi
 fi

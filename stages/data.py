@@ -47,7 +47,6 @@ from dataclasses import dataclass
 from common.progress import emit
 from stages import codebench, harness, sandbox, testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
-from stages.taskdata import GEMMA4_THINK, think_tags
 
 STAGE = "data"
 N_SCENARIOS = int(os.environ.get("LOBBOT_DATA_SCENARIOS", 40))
@@ -289,15 +288,13 @@ class Teacher:
         self.llm = LLM(model=model_path, max_model_len=max_len, gpu_memory_utilization=GPU_UTIL,
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
-        # Gemma 4's thought channel opens and closes with special tokens, which the
-        # decoded text drops unless told to keep them; split_think needs them.
-        template = getattr(self.llm.get_tokenizer(), "chat_template", None)
-        self.keep_special = isinstance(template, str) and think_tags(template) == GEMMA4_THINK
-
     def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int, thinking: bool = False) -> list[Gen]:
+        # Thinking markers can be special tokens (Gemma 4's thought channel; Granite's
+        # <think> tags may be), which the decoded text drops unless told to keep them, and
+        # split_think needs them. vLLM leaves the stop token out of the text either way.
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
                                  max_tokens=max_tokens, **({"top_k": self.top_k} if thinking else {}),
-                                 **({"skip_special_tokens": False} if thinking and self.keep_special else {}))
+                                 **({"skip_special_tokens": False} if thinking else {}))
         try:  # Qwen3 hybrid checkpoints: no <think> unless asked; Instruct-2507 ignores the flag
             res = self.llm.chat(convs, sp, use_tqdm=False, chat_template_kwargs={"enable_thinking": thinking})
         except TypeError:
