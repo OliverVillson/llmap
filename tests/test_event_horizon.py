@@ -1463,3 +1463,31 @@ def test_every_command_line_parses_in_the_stage_it_calls(tmp_path, monkeypatch, 
             "scripts/event_horizon.py rescore"} <= seen
     assert any(t == "scripts/thinking_report.py" for t, _ in calls)
     assert any(t == "scripts/event_horizon.py" and a[:1] == ["smoke"] for t, a in calls)
+
+
+@pytest.mark.parametrize("rc", [0, 3])
+def test_server_scripts_end_with_their_last_commands_status_and_stop_the_server(tmp_path, monkeypatch, rc):
+    """The smoke's and gen's wrappers under set -e: a stub vLLM that never exits, a stub
+    curl that says healthy, and a last command that exits rc. The EXIT trap's KILL of a
+    group already gone used to turn rc 0 into exit 1 (step 5's (a+d) on the B200)."""
+    from stages.ternary import gen_command
+    m = load(tmp_path, monkeypatch)
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    pidfile = tmp_path / "server.pid"
+    (stub / "py").write_text(f"#!/bin/bash\necho $$ > {pidfile}\nexec sleep 300\n")
+    (stub / "curl").write_text("#!/bin/bash\nexit 0\n")
+    (stub / "python").write_text(f"#!/bin/bash\nexit {rc}\n")  # gen's last command
+    for f in stub.iterdir():
+        f.chmod(0o755)
+    env = {**os.environ, "LOBBOT_VLLM_PY": str(stub / "py"), "PATH": f"{stub}:{os.environ['PATH']}"}
+    env.pop("LOBBOT_VLLM_ATTN_BACKEND", None)
+    scripts = {"smoke": "set -e\n" + m.vllm_script(tmp_path / "hf", 8199, tmp_path / "vllm.log", f"exit {rc}"),
+               "gen": gen_command(str(tmp_path / "hf"), "/b", tmp_path / "w" / "traces.jsonl", 8e6, port=8199)}
+    for name, script in scripts.items():
+        pidfile.unlink(missing_ok=True)
+        r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
+        assert r.returncode == rc, (name, r.stdout, r.stderr)
+        pid = int(pidfile.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)

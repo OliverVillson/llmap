@@ -542,8 +542,10 @@ def vllm_script(model: Path, port: int, log: Path, then: str, seqs: int = 32) ->
         f"--host 127.0.0.1 --port {port} --max-model-len 22528 --max-num-seqs {seqs} --kv-cache-dtype fp8 "
         "${LOBBOT_VLLM_ATTN_BACKEND:+--attention-backend $LOBBOT_VLLM_ATTN_BACKEND} "
         f"--gpu-memory-utilization 0.9 > {log} 2>&1 & srv=$!",
-        "trap 'kill -TERM -- -$srv 2>/dev/null; for i in $(seq 30); do kill -0 $srv 2>/dev/null || break; sleep 1; "
-        "done; kill -KILL -- -$srv 2>/dev/null; true' EXIT",
+        # set +e: under the caller's set -e, the KILL of a group already gone would end the
+        # trap, and so the script, with exit 1 after `then` succeeded.
+        "trap 'set +e; kill -TERM -- -$srv 2>/dev/null; for i in $(seq 30); do kill -0 $srv 2>/dev/null || break; "
+        "sleep 1; done; kill -KILL -- -$srv 2>/dev/null; true' EXIT",
         f"for i in $(seq 240); do curl -sf http://127.0.0.1:{port}/health >/dev/null && break; "
         f"kill -0 $srv 2>/dev/null || {{ tail -50 {log}; exit 1; }}; sleep 5; done",
         f"curl -sf http://127.0.0.1:{port}/health >/dev/null || {{ echo 'vLLM not healthy after 20 min'; "
@@ -1798,8 +1800,16 @@ def run_smoke(step: Step, kind: str) -> None:
     def bucket_probe() -> None:
         probe, back = S / "probe.bin", S / "probe.back"
         probe.write_bytes(os.urandom(1024))
+        back.unlink(missing_ok=True)
         key = bucket("smoke", S.name, "probe.bin")
-        if not (put(probe, key) and get(key, back) and back.read_bytes() == probe.read_bytes()):
+        # get tries once (a read doubles as an existence probe); this object is there, and
+        # evroc has answered reads with a 500 now and then, so the read back gets 3 tries.
+        ok = put(probe, key)
+        for k in range(3 if ok else 0):
+            if get(key, back):
+                break
+            time.sleep(10 * (k + 1))
+        if not (ok and back.exists() and back.read_bytes() == probe.read_bytes()):
             raise RuntimeError("smoke (h): a 1 KB upload to the bucket and back failed (evroc login?)")
 
     # (b) first: if the template adds text next to our system message, or opens the answer

@@ -219,8 +219,10 @@ def gen_command(model_dir: str, problems: str, out: Path, tokens: float, *, port
         f"--max-num-seqs {seqs} --kv-cache-dtype fp8 --gpu-memory-utilization {gpu_util} "
         "${LOBBOT_VLLM_ATTN_BACKEND:+--attention-backend $LOBBOT_VLLM_ATTN_BACKEND} "
         f"--enable-prefix-caching > {log_path} 2>&1 & gen=$!",
-        "trap 'kill -TERM -- -$gen 2>/dev/null; for i in $(seq 30); do kill -0 $gen 2>/dev/null || break; sleep 1; "
-        "done; kill -KILL -- -$gen 2>/dev/null; true' EXIT",
+        # set +e: under set -e, the KILL of a group already gone would end the trap, and so
+        # the script, with exit 1 after gen succeeded.
+        "trap 'set +e; kill -TERM -- -$gen 2>/dev/null; for i in $(seq 30); do kill -0 $gen 2>/dev/null || break; "
+        "sleep 1; done; kill -KILL -- -$gen 2>/dev/null; true' EXIT",
         f"for i in $(seq {health_minutes * 12}); do curl -sf http://127.0.0.1:{port}/health >/dev/null && break; "
         f"kill -0 $gen 2>/dev/null || {{ tail -50 {log_path}; exit 1; }}; sleep 5; done",
         f"curl -sf http://127.0.0.1:{port}/health >/dev/null || "
