@@ -36,19 +36,27 @@ Run them in order: `s1`, then `laptop` and `eval` (at the same time on two lapto
 
 ## Before a run
 
-- **Every machine:**
-  - Python 3.12 or newer, and bun (the engine and its bench live in `mugge/`).
-  - Network access to the bucket: `evroc login --oidc-port 8765`. To use a local folder instead, set `BH_BUCKET=/some/dir`.
-- **GPU boxes (B200, the 4060):**
-  - The `setup` stage runs `scripts/setup_vm.sh` with exact pins: vLLM 0.31.0, transformers 5.x, the llama.cpp commit and UV_EXCLUDE_NEWER.
-  - It also builds MuggeBench's sandbox images and does a boot dry-run of the teacher ladder.
-  - A B200 refuses to start a paid session when a pin is loose.
-  - On the 4060, run `NVME=<dir> SKIP_POLYGLOT=1 bash scripts/setup_vm.sh` once yourself.
-- **Data:** bhdata, BlackHole's kit library.
-  - Set `BHDATA` to its package directory (the folder holding `llmap.py`), unless it sits at `/mnt/project-files/blackhole/data/bhdata`, `~/blackhole/data/bhdata` or `~/bhdata`.
-- **Score on the Mac:** set `MUGGEBENCH_SH` to MuggeBench's `muggebench.sh`. Without it, score runs `mugge/bench/run.ts` on the dev set given by `--set score_bench=DIR`.
+Check the plumbing first. It needs only `python3` (3.10 or newer), `bash` and `tar`, and no GPU, models, bun or bucket:
 
-To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_run.py g0 --dry-run /tmp/bh-dry`. Running `s1`, `laptop`, `eval` and `s2` in turn with the same DIR exercises the real hand-over.
+```
+git clone -b claude/centipede-train-pipeline https://github.com/OliverVillson/llmap && cd llmap
+python3 scripts/bh_run.py g0 --dry-run /tmp/bh-dry
+for p in s1 laptop eval s2; do python3 scripts/bh_run.py $p --dry-run /tmp/bh-dry2; done   # the hand-over
+```
+
+Then, once per machine:
+
+- **The bucket (every machine):** `evroc login --oidc-port 8765`. Every machine of a run must use the same bucket. On one machine you can use a local folder instead: `export BH_BUCKET=/some/dir`.
+- **The B200:** nothing. The `setup` stage runs `scripts/setup_vm.sh` with exact pins (vLLM 0.31.0, transformers 5.x, the llama.cpp commit, UV_EXCLUDE_NEWER), builds MuggeBench's sandbox images and boot-checks the teacher ladder. It refuses to start a paid session when a pin is loose. Run the profile inside `tmux`, so a dropped ssh does not stop it.
+- **Each laptop (the 4060 and the second one; Ubuntu or WSL2 with an NVIDIA GPU):** clone into the Linux home (`~/llmap`, not `/mnt/c/...`), then run these once:
+  ```
+  NVME=~/bh NVME_LOCAL=1 SKIP_EXTRAS=1 TEACHER=Qwen/Qwen3.5-2B STUDENT=Qwen/Qwen3.5-0.8B bash scripts/setup_vm.sh
+  curl -fsSL https://bun.sh/install | bash
+  cd mugge && ENGINE=docker bash sandbox/build.sh && cd ..   # the bench's sandbox images (needs docker)
+  ```
+  The first line builds llama.cpp and the two venvs in `~/bh` (the harness's default `NVME` on a laptop) and downloads the G0 models. Do not run `scripts/setup_muggebench.sh` on a laptop: it is for the VMs and resets Docker's storage.
+- **Data (the `data` stage, on the B200 or for G0):** bhdata, BlackHole's kit library. Set `BHDATA` to its package directory (the folder holding `llmap.py`), unless it is at `/mnt/project-files/blackhole/data/bhdata`, `~/blackhole/data/bhdata` or `~/bhdata`.
+- **Scoring on the Mac:** set `MUGGEBENCH_SH` to MuggeBench's `muggebench.sh`, and run `python3 scripts/bh_run.py eval`. Without it, `score` runs `mugge/bench/run.ts` against llama-server, on the spike or on the dev set given by `--set score_bench=DIR`.
 
 ## Stages
 
@@ -61,7 +69,7 @@ To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_
 | sft | full FT (LoRA on G0) with masked prompts and top-20 logit KL on the Qwen path | `W/sft/sft/model/` |
 | smoke | the bf16 student on the 15 public spike tickets (llama-server BF16 GGUF when vLLM can't load it) | `W/smoke/sft/smoke.json` |
 | export | vocab cut, BF16 GGUF, imatrix on training-shaped text, the quant ladder | `W/export/<student>/` |
-| footprint | each quant's llama.cpp footprint (one 16K q8 slot after a 12K prompt); the best that fits 2 GB ships | `W/ship/BH<v>-<GB>.gguf`, `W/footprint/` |
+| footprint | each quant's llama.cpp footprint (one 16K q8 slot after a 12K prompt); the best that fits 2 GB ships | `W/ship/<student>/BH<v>-<GB>.gguf`, `W/footprint/` |
 | score | MuggeBench through `muggebench.sh`, else `bench/run.ts`: mean per-ticket solve rate with a 95% CI | `W/score/<student>/score.json` |
 | round2-sample | the student answers held-out tickets (laptop GGUF or B200 bf16), transcripts kept | `W/round2/samples/` |
 | round2-repair | `data.py repair-requests`, then `answer` (the teacher, through the proxy), `repair`, `rft` and `build --round 2` | `W/rows/train-round2.jsonl` |
@@ -70,19 +78,20 @@ To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_
 ## Running unattended
 
 - **Resume:**
-  - A stage whose output exists is skipped, so rerunning the same command continues where it stopped.
-  - Teacher answers resume per shard, and the SFT resumes from its checkpoint.
+  - A stage whose output exists is skipped, so rerunning the same command continues where it stopped, also after a crash or a kill.
+  - Teacher answers resume per shard, the SFT from its checkpoint, the export per file.
   - Inputs another machine made are fetched from the bucket.
-- **Exit code:** 0 when every stage finished or was skipped, and non-zero when a required stage failed. Optional steps (vocab cut, tokenizer check, smoke bench) report and carry on. There are no prompts.
-- **Uploads:** after every step, and when the run ends however it ends, `results-<profile>.tar` (everything small, plus the logs) and the files later machines need go to `bucket://mugge-library/blackhole/<run>/`.
-- **Shutdown:** `--shutdown` powers a VM off only after a clean finish with everything uploaded.
+  - To redo a finished stage, delete its folder under W (the table above). `score` reruns by itself when a new GGUF ships.
+- **Exit code:** 0 when every stage finished or was skipped, and non-zero when a required stage failed. Optional steps (vocab cut, tokenizer checks, bhdata's free rows, the smoke) report and carry on. There are no prompts.
+- **Uploads:** after every step, and when the run ends however it ends (a failure, Ctrl-C, a kill or a dropped ssh), `results-<profile>.tar` (everything small, plus the logs) and the files later machines need go to `bucket://mugge-library/blackhole/<run>/`. A hand-over file that fails to upload is retried, in order, after every later step and by the next run; `status` lists any that are still waiting.
+- **Shutdown:** `--shutdown` powers a VM off only after a clean finish whose last upload went through.
 - **Gates that decide on their own:**
   - **G2:** the first teacher of the ladder that solves at least 55% of 200 kit tickets at 250 answers/min or more within 15 minutes is used. Otherwise the next teacher is tried, and the run stops when none passes. The ladder is Qwen3.8-27B-NVFP4, then Qwen3.6-35B-A3B-NVFP4, then Qwen3.6-35B-A3B-FP8.
   - **Smoke:** a student that writes no files is BROKEN, and export refuses it unless you pass `--force`.
-  - **Session clock:** on a B200, a step that cannot finish in the session's remaining minutes is shortened or skipped, keeping time for the steps after it.
-  - **GPU watchdog:** a long step whose GPU sits idle for its first 5 minutes is stopped.
+  - **Session clock:** on a B200, each step gets what the session can spare after keeping time for the steps that follow. A bench run is stopped at its share and what finished counts; a step with no time left is skipped.
+  - **GPU watchdog:** a long GPU step whose GPU sits idle for its first 5 minutes is stopped (for the SFT, the 5 minutes start when it loads the model, after reading the rows on the CPU).
   - **Drops:** when more than 20% of answers drop for length or parsing, the run warns and prints the counts. Cut, forced and thinking answers never become rows.
-- **Read the results:** `python3 scripts/bh_run.py PROFILE status`, or `results-<profile>.tar` in the bucket.
+- **Read the results:** `python3 scripts/bh_run.py PROFILE status` (the plan, what is done, the results, how the last run ended and its warnings), or `results-<profile>.tar` in the bucket.
 
 ## Two laptops
 
@@ -95,7 +104,7 @@ laptop1 (the 4060):   python3 scripts/bh_run.py laptop   # export, footprint, th
 laptop2:              python3 scripts/bh_run.py eval     # waits for the shipped GGUF, then MuggeBench
 ```
 
-Each laptop serves its own llama-server. laptop2's score starts when laptop1's footprint uploads the ship, and it runs while laptop1 samples the held-out tickets.
+Each laptop serves its own llama-server. laptop2 waits (up to 4 hours) until laptop1's footprint has uploaded the ship, then scores it while laptop1 samples the held-out tickets. Start them in either order.
 
 **By machine (a role served elsewhere).** Every stage that talks to a model has a role:
 - `teacher`: teacher-serve, teacher-answers and round2-repair.
@@ -130,7 +139,16 @@ All settings are in `scripts/bh/config.py` (`Config` and `PROFILE_SETTINGS`). Th
 --set score_bench=/path/to/dev  # score without muggebench.sh
 ```
 
-Environment variables: `NVME` (the fast disk), `BH_WORK`, `BH_LOGS`, `BH_BUCKET`, `BH_BACKENDS`, `BHDATA`, `MUGGEBENCH_SH`, `FOOTPRINT_SH` and `CODEBENCH`.
+Environment variables, all optional:
+
+| Variable | What it is |
+|---|---|
+| `NVME` | the fast disk: `/mnt/nvme` on the VMs, `~/bh` on a laptop |
+| `BH_BUCKET` | a local folder instead of the evroc bucket |
+| `BH_BACKENDS` | machines that serve a role (above) |
+| `BHDATA` | bhdata's package directory |
+| `MUGGEBENCH_SH` | BlackHole's `muggebench.sh`, for `score` |
+| `FOOTPRINT_SH` | BlackHole's `footprint.sh`, the reference footprint measurement |
 
 ## The contract with the model (BlackHole)
 
