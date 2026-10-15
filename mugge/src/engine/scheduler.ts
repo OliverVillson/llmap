@@ -3,13 +3,17 @@
  * no running ticket owns one of its files, gives it its own worktree and runs the harness loop.
  * When every ticket has ended it integrates the finished branches.
  *
- * Slots stand for concurrent sequences on the inference server; more GPUs (more vLLM replicas
- * behind one endpoint) means a higher `concurrency`, nothing else changes.
+ * `concurrency` is how many tickets (agents) run at once. Every model call a ticket makes takes a
+ * slot on a machine of the backend pool (backends.ts) for the length of the call; a ticket whose
+ * call is waiting for a slot is "queued". Without a pool the crew is one machine with
+ * `concurrency` slots, so a ticket never queues and nothing changes. With more agents than
+ * worker slots, some agents run their checks while others use the model.
  */
 import type { Plan, Ticket } from '../tickets/schema.ts';
 import type { EngineEvent, EventSink, RunSummary } from './events.ts';
 import { branchFor, DEFAULT_AUTHOR, Worktrees, type Author } from './git.ts';
 import { runTicket, type TicketResult } from './harness.ts';
+import { BackendPool } from './backends.ts';
 import type { Inference } from './inference.ts';
 import { integrate, type IntegrateResult } from './integrate.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -19,7 +23,12 @@ export interface RunOptions {
   /** Commit every ticket without dependencies starts from: the scaffold. */
   base: string;
   plan: Plan;
-  inference: Inference;
+  /** The model when the crew is one machine; ignored when `pool` is given. */
+  inference?: Inference;
+  /** The crew's machines and their slots (config.ts poolFromEnv). */
+  pool?: BackendPool;
+  /** Which team a ticket's agent counts under in the pool's stats (default: its model). */
+  teamOf?: (t: Ticket) => string;
   sandbox: Sandbox;
   /** Folder for the worktrees, outside the repo. */
   worktreeRoot: string;
@@ -42,6 +51,13 @@ export interface RunReport {
 
 export async function runPlan(o: RunOptions): Promise<RunReport> {
   const emit: EventSink = o.emit ?? (() => {});
+  if (!o.pool && !o.inference) throw new Error('runPlan needs inference or a pool');
+  const pool = o.pool ?? BackendPool.single(o.inference!, o.concurrency);
+  const teamOf = o.teamOf ?? ((t: Ticket) => t.model.split('@')[0]);
+  const agentFor = (t: Ticket) => pool.forAgent({
+    agent: t.id, team: teamOf(t), role: 'worker', signal: o.signal,
+    onSlot: (e) => emit({ type: 'slot', at: Date.now(), ticket: t.id, state: e.state, machine: e.machine, waitedMs: e.waitedMs }),
+  });
   const author = o.author ?? DEFAULT_AUTHOR;
   const wt = new Worktrees(o.repo, o.worktreeRoot, author);
   const started = Date.now();
@@ -51,7 +67,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   const running = new Map<string, Promise<void>>();
   let peak = 0, serialMs = 0;
 
-  emit({ type: 'plan', at: started, tickets: tickets.map(({ id, title, depends_on, model, image }) => ({ id, title, depends_on, model, image })), concurrency: o.concurrency });
+  emit({ type: 'plan', at: started, tickets: tickets.map(({ id, title, depends_on, model, image }) => ({ id, title, depends_on, model, image })), concurrency: o.concurrency, slots: pool.slotsFor('worker') });
 
   const finish = (id: string, state: 'done' | 'failed' | 'skipped', extra: Partial<Extract<EngineEvent, { type: 'finish' }>> = {}) => {
     states.set(id, state);
@@ -75,7 +91,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       }
       emit({ type: 'start', at: Date.now(), ticket: t.id, attempt: 1, worktree: path });
       try {
-        const r = await runTicket(t, path, { plan: o.plan, inference: o.inference, sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal });
+        const r = await runTicket(t, path, { plan: o.plan, inference: agentFor(t), sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal });
         results.set(t.id, r);
         if (r.ok) {
           const commit = wt.commit(path, t.owns, t.title) ?? undefined;
@@ -88,6 +104,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       } finally {
         serialMs += Date.now() - t0;
         wt.remove(t.id);
+        pool.retire(t.id);
       }
     })();
     running.set(t.id, p.finally(() => running.delete(t.id)));
@@ -125,7 +142,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   let integration: IntegrateResult | null = null;
   if (o.integrate !== false && done.length && !o.signal?.aborted) {
     integration = await integrate({ repo: o.repo, base: o.base, plan: o.plan, done: done.map((t) => t.id), sandbox: o.sandbox, worktrees: wt, checkTimeoutMs: o.checkTimeoutMs,
-      fixer: (fix, path) => runTicket(fix, path, { plan: o.plan, inference: o.inference, sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal }),
+      fixer: (fix, path) => runTicket(fix, path, { plan: o.plan, inference: agentFor(fix), sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal }),
     });
     emit({ type: 'integrate', at: Date.now(), ok: integration.ok, branch: integration.branch, merged: integration.merged, failed: integration.failedChecks, error: integration.error ?? undefined });
   }

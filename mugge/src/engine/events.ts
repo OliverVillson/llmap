@@ -4,12 +4,15 @@
  */
 import type { Ticket } from '../tickets/schema.ts';
 
-export type TicketState = 'waiting' | 'running' | 'done' | 'failed' | 'skipped';
+/** `queued`: running, but its model call is waiting for a free slot (backends.ts). */
+export type TicketState = 'waiting' | 'running' | 'queued' | 'done' | 'failed' | 'skipped';
 
 export type EngineEvent =
-  | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number }
+  | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number; slots?: number }
+  /** A ticket's model call waits for a slot (`queued`) or gets one (`got`, on `machine`). */
+  | { type: 'slot'; at: number; ticket: string; state: 'queued' | 'got'; machine?: string; waitedMs?: number }
   | { type: 'start'; at: number; ticket: string; attempt: number; worktree: string }
-  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; ms: number; note: string; files?: number }
+  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number }
   | { type: 'refused'; at: number; ticket: string; attempt: number; paths: string[] }
   | { type: 'check'; at: number; ticket: string; attempt: number; command: string; ok: boolean; ms: number; tail: string }
   | { type: 'finish'; at: number; ticket: string; state: 'done' | 'failed' | 'skipped'; attempts: number; error?: string; commit?: string }
@@ -74,6 +77,9 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       if (t) { t.attempt = e.attempt; t.lastNote = e.note; }
       line(`${e.ticket} #${e.attempt} ${e.kind} ${e.completionTokens} tok ${e.note}`);
       break;
+    case 'slot':
+      if (t && (t.state === 'running' || t.state === 'queued')) t.state = e.state === 'queued' ? 'queued' : 'running';
+      break;
     case 'refused':
       line(`${e.ticket} #${e.attempt} refused ${e.paths.join(', ')}`);
       break;
@@ -94,6 +100,6 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       v.summary = e.summary;
       break;
   }
-  v.running = v.tickets.filter((x) => x.state === 'running').length;
+  v.running = v.tickets.filter((x) => x.state === 'running' || x.state === 'queued').length;
   return v;
 }
