@@ -1,0 +1,343 @@
+LLMAP / MUGGE: PROJECT HISTORY
+==============================
+
+Covers 2026-10-04 to 2026-10-15. Written from the project's notes, plan
+documents and run logs. Scores are pass@1 unless stated otherwise. "ref" means
+the uncompressed model scored on the same harness in the same run.
+
+Contents
+  1. What the project is
+  2. Timeline
+  3. Results, experiment by experiment
+  4. What went well
+  5. Lessons learned
+  6. What to improve
+  7. Where things stand
+
+
+1. WHAT THE PROJECT IS
+----------------------
+
+Mugge is a terminal coding tool: an orchestrator (from salu) hands small
+tickets to specialised code agents running on one GPU VM per project. The
+agents write the files a ticket owns; the engine compiles, runs tests and feeds
+errors back (the "harness loop"). Output goes to the user's own git repo with
+no AI stamp.
+
+llmap (large language model augmentation pipeline) is LobBot's successor. It
+builds the agents' models: teacher data -> expert pruning (REAP) -> healing
+(LoRA) -> mixed-bit quantization -> evaluation -> GGUF / vLLM package.
+
+Product decisions that held throughout:
+  - Harness loop with single-turn specialists, not multi-turn agent models.
+  - One VM per project, billed only while coding (evroc L40S 1.50 EUR/h,
+    B200 8 EUR/h).
+  - Not strictly local: the inference backend is swappable (Cerebras later).
+  - Languages: C, JS, TS, Python, HTML/frontend, later C#, plus architect
+    agents.
+
+From 2026-10-14 the model work was re-aimed at Project Centipede: one manager,
+four team leads and forty code agents of about 1.5 GB each, all served from
+one shared model with forty contexts.
+
+
+2. TIMELINE
+-----------
+
+2026-10-04  Plan written (salu x LobBot). llmap repo created from LobBot's
+            history. Four parallel threads built Qwen3.6 REAP support, code
+            task data with sandbox tests, execution-based eval, and the Mugge
+            engine spike + CLI (PRs #1-#4, merged the same day).
+2026-10-04  exp01 on a B200: does ~10x compression keep coding skill?
+2026-10-05  exp01b bit-mix ablations. Model library bucket set up. Thinking-on
+            test on a MacBook showed the compressed model could not think.
+2026-10-07  Research: tokenizer rebuilds, which model parts to rebuild, task-
+            type specialists. Recommendations only.
+2026-10-08  exp03: Qwen3.8-27B (dense) with thinking on. Rule set afterwards:
+            no dense bases, keep the GPU busy.
+2026-10-09  exp02 on a B200: thinking model, expert count, deeper pruning,
+            Mugge file format. Augmentation research thread started (daily).
+2026-10-10  Next-model plan (under 10 GB, vLLM, Aider Polyglot bar), MoE base
+            survey, exp04 built (PR #6). Benchmark choice recommended.
+2026-10-11  MuggeBench designed and built (PR #7). Goal: 6.5 LCB points/GB.
+2026-10-12  Granite 4.2 3B record attempt planned (exp05/exp06), then
+            replaced by "blackhole": 10x smaller at 95% kept on a dense model.
+            Blackhole bh15 route run on an L40S; scoring too slow, then
+            crashes.
+2026-10-13  Full blackhole audit: 62 confirmed flaws. Event Horizon (QAT,
+            goal 40 LCB points/GB) designed, built and brought up on a B200.
+2026-10-14  Event Horizon smoke passed; original Granite 3B read 53.0, Gate 0
+            passed. VM shut down mid-run to start Centipede. Centipede run 1
+            built with MuggeBench and started on a B200.
+2026-10-15  Centipede run 1 agent scored 0% on MuggeBench because of three
+            bugs (section 3.9). All three fixed; agent bench re-run started.
+
+
+3. RESULTS
+----------
+
+3.1 exp01: ~10x on Qwen3.6-35B-A3B (B200, thinking off)
+
+  ref BF16 71.1 GB: py 96, js 90, ts 91, cpp 92, C set 92, LCB 45; mean 84%.
+
+  recipe        size     kept of ref   notes
+  fp8 (Q8_0)    37.8 GB  102%          noise
+  r25q4         15.3 GB   96%          lowest suite 91%
+  r50q6         14.9 GB   95%
+  r50q4         10.7 GB   94%
+  r50w95s        9.3 GB   95%          best quality per GB (2-8 bit experts,
+                                       everything else q8_0)
+  r50mix         7.4 GB   91%          9.6x; lowest suite 84%; whole
+                                       pipeline about 1 hour
+  r50mix-gen     7.4 GB    4%          pruning calibrated on WikiText
+
+  - The ~10x target held for thinking-off code work.
+  - Calibration on general text pruned the code experts and destroyed the
+    model. Code-specific calibration is required.
+  - Pruning cost ~5 points, 4 -> 3 bit ~3 points (mostly C++ and LCB).
+  - The C set swings about +-8 points between identical runs; an early
+    "C is stuck at 83" was noise. Multi-language healing gave no gain.
+
+3.2 Thinking mode (MacBook, 2026-10-05)
+
+  - Every exp01 eval had thinking off. The model card's LCB v6 80.4 is with
+    thinking on, against our 45% off.
+  - r50w95s scored 0% with thinking on: healing data was thinking-off only,
+    so it wrote its code inside the think block and stopped.
+  - Decision: two models, r50w95s (thinking off) and r50w95s-t (thinking on,
+    healed on thinking teacher data).
+
+3.3 exp03: Qwen3.8-27B dense, thinking on (B200)
+
+  q4 16.2 GB:   LCB v6 81 / 85 / 88% at 16k / 32k / 64k thinking (97% of the
+                card's 90.3).
+  w18s 18.0 GB: 79 / 86 / 87%. Same within noise, so plain q4 wins for a
+                dense model.
+  - 32k thinking costs 1-2 points, 16k costs 7-8.
+  - llama.cpp ran 24 answers at ~18 tok/s each (~430 tok/s total) with the
+    B200 only 46% busy. Each LCB scoring took ~4 h instead of 1.5 h.
+  - Rule from Oliver: use the GPU fully and don't use dense models.
+
+3.4 exp02: thinking, experts, deeper pruning, Mugge format (B200)
+
+  - 6 routed experts per token = 8 (82.2 vs 81.7%), ~25% less expert compute.
+  - Keeping 37.5% of experts (r62) costs ~4 points at equal size; r50 stays.
+  - Mugge file format: r50w95s 12%, r50w95s-h (healed with half its rows in
+    Mugge format) 80%. A model must be healed on Mugge-shaped data to work
+    inside Mugge.
+  - Of 900 teacher fix answers, 670 were dropped because the full model did
+    not put the owned path on its own line. Mugge's parser is strict.
+  - Thinking on (LCB 2025-01..04, 32k): ref 66%, r50w95s-t 53%. Compression
+    keeps 96% with thinking off but only 80% with thinking on.
+
+3.5 exp04, exp05, exp06: built, never run
+
+  - exp04 (PR #6): Aider Polyglot bar (>= 90% of the best full model) across
+    Qwen3.6, Ornith-1.5-35B-A3B and Gemma 4 26B-A4B; int4 GPTQ experts on
+    vLLM. About 14.8 h on a B200. Superseded before it ran.
+  - exp05/exp06: Granite 4.2 3B size ladder and on-policy distillation from
+    the 30B. Parked when Oliver chose blackhole only.
+
+3.6 Benchmarks and goals
+
+  - MuggeBench (PR #7): each task is a real Mugge ticket through the real
+    engine (4 attempts, 60k tokens), scored by hidden tests the model never
+    sees. Dev set: the spike plus 5 projects, 62 tickets, in C#, TS, C,
+    Python and a frontend. Task data is kept out of this public repo.
+  - 5 of the 62 dev tickets fail even with their reference answers (browser
+    tests and one CLI ticket); the score excludes them.
+  - LCB-per-GB goal (2026-10-11): 6.5 points/GB looked feasible with thinking
+    on at 8-10 GB. r50w95s-t measured 5.6. Our harness read ~14 points below
+    the Qwen3.6 card; the same harness read Qwen3.8 within 2 points of its
+    card, so the gap is specific to that setup.
+
+3.7 Blackhole (Granite 4.2 3B, L40S, 2026-10-12/13)
+
+  - Original Granite 3B on our LCB window: 52.3 (card 69.7).
+  - llama.cpp scoring did ~100 answers per hour (~7 h per model); moved to
+    vLLM, which was only ~2x faster because 16k thinking is memory-bandwidth
+    bound on an L40S. The second vLLM crashed twice because the previous
+    server still held the GPU.
+  - No compressed blackhole model was ever scored.
+  - Audit (2026-10-13): 62 confirmed flaws, 3 critical, 5 "hardcoded to
+    fail". The worst: under transformers 5, the chat template returned dict
+    keys instead of token ids, so 12M tokens of repair text would have been
+    garbage, and the repair step would only have crashed 6-8 GPU hours in.
+    The unit test had mocked that exact function.
+
+3.8 Event Horizon (Granite 3B QAT, B200, 2026-10-13/14)
+
+  - Goal: 40 LCB points per GB. Built (577 CPU tests), one command for all
+    29 steps.
+  - Bring-up took two VMs and many fix round trips: an EXIT trap under set -e
+    turned success into failure, the Hub's shard index pointed tensors at the
+    wrong file, FlashInfer JIT on B200, and more.
+  - Smoke passed; the original read R0 = 53.02 (37 min for 182 x 4 answers
+    on the B200). Gate 0 (>= 52) passed. At R0 <= 53 the plan's odds were
+    below 5%. Gates 1 and 2 were made report-only.
+  - Oliver stopped this VM to start Centipede, so no compressed Event
+    Horizon reading exists yet.
+
+3.9 Centipede run 1 (Granite 3B agent, 30B teacher, B200, 2026-10-14/15)
+
+  - Granite 3B as released: about 20% on good MuggeBench tickets. About two
+    thirds of its answers had no file because it thought until the 12,288-
+    token per-call cap; many tickets used 49,152 tokens in 4 calls.
+  - Granite 4.2 30B teacher, 20 tickets, 1 seed: 35% (95% interval 15-55).
+    65% passed visible checks, but 46% of those passes failed hidden tests.
+    49% of answers had no file (thought past the cap). Frontend 0/3.
+  - Teacher data, Python: 1092 tasks written, 507 kept (511 failed tests,
+    57 did not compile, 17 ran out of 8k thinking), plus fix rows and
+    CodeContests.
+  - Fixed mid-run: answers are forced when a bench call is still thinking at
+    its cap (scoring only; forced answers never become training rows).
+  - The finished 1.5 GB agent GGUF scored 0% on MuggeBench. Three causes:
+      1. Every training ticket owned a file named prog.<ext>, so the agent
+         always named its file prog.ts etc. and the engine refused 100% of
+         answers ("writing outside owns 100%").
+      2. Bun 1.3.14's fetch cuts every request at 300 s by default, so every
+         ticket's last long call timed out (186 of 186 errors).
+      3. With top_k 0 (Granite's card setting) llama-server sorted the whole
+         vocabulary on the CPU per token per slot: 4 tok/s per slot, GPU 0%.
+    Fixes: 54118cc (lone file mapped to the owned path; no fetch timeout)
+    and f53772f (top_k 100 on llama-server). The re-run of the agent bench
+    is the latest step; its score was not in at the time of writing.
+  - The SFT and loop-round models were benchmarked under the same bugs, so
+    the pick between them was effectively a tie.
+
+
+4. WHAT WENT WELL
+-----------------
+
+  - The core compression recipe works for MoE code models with thinking off:
+    9.3 GB keeping 95% of a 71 GB model, built in about an hour.
+  - Controls caught real effects: the WikiText-calibrated twin (4%) proved
+    calibration matters; repeated runs exposed the C-set noise; the k6/k8
+    and r50/r62 side tests gave clean answers cheaply.
+  - Measuring in the product's own format (exp02 12% -> 80%) found the
+    largest single effect of the whole project, which no public benchmark
+    would have shown.
+  - MuggeBench exists: real tickets, real engine, hidden tests, themes and
+    roles. HIDDEN results made "passes its own checks but is wrong" visible.
+  - One-command runs with progress bars, resume, per-step uploads and
+    --shutdown made long unattended GPU runs possible with Oliver pasting
+    only a few lines.
+  - Teacher data kept only answers that passed their tests, and turned
+    failing drafts into fix rows, so a weak teacher costs time, not quality.
+  - The audit approach (many readers, independent verification) found real
+    critical bugs before more GPU money was spent.
+  - Bugs, once found, were diagnosed from a few pasted log lines and fixed
+    in small commits (e.g. the three Centipede 0% causes within about an
+    hour).
+  - Persistent model library in object storage survived VM wipes for exp01.
+
+
+5. LESSONS LEARNED
+------------------
+
+Measurement
+  - Decide thinking on or off before the first eval. A whole experiment ran
+    thinking off while the goal needed thinking on.
+  - Score in the product's real format and loop from the start. Format alone
+    moved a model from 12% to 80%; filename conventions alone moved one from
+    something to 0%.
+  - Training data must look like the real tickets: real, varied file paths,
+    multi-file projects, every language and theme the bench has (run 1 had
+    no frontend, no C# and only prog.<ext> files).
+  - Treat any model-card number as unknown settings. Our own windows read
+    52-53 for Granite 3B against a card 69.7.
+  - Small evals are noisy: 20 tickets x 1 seed is +-20 points, the C set
+    +-8. Use seeds and paired comparisons before drawing conclusions.
+  - Check reference answers pass in the real containers before any model is
+    scored (5 broken tickets were found only on the VM).
+
+Compression
+  - Calibrate pruning on the target domain; general text destroys it.
+  - Compression costs far more with thinking on (80% kept vs 96% off).
+  - For dense models, plain q4 matched the mixed-bit recipe.
+  - Long thinking cuts both ways: a small model that thinks past its cap
+    writes no answer at all. Cap behaviour (force an answer, train short
+    thinking) matters as much as skill.
+
+Infrastructure and speed
+  - Check GPU utilisation in the first minutes of every long step. llama.cpp
+    left a B200 46% busy in exp03 and a sampling setting left it 0% busy in
+    Centipede.
+  - top_k 0 on llama-server is a CPU trap; set a finite top_k.
+  - Know every timeout in the call path (Bun's default 300 s fetch, httpx
+    read timeouts with long prefills).
+  - Local NVMe on evroc VMs is wiped on stop; upload results after every
+    step, and confirm each upload printed OK (two exp02 GGUFs were lost).
+  - The 14 GB root disk fills easily: Docker's containerd store ignored
+    data-root until disabled.
+  - Start each new server only after the previous one has released the GPU.
+  - Pin library versions; a transformers major version silently changed an
+    API return type.
+
+Tests and code
+  - A unit test that mocks the function under test proves nothing; the
+    critical audit bug hid behind exactly that.
+  - Run the real path end to end on a tiny model before renting a GPU.
+  - Shell wrappers with traps under set -e can turn success into failure.
+
+Working with Oliver
+  - While he is on a paid VM: short replies, commands only, and check the
+    rest of the path so one push covers several failures.
+  - Simplify; small robust fixes; don't boil the ocean.
+  - Long pasted command lines break; give one command per line.
+  - Several goals were replaced before their runs started (exp04, exp05/06,
+    blackhole). Running one plan to a measured result before pivoting would
+    have produced more data per euro.
+
+
+6. WHAT TO IMPROVE
+------------------
+
+Next run (Centipede run 2)
+  - Training tickets with real, varied file paths and multi-file projects,
+    shaped like MuggeBench, including frontend and C#.
+  - Sample the teacher several times per task and keep only passes; use a
+    stronger hosted teacher for the parts the 30B cannot pass.
+  - Train short, length-controlled thinking so the agent finishes inside its
+    cap; A/B thinking off or a 2k budget on MuggeBench.
+  - Add a test-writer call (same model, QA prompt) whose edge-case tests join
+    acceptance, to cut the HIDDEN rate; add test-writing rows to training.
+  - A quick bench of the SFT model before compression, so format failures
+    show up hours earlier.
+
+Benchmark
+  - Fix the 5 broken dev tickets (browser test image, CLI ticket).
+  - Create the private llmap-bench repo and build the 300-ticket test set;
+    the dev set alone is too small for fine comparisons.
+  - Make the bench resumable.
+
+Pipeline and infrastructure
+  - A GPU-busy check built into every scoring step that stops early when
+    utilisation stays low.
+  - One preflight that exercises every server, timeout and upload with a
+    fake model before the long steps.
+  - Serve evals on vLLM where the format allows; keep llama.cpp for the
+    final GGUF check.
+  - Persistent storage for models and teacher rows between VMs, with
+    verified uploads.
+
+Open research threads, ranked by the project's own notes
+  - On-policy distillation from the full model as heal-after-quant.
+  - Sampling plus repair turns plus test-based selection at inference time.
+  - Type/lint diagnostics before tests in the loop.
+  - Finish one Event Horizon reading to know what QAT actually keeps on
+    Granite 3B.
+
+
+7. WHERE THINGS STAND (2026-10-15)
+----------------------------------
+
+  - Best measured models: r50w95s (9.3 GB, 95% of ref, thinking off) and
+    r50w95s-t (53% LCB thinking on, 80% of ref). GGUFs from exp01 are in the
+    model library; the exp02 healed GGUFs were lost with the VM.
+  - Centipede run 1's agent GGUF is being re-scored on MuggeBench after the
+    three fixes; that score decides how much of run 1's training carries
+    into run 2.
+  - Active code is on branch claude/project-thread-uidsop (Event Horizon,
+    Centipede, MuggeBench merged in). Draft PRs #5-#8 hold the earlier
+    experiments.
