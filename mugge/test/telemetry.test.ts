@@ -267,3 +267,14 @@ test('a real engine run: agents come from the engine state events, review calls 
   expect(s.calls.review).toBe(15);
   rmSync(work, { recursive: true, force: true });
 }, 180_000);
+
+test('an answer whose path the parser had to guess is usable but never a clean row', () => {
+  const owns = ['libshort/src/hash.c'];
+  expect(check('libshort/src/hash.c\n```c\nint x;\n```', owns).loose).toEqual([]);
+  expect(check('prog.c\n```c\nint x;\n```', owns).loose).toEqual(owns); // run 1's prog.<ext>
+  expect(check('**libshort/src/hash.c**\n```c\nint x;\n```', owns).loose).toEqual(owns);
+  expect(check('Here is the fix:\n```c\nint x;\n```', owns).loose).toEqual(owns);
+  const t = new Telemetry({ warn: null });
+  t.emit({ type: 'model', at: 1, ticket: 'h', attempt: 1, kind: 'write', promptTokens: 1, completionTokens: 1, ms: 1, note: '', files: 1, loose: 1 });
+  expect([t.calls().clean, t.calls().loose, t.calls().dropped]).toEqual([0, 1, 0]);
+});

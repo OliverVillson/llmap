@@ -131,7 +131,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
         r.inferenceMs += c.ms;
         out = parseFiles(c.value, ticket.owns);
         const seen = classifyAnswer(c.value, ticket.owns, out, c.cut);
-        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length, model, maxTokens: c.maxTokens, forced: c.forced, drop: seen.drop, missing: seen.missing.length || undefined, reasoningChars: c.reasoningChars });
+        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length, model, maxTokens: c.maxTokens, forced: c.forced, drop: seen.drop, missing: seen.missing.length || undefined, loose: seen.loose.length || undefined, reasoningChars: c.reasoningChars });
       } catch (e) {
         failed = { command: '(model call)', output: String((e as Error).message ?? e) };
         r.error = failed.output;

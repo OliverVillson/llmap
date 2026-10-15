@@ -21,9 +21,10 @@ export type EngineEvent =
   /**
    * One model call and what the parser made of it. `forced`: the server forced the answer after
    * the thinking (never a training row). `drop`: why the answer gave the engine no usable file
-   * (telemetry.ts DropReason); `missing`: owned files the answer left out.
+   * (telemetry.ts DropReason); `missing`: owned files the answer left out; `loose`: owned files whose
+   * path the parser had to guess (not the training format).
    */
-  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number; model?: string; maxTokens?: number; forced?: string; drop?: DropReason; missing?: number; reasoningChars?: number }
+  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number; model?: string; maxTokens?: number; forced?: string; drop?: DropReason; missing?: number; loose?: number; reasoningChars?: number }
   /** A model call that threw (HTTP error, timeout): no answer at all. */
   | { type: 'call_error'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; model?: string; error: string }
   | { type: 'refused'; at: number; ticket: string; attempt: number; paths: string[] }

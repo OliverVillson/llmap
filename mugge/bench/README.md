@@ -66,8 +66,9 @@ bun bench/smoke.ts --fake --fake-mess        # no model: the fake server, with f
    `MUGGE_MAX_CALL_TOKENS`). `--min-p 0` for MiniCPM5-2B.
 3. It prints tickets passing, parser drops (by reason), forced and cut answers, call errors, wall
    time and **MEETS** (exit 0) when at least `--bar` (default 0.5) of the tickets pass, at most
-   20% of answers were lost to the parser or the cap, and no call failed; **MISSES** (exit 1)
-   otherwise, with the reasons.
+   20% of answers were lost to the parser or the cap, at most 20% wrote a file path the parser
+   had to guess (`prog.c`, `**a.py**`: not the training format), and no call failed; **MISSES**
+   (exit 1) otherwise, with the reasons.
 
 Writes `calls.jsonl`, `status.json`, `smoke.json` and the bench's `results.jsonl` / `report.json`
 in `--out` (default `runs/smoke-<time>`).
@@ -80,10 +81,11 @@ Every run (`mugge run`, `bench/run.ts`, the smoke, the engine API) writes, throu
 - `calls.jsonl`: one line per model call with ticket, attempt, write/fix, agent/team/machine,
   prompt, completion and reasoning tokens, max_tokens, ms, tok/s, `cut` (stopped at max_tokens),
   `forced` (the bench proxy closed the thinking and forced the answer: why, or null), `drop` (the
-  parser got no usable file: `cut`, `empty`, `no_fence`, `unlabelled`, `not_owned`), `error`, and
+  parser got no usable file: `cut`, `empty`, `no_fence`, `unlabelled`, `not_owned`), `loose`
+  (owned files whose path the parser had to guess, not the training format), `error`, and
   `clean`: false for every call that must never become a training row. A warning goes to stderr
   when more than 20% of answers are dropped or cut. `bench/run.ts --transcripts` carries the same
-  `cut`, `forced` and `drop` on every transcript call.
+  `cut`, `forced`, `drop` and `loose` on every transcript call.
 - `status.json` (schema `centipede.status/1`, also `GET /telemetry` on the engine API): crew state,
   every agent (a1–d10: state, ticket, owned files, attempt n/4, own tok/s), tickets, total tok/s
   over one minute with a 60-point sparkline and its split by team and machine, slots used and

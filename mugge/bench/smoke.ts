@@ -10,7 +10,9 @@
  *      dependencies' reference answers in place, and is scored on its hidden tests.
  *   3. It prints the pass count, parser drops, forced and cut answers, wall time and a verdict:
  *      MEETS when at least `--bar` of the tickets pass, at most 20% of answers were lost to the
- *      parser or the cap, and no model call failed. MISSES otherwise, with the reasons.
+ *      parser or the cap, at most 20% named a file in a shape the parser had to guess (`prog.c`,
+ *      `**a.py**`: not the training format), and no model call failed. MISSES otherwise, with
+ *      the reasons.
  *
  *   bun bench/smoke.ts --url http://127.0.0.1:8080/v1 --model BH0.1-1.3 --sandbox local
  *   bun bench/smoke.ts --fake                  the fake model on the reference answers (CI)
@@ -197,6 +199,8 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const reasons: string[] = [];
   if (passed < Math.ceil(bar * tickets)) reasons.push(`${passed}/${tickets} pass, the bar is ${Math.ceil(bar * tickets)} (${Math.round(bar * 100)}%)`);
   if (calls.lostShare > LOST_WARN_SHARE) reasons.push(`${Math.round(calls.lostShare * 100)}% of answers lost to the parser or the cap (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
+  const answers = calls.calls - calls.errors;
+  if (answers && calls.loose / answers > LOST_WARN_SHARE) reasons.push(`${Math.round((100 * calls.loose) / answers)}% of answers named a file in a shape the parser had to guess, not the training format (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
   if (calls.errors) reasons.push(`${calls.errors} model calls failed (timeouts or server errors)`);
   if (rows.length < tickets * seeds) reasons.push(`only ${rows.length} of ${tickets * seeds} ticket runs finished`);
   const result: SmokeResult = { verdict: reasons.length ? 'MISSES' : 'MEETS', reasons, refs, passed, tickets, calls, wallMs: Math.round(performance.now() - started), out: o.out };
@@ -212,6 +216,7 @@ export function formatSmoke(r: SmokeResult): string {
     `tickets passing    ${r.passed}/${r.tickets}`,
     `parser drops       ${c.dropped}${drops ? ` (${drops})` : ''} of ${c.calls} answers`,
     `forced / cut       ${c.forced} / ${c.cut}`,
+    `guessed paths      ${c.loose}`,
     `call errors        ${c.errors}`,
     `wall time          ${(r.wallMs / 1000).toFixed(1)} s`,
     '',

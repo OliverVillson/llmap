@@ -77,8 +77,8 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
       const c = await base.text(m, msgs, cap(n));
       if (o.transcripts) {
         // cut, forced and drop mark answers that must never become training rows
-        const drop = classifyAnswer(c.raw, t.ticket.owns, parseFiles(c.raw, t.ticket.owns), c.cut).drop;
-        transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw, cut: !!c.cut, forced: c.forced ?? null, drop: drop ?? null, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null });
+        const seen = classifyAnswer(c.raw, t.ticket.owns, parseFiles(c.raw, t.ticket.owns), c.cut);
+        transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw, cut: !!c.cut, forced: c.forced ?? null, drop: seen.drop ?? null, loose: seen.loose.length > 0, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null });
       }
       return c;
     },

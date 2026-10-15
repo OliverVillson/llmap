@@ -56,6 +56,13 @@ export interface AnswerCheck {
   missing: string[];
   /** Paths it wrote that the ticket does not own. */
   stray: string[];
+  /**
+   * Owned paths the parser had to guess: not written as the training format writes them (the
+   * path alone on its line, then the fence; files.ts renderFiles), e.g. `prog.c` for
+   * `libshort/src/hash.c` or `**src/a.py**`. The engine can use such an answer; a training row
+   * must not, or the model learns the wrong shape (Centipede run 1's 0%).
+   */
+  loose: string[];
 }
 
 /** What the parser (files.ts parseFiles) made of one answer; read-only, never changes the format. */
@@ -64,6 +71,8 @@ export function classifyAnswer(raw: string, owns: string[], out: WorkerOutput | 
   const written = paths.filter((p) => owns.includes(p));
   const stray = paths.filter((p) => !owns.includes(p));
   const missing = owns.filter((p) => !written.includes(p));
+  const strict = (p: string) => new RegExp(`^${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*\\r?\\n\`{3,}`, 'm').test(raw);
+  const loose = written.filter((p) => !strict(p));
   let drop: DropReason | undefined;
   if (stray.length) drop = 'not_owned';
   else if (!written.length) {
@@ -73,7 +82,7 @@ export function classifyAnswer(raw: string, owns: string[], out: WorkerOutput | 
     else if (!/^\s*`{3,}/m.test(text)) drop = 'no_fence';
     else drop = 'unlabelled';
   }
-  return { drop, written, missing, stray };
+  return { drop, written, missing, stray, loose };
 }
 
 /** Share of answers lost to the parser or the cap above which a run warns. */
@@ -115,10 +124,12 @@ export interface CallRecord {
   files: number;
   /** Owned files the answer left out. */
   missing: number;
+  /** Owned files whose path the parser had to guess (AnswerCheck.loose). */
+  loose: number;
   drop: DropReason | null;
   /** The call threw: no answer at all. */
   error: string | null;
-  /** Not cut, not forced, not dropped, no error: the only calls that may ever become training rows. */
+  /** Not cut, not forced, not dropped, no guessed path, no error: the only calls that may ever become training rows. */
   clean: boolean;
 }
 
@@ -128,6 +139,8 @@ export interface CallSummary {
   clean: number;
   cut: number;
   forced: number;
+  /** Answers with a path the parser had to guess. */
+  loose: number;
   /** Answers with no usable file (any DropReason). */
   dropped: number;
   dropReasons: Record<DropReason, number>;
@@ -144,7 +157,7 @@ export interface CallSummary {
 
 export function emptyCallSummary(): CallSummary {
   return {
-    calls: 0, errors: 0, clean: 0, cut: 0, forced: 0, dropped: 0,
+    calls: 0, errors: 0, clean: 0, cut: 0, forced: 0, loose: 0, dropped: 0,
     dropReasons: { cut: 0, empty: 0, no_fence: 0, unlabelled: 0, not_owned: 0 },
     lost: 0, lostShare: 0, write: 0, fix: 0, review: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
   };
@@ -157,6 +170,7 @@ export function addCall(s: CallSummary, r: CallRecord): CallSummary {
   if (r.clean) s.clean++;
   if (r.cut) s.cut++;
   if (r.forced) s.forced++;
+  if (r.loose) s.loose++;
   if (r.drop) {
     s.dropped++;
     s.dropReasons[r.drop]++;
@@ -195,6 +209,7 @@ export function formatCallSummary(s: CallSummary): string {
     ['parser drops', `${s.dropped}${reasons ? ` (${reasons})` : ''}`],
     ['cut at the cap', String(s.cut)],
     ['forced after thinking', String(s.forced)],
+    ['paths the parser guessed', String(s.loose)],
     ['call errors', String(s.errors)],
     ['clean answers (may become rows)', `${s.clean}/${s.calls}`],
     ['tokens prompt / completion / reasoning', `${s.promptTokens} / ${s.completionTokens} / ${s.reasoningTokens}`],
@@ -542,7 +557,7 @@ export class Telemetry {
           agent: a.id, team: a.team, machine: a.machine, model: null,
           promptTokens: e.promptTokens, completionTokens: e.completionTokens, reasoningTokens: e.reasoningTokens ?? null, reasoningChars: null, maxTokens: null,
           ms: e.ms, tokS: e.ms > 0 ? round1((1000 * e.completionTokens) / e.ms) : 0, cut: !!e.cut, forced: null,
-          files: 0, missing: 0, drop: null, error: e.verdict === 'error' ? e.error ?? 'review failed' : null, clean: !e.cut && e.verdict !== 'error',
+          files: 0, missing: 0, loose: 0, drop: null, error: e.verdict === 'error' ? e.error ?? 'review failed' : null, clean: !e.cut && e.verdict !== 'error',
         });
         this.spans.push({ start: e.at - e.ms, end: e.at, tokens: e.completionTokens, agent: a.id, team: a.team, machine: a.machine });
         this.sessionTokens += e.completionTokens;
@@ -569,8 +584,8 @@ export class Telemetry {
           promptTokens: e.promptTokens, completionTokens: e.completionTokens,
           reasoningTokens: e.reasoningTokens ?? null, reasoningChars: e.reasoningChars ?? null, maxTokens: e.maxTokens ?? null,
           ms: e.ms, tokS: Math.round(tokS * 10) / 10, cut: !!e.cut, forced: e.forced ?? null,
-          files: e.files ?? 0, missing: e.missing ?? 0, drop: e.drop ?? null, error: null,
-          clean: !e.cut && !e.forced && !e.drop,
+          files: e.files ?? 0, missing: e.missing ?? 0, loose: e.loose ?? 0, drop: e.drop ?? null, error: null,
+          clean: !e.cut && !e.forced && !e.drop && !e.loose,
         });
         this.spans.push({ start: e.at - e.ms, end: e.at, tokens: e.completionTokens, agent: a.id, team: a.team, machine: a.machine });
         this.sessionTokens += e.completionTokens;
@@ -588,7 +603,7 @@ export class Telemetry {
           v: 1, run: this.run, at: e.at, ticket: e.ticket, attempt: e.attempt, kind: e.kind,
           agent: a.id, team: a.team, machine: a.machine, model: e.model ?? null,
           promptTokens: 0, completionTokens: 0, reasoningTokens: null, reasoningChars: null, maxTokens: null,
-          ms: 0, tokS: 0, cut: false, forced: null, files: 0, missing: 0, drop: null, error: e.error, clean: false,
+          ms: 0, tokS: 0, cut: false, forced: null, files: 0, missing: 0, loose: 0, drop: null, error: e.error, clean: false,
         });
         a.calls++;
         this.next(t, a, e.attempt, e.at);
