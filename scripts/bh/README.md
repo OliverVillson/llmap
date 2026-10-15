@@ -13,7 +13,10 @@ python3 scripts/bh_run.py PROFILE [STAGES] [options]
   STAGES    none: the profile's whole plan, resuming (finished stages are skipped)
             one or more stages, or a span of the plan: sft..smoke, data.., ..sft
             round2 = round2-sample round2-repair round2-rft
-            status: the plan with what is done, and the results so far
+            status: the plan with what is done, and the results so far (one shot)
+  start [STAGES]   the same, detached: it keeps going when you log out (one log per run)
+  watch            the live view of this profile's run: stage, clock, gates, tok/s, log tail
+  stop             end the run cleanly (as Ctrl-C: uploads, then exits; start again resumes)
   --set key=value  override a config field (repeatable; scripts/bh/config.py)
   --dry-run DIR    on the CPU with mocks: DIR/<profile> is the machine, DIR/bucket the bucket
   --force          export even when the smoke said BROKEN
@@ -92,6 +95,40 @@ Then, once per machine:
   - **GPU watchdog:** a long GPU step whose GPU sits idle for its first 5 minutes is stopped (for the SFT, the 5 minutes start when it loads the model, after reading the rows on the CPU).
   - **Drops:** when more than 20% of answers drop for length or parsing, the run warns and prints the counts. Cut, forced and thinking answers never become rows.
 - **Read the results:** `python3 scripts/bh_run.py PROFILE status` (the plan, what is done, the results, how the last run ended and its warnings), or `results-<profile>.tar` in the bucket.
+
+## Checking in over SSH
+
+Start a run detached on the machine, log out, and check on it from the Mac whenever you like. Each command takes the same profile and options the run was started with.
+
+```
+ssh laptop1                                          # or the B200, or WSL2 (below)
+cd llmap
+python3 scripts/bh_run.py g0 start                   # detached; prints its log, pid and these hints
+python3 scripts/bh_run.py g0 watch                   # live: Ctrl-C leaves the view, not the run
+python3 scripts/bh_run.py g0 status                  # one shot: the plan, what is done, the results
+python3 scripts/bh_run.py g0 stop                    # clean stop; `g0 start` again resumes
+```
+
+Or in one line from the Mac: `ssh -t laptop1 'cd llmap && python3 scripts/bh_run.py g0 watch'`.
+
+- **What watch shows**, redrawn every 3 seconds:
+  - the run's state, pid and uptime (and the minutes left on a B200 session);
+  - every stage as done ✓, running ▶, waiting ·, skipped –, stopped ■ or failed ✗;
+  - the current stage's time against its guess, and its progress when it reports one (the SFT's update count);
+  - tok/s over the last minute from the recording proxy, with how many answers were cut;
+  - the gate readings so far (G2, smoke, footprint, score), the run's warnings, and the last lines of its log.
+- **One run per profile.** A second `start` of the same profile is refused while one is going, and so is a plain run in the foreground.
+- **Stop.** `stop` sends Ctrl-C: the step in flight stops, the servers stop, the results upload, and the run exits 130. A second `stop` while it is still uploading interrupts that too. A dropped ssh or a kill ends a foreground run the same way.
+- **Files**, in `~/bh-logs/<run>/` (BH_LOGS):
+  - `<profile>-current.log` is the newest run's whole output: `tail -f ~/bh-logs/*/g0-current.log`.
+  - `NN-<stage>.log` holds each step's own output.
+  - `<profile>-run.json` is what watch reads: the state, the stage and when it started, each stage's state, and the exit code.
+- **Crew and smoke runs.** With the engine's telemetry (PR #14), each bench run also writes the engine's own `status.json` (agents working and queued, tickets done, tok/s) next to its results under W. watch shows it as a `crew` line. To see it whole, run `cd mugge && bun src/cli.ts status <that folder> --watch`. A smoke started by hand (`cd mugge && bun bench/smoke.ts`) writes it to `mugge/runs/smoke-<time>/`.
+- **Keep the machine awake.** A detached run outlives the ssh session, but not a laptop that sleeps.
+  - **Linux:** `sudo systemctl mask sleep.target suspend.target`, or set the lid to do nothing.
+  - **macOS:** `caffeinate -dims python3 scripts/bh_run.py g0 watch` keeps it awake while you watch; for a whole run, use `sudo pmset -a sleep 0`.
+  - **Windows:** turn sleep off in Windows (Power settings). WSL2 also stops when its last terminal closes. Either keep one WSL window open, or set `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig`.
+  - **SSH into WSL2:** run `sshd` inside WSL, then port-forward from Windows: `netsh interface portproxy add v4tov4 listenport=2222 connectport=22 connectaddress=<WSL IP>`. Then `ssh -p 2222 you@laptop1`.
 
 ## Two laptops
 

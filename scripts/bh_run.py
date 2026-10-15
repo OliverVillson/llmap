@@ -11,6 +11,7 @@ after every step.
     python3 scripts/bh_run.py s2                 # B200 session 2: the own-mistakes round
     python3 scripts/bh_run.py s1 sft..smoke      # a span of the plan (also: data.., ..sft, one stage)
     python3 scripts/bh_run.py s1 status          # the plan, what is done, the results so far
+    python3 scripts/bh_run.py g0 start           # detached: survives logging out; `watch` and `stop` it
     options: --set key=value  --dry-run DIR  --force  --shutdown   (run sheet: scripts/bh/README.md)
 
 Stages, in order (each runs alone and is skipped when its output exists; inputs another
