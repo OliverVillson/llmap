@@ -17,6 +17,10 @@ export interface Completion<T> {
   raw: string;
   promptTokens: number;
   completionTokens: number;
+  /** Tokens the model spent thinking, when the server reports them (vLLM, llama-server). */
+  reasoningTokens?: number;
+  /** The answer stopped at max_tokens, so it is probably incomplete. */
+  cut?: boolean;
   ms: number;
 }
 
@@ -36,6 +40,10 @@ export interface InferenceConfig {
   /** Extra request fields sent as they are, e.g. seed, top_p, top_k, chat_template_kwargs. */
   extra?: Record<string, unknown>;
   timeoutMs?: number;
+  /** Most tokens one call may write, however much the caller offers (MUGGE_MAX_CALL_TOKENS). */
+  maxCallTokens?: number;
+  /** One line per call on stderr (MUGGE_DEBUG_CALLS=1). */
+  debug?: boolean;
 }
 
 export interface Inference {
@@ -59,10 +67,11 @@ export class OpenAICompatible implements Inference {
 
   async text(model: string, messages: ChatMessage[], maxTokens: number, schema?: object): Promise<Completion<string>> {
     const started = performance.now();
+    const cap = this.cfg.maxCallTokens;
     const body: Record<string, unknown> = {
       model: this.served(model),
       messages,
-      max_tokens: maxTokens,
+      max_tokens: cap && cap < maxTokens ? cap : maxTokens,
       temperature: this.cfg.temperature ?? 0.2,
       ...this.cfg.extra,
     };
@@ -79,15 +88,27 @@ export class OpenAICompatible implements Inference {
     } as RequestInit);
     if (!res.ok) throw new Error(`inference ${res.status}: ${(await res.text()).slice(0, 500)}`);
     const data: any = await res.json();
-    const raw: string = data?.choices?.[0]?.message?.content ?? '';
-    return {
+    const choice = data?.choices?.[0];
+    const raw: string = choice?.message?.content ?? '';
+    const reasoning = data?.usage?.completion_tokens_details?.reasoning_tokens;
+    const out: Completion<string> = {
       value: raw,
       raw,
       promptTokens: data?.usage?.prompt_tokens ?? 0,
       completionTokens: data?.usage?.completion_tokens ?? 0,
+      reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
+      cut: choice?.finish_reason === 'length' || undefined,
       ms: Math.round(performance.now() - started),
     };
+    if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));
+    return out;
   }
+}
+
+/** The MUGGE_DEBUG_CALLS line: what one call cost and whether it finished. */
+export function describeCall(model: string, maxTokens: number, c: Completion<string>): string {
+  const reasoning = c.reasoningTokens === undefined ? '' : ` reasoning ${c.reasoningTokens}`;
+  return `call ${model}: prompt ${c.promptTokens} completion ${c.completionTokens}${reasoning} of ${maxTokens} max, ${c.ms} ms, ${c.cut ? 'CUT at max_tokens' : 'finished'}, ${c.raw.length} chars`;
 }
 
 /** Parses a JSON answer, tolerating a ```json fence or text around one object (for `guided: none`). */

@@ -9,7 +9,7 @@ export type TicketState = 'waiting' | 'running' | 'done' | 'failed' | 'skipped';
 export type EngineEvent =
   | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number }
   | { type: 'start'; at: number; ticket: string; attempt: number; worktree: string }
-  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; ms: number; note: string; files?: number }
+  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number }
   | { type: 'refused'; at: number; ticket: string; attempt: number; paths: string[] }
   | { type: 'check'; at: number; ticket: string; attempt: number; command: string; ok: boolean; ms: number; tail: string }
   | { type: 'finish'; at: number; ticket: string; state: 'done' | 'failed' | 'skipped'; attempts: number; error?: string; commit?: string }

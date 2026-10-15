@@ -81,7 +81,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
         r.completionTokens += c.completionTokens;
         r.inferenceMs += c.ms;
         out = parseFiles(c.value, ticket.owns);
-        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length });
+        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length });
       } catch (e) {
         failed = { command: '(model call)', output: String((e as Error).message ?? e) };
         r.error = failed.output;

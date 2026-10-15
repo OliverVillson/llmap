@@ -177,7 +177,9 @@ if (import.meta.main) {
   if (values.tickets) projects = firstTickets(projects, Number(values.tickets));
   const fake = values.fake ? startFakeModel({ solutions: fakeSolutions(projects) }) : null;
   const cfg = inferenceFromEnv();
-  const thinking = values.thinking ?? 'on';
+  // --thinking wins; otherwise MUGGE_THINKING (config.ts); otherwise on, the Centipede setting
+  const envThinking = (cfg.extra as any)?.chat_template_kwargs?.enable_thinking;
+  const thinking = values.thinking ?? (envThinking === false ? 'off' : 'on');
   const extra = (seed: number): Record<string, unknown> => ({
     seed,
     ...(values['top-p'] ? { top_p: Number(values['top-p']) } : {}),
