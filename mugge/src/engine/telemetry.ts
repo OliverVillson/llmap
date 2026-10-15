@@ -81,6 +81,9 @@ export function classifyAnswer(raw: string, owns: string[], out: WorkerOutput | 
     else if (!text) drop = 'empty';
     else if (!/^\s*`{3,}/m.test(text)) drop = 'no_fence';
     else drop = 'unlabelled';
+  } else if (cut && (raw.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '').match(/^[ \t]*`{3,}/gm)?.length ?? 0) % 2 === 1) {
+    // the cap fell inside a file: the parser kept half of it
+    drop = 'cut';
   }
   return { drop, written, missing, stray, loose };
 }

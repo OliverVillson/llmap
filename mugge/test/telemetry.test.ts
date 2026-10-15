@@ -27,6 +27,10 @@ describe('parser drops', () => {
   });
   test('each way an answer gives no usable file has its reason', () => {
     expect(check('<think>still going and going', ['a.py'], true).drop).toBe('cut');
+    // the cap fell inside a file: the parser keeps half of it, but the answer is still lost
+    expect(check('a.py\n```python\nx = 1\ny =', ['a.py'], true).drop).toBe('cut');
+    // cut after the last file closed: the files are whole
+    expect(check('a.py\n```python\nx = 1\n```\nNote: I also', ['a.py'], true).drop).toBeUndefined();
     expect(check('<think>long</think>', ['a.py']).drop).toBe('empty');
     expect(check('', ['a.py']).drop).toBe('empty');
     expect(check('I would loop over the items and sum them.', ['a.py']).drop).toBe('no_fence');
@@ -182,10 +186,10 @@ describe('spike smoke', () => {
     expect(r.verdict).toBe('MEETS');
     expect(r.refs).toEqual({ passed: 15, tickets: 15, failures: [] });
     expect(r.passed).toBe(15);
-    expect([r.calls.calls, r.calls.forced, r.calls.cut, r.calls.dropped, r.calls.errors, r.calls.lost]).toEqual([17, 1, 1, 1, 0, 3]);
+    expect([r.calls.calls, r.calls.forced, r.calls.cut, r.calls.dropped, r.calls.errors, r.calls.lost]).toEqual([17, 1, 1, 2, 0, 3]); // the cut answer is half a file: cut and dropped as cut
     const rows: CallRecord[] = readFileSync(join(out, 'calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const bad = rows.filter((x) => !x.clean).map((x) => `${x.ticket.split('/')[1]} ${x.attempt} ${x.forced ?? ''}${x.cut ? 'cut' : ''}${x.drop ?? ''}`).sort();
-    expect(bad).toEqual([`${MESS.cut[0]}#s0 1 cut`, `${MESS.forced[0]}#s0 1 length`, `${MESS.prose[0]}#s0 1 no_fence`].sort());
+    expect(bad).toEqual([`${MESS.cut[0]}#s0 1 cutcut`, `${MESS.forced[0]}#s0 1 length`, `${MESS.prose[0]}#s0 1 no_fence`].sort());
     const status: CrewStatus = JSON.parse(readFileSync(join(out, 'status.json'), 'utf8'));
     expect(status.crew.tickets.done).toBe(15);
     expect(existsSync(join(out, 'smoke.json'))).toBe(true);
@@ -229,9 +233,9 @@ test('bench transcripts mark cut, forced and dropped answers so harvest can skip
     await runBench({ projects, inference: () => new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), seeds: 1, concurrency: 3, out, transcripts: true, telemetry: tel });
     const calls = readFileSync(join(out, 'transcripts.jsonl'), 'utf8').trim().split('\n').flatMap((l) => JSON.parse(l).calls);
     const flags = calls.map((c: any) => `${c.cut ? 'cut' : ''}${c.forced ?? ''}${c.drop ?? ''}` || 'clean').sort();
-    expect(flags).toEqual(['clean', 'clean', 'cut', 'length', 'no_fence'].sort());
+    expect(flags).toEqual(['clean', 'clean', 'cutcut', 'length', 'no_fence'].sort());
     const results = readFileSync(join(out, 'results.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-    expect(results.reduce((n, r) => n + r.cutAnswers + r.forcedAnswers + r.droppedAnswers, 0)).toBe(3);
+    expect(results.reduce((n, r) => n + r.cutAnswers + r.forcedAnswers + r.droppedAnswers, 0)).toBe(4); // the half-file answer counts as cut and as dropped (drop: cut), like a cut with no file
     expect(tel.close().crew.agents.finished).toBe(3);
   } finally {
     fake.stop();
