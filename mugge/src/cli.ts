@@ -34,6 +34,7 @@ const HELP = `mugge ${VERSION}: parallel coding with small specialist models
   mugge list                     projects and their state
   mugge spike [--fake]           the engine spike on the polyglot test project
   mugge bench run|check|report … MuggeBench (see bench/run.ts, check.ts, report.ts)
+  mugge render-call < req.jsonl  the engine's write/fix messages for training rows (bench/render.ts)
   mugge engine serve --port N --project <dir>    (on the VM) the engine API
   mugge dog                      the dog
 
@@ -244,6 +245,11 @@ async function main(argv: string[]) {
       const sub = rest[0];
       if (!['run', 'check', 'report'].includes(sub)) die('mugge bench run|check|report …');
       const p = Bun.spawnSync(['bun', join(import.meta.dir, '..', 'bench', `${sub}.ts`), ...rest.slice(1)], { stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
+      process.exit(p.exitCode ?? 1);
+    }
+    case 'render-call': {
+      // the engine's write and fix messages as training rows (bench/render.ts): JSONL in, JSONL out
+      const p = Bun.spawnSync(['bun', join(import.meta.dir, '..', 'bench', 'render.ts'), ...rest], { stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
       process.exit(p.exitCode ?? 1);
     }
     case 'engine': {
