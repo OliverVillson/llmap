@@ -15,7 +15,7 @@
 import { clashReason, findOwnershipClashes, type Plan, type Ticket } from '../tickets/schema.ts';
 import type { EngineEvent, EventSink, RunSummary } from './events.ts';
 import { branchFor, DEFAULT_AUTHOR, Worktrees, type Author } from './git.ts';
-import { runTicket, type TicketResult } from './harness.ts';
+import { runTicket, thinkingOn, type TicketResult } from './harness.ts';
 import { BackendPool } from './backends.ts';
 import type { Inference } from './inference.ts';
 import { integrate, type IntegrateResult } from './integrate.ts';
@@ -69,6 +69,8 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   });
   // The lead review goes to a machine serving leads when the crew has one; same model either way.
   const reviewRole = pool.slotsFor('lead') > 0 ? 'lead' : 'worker';
+  // whether worker calls think, for the state they show: the machines' clients carry the switch
+  const thinking = thinkingOn(pool.machines.find((m) => m.machine.roles.includes('worker'))?.client ?? pool.machines[0].client);
   const author = o.author ?? DEFAULT_AUTHOR;
   const wt = new Worktrees(o.repo, o.worktreeRoot, author);
   const started = Date.now();
@@ -123,16 +125,17 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
     const p = (async () => {
       const t0 = Date.now();
       const branch = branchFor(t.id);
-      let path: string;
       try {
-        path = wt.create(t.id, branch, o.base, t.depends_on.map(branchFor));
-      } catch (e) {
-        finish(t.id, 'failed', { error: String((e as Error).message) });
-        return;
-      }
-      emit({ type: 'start', at: Date.now(), ticket: t.id, attempt: 1, worktree: path });
-      try {
-        const r = await runTicket(t, path, { plan: o.plan, inference: agentFor(t, 'worker', onSlot), reviewInference: agentFor(t, reviewRole, onSlot), sandbox: o.sandbox, emit: forAgent, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal });
+        let path: string;
+        try {
+          path = wt.create(t.id, branch, o.base, t.depends_on.map(branchFor));
+        } catch (e) {
+          // the finally below still frees the agent number, or the next ticket would get agent -1
+          finish(t.id, 'failed', { error: String((e as Error).message) });
+          return;
+        }
+        emit({ type: 'start', at: Date.now(), ticket: t.id, attempt: 1, worktree: path });
+        const r = await runTicket(t, path, { plan: o.plan, inference: agentFor(t, 'worker', onSlot), reviewInference: agentFor(t, reviewRole, onSlot), sandbox: o.sandbox, emit: forAgent, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal, thinking });
         results.set(t.id, r);
         if (r.ok) {
           const commit = wt.commit(path, t.owns, t.title) ?? undefined;
@@ -201,7 +204,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   let integration: IntegrateResult | null = null;
   if (o.integrate !== false && done.length && !o.signal?.aborted) {
     integration = await integrate({ repo: o.repo, base: o.base, plan: o.plan, done: done.map((t) => t.id), sandbox: o.sandbox, worktrees: wt, checkTimeoutMs: o.checkTimeoutMs,
-      fixer: (fix, path) => runTicket(fix, path, { plan: o.plan, inference: agentFor(fix), sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal }),
+      fixer: (fix, path) => runTicket(fix, path, { plan: o.plan, inference: agentFor(fix), sandbox: o.sandbox, emit, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal, thinking }),
     });
     emit({ type: 'integrate', at: Date.now(), ok: integration.ok, branch: integration.branch, merged: integration.merged, failed: integration.failedChecks, error: integration.error ?? undefined });
   }

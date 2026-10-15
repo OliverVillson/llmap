@@ -373,9 +373,10 @@ export class BackendPool {
       rec.state = 'calling';
       rec.machine = m.machine.name;
       rec.since = Date.now();
-      o.onSlot?.({ state: 'got', machine: m.machine.name, waitedMs: Date.now() - waitStart });
-      this.changed();
+      // from here the slot is ours: whatever throws, even a listener, must give it back
       try {
+        o.onSlot?.({ state: 'got', machine: m.machine.name, waitedMs: Date.now() - waitStart });
+        this.changed();
         const c = await run(m.client);
         this.record(m.machine.name, rec, c);
         return c;
@@ -386,8 +387,8 @@ export class BackendPool {
       }
     };
     return {
-      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens)),
-      text: (model: string, messages: ChatMessage[], maxTokens: number) => call<string>((c) => c.text(model, messages, maxTokens)),
+      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal)),
+      text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal) => call<string>((c) => c.text(model, messages, maxTokens, signal ?? o.signal)),
     };
   }
 
@@ -506,10 +507,17 @@ export class BackendPool {
     if (i) this.records.splice(0, i);
   }
 
+  /** Tells the listeners; one that throws (a status file that cannot be written) never reaches a call or a slot. */
   private changed() {
     if (!this.listeners.size) return;
     const s = this.snapshot();
-    for (const fn of this.listeners) fn(s);
+    for (const fn of this.listeners) {
+      try {
+        fn(s);
+      } catch (e) {
+        console.error(`serving listener failed: ${(e as Error).message ?? e}`);
+      }
+    }
   }
 }
 

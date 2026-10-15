@@ -139,7 +139,10 @@ export async function review(inference: Inference, model: string, input: ReviewI
   try {
     c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, REVIEW_MAX_TOKENS));
   } catch (e) {
-    return { verdict: 'error', problems: [], fix: '', error: String((e as Error).message ?? e), promptTokens: 0, completionTokens: 0, ms: 0 };
+    // an answer that came back but is not JSON (most often cut at the cap) still cost its tokens
+    const got = (e as { completion?: Completion<string> }).completion;
+    const usage = got ? { promptTokens: got.promptTokens, completionTokens: got.completionTokens, reasoningTokens: got.reasoningTokens, cut: got.cut, ms: got.ms } : { promptTokens: 0, completionTokens: 0, ms: 0 };
+    return { verdict: 'error', problems: [], fix: '', error: String((e as Error).message ?? e), ...usage };
   }
   const usage = { promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms };
   const r = normalizeReview(c.value);

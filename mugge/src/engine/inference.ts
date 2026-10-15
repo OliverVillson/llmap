@@ -107,10 +107,10 @@ export interface InferenceConfig {
 }
 
 export interface Inference {
-  /** An answer constrained to `schema`, parsed. */
-  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>>;
+  /** An answer constrained to `schema`, parsed. `signal` aborts the call, even once it is sent. */
+  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>>;
   /** A free-text answer. */
-  text(model: string, messages: ChatMessage[], maxTokens: number): Promise<Completion<string>>;
+  text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal): Promise<Completion<string>>;
 }
 
 export class OpenAICompatible implements Inference {
@@ -120,12 +120,17 @@ export class OpenAICompatible implements Inference {
     return this.cfg.models?.[model] ?? this.cfg.models?.[model.split('@')[0]] ?? this.cfg.defaultModel;
   }
 
-  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>> {
-    const c = await this.text(model, messages, maxTokens, schema);
-    return { ...c, value: parseJsonAnswer<T>(c.raw) };
+  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>> {
+    const c = await this.text(model, messages, maxTokens, signal, schema);
+    try {
+      return { ...c, value: parseJsonAnswer<T>(c.raw) };
+    } catch (e) {
+      // the caller can still count what the answer cost and see whether it was cut
+      throw Object.assign(e as Error, { completion: c });
+    }
   }
 
-  async text(model: string, messages: ChatMessage[], maxTokens: number, schema?: object): Promise<Completion<string>> {
+  async text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object): Promise<Completion<string>> {
     const started = performance.now();
     const cap = this.cfg.maxCallTokens;
     const body: Record<string, unknown> = {
@@ -143,7 +148,8 @@ export class OpenAICompatible implements Inference {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      // the run's stop (POST /stop) ends a call in flight too, so it does not hold its slot for up to timeoutMs
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS), signal]) : AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
       timeout: false,
     } as RequestInit);

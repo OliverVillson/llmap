@@ -63,10 +63,12 @@ export interface TicketResult {
   review: ReviewOutcome | null;
   /** The review found problems that its fix attempts did not get through the checks; the passing version was kept. */
   reviewUnresolved: boolean;
+  /** The attempt whose answer is in the worktree when the ticket finished: earlier than `attempts` when the review's fix was undone. */
+  answerAttempt: number | null;
 }
 
 /** Whether the inference config turns thinking on (MUGGE_THINKING / bench --thinking), else the environment. */
-function thinkingOn(inference: Inference): boolean {
+export function thinkingOn(inference: Inference): boolean {
   const kw = (inference as { cfg?: { extra?: { chat_template_kwargs?: { enable_thinking?: unknown } } } }).cfg?.extra?.chat_template_kwargs;
   if (typeof kw?.enable_thinking === 'boolean') return kw.enable_thinking;
   return process.env.MUGGE_THINKING?.trim().toLowerCase() === 'on';
@@ -88,14 +90,17 @@ export function applyOutput(worktree: string, ticket: Ticket, out: WorkerOutput)
 }
 
 export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessContext): Promise<TicketResult> {
-  const r: TicketResult = { ok: false, attempts: 0, firstTry: false, error: null, promptTokens: 0, completionTokens: 0, inferenceMs: 0, checkMs: 0, model: ticket.model, review: null, reviewUnresolved: false };
+  const r: TicketResult = { ok: false, attempts: 0, firstTry: false, error: null, promptTokens: 0, completionTokens: 0, inferenceMs: 0, checkMs: 0, model: ticket.model, review: null, reviewUnresolved: false, answerAttempt: null };
   const reviewOn = ctx.review ?? reviewFromEnv();
   const thinking = ctx.thinking ?? thinkingOn(ctx.inference);
   const pack = buildPack(worktree, ctx.plan, ticket, ctx.memory);
   const rounds = [ticket.model, ...(ticket.escalate_to ? [ticket.escalate_to] : [])];
   const of = ticket.budget.attempts * rounds.length;
-  const state = (s: AgentState, reason?: string) =>
+  let now: AgentState | undefined;
+  const state = (s: AgentState, reason?: string) => {
+    now = s;
     ctx.emit({ type: 'state', at: Date.now(), ticket: ticket.id, state: s, attempt: r.attempts, of, ...(reason ? { reason } : {}) });
+  };
   const before = reviewOn ? snapshot(worktree, ticket.owns) : {};
   let failed: { command: string; output: string } | null = null;
   // The last version whose checks passed, while a review's fix is being tried.
@@ -105,8 +110,22 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
     r.ok = true;
     r.firstTry = attempt === 1;
     r.error = null;
+    r.answerAttempt = attempt;
     state('finished', r.reviewUnresolved ? 'lead review problems left unfixed' : undefined);
     return r;
+  };
+
+  // Every acceptance command in order; the first that fails, or null when all pass (their output goes to `passing`).
+  const check = async (attempt: number, passing: Array<{ command: string; output: string }> = []) => {
+    for (const command of ticket.acceptance) {
+      const res = await ctx.sandbox.run(command, { cwd: worktree, image: ticket.image, timeoutMs: ctx.checkTimeoutMs });
+      r.checkMs += res.ms;
+      const ok = res.code === 0;
+      ctx.emit({ type: 'check', at: Date.now(), ticket: ticket.id, attempt, command, ok, ms: res.ms, tail: tail(res.out, 800) });
+      if (!ok) return { command, output: (res.timedOut ? '(timed out)\n' : '') + tail(res.out) };
+      passing.push({ command, output: res.out });
+    }
+    return null;
   };
 
   for (const model of rounds) {
@@ -149,19 +168,8 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       }
 
       state('checking');
-      failed = null;
       const checks: Array<{ command: string; output: string }> = [];
-      for (const command of ticket.acceptance) {
-        const res = await ctx.sandbox.run(command, { cwd: worktree, image: ticket.image, timeoutMs: ctx.checkTimeoutMs });
-        r.checkMs += res.ms;
-        const ok = res.code === 0;
-        ctx.emit({ type: 'check', at: Date.now(), ticket: ticket.id, attempt, command, ok, ms: res.ms, tail: tail(res.out, 800) });
-        if (!ok) {
-          failed = { command, output: (res.timedOut ? '(timed out)\n' : '') + tail(res.out) };
-          break;
-        }
-        checks.push({ command, output: res.out });
-      }
+      failed = await check(attempt, checks);
       if (failed) {
         r.error = `${failed.command}\n${failed.output}`;
         continue;
@@ -189,10 +197,15 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
     if (passed) break; // the review's fix ran out of attempts: keep the passing version, do not escalate
   }
   if (passed) {
+    // Put the passing version back and check it again, so the ticket ends through `checking`
+    // (state.ts) and only on files that pass now.
     restore(worktree, passed.files);
     r.model = passed.model;
     r.reviewUnresolved = true;
-    return finished(passed.attempt);
+    if (now !== 'checking') state('checking');
+    const again = await check(passed.attempt);
+    if (!again) return finished(passed.attempt);
+    r.error = `${again.command}\n${again.output}`;
   }
   state('failed', r.error?.split('\n')[0]);
   return r;
