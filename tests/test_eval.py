@@ -144,6 +144,17 @@ def test_sampling_names_the_penalty_in_each_engines_field(monkeypatch):
     assert ev.sampling_params(None, True) == {"top_k": ev.THINK_TOP_K, "min_p": 0.0, "repetition_penalty": 1.0}
 
 
+def test_no_top_k_reaches_llama_server_as_a_bounded_one(monkeypatch):
+    monkeypatch.setattr(ev, "MIN_P", 0.0)
+    monkeypatch.setattr(ev, "THINK_TOP_K", 0)
+    assert ev.sampling_params(None, True)["top_k"] == ev.LLAMA_TOP_K  # llama.cpp would sort the whole vocabulary
+    monkeypatch.setattr(ev, "THINK_TOP_K", 20)
+    assert ev.sampling_params(None, True)["top_k"] == 20
+    monkeypatch.setattr(ev, "THINK_TOP_K", 0)
+    monkeypatch.setattr(ev, "VLLM", {"name": "m", "dir": "/m"})
+    assert ev.sampling_params(None, True)["top_k"] == 0  # vLLM samples on the GPU
+
+
 def test_an_answer_cut_after_its_thinking_is_counted_and_left_as_it_is(server):
     fake = server(lambda path, body: chat_stream("```py\nx = ", "done thinking", finish="length", tokens=4096))
     infos = []

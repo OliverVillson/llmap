@@ -127,6 +127,10 @@ KV_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 3
 # serves. generate() and force_answer() speak to whichever runs.
 VLLM: dict[str, str] = {}
 THINK_TOP_K = 20  # top_k for thinking answers; serve() takes the job's thinking_top_k
+# llama-server's top_k when the job asks for none (0): with none, llama.cpp sorts the whole
+# vocabulary on the CPU for every token of every slot, one slot after another, and the
+# GPU idles (4 tokens/s per slot for Granite 3B on a B200). vLLM samples on the GPU.
+LLAMA_TOP_K = 100
 MIN_P = 0.0  # serve() takes the job's eval_min_p
 # The server serve() started ({"proc", "path", "name"}): alive() watches its process, and
 # the SIGTERM handler stops its process group.
@@ -593,9 +597,11 @@ def split_reasoning(message: dict, cut: bool = False) -> tuple[str, str]:
 def sampling_params(seed: int | None, thinking: bool) -> dict:
     """Sampling fields for a request to the running server. min_p (Config.eval_min_p) and
     a repetition penalty of 1 always go explicitly, in the engine's own field names, so
-    neither engine's default applies (llama-server's min_p is 0.05)."""
+    neither engine's default applies (llama-server's min_p is 0.05). A top_k of 0 (none)
+    goes to llama-server as LLAMA_TOP_K."""
     penalty = {"repetition_penalty": 1.0} if VLLM else {"repeat_penalty": 1.0}
-    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": THINK_TOP_K} if thinking else {}),
+    top_k = THINK_TOP_K if VLLM or THINK_TOP_K > 0 else LLAMA_TOP_K
+    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": top_k} if thinking else {}),
             "min_p": MIN_P, **penalty}
 
 
