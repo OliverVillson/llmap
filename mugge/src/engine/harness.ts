@@ -74,7 +74,11 @@ export function thinkingOn(inference: Inference): boolean {
   return process.env.MUGGE_THINKING?.trim().toLowerCase() === 'on';
 }
 
-/** Writes the answer's owned files into the worktree; returns the paths it refused. */
+/**
+ * Writes the answer's owned files into the worktree; returns the paths it refused. An answer
+ * with refused paths still leaves its owned files written (the next fix call shows them), but
+ * the per-call log marks it `drop: not_owned`, unclean, so it never becomes a training row.
+ */
 export function applyOutput(worktree: string, ticket: Ticket, out: WorkerOutput): string[] {
   const refused: string[] = [];
   for (const [path, content] of Object.entries(out?.files ?? {})) {

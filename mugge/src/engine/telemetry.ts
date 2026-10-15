@@ -85,7 +85,7 @@ export function classifyAnswer(raw: string, owns: string[], out: WorkerOutput | 
   return { drop, written, missing, stray, loose };
 }
 
-/** Share of answers lost to the parser or the cap above which a run warns. */
+/** Share of answers lost to the parser, the cap or a forced answer above which a run warns. */
 export const LOST_WARN_SHARE = 0.2;
 
 // ---------------------------------------------------------------------------------------------
@@ -144,7 +144,7 @@ export interface CallSummary {
   /** Answers with no usable file (any DropReason). */
   dropped: number;
   dropReasons: Record<DropReason, number>;
-  /** Answers dropped or cut: what the 20% warning counts. */
+  /** Answers dropped, cut or forced (none can become a row): what the 20% warning counts. */
   lost: number;
   lostShare: number;
   write: number;
@@ -175,7 +175,8 @@ export function addCall(s: CallSummary, r: CallRecord): CallSummary {
     s.dropped++;
     s.dropReasons[r.drop]++;
   }
-  if (r.drop || r.cut) s.lost++;
+  // a forced answer can never be a row either, and many of them mean the cap is wrong
+  if (r.drop || r.cut || r.forced) s.lost++;
   const answers = s.calls - s.errors;
   s.lostShare = answers ? s.lost / answers : 0;
   s.promptTokens += r.promptTokens;
@@ -197,8 +198,8 @@ export function lostWarning(s: CallSummary, share = LOST_WARN_SHARE): string | n
   if (!s.calls || s.lostShare <= share) return null;
   const reasons = DROP_REASONS.filter((r) => s.dropReasons[r]).map((r) => `${r} ${s.dropReasons[r]}`).join(', ');
   const cutKept = s.lost - s.dropped;
-  return `WARNING: ${s.lost} of ${s.calls - s.errors} answers (${pct(s.lostShare)}) were lost to the parser or the token cap` +
-    ` (dropped: ${reasons || 'none'}${cutKept ? `; cut at the cap but parsed: ${cutKept}` : ''}). Check the format and MUGGE_MAX_CALL_TOKENS before trusting this run.`;
+  return `WARNING: ${s.lost} of ${s.calls - s.errors} answers (${pct(s.lostShare)}) were lost to the parser, the token cap or a forced answer` +
+    ` (dropped: ${reasons || 'none'}${cutKept ? `; cut or forced but parsed: ${cutKept}` : ''}). Check the format and MUGGE_MAX_CALL_TOKENS before trusting this run.`;
 }
 
 /** Plain lines for the end of a run. */

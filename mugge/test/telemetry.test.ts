@@ -163,16 +163,16 @@ describe('the inference client reads forced and cut answers', () => {
 });
 
 describe('spike smoke', () => {
-  test('the fake model with a messy first answer on four tickets MEETS, and the log names every bad answer', async () => {
+  test('the fake model with a messy first answer on three tickets MEETS, and the log names every bad answer', async () => {
     const out = tmp('mugge-smoke-');
     const r = await runSmoke({ fake: true, fakeMess: true, fakeLatencyMs: 20, out, quiet: true });
     expect(r.verdict).toBe('MEETS');
     expect(r.refs).toEqual({ passed: 15, tickets: 15, failures: [] });
     expect(r.passed).toBe(15);
-    expect([r.calls.calls, r.calls.forced, r.calls.cut, r.calls.dropped, r.calls.errors]).toEqual([18, 1, 1, 2, 0]);
+    expect([r.calls.calls, r.calls.forced, r.calls.cut, r.calls.dropped, r.calls.errors, r.calls.lost]).toEqual([17, 1, 1, 1, 0, 3]);
     const rows: CallRecord[] = readFileSync(join(out, 'calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const bad = rows.filter((x) => !x.clean).map((x) => `${x.ticket.split('/')[1]} ${x.attempt} ${x.forced ?? ''}${x.cut ? 'cut' : ''}${x.drop ?? ''}`).sort();
-    expect(bad).toEqual([`${MESS.cut[0]}#s0 1 cut`, `${MESS.flaky[0]}#s0 1 no_fence`, `${MESS.forced[0]}#s0 1 length`, `${MESS.prose[0]}#s0 1 no_fence`].sort());
+    expect(bad).toEqual([`${MESS.cut[0]}#s0 1 cut`, `${MESS.forced[0]}#s0 1 length`, `${MESS.prose[0]}#s0 1 no_fence`].sort());
     const status: CrewStatus = JSON.parse(readFileSync(join(out, 'status.json'), 'utf8'));
     expect(status.crew.tickets.done).toBe(15);
     expect(existsSync(join(out, 'smoke.json'))).toBe(true);
@@ -337,4 +337,12 @@ test('settings the smoke cannot run with are no score before any call', async ()
   } finally {
     rmSync(out, { recursive: true, force: true });
   }
+});
+
+test('forced answers count as lost: a run of forced answers misses even when every ticket passes', () => {
+  const t = new Telemetry({ warn: null });
+  for (let i = 0; i < 10; i++) t.emit({ type: 'model', at: 1000, ticket: `t${i}`, attempt: 1, kind: 'write', promptTokens: 10, completionTokens: 5, ms: 10, note: '', files: 1, forced: 'length' });
+  const c = t.calls();
+  expect([c.forced, c.lost, c.clean, c.lostShare]).toEqual([10, 10, 0, 1]);
+  expect(lostWarning(c)).toContain('forced');
 });

@@ -10,13 +10,13 @@
  *      dependencies' reference answers in place, and is scored on its hidden tests.
  *   3. It prints the pass count, parser drops, forced and cut answers, wall time and a verdict:
  *      MEETS when at least `--bar` of the tickets pass, at most 20% of answers were lost to the
- *      parser or the cap, at most 20% named a file in a shape the parser had to guess (`prog.c`,
+ *      parser, the cap or a forced answer (none can become a training row), at most 20% named a file in a shape the parser had to guess (`prog.c`,
  *      `**a.py**`: not the training format), and no model call failed. MISSES otherwise, with
  *      the reasons.
  *
  *   bun bench/smoke.ts --url http://127.0.0.1:8080/v1 --model BH0.1-1.3 --sandbox local
  *   bun bench/smoke.ts --fake                  the fake model on the reference answers (CI)
- *   bun bench/smoke.ts --fake --fake-mess      … plus a cut, a forced, a prose and an empty first answer
+ *   bun bench/smoke.ts --fake --fake-mess      … plus a cut, a forced and a prose first answer
  *   options: --out <dir> (default runs/smoke-<time>), --concurrency 12, --sandbox local|podman|docker,
  *            --thinking off|on (default off: BlackHole workers are trained thinking-off),
  *            --max-tokens <per call> (default MUGGE_MAX_CALL_TOKENS, else 4096 off / 8192 on),
@@ -45,7 +45,7 @@ export const SPIKE_DIR = join(import.meta.dir, '..', 'spike');
 
 export interface SmokeOptions {
   fake?: boolean;
-  /** Fake model only: a cut, a forced, a prose and an empty first answer on four tickets. */
+  /** Fake model only: a cut, a forced and a prose first answer on three tickets. */
   fakeMess?: boolean;
   fakeLatencyMs?: number;
   url?: string;
@@ -79,8 +79,11 @@ export interface SmokeResult {
   out: string;
 }
 
-/** Fake-mess tickets: first answer cut, prose, forced, empty. */
-export const MESS = { cut: ['c-hash'], prose: ['py-store'], forced: ['ts-format'], flaky: ['ts-args'] };
+/**
+ * Fake-mess tickets: first answer cut, prose, forced. Three lost answers of 18 calls stay under
+ * the 20% line now that forced answers count as lost (an empty answer drops as no_fence, like prose).
+ */
+export const MESS = { cut: ['c-hash'], prose: ['py-store'], forced: ['ts-format'] };
 
 /** Reference answers through acceptance and hidden tests, each ticket once. */
 export async function checkReferences(projects: BenchProject[], sandbox: Sandbox, concurrency = 8): Promise<{ passed: number; tickets: number; failures: string[] }> {
@@ -206,7 +209,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const passed = [...byKey.values()].filter(Boolean).length;
   const reasons: string[] = [];
   if (passed < Math.ceil(bar * tickets)) reasons.push(`${passed}/${tickets} pass, the bar is ${Math.ceil(bar * tickets)} (${Math.round(bar * 100)}%)`);
-  if (calls.lostShare > LOST_WARN_SHARE) reasons.push(`${Math.round(calls.lostShare * 100)}% of answers lost to the parser or the cap (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
+  if (calls.lostShare > LOST_WARN_SHARE) reasons.push(`${Math.round(calls.lostShare * 100)}% of answers lost to the parser, the cap or forced answers (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
   const answers = calls.calls - calls.errors;
   if (answers && calls.loose / answers > LOST_WARN_SHARE) reasons.push(`${Math.round((100 * calls.loose) / answers)}% of answers named a file in a shape the parser had to guess, not the training format (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
   if (calls.errors) reasons.push(`${calls.errors} model calls failed (timeouts or server errors)`);
