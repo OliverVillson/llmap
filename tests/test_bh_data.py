@@ -166,6 +166,34 @@ def test_harvest_guards(run, tmp_path):
     assert st.dropped == {"broken_reference": 2, "decontam": 2} and len(rows) == 6
 
 
+def test_harvest_skips_loose_and_unclean_calls(run, tmp_path, tks):
+    # a passing answer whose path the parser had to guess (Centipede run 1's prog.c) is never a row
+    def loosen(t):
+        c = t["calls"][-1]
+        owns = tks[t["key"]]["owns"]
+        if len(owns) == 1:
+            c["answer"] = c["answer"].replace(owns[0] + "\n```", "**" + owns[0].rsplit("/", 1)[-1] + "**\n```", 1)
+    loose = _edit(run, tmp_path / "loose", loosen)
+    rows, st = harvest.harvest(SPIKE, [loose])
+    assert st.dropped["loose"] == 10 and rows == [] and st.loose >= 10
+    # the engine's per-call log (telemetry.ts CallRecord) marks a call unclean: it drops,
+    # and so does every flag the observability PR writes into transcripts
+    recs = []
+    for t in harvest.read_jsonl(run / "transcripts.jsonl"):
+        for i, _ in enumerate(t["calls"], 1):
+            recs.append({"v": 1, "ticket": f"{t['key']}#s{t['seed']}", "attempt": i, "kind": "write" if i == 1 else "fix",
+                         "cut": False, "forced": None, "drop": None, "loose": 0, "error": None,
+                         "clean": not (t["key"] == "spike/c-hash" and i == len(t["calls"]))})
+    recs.append({"v": 1, "ticket": "spike/c-hash#s0", "attempt": 9, "kind": "fix", "error": "inference 500", "clean": False})
+    log = tmp_path / "calls.jsonl"
+    harvest.write_jsonl(log, recs)
+    rows, st = harvest.harvest(SPIKE, [run], calls_logs=[log])
+    assert st.dropped["unclean"] == 2 and len(rows) == 8
+    for flag, val, why in (("forced", "length", "forced"), ("drop", "unlabelled", "parser"), ("loose", True, "loose")):
+        d = _edit(run, tmp_path / f"flag-{flag}", lambda t: t["calls"][-1].update({flag: val}))
+        assert harvest.harvest(SPIKE, [d])[1].dropped[why] == 10, flag
+
+
 def test_harvest_write_from_fix_and_max_fix(run, tmp_path):
     # only the fixed seeds: no first-call pass, so the write row comes from the fix answer
     only_fix = tmp_path / "only-fix"
@@ -257,10 +285,12 @@ def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
     path = t["owns"][0]
     good = render.one({"op": "write", "project": t["dir"], "ticket": t["id"], "answer": answer(ref(t))})["messages"]
     loose = [*good[:2], {"role": "assistant", "content": f"Here it is:\n\n**{path}**\n```c\n{ref(t)[path]}```"}]
+    relaid = [*good[:2], {"role": "assistant", "content": f"{path}\n```\n{ref(t)[path]}```\n\n"}]
     wrong = render.one({"op": "write", "project": t["dir"], "ticket": t["id"], "answer": answer({path: "int nope;\n"})})["messages"]
     rows = [
         {"messages": good, "meta": {"project": t["dir"], "ticket": t["id"]}},
         {"messages": loose},
+        {"messages": relaid},
         {"messages": wrong, "meta": {"project": t["dir"], "ticket": t["id"]}},
         {"messages": [{"role": "system", "content": "You review."}, *good[1:]], "meta": {"kind": "review"}},
         {"messages": [{"role": "system", "content": "Other"}, *good[1:]]},
@@ -272,7 +302,7 @@ def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
     st = json.loads(cfg.stats("extra").read_text())
     assert len(out) == 2 and out[0]["meta"]["checked"] is True and out[1]["meta"]["checked"] is False
     assert out[1]["messages"][2]["content"] == good[2]["content"]  # re-rendered canonical
-    assert st["recanonicalised"] == 1 and st["sandbox_acceptance"] == 1 and st["review"] == 1
+    assert st["loose"] == 1 and st["recanonicalised"] == 1 and st["sandbox_acceptance"] == 1 and st["review"] == 1
     assert st["system_drift"] == 1 and st["parser"] == 1 and st["unchecked"] == 1
     assert len(harvest.read_jsonl(cfg.rows("extra-review"))) == 1
     strict = data.DataConfig(work=tmp_path / "strict", benches=[], extra_require_check=True)

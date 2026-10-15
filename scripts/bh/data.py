@@ -168,8 +168,9 @@ OWNS_LINE = re.compile(r"^Files you own \(write each in full\): (.*)$", re.M)
 def extra_rows(cfg: DataConfig, path: Path | None = None) -> Path:
     """bhdata's free rows (mutation fix, test, review), held to the engine's wire: the system
     prompt must be the engine's, the user message a write or fix message, the answer every
-    owned file in the canonical form (re-rendered through the engine when only its layout
-    differs). A row naming its ticket ("meta": {"project": <bench project dir>, "ticket": id})
+    owned file, each path alone on its line before its fence (an answer whose paths the
+    parser had to guess is dropped), re-rendered through the engine when only its layout
+    differs (fence language, blank lines). A row naming its ticket ("meta": {"project": <bench project dir>, "ticket": id})
     is checked in the sandbox; review rows are not worker calls and go to extra-review.jsonl
     for BH0.2."""
     path = path or bhdata_io.layout(cfg.export_dir).extra_rows
@@ -199,6 +200,9 @@ def extra_rows(cfg: DataConfig, path: Path | None = None) -> Path:
     for r, o, x in zip(shaped, owns, canon):
         if x["parsed"]["missing"] or x["parsed"]["extra"]:
             counts["parser"] += 1
+            continue
+        if x["parsed"]["loose"]:  # the parser had to guess a path: the row would teach the wrong shape
+            counts["loose"] += 1
             continue
         if x["content"] != r["messages"][2]["content"]:
             counts["recanonicalised"] += 1
