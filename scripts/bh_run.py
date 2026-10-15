@@ -403,8 +403,7 @@ class Run:
         outs = [o for o in outs if (o / "transcripts.jsonl").exists()]
         if not outs:
             raise RuntimeError("no teacher transcripts to harvest")
-        self.ex.run(step, self.data_cmd("teacher", "data-teacher", "--runs " + " ".join(q(o) for o in outs),
-                                        runs=[str(o) for o in outs]))
+        self.ex.run(step, self.data_cmd("teacher", "data-teacher", self.runs_args(outs), runs=[str(o) for o in outs]))
         if cfg.extra_rows and (self.data / "export" / "extra_rows.jsonl").exists():
             self.ex.run(step, self.data_cmd("extra", "data-extra"))
         else:
@@ -420,6 +419,13 @@ class Run:
         self.upload_once(self.rows / "train.jsonl", "train-rows.jsonl")
         for n in ("teacher", "extra"):
             self.upload_once(self.data / "rows" / f"{n}.jsonl", f"data-rows-{n}.jsonl")
+
+    @staticmethod
+    def runs_args(runs: list[Path]) -> str:
+        """--runs for data.py, and the proxy's per-call logs beside them (cut calls never rows)."""
+        logs = [r / "proxy" / "calls.jsonl" for r in runs if (r / "proxy" / "calls.jsonl").exists()]
+        return "--runs " + " ".join(q(r) for r in runs) + ("".join(f" --calls-log {q(x)}" for x in logs[:1])
+                                                           + "".join(f" {q(x)}" for x in logs[1:]))
 
     def restore_data_rows(self) -> None:
         """data.py's round-1 row files (round 2's build adds to them), from the bucket."""
@@ -813,7 +819,7 @@ class Run:
         self.restore_data_rows()
         if not (self.data / "rows" / "teacher.jsonl").exists():
             raise RuntimeError("no round-1 teacher rows (data-rows-teacher.jsonl): run teacher-answers first")
-        self.ex.run(step, self.data_cmd("repair-requests", "data-repair-requests", f"--runs {q(samples)}",
+        self.ex.run(step, self.data_cmd("repair-requests", "data-repair-requests", self.runs_args([samples]),
                                         runs=[str(samples)]))
         reqs = self.data / "round2" / "repair-requests.jsonl"
         answers = self.data / "round2" / "repair-answers.jsonl"
@@ -836,7 +842,7 @@ class Run:
             write_jsonl(answers, [])
             pc = {}
         self.ex.run(step, self.data_cmd("repair", "data-repair", f"--answers {q(answers)}"))
-        self.ex.run(step, self.data_cmd("rft", "data-rft", f"--runs {q(samples)}", runs=[str(samples)]))
+        self.ex.run(step, self.data_cmd("rft", "data-rft", self.runs_args([samples]), runs=[str(samples)]))
         st = self.build_rows(step, 2)
         sd = self.data / "stats"
         dump(self.r2("round2.json"), {**st, "requests": load(sd / "repair-requests.json"), "proxy": pc,
