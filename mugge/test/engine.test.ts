@@ -8,7 +8,7 @@ import { git, initRepo } from '../src/engine/git.ts';
 import { OpenAICompatible, parseJsonAnswer } from '../src/engine/inference.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
 import { runPlan } from '../src/engine/scheduler.ts';
-import { PlanError, validatePlan } from '../src/tickets/schema.ts';
+import { clashReason, PlanError, validatePlan } from '../src/tickets/schema.ts';
 
 const t = (id: string, extra: any = {}) => ({ id, title: `Write ${id}`, image: 'node', owns: [`${id}.txt`], acceptance: [`grep -q ok-${id} ${id}.txt`], ...extra });
 
@@ -24,9 +24,14 @@ describe('plan validation', () => {
     expect(() => validatePlan({ tickets: [t('a', { owns: ['../etc/passwd'] })] })).toThrow(/owns path/);
     expect(() => validatePlan({ tickets: [t('a', { owns: ['src/*.ts'] })] })).toThrow(/owns path/);
   });
-  test('two tickets that can run at once may not own the same file', () => {
-    expect(() => validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] })).toThrow(/both own x/);
-    expect(() => validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'], depends_on: ['a'] })] })).not.toThrow();
+  test('two tickets that can run at once and own the same file: the later one is a clash', () => {
+    expect(() => validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] }, { clashes: 'reject' })).toThrow(/both own x/);
+    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] }).clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
+    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'], depends_on: ['a'] })] }).clashes).toBeUndefined();
+    // each later claimant is blocked once, against the tickets that keep their files
+    const three = validatePlan({ tickets: [t('a', { owns: ['x', 'y'] }), t('b', { owns: ['x'] }), t('c', { owns: ['x', 'y', 'z'] })] });
+    expect(three.clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }, { ticket: 'c', files: ['x', 'y'], with: ['a'] }]);
+    expect(clashReason(three.clashes![1]!)).toBe('two tickets need the same file: x, y (also owned by a)');
   });
 });
 

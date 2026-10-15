@@ -17,6 +17,8 @@
  *                         spend in one call)
  *   MUGGE_DEBUG_CALLS     1: one line per model call on stderr: model, prompt, completion and
  *                         reasoning tokens, time, and whether the answer was cut at max_tokens
+ *   MUGGE_REVIEW          on | off (default off): one lead review of each ticket whose checks pass
+ *                         (engine/review.ts); read by the harness itself
  */
 import type { InferenceConfig } from './engine/inference.ts';
 

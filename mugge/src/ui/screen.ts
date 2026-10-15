@@ -193,7 +193,7 @@ export interface RunOpts {
   now?: number;
 }
 
-const STATE_ROLE: Record<TicketState, Role> = { waiting: 'chrome', running: 'accent', done: 'ok', failed: 'error', skipped: 'chrome' };
+const STATE_ROLE: Record<TicketState, Role> = { waiting: 'chrome', running: 'accent', done: 'ok', failed: 'error', skipped: 'chrome', blocked: 'warn' };
 
 function stateIcon(s: TicketState, frame: number): string {
   switch (s) {
@@ -202,6 +202,7 @@ function stateIcon(s: TicketState, frame: number): string {
     case 'done': return GLYPHS.done;
     case 'failed': return GLYPHS.failed;
     case 'skipped': return GLYPHS.backlog;
+    case 'blocked': return GLYPHS.blocked;
   }
 }
 
@@ -268,6 +269,7 @@ export function renderRun(view: RunView, o: RunOpts): string[] {
       (s.failed ? P.error : P.chrome)(`${GLYPHS.failed} ${s.failed} failed`),
     ];
     if (s.skipped) counts.push(P.chrome(`${GLYPHS.backlog} ${s.skipped} skipped`));
+    if (s.blocked) counts.push(P.warn(`${GLYPHS.blocked} ${s.blocked} blocked`));
     const metrics = [
       P.chrome('first-try ') + P.text(`${s.firstTry}/${s.tickets}`),
       P.chrome('tokens ') + P.text(`${fmtTok(s.promptTokens)} in / ${fmtTok(s.completionTokens)} out`),
@@ -298,18 +300,18 @@ export function renderRun(view: RunView, o: RunOpts): string[] {
     const hidden = n - shown;
     if (hidden > 0) shown = Math.max(0, shown - 1);
     // keep running and failed tickets in view first, then the rest in plan order
-    const rank: Record<TicketState, number> = { running: 0, failed: 1, waiting: 2, done: 3, skipped: 4 };
+    const rank: Record<TicketState, number> = { running: 0, failed: 1, blocked: 1, waiting: 2, done: 3, skipped: 4 };
     const pick = hidden > 0
       ? new Set([...view.tickets].sort((a, b) => rank[a.state] - rank[b.state]).slice(0, shown))
       : new Set(view.tickets);
     for (const t of view.tickets) {
       if (!pick.has(t)) continue;
       const role = STATE_ROLE[t.state];
-      const note = t.state === 'failed' && t.error ? t.error.split('\n')[0]! : t.lastNote || t.title;
+      const note = (t.state === 'failed' || t.state === 'blocked') && t.error ? t.error.split('\n')[0]! : t.lastNote || t.title;
       let line = P.role(role, stateIcon(t.state, o.frame)) + ' ' + P.role(role, padR(t.id, idW)) + '  ';
       if (showModel) line += P.chrome(padR(t.model, modelW)) + '  ';
       line += P.text(padR(t.attempt ? `#${t.attempt}` : '', 3));
-      if (noteW >= 4) line += '  ' + (t.state === 'failed' ? P.error(clip(note, noteW)) : P.chrome(clip(note, noteW)));
+      if (noteW >= 4) line += '  ' + (t.state === 'failed' ? P.error(clip(note, noteW)) : t.state === 'blocked' ? P.warn(clip(note, noteW)) : P.chrome(clip(note, noteW)));
       out.push(line);
       avail--;
     }

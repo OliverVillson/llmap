@@ -85,8 +85,11 @@ describe('architect and planner', () => {
   test('tickets are validated', async () => {
     const good = { interfaces: ['lib/short.h'], tickets: [{ id: 'enc', title: 'Encode', image: 'c', owns: ['lib/enc.c'], acceptance: ['make test'] }] };
     expect((await tickets(canned(good), d, ['lib/short.h'])).tickets[0].budget.attempts).toBe(4);
-    const bad = { interfaces: [], tickets: [{ id: 'a', owns: ['x'] }, { id: 'b', owns: ['x'] }] };
-    expect(tickets(canned(bad), d, [])).rejects.toThrow(/both own/);
+    // a clash is kept for the owner to settle, not thrown away with the plan
+    const clash = { interfaces: [], tickets: [{ id: 'a', owns: ['x'] }, { id: 'b', owns: ['x'] }] };
+    expect((await tickets(canned(clash), d, [])).clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
+    const bad = { interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['nope'] }] };
+    expect(tickets(canned(bad), d, [])).rejects.toThrow(/unknown ticket/);
   });
 });
 

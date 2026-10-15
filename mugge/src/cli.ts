@@ -214,7 +214,7 @@ async function main(argv: string[]) {
       if (!values.plain && process.stdout.isTTY) void follow(repo.split('/').pop()!, feed.subscribe);
       const report = await run;
       const s = report.summary;
-      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
+      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped${s.blocked ? `, ${s.blocked} blocked (two tickets need the same file)` : ''}; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
       process.exit(s.done === s.tickets && s.integrated ? 0 : 1);
     }
     case 'ship': {

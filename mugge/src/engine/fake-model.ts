@@ -3,12 +3,15 @@
  * solutions (spike/solutions/<ticket>.json), found by the `Ticket: <id>` line of the prompt.
  * Calls with a JSON schema get JSON back; coder calls get the files as plain fenced files.
  * `flaky` tickets get a useless first answer so the fix loop runs; `latencyMs` stands in for
- * inference time so the parallel speed-up shows.
+ * inference time so the parallel speed-up shows. Lead review calls (REVIEW_SYSTEM) get the
+ * ticket's canned reviews in turn, else an approval.
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorkerOutput } from '../tickets/schema.ts';
 import { renderFiles } from './files.ts';
+import { REVIEW_SYSTEM } from './prompts.ts';
+import type { LeadReview } from './review.ts';
 
 export interface FakeOptions {
   solutions: Record<string, WorkerOutput>;
@@ -18,6 +21,18 @@ export interface FakeOptions {
   broken?: string[];
   latencyMs?: number;
   port?: number;
+  /** Ticket id → the answers to its review calls, in order (the last one repeats). */
+  reviews?: Record<string, LeadReview[]>;
+  /** Ticket id → the answers to its fix calls, in order (the last one repeats), in place of the solution. */
+  fixes?: Record<string, WorkerOutput[]>;
+}
+
+/** One request the fake answered, for tests. */
+export interface FakeCall {
+  ticket: string;
+  kind: 'review' | 'fix' | 'write' | 'json';
+  maxTokens: number;
+  prompt: string;
 }
 
 export function loadSolutions(dir: string): Record<string, WorkerOutput> {
@@ -32,7 +47,8 @@ export function loadSolutions(dir: string): Record<string, WorkerOutput> {
 const approxTokens = (s: string) => Math.ceil(s.length / 4);
 
 export function startFakeModel(o: FakeOptions) {
-  const seen = new Map<string, number>();
+  const seen = new Map<string, number>(), reviewed = new Map<string, number>(), fixed = new Map<string, number>();
+  const calls: FakeCall[] = [];
   let inFlight = 0, peakInFlight = 0, requests = 0;
   const server = Bun.serve({
     port: o.port ?? 0,
@@ -48,11 +64,31 @@ export function startFakeModel(o: FakeOptions) {
         const body: any = await req.json();
         const prompt: string = body.messages?.map((m: any) => m.content).join('\n') ?? '';
         const id = prompt.match(/^Ticket: (\S+)$/m)?.[1] ?? '';
+        const isReview = body.messages?.[0]?.content === REVIEW_SYSTEM;
+        const isFix = !isReview && /\n## Fix\n/.test(prompt);
+        calls.push({ ticket: id, kind: isReview ? 'review' : body.response_format || body.guided_json ? 'json' : isFix ? 'fix' : 'write', maxTokens: body.max_tokens, prompt });
+        if (o.latencyMs) await Bun.sleep(o.latencyMs);
+        if (isReview) {
+          const k = reviewed.get(id) ?? 0;
+          reviewed.set(id, k + 1);
+          const list = o.reviews?.[id] ?? [];
+          const rv: LeadReview = list[Math.min(k, list.length - 1)] ?? { verdict: 'approve', problems: [], fix: '' };
+          const content = JSON.stringify(rv);
+          return Response.json({
+            id: `fake-${requests}`, object: 'chat.completion', model: body.model,
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }],
+            usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(content), total_tokens: approxTokens(prompt) + approxTokens(content) },
+          });
+        }
         const n = (seen.get(id) ?? 0) + 1;
         seen.set(id, n);
-        if (o.latencyMs) await Bun.sleep(o.latencyMs);
         let answer: WorkerOutput;
-        if (o.broken?.includes(id)) answer = { files: {}, note: 'no idea' };
+        const fixList = isFix ? o.fixes?.[id] : undefined;
+        if (fixList?.length) {
+          const k = fixed.get(id) ?? 0;
+          fixed.set(id, k + 1);
+          answer = fixList[Math.min(k, fixList.length - 1)]!;
+        } else if (o.broken?.includes(id)) answer = { files: {}, note: 'no idea' };
         else if (o.flaky?.includes(id) && n === 1) answer = { files: {}, note: 'first try, wrote nothing' };
         else answer = o.solutions[id] ?? { files: {}, note: `no canned answer for ${id || 'this prompt'}` };
         const content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
@@ -71,6 +107,7 @@ export function startFakeModel(o: FakeOptions) {
   return {
     url: `http://127.0.0.1:${server.port}/v1`,
     stats: () => ({ requests, peakInFlight }),
+    calls: () => calls,
     stop: () => server.stop(true),
   };
 }
