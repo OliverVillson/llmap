@@ -43,6 +43,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -183,7 +184,7 @@ def extra_rows(cfg: DataConfig, path: Path | None = None) -> Path:
             counts["not_one_call"] += 1
         elif m[0]["content"] != system:
             if (review and m[0]["content"] == review) or (r.get("meta") or {}).get("kind") == "review":
-                reviews.append(r)
+                reviews.append({**r, "kind": "review", "source": "extra"})
                 counts["review"] += 1
             else:
                 counts["system_drift"] += 1
@@ -202,9 +203,14 @@ def extra_rows(cfg: DataConfig, path: Path | None = None) -> Path:
         if x["content"] != r["messages"][2]["content"]:
             counts["recanonicalised"] += 1
         meta = r.get("meta") or {}
-        ready.append({"messages": [*r["messages"][:2], {"role": "assistant", "content": x["content"]}],
-                      "meta": {**meta, "kind": render.kind_of(r["messages"][1]["content"]), "source": "bhdata-extra"},
-                      "_files": x["parsed"]["files"]})
+        kind = render.kind_of(r["messages"][1]["content"])
+        msgs = [*r["messages"][:2], {"role": "assistant", "content": x["content"]}]
+        tid = re.search(r"^Ticket: (\S+)$", msgs[1]["content"], re.M)
+        ready.append({"id": hashlib.sha256((msgs[1]["content"] + "\0" + msgs[2]["content"]).encode()).hexdigest()[:24],
+                      "kind": kind, "source": "extra", "project": meta.get("project", ""),
+                      "ticket": meta.get("ticket") or (tid.group(1) if tid else ""), "kit": meta.get("kit", ""),
+                      "messages": msgs, "completion_tokens": None, "cut": False, "forced": False,
+                      "meta": {**meta, "kind": kind, "source": "extra"}, "_files": x["parsed"]["files"]})
     # sandbox check where the row names its ticket
     named = [r for r in ready if r["meta"].get("project") and r["meta"].get("ticket")]
     tks = {}
@@ -317,7 +323,7 @@ def repair(cfg: DataConfig, answers: Path, requests: Path | None = None) -> Path
 
 def rft_rows(cfg: DataConfig, runs: list[str | Path]) -> Path:
     broken, excluded = _guards(cfg, "heldout")
-    rows, stats = harvest.harvest(cfg.bench("heldout"), runs, source="student-rft", broken=broken, excluded=excluded,
+    rows, stats = harvest.harvest(cfg.bench("heldout"), runs, source="rft", broken=broken, excluded=excluded,
                                   max_fix=cfg.max_fix, write_from_fix=cfg.write_from_fix, sandbox=cfg.sandbox,
                                   workers=cfg.workers or None, timeout=cfg.timeout)
     harvest.write_jsonl(cfg.rows("rft"), rows)
@@ -525,12 +531,145 @@ def smoke(cfg: DataConfig) -> dict:
     return report
 
 
+# ---------- row-file commands (scripts/bh_run.py's interface) ----------
+# Each reads and writes files only and writes <out>.stats.json beside its output.
+
+def _stats_path(out: Path) -> Path:
+    return out.with_name(out.name + ".stats.json")
+
+
+def export_kits(kits: Path | None, out: Path, *, limit_kits: int | None = None, heldout_share: float | None = None,
+                seed: int | None = None) -> dict:
+    """bhdata's export into out (train-bench/, heldout-bench/, extra_rows.jsonl) and
+    out/export.json with its counts. canary_hits: practice tickets carrying MuggeBench's canary."""
+    args = [*(["--kits", str(kits)] if kits else []), *(["--limit-kits", str(limit_kits)] if limit_kits else []),
+            *(["--heldout-share", str(heldout_share)] if heldout_share is not None else []),
+            *(["--seed", str(seed)] if seed is not None else [])]
+    e = bhdata_io.export(out, args=args + shlex.split(os.environ.get("BHDATA_EXPORT_ARGS", "")))
+    st = {"kits": 0, "extra_rows": len(harvest.read_jsonl(e.extra_rows)), "canary_hits": 0}
+    for name, b in (("train", e.train_bench), ("heldout", e.heldout_bench)):
+        tks = render.tickets(b)
+        st[f"{name}_projects"] = len({t["project"] for t in tks.values()})
+        st[f"{name}_tickets"] = len(tks)
+        st["kits"] += len({t.get("kit") or t["project"] for t in tks.values()})  # split by kit: no kit is in both
+        st["canary_hits"] += sum(1 for v in decontam.contaminated_tickets(b, decontam.Index()).values() if v == "canary")
+    _dump(out / "export.json", st)
+    return st
+
+
+def harvest_files(transcripts: list[Path], bench: Path, out: Path, *, calls_logs: list[Path] = (), source: str = "teacher",
+                  cfg: DataConfig | None = None) -> dict:
+    """harvest() over the bench runs whose transcripts.jsonl these are (results.jsonl beside each)."""
+    cfg = cfg or DataConfig(work=out.parent)
+    rows, st = harvest.harvest(bench, sorted({Path(t).parent for t in transcripts}), source=source,
+                               max_fix=cfg.max_fix, write_from_fix=cfg.write_from_fix, sandbox=cfg.sandbox,
+                               workers=cfg.workers or None, timeout=cfg.timeout, calls_logs=calls_logs)
+    harvest.write_jsonl(out, rows)
+    d = st.dropped
+    stats = {"calls": st.answers, "tickets": len({r["key"] for r, _ in harvest.load_runs(sorted({Path(t).parent for t in transcripts}))}),
+             "tickets_solved": st.tickets_with_rows, "rows": len(rows),
+             "write_rows": sum(1 for r in rows if r["kind"] == "write"), "fix_rows": sum(1 for r in rows if r["kind"] == "fix"),
+             "dropped": {"length": d["cut"], "parse": d["parser"], "forced": d["forced"],
+                         "failed": sum(v for k, v in d.items() if k.startswith("sandbox_")),
+                         "dupe": 0, **{k: v for k, v in d.items() if k not in ("cut", "parser", "forced") and not k.startswith("sandbox_")}},
+             "parser_drops_all_calls": st.parser, "cut_all_calls": st.cut, "drop_share": round(st.drop_share(), 4),
+             "warnings": st.warnings}
+    _dump(_stats_path(out), stats)
+    return stats
+
+
+def check_rows(rows_path: Path, bench: Path, out: Path, *, cfg: DataConfig | None = None) -> dict:
+    """The rows whose answers pass their ticket's acceptance and hidden tests (no network)."""
+    cfg = cfg or DataConfig(work=out.parent)
+    rows = harvest.read_jsonl(rows_path)
+    tks = render.tickets(bench)
+    by_pt = {(t["project"], t["id"]): t for t in tks.values()}
+    keyed, errors = [], 0
+    for r in rows:
+        t = tks.get((r.get("meta") or {}).get("key", "")) or by_pt.get((r.get("project"), r.get("ticket")))
+        if t is None:
+            errors += 1
+        else:
+            keyed.append((r, t))
+    canon = render.call([{"op": "canonical", "answer": r["messages"][-1]["content"], "owns": t["owns"]} for r, t in keyed])
+    items = []
+    for (r, t), x in zip(keyed, canon):
+        if x["parsed"]["missing"] or x["parsed"]["extra"]:
+            errors += 1
+        else:
+            items.append((r, check.Item(t["dir"], t["id"], x["parsed"]["files"], key=t["key"])))
+    res = check.check_many([it for _, it in items], tks, workers=cfg.workers or None, timeout=cfg.timeout, kind=cfg.sandbox)
+    kept = [r for (r, _), x in zip(items, res) if x.ok]
+    harvest.write_jsonl(out, kept)
+    st = {"rows_in": len(rows), "passed": len(kept), "failed": len(items) - len(kept), "errors": errors}
+    _dump(_stats_path(out), st)
+    return st
+
+
+def decontam_rows(rows_path: Path, out: Path, benches: list[str] | None = None) -> dict:
+    rows = harvest.read_jsonl(rows_path)
+    kept, dropped = decontam.filter_rows(rows, decontam.index(benches))
+    kept, bh = bhdata_io.bhdata_decontam(kept)
+    harvest.write_jsonl(out, kept)
+    st = {"rows_in": len(rows), "kept": len(kept), "dropped_canary": dropped.get("canary", 0),
+          "dropped_overlap": dropped.get("overlap", 0), "dropped_bhdata": bh}
+    _dump(_stats_path(out), st)
+    return st
+
+
+def render_calls(calls_path: Path, out: Path) -> dict:
+    """Call specs {id, kind, source, project, ticket, kit, bench, current{}, failed{command, output},
+    answer_files{}, note} rendered into rows by the engine (prompts.ts, files.ts)."""
+    specs = harvest.read_jsonl(calls_path)
+    tks_by_bench = {b: render.tickets(b) for b in sorted({s["bench"] for s in specs})}
+    answers = render.call([{"op": "answer", "files": s.get("answer_files") or {}, "note": s.get("note") or ""} for s in specs])
+    reqs, keep = [], []
+    for s, a in zip(specs, answers):
+        t = tks_by_bench[s["bench"]].get(f"{s['project']}/{s['ticket']}")
+        if t is None:
+            continue
+        req = {"op": "fix" if s.get("kind") == "fix" else "write", "project": t["dir"], "ticket": t["id"],
+               "current": s.get("current") or None, "answer": a["content"]}
+        if req["op"] == "fix":
+            req["failed"] = s["failed"]
+        reqs.append(req)
+        keep.append((s, t))
+    rendered = render.call(reqs, strict=False)
+    rows, errors = [], len(specs) - len(keep)
+    for (s, t), r in zip(keep, rendered):
+        if r.get("error") or r["parsed"]["missing"]:
+            errors += 1
+            continue
+        row = harvest.make_row(t, r["messages"], kind=s.get("kind", "write"), source=s.get("source", "extra"))
+        row["id"] = s.get("id") or row["id"]
+        row["kit"] = s.get("kit") or row["kit"]
+        rows.append(row)
+    harvest.write_jsonl(out, rows)
+    st = {"calls": len(specs), "rows": len(rows), "errors": errors}
+    _dump(_stats_path(out), st)
+    return st
+
+
+def repairs_files(transcripts: list[Path], bench: Path, out: Path, *, calls_logs: list[Path] = (),
+                  cfg: DataConfig | None = None) -> dict:
+    cfg = cfg or DataConfig(work=out.parent)
+    runs = sorted({Path(t).parent for t in transcripts})
+    reqs, counts = harvest.repair_requests(bench, runs, sandbox=cfg.sandbox, workers=cfg.workers or None,
+                                           timeout=cfg.timeout, calls_logs=calls_logs)
+    harvest.write_jsonl(out, reqs)
+    pairs = harvest.load_runs(runs)
+    st = {"tickets": len({r["key"] for r, _ in pairs}), "failed_tickets": len({r["key"] for r, _ in pairs if not r.get("solved")}),
+          "prompts": len(reqs), **counts}
+    _dump(_stats_path(out), st)
+    return st
+
+
 # ---------- command line ----------
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("cmd", choices=["export", "check", "teacher", "extra", "repair-requests", "answer", "repair", "rft",
-                                    "build", "smoke"])
+                                    "build", "smoke", "harvest", "decontam", "render", "repairs"])
     ap.add_argument("--work", type=Path, default=Path(os.environ.get("BH_WORK", "bh-work")))
     ap.add_argument("--runs", nargs="*", default=[])
     ap.add_argument("--sandbox", default="local")
@@ -547,12 +686,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--thinking", choices=["on", "off"], default="off")
+    # the row-file commands
+    ap.add_argument("--kits", type=Path)
+    ap.add_argument("--limit-kits", type=int)
+    ap.add_argument("--heldout-share", type=float)
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--transcripts", nargs="*", type=Path, default=[])
+    ap.add_argument("--calls-log", nargs="*", type=Path, default=[])
+    ap.add_argument("--bench", nargs="*", type=Path, default=[])
+    ap.add_argument("--rows", type=Path)
+    ap.add_argument("--calls", type=Path)
+    ap.add_argument("--source", default="teacher")
+    ap.add_argument("--keep", default="shortest", choices=["shortest"])
     a = ap.parse_args(argv)
     cfg = DataConfig(work=a.work, sandbox=a.sandbox, workers=a.workers, timeout=a.timeout)
+    bench = a.bench[0] if a.bench else None
     if a.cmd == "export":
-        export(cfg)
+        if a.out:
+            export_kits(a.kits, a.out, limit_kits=a.limit_kits, heldout_share=a.heldout_share, seed=a.seed)
+        else:
+            export(cfg)
     elif a.cmd == "check":
-        check_benches(cfg)
+        if a.rows:
+            check_rows(a.rows, bench, a.out, cfg=cfg)
+        else:
+            check_benches(cfg)
+    elif a.cmd == "harvest":
+        harvest_files(a.transcripts, bench, a.out, calls_logs=a.calls_log, source=a.source, cfg=cfg)
+    elif a.cmd == "decontam":
+        decontam_rows(a.rows, a.out, [str(b) for b in a.bench] or None)
+    elif a.cmd == "render":
+        render_calls(a.calls, a.out)
+    elif a.cmd == "repairs":
+        repairs_files(a.transcripts, bench, a.out, calls_logs=a.calls_log, cfg=cfg)
     elif a.cmd == "teacher":
         teacher_rows(cfg, a.runs)
     elif a.cmd == "extra":
