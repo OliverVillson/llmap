@@ -360,7 +360,14 @@ describe('remote and cloud machines', () => {
       const env = { EVROC_KEY: 's3cret' };
       expect(await probeMachines(machines, env)).toMatchObject([{ name: 'b200', ok: true, detail: 'reachable' }]);
       expect((await probeMachines(machines, { EVROC_KEY: 'wrong' }))[0]).toMatchObject({ ok: false, detail: 'the API key was refused (401)' });
-      expect((await probeMachines(machines, {}))[0]).toMatchObject({ ok: false, detail: 'EVROC_KEY is not set' });
+      expect((await probeMachines(machines, {}))[0]).toMatchObject({ ok: false, kind: 'config', detail: 'EVROC_KEY is not set' });
+      // a key that is missing or refused stops the run even on an optional machine: it is a mistake, not a laptop asleep
+      const opt = resolveMachines([{ name: 'b200', url, api_key_env: 'EVROC_KEY', optional: true }, { name: 'w', url, api_key_env: 'EVROC_KEY' }]);
+      const wrongKey = [(await probeMachines(opt, { EVROC_KEY: 'wrong' }))[0]!, { name: 'w', url, optional: false, ok: true, detail: 'reachable', ms: 1 }];
+      expect(describeProbe(wrongKey[0]!)).not.toContain('left out');
+      expect(() => usableMachines(opt, wrongKey)).toThrow(/b200 \(the API key was refused \(401\)\) is set up wrong/);
+      // the pool refuses a key variable that is not set rather than sending no key
+      expect(() => BackendPool.fromMachines(machines, { baseUrl: url, defaultModel: 'm' }, { EVROC_KEY: ' ' })).toThrow(/b200: EVROC_KEY is not set/);
       const pool = BackendPool.fromMachines(machines, { baseUrl: url, defaultModel: 'm' }, env);
       expect((pool.machines[0]!.client as OpenAICompatible).cfg.timeoutMs).toBe(3_600_000);
       await pool.forAgent({}).text('m', [], 1);
@@ -371,7 +378,7 @@ describe('remote and cloud machines', () => {
   });
 
   test('an unreachable optional machine is left out; an unreachable required one stops the run', async () => {
-    const server = Bun.serve({ port: 0, fetch: () => new Response('not here', { status: 404 }) });
+    const server = Bun.serve({ port: 0, fetch: () => Response.json({ data: [] }) });
     // a port nothing listens on
     const dead = Bun.serve({ port: 0, fetch: () => new Response('') });
     const deadUrl = `http://127.0.0.1:${dead.port}/v1`;
@@ -383,8 +390,7 @@ describe('remote and cloud machines', () => {
         { name: 'wifi-mac', url: deadUrl, roles: ['worker', 'lead'], optional: true },
       ]);
       const probes = await probeMachines(machines, {}, 2000);
-      // a server without /models still answers: reachable
-      expect(probes.map((p) => [p.name, p.ok])).toEqual([['laptop', true], ['wifi-mac', false]]);
+      expect(probes.map((p) => [p.name, p.ok, p.kind])).toEqual([['laptop', true, undefined], ['wifi-mac', false, 'unreachable']]);
       expect(describeProbe(probes[1]!)).toContain('(optional: left out)');
       expect(usableMachines(machines, probes).map((m) => m.name)).toEqual(['laptop']);
       const required = resolveMachines([{ name: 'laptop', url: up }, { name: 'aws-l40s', url: deadUrl }]);
@@ -392,8 +398,43 @@ describe('remote and cloud machines', () => {
       const onlyOptional = resolveMachines([{ name: 'wifi-mac', url: deadUrl, optional: true }]);
       expect(() => usableMachines(onlyOptional, [probes[1]!])).toThrow(/no reachable backend serves worker calls/);
       expect(() => resolveMachine({ name: 'x', url: up, optional: 'yes' as any })).toThrow(/optional must be true or false/);
+      // the roles a command needs: mugge plan needs a manager
+      const withMgr = resolveMachines([{ name: 'laptop', url: up, roles: ['worker'] }, { name: 'wifi-mac', url: deadUrl, roles: ['manager'], optional: true }]);
+      expect(() => usableMachines(withMgr, [probes[0]!, { ...probes[1]! }], ['manager'])).toThrow(/no reachable backend serves manager calls/);
     } finally {
       server.stop(true);
     }
+  });
+
+  test('a url with no API behind it (404) and a gateway with no GPU behind it (5xx) are not "up"', async () => {
+    const server = Bun.serve({ port: 0, fetch: (req) => new URL(req.url).pathname.startsWith('/gw') ? new Response('bad gateway', { status: 502 }) : new Response('not here', { status: 404 }) });
+    try {
+      const root = `http://127.0.0.1:${server.port}`;
+      const machines = resolveMachines([{ name: 'b200', url: root }, { name: 'l40s', url: `${root}/gw/v1`, optional: true }, { name: 'auth', url: `http://user:pw@127.0.0.1:${server.port}/v1` }]);
+      const probes = await probeMachines(machines, {});
+      expect(probes.map((p) => [p.name, p.ok, p.kind])).toEqual([['b200', false, 'config'], ['l40s', false, 'unreachable'], ['auth', false, 'config']]);
+      expect(probes[0]!.detail).toMatch(/404: the url must be the API root, ending in \/v1/);
+      expect(describeProbe(probes[1]!)).toContain('answered 502');
+      expect(describeProbe(probes[2]!)).not.toContain('pw');
+      expect(() => usableMachines(machines, probes)).toThrow(/b200 .*set up wrong/);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('a machine whose call fails is passed over by retries while another can take them', async () => {
+    const used: string[] = [];
+    const ok = async () => ({ value: 'ok', raw: 'ok', promptTokens: 1, completionTokens: 1, ms: 1 });
+    const dead: Inference = { text: async () => { used.push('dead'); throw new Error('Unable to connect'); }, complete: (async () => { used.push('dead'); throw new Error('Unable to connect'); }) as any };
+    const live: Inference = { text: async () => (used.push('live'), ok()), complete: (async () => (used.push('live'), ok())) as any };
+    const m = (name: string) => resolveMachine({ name, url: `http://${name}/v1`, slots: 4 });
+    // the asleep laptop is listed first, so with equal load it is picked first
+    const pool = new BackendPool([{ machine: m('laptop'), client: dead }, { machine: m('gpu'), client: live }]);
+    for (const id of ['t0', 't1', 't2']) {
+      const a = pool.forAgent({ agent: id });
+      for (let i = 0; i < 3; i++) await a.text('m', [], 1).catch(() => {});
+    }
+    // one failure, then every later call goes to the machine that answers
+    expect(used).toEqual(['dead', 'live', 'live', 'live', 'live', 'live', 'live', 'live', 'live']);
   });
 });

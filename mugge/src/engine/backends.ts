@@ -172,6 +172,12 @@ export interface MachineProbe {
   url: string;
   optional: boolean;
   ok: boolean;
+  /**
+   * Why a machine is down: `unreachable` (no answer, or a gateway with nothing behind it) may be
+   * a laptop asleep, so an optional machine is left out; `config` (a key that is not set or is
+   * refused, a URL with no API behind it) is a mistake that stops the run even for an optional one.
+   */
+  kind?: 'unreachable' | 'config';
   /** "reachable", or what went wrong (no answer, a refused key, a key variable that is not set). */
   detail: string;
   ms: number;
@@ -181,42 +187,55 @@ export interface MachineProbe {
 export const PROBE_TIMEOUT_MS = 5000;
 
 /**
- * Asks every machine for GET /models, with its API key when it has one, all at once. Any HTTP
- * answer but 401/403 counts as reachable (some hosts serve no /models); no answer, a refused
- * key, or an api_key_env that is not set does not.
+ * Asks every machine for GET /models, with its API key when it has one, all at once. A 2xx/3xx
+ * answer counts as reachable. No answer or a 5xx (a cloud gateway in front of a stopped GPU, a
+ * server still loading) is unreachable; a refused key, an api_key_env that is not set, or a 404
+ * (the url is not the API root ending in /v1, so every call would 404) is a config mistake.
  */
 export async function probeMachines(machines: Machine[], env: NodeJS.ProcessEnv = process.env, timeoutMs = PROBE_TIMEOUT_MS, crewKey?: string): Promise<MachineProbe[]> {
   return Promise.all(machines.map(async (m): Promise<MachineProbe> => {
     const started = Date.now();
-    const done = (ok: boolean, detail: string): MachineProbe => ({ name: m.name, url: m.url, optional: m.optional, ok, detail, ms: Date.now() - started });
+    const done = (ok: boolean, detail: string, kind?: MachineProbe['kind']): MachineProbe => ({ name: m.name, url: m.url, optional: m.optional, ok, ...(kind ? { kind } : {}), detail, ms: Date.now() - started });
     // the crew-wide key (MUGGE_API_KEY) for a machine without its own, as fromMachines sends it
-    const key = m.apiKeyEnv ? env[m.apiKeyEnv] : crewKey;
-    if (m.apiKeyEnv && !key) return done(false, `${m.apiKeyEnv} is not set`);
+    const key = m.apiKeyEnv ? env[m.apiKeyEnv]?.trim() : crewKey;
+    if (m.apiKeyEnv && !key) return done(false, `${m.apiKeyEnv} is not set`, 'config');
     try {
       const r = await fetch(`${m.url.replace(/\/$/, '')}/models`, { headers: key ? { authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(timeoutMs) });
-      if (r.status === 401 || r.status === 403) return done(false, `the API key was refused (${r.status})`);
+      await r.body?.cancel().catch(() => {});
+      if (r.status === 401 || r.status === 403) return done(false, `the API key was refused (${r.status})`, 'config');
+      if (r.status === 404) return done(false, 'GET /models answered 404: the url must be the API root, ending in /v1', 'config');
+      if (r.status >= 500) return done(false, `answered ${r.status}${r.status === 503 ? ' (still loading the model?)' : ' (a gateway with no model server behind it?)'}`, 'unreachable');
+      if (r.status >= 400) return done(false, `GET /models answered ${r.status}`, 'config');
       return done(true, 'reachable');
     } catch (e) {
-      return done(false, `no answer: ${(e as Error).message ?? e}`);
+      return done(false, `no answer: ${(e as Error).message ?? e}`, 'unreachable');
     }
   }));
 }
 
 /** One line per probe, for the start of a run and `mugge backends`. */
 export function describeProbe(p: MachineProbe): string {
-  return `${p.ok ? 'up  ' : 'DOWN'}  ${p.name}  ${p.url}  ${p.detail}${p.ok ? ` (${p.ms} ms)` : ''}${!p.ok && p.optional ? ' (optional: left out)' : ''}`;
+  return `${p.ok ? 'up  ' : 'DOWN'}  ${p.name}  ${hideUserinfo(p.url)}  ${p.detail}${p.ok ? ` (${p.ms} ms)` : ''}${!p.ok && p.optional && p.kind !== 'config' ? ' (optional: left out)' : ''}`;
+}
+
+/** A URL as it may be printed: no user:password@. */
+export function hideUserinfo(url: string): string {
+  return url.replace(/^(https?:\/\/)[^/@]*@/, '$1***@');
 }
 
 /**
  * The machines a run starts with: every reachable one. An unreachable optional machine is left
- * out; an unreachable required one, or no reachable machine serving workers, stops the run.
+ * out; an unreachable required one, a misconfigured one (optional or not), or no reachable
+ * machine serving one of the `needed` roles stops the run.
  */
-export function usableMachines(machines: Machine[], probes: MachineProbe[]): Machine[] {
+export function usableMachines(machines: Machine[], probes: MachineProbe[], needed: CallRole[] = ['worker']): Machine[] {
   const down = new Set(probes.filter((p) => !p.ok).map((p) => p.name));
+  const wrong = probes.filter((p) => !p.ok && p.kind === 'config');
+  if (wrong.length) throw new Error(`backend ${wrong.map((p) => `${p.name} (${p.detail})`).join(', ')} is set up wrong; fix its entry in MUGGE_BACKENDS`);
   const required = probes.filter((p) => !p.ok && !p.optional);
   if (required.length) throw new Error(`backend ${required.map((p) => `${p.name} (${p.detail})`).join(', ')} cannot be reached; mark a machine "optional": true to run without it`);
   const up = machines.filter((m) => !down.has(m.name));
-  if (!up.some((m) => m.roles.includes('worker'))) throw new Error('no reachable backend serves worker calls');
+  for (const role of needed) if (!up.some((m) => m.roles.includes(role))) throw new Error(`no reachable backend serves ${role} calls`);
   return up;
 }
 
@@ -248,7 +267,7 @@ export function fmtBytes(n: number): string {
 export function describeMachine(m: Machine): string {
   const mem = m.bytesPerSlot !== undefined ? `, ${fmtBytes(m.bytesPerSlot)}/slot at ${m.ctxPerCall} ctx ${m.cacheType}` : '';
   const budget = m.memoryBytes !== undefined ? ` of ${fmtBytes(m.memoryBytes)} (fits ${m.slotsFromMemory})` : '';
-  return `${m.name}  ${m.url}  ${m.roles.join('+')}  ${m.slots} slots (${m.slotSource})${mem}${budget}${m.optional ? ', optional' : ''}${m.apiKeyEnv ? `, key from ${m.apiKeyEnv}` : ''}${m.timeoutMs ? `, ${m.timeoutMs / 1000} s timeout` : ''}`;
+  return `${m.name}  ${hideUserinfo(m.url)}  ${m.roles.join('+')}  ${m.slots} slots (${m.slotSource})${mem}${budget}${m.optional ? ', optional' : ''}${m.apiKeyEnv ? `, key from ${m.apiKeyEnv}` : ''}${m.timeoutMs ? `, ${m.timeoutMs / 1000} s timeout` : ''}`;
 }
 
 // ---- the pool --------------------------------------------------------------------------------
@@ -327,7 +346,12 @@ interface Slotted {
   machine: Machine;
   client: Inference;
   busy: number;
+  /** When its last call failed (cleared by the next one that answers). */
+  failedAt?: number;
 }
+
+/** How long a machine whose call failed is passed over while another can take the call. */
+export const FAILED_MS = 30_000;
 
 interface Waiter {
   role: CallRole;
@@ -377,13 +401,15 @@ export class BackendPool {
 
   /** One OpenAI-compatible client per machine; `base` gives the shared settings (models, thinking, cap). */
   static fromMachines(machines: Machine[], base: InferenceConfig, env: NodeJS.ProcessEnv = process.env): BackendPool {
+    // a key variable that is not set would send no key at all and come back as a bare 401
+    for (const m of machines) if (m.apiKeyEnv && !env[m.apiKeyEnv]?.trim()) throw new Error(`backend ${m.name}: ${m.apiKeyEnv} is not set`);
     return new BackendPool(machines.map((m) => ({
       machine: m,
       client: new OpenAICompatible({
         ...base,
         baseUrl: m.url,
         defaultModel: m.model ?? base.defaultModel,
-        apiKey: m.apiKeyEnv ? env[m.apiKeyEnv] : base.apiKey,
+        apiKey: m.apiKeyEnv ? env[m.apiKeyEnv]!.trim() : base.apiKey,
         sampling: m.sampling,
         timeoutMs: m.timeoutMs ?? base.timeoutMs,
       }),
@@ -429,7 +455,6 @@ export class BackendPool {
           throw e;
         }
       }
-      last = m.machine.name;
       rec.state = 'calling';
       rec.machine = m.machine.name;
       rec.since = Date.now();
@@ -439,7 +464,16 @@ export class BackendPool {
         this.changed();
         const c = await run(m.client);
         this.record(m.machine.name, rec, c);
+        // the next call prefers this machine (prompt cache), but only once it has answered
+        last = m.machine.name;
+        m.failedAt = undefined;
         return c;
+      } catch (e) {
+        // a machine that fails a call (asleep, gone, 500s) frees its slot at once and would look
+        // like the least busy one: retries go elsewhere for a while
+        if (!o.signal?.aborted) m.failedAt = Date.now();
+        if (last === m.machine.name) last = undefined;
+        throw e;
       } finally {
         rec.state = 'idle';
         rec.since = Date.now();
@@ -521,9 +555,15 @@ export class BackendPool {
     this.records.push({ end: Date.now(), machine, agent: a.agent, team: a.team, promptTokens: c.promptTokens, completionTokens: c.completionTokens });
   }
 
-  /** A free slot on a machine serving `role`: the preferred machine if it has one, else the least occupied. */
+  /**
+   * A free slot on a machine serving `role`: the preferred machine if it has one, else the least
+   * occupied, leaving out machines whose last call failed in the past FAILED_MS while another is free.
+   */
   private tryTake(role: CallRole, prefer?: string): Slotted | null {
-    const free = this.machines.filter((m) => m.machine.roles.includes(role) && m.busy < m.machine.slots);
+    const all = this.machines.filter((m) => m.machine.roles.includes(role) && m.busy < m.machine.slots);
+    const now = Date.now();
+    const healthy = all.filter((m) => m.failedAt === undefined || now - m.failedAt > FAILED_MS);
+    const free = healthy.length ? healthy : all;
     if (!free.length) return null;
     const m = free.find((x) => x.machine.name === prefer) ?? free.reduce((a, b) => (b.busy / b.machine.slots < a.busy / a.machine.slots ? b : a));
     m.busy++;
@@ -551,7 +591,11 @@ export class BackendPool {
   /** Frees a slot and hands it to the first waiter (in arrival order) that the machine serves. */
   private release(m: Slotted) {
     m.busy--;
-    const i = this.waiters.findIndex((w) => m.machine.roles.includes(w.role));
+    // a slot freed by a machine that just failed is not handed on while a healthy machine serves
+    // the waiter: that machine frees a slot when its call ends
+    const failing = (x: Slotted) => x.failedAt !== undefined && Date.now() - x.failedAt <= FAILED_MS;
+    const i = this.waiters.findIndex((w) => m.machine.roles.includes(w.role)
+      && !(failing(m) && this.machines.some((x) => x !== m && x.machine.roles.includes(w.role) && !failing(x))));
     if (i >= 0) {
       const [w] = this.waiters.splice(i, 1);
       m.busy++;
