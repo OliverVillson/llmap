@@ -28,7 +28,7 @@ def bh_run():
 
 
 def dry(tmp_path, profile, *more):
-    return bh_run().main(["all", "--profile", profile, "--dry-run", str(tmp_path / "dry"), *more])
+    return bh_run().main([profile, "--dry-run", str(tmp_path / "dry"), *more])
 
 
 def machine(tmp_path, profile):
@@ -152,9 +152,9 @@ def test_broken_smoke_blocks_export(tmp_path, capsys):
     sm.write_text(json.dumps(d))
     bucket = tmp_path / "dry" / "bucket" / "blackhole" / "bh01" / "smoke-sft.json"
     bucket.write_text(json.dumps(d))
-    assert bh_run().main(["export", "--profile", "laptop", "--dry-run", str(tmp_path / "dry")]) == 1
+    assert bh_run().main(["laptop", "export", "--dry-run", str(tmp_path / "dry")]) == 1
     assert "--force exports anyway" in capsys.readouterr().out
-    assert bh_run().main(["export", "--profile", "laptop", "--dry-run", str(tmp_path / "dry"), "--force"]) == 0
+    assert bh_run().main(["laptop", "export", "--dry-run", str(tmp_path / "dry"), "--force"]) == 0
 
 
 def test_resume_skips_done_stages(tmp_path, capsys):
@@ -168,9 +168,9 @@ def test_resume_skips_done_stages(tmp_path, capsys):
 
 def test_b200_refuses_laptop_stages_and_unpinned_versions(tmp_path, capsys):
     r = bh_run()
-    assert r.main(["export", "--profile", "s1", "--dry-run", str(tmp_path / "d")]) == 0
+    assert r.main(["s1", "export", "--dry-run", str(tmp_path / "d")]) == 0
     assert "does not run on a b200" in capsys.readouterr().out
-    assert r.main(["setup", "--profile", "s1", "--dry-run", str(tmp_path / "d2"), "--set", "vllm=vllm>=0.31"]) == 1
+    assert r.main(["s1", "setup", "--dry-run", str(tmp_path / "d2"), "--set", "vllm=vllm>=0.31"]) == 1
     assert "refusing a paid session without exact pins" in capsys.readouterr().out
 
 
@@ -225,6 +225,27 @@ def test_every_dry_command_is_valid_bash_and_has_a_mock(tmp_path, monkeypatch):
     # the teacher server: 16K-or-less slots, prefix caching, top-20 log-probs
     serve = next(c for c in ex.commands if c.kind == "serve-vllm")
     assert "--enable-prefix-caching" in serve.sh and "--max-logprobs 20" in serve.sh
+
+
+def test_command_line_spans_status_and_usage(tmp_path, capsys):
+    r = bh_run()
+    assert r.stage_names([], "s1") == list(r.PLAN["s1"])
+    assert r.stage_names(["sft..smoke"], "s1") == ["sft", "smoke"]
+    assert r.stage_names(["teacher-answers.."], "s1") == ["teacher-answers", "sft", "smoke"]
+    assert r.stage_names(["..data", "round2"], "s2") == ["setup", "data", "round2-sample", "round2-repair", "round2-rft"]
+    with pytest.raises(SystemExit, match="not in the s1 plan"):
+        r.stage_names(["export.."], "s1")
+    with pytest.raises(SystemExit, match="usage: bh_run.py PROFILE"):
+        r.main([])
+    with pytest.raises(SystemExit, match="unknown profile"):
+        r.main(["all"])
+    # a span on its own, then status: the finished stages show as done
+    assert r.main(["g0", "..data", "--dry-run", str(tmp_path / "dry")]) == 0
+    capsys.readouterr()
+    assert r.main(["g0", "status", "--dry-run", str(tmp_path / "dry")]) == 0
+    out = capsys.readouterr().out
+    done = [line for line in out.splitlines() if line.endswith("[done]")]
+    assert len(done) == 1 and "data:" in done[0] and "BH0.1 train harness, profile g0" in out  # setup re-checks
 
 
 # ---------- config ----------
@@ -423,7 +444,7 @@ def test_sft_lora_reaches_every_deltanet_layer(tmp_path):
 
 def test_tokenize_row_masks_the_prompt_as_served(tmp_path):
     tok = tiny_model(tmp_path / "m", hybrid=False)
-    r = row(f"a.py\n```python\nx = 1\n```")
+    r = row("a.py\n```python\nx = 1\n```")
     t = R.tokenize_row(tok, r["messages"])
     prompt = tok.decode(t["prompt"])
     assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")  # thinking off, as the server renders

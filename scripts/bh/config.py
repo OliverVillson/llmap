@@ -1,8 +1,8 @@
 """The train harness's one config: the base, the teacher ladder, the pins, and a profile
 per place it runs (G0 on the 4060, B200 sessions 1 and 2, the laptops in between).
 
-A run is one profile plus optional overrides from a JSON file (--config) and --set
-key=value, in that order. Everything a stage reads comes from the Config below, so
+A run is one profile plus optional --set key=value overrides (a JSON file of overrides
+too, for code that calls load() itself). Everything a stage reads comes from the Config below, so
 a changed setting is visible in config.json beside the results.
 """
 
@@ -182,9 +182,9 @@ PROFILE_SETTINGS: dict[str, dict] = {
 # Which stages a place may run.
 WHERE = {
     "b200": {"setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke", "round2-sample",
-             "round2-repair", "round2-rft", "upload"},
+             "round2-repair", "round2-rft"},
     "laptop": {"setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke", "export", "footprint", "score",
-               "round2-sample", "round2-repair", "round2-rft", "upload"},
+               "round2-sample", "round2-repair", "round2-rft"},
 }
 
 

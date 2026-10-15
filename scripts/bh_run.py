@@ -4,14 +4,13 @@ crew, taught by a large teacher on the engine's own calls. Forked from centipede
 1: Granite 3B from 30B): one config, one command per stage, resumable, results uploaded
 after every step.
 
-    python3 scripts/bh_run.py all --profile g0          # the G0 smoke: end to end on the 4060
-    python3 scripts/bh_run.py all --profile s1          # B200 session 1: teacher, G2, answers, SFT, smoke
-    python3 scripts/bh_run.py all --profile laptop      # export, footprint, score, student samples
-    python3 scripts/bh_run.py all --profile s2          # B200 session 2: the own-mistakes round
-    python3 scripts/bh_run.py <stage> [<stage> ...] --profile P   # just those (each skips when done)
-    python3 scripts/bh_run.py --list --profile P        # the steps and their time guesses
-    python3 scripts/bh_run.py summary --profile P       # the results so far
-    options: --config run.json  --set key=value  --dry-run DIR  --force  --shutdown
+    python3 scripts/bh_run.py g0                 # the G0 smoke: end to end on the 4060
+    python3 scripts/bh_run.py s1                 # B200 session 1: teacher, G2, answers, SFT, smoke
+    python3 scripts/bh_run.py laptop             # export, footprint, score, student samples
+    python3 scripts/bh_run.py s2                 # B200 session 2: the own-mistakes round
+    python3 scripts/bh_run.py s1 sft..smoke      # a span of the plan (also: data.., ..sft, one stage)
+    python3 scripts/bh_run.py s1 status          # the plan, what is done, the results so far
+    options: --set key=value  --dry-run DIR  --force  --shutdown   (run sheet: scripts/bh/README.md)
 
 Stages, in order (each runs alone and is skipped when its output exists; inputs another
 machine made are fetched from the bucket):
@@ -34,7 +33,9 @@ machine made are fetched from the bucket):
   round2-repair    data.py repair-requests / answer (teacher, via the proxy) / repair / rft /
                    build --round 2: own-repair and the student's own passes join round 1's rows
   round2-rft       SFT again with the student's own passes and the repairs, then its smoke
-  upload           everything small, and the big files once (also after every step)
+
+After every step (and when the run ends, however it ends) everything small and the logs go
+to the bucket, and the big files once each.
 
 Every bench run goes through the recording proxy (scripts/bh/proxy.py): finite top_k,
 thinking off, the per-call cap, and a log of every call's finish (so cut answers never
@@ -58,7 +59,6 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import random
 import shutil
 import subprocess
 import sys
@@ -79,13 +79,13 @@ from bh.proxy import recording  # noqa: E402
 from bh.servers import Servers, llama_spec, vllm_spec  # noqa: E402
 
 STAGES = ("setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke", "export", "footprint", "score",
-          "round2-sample", "round2-repair", "round2-rft", "upload")
+          "round2-sample", "round2-repair", "round2-rft")
 ALIASES = {"round2": ("round2-sample", "round2-repair", "round2-rft")}
 PLAN = {
     "g0": STAGES,
-    "s1": ("setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke", "upload"),
-    "laptop": ("export", "footprint", "score", "round2-sample", "upload"),
-    "s2": ("setup", "data", "teacher-serve", "round2-sample", "round2-repair", "round2-rft", "upload"),
+    "s1": ("setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke"),
+    "laptop": ("export", "footprint", "score", "round2-sample"),
+    "s2": ("setup", "data", "teacher-serve", "round2-sample", "round2-repair", "round2-rft"),
 }
 SANDBOX_IMAGES = ("c", "node", "python", "web", "dotnet")
 LLAMA_BINS = ("llama-server", "llama-quantize", "llama-imatrix", "llama-tokenize")
@@ -899,9 +899,6 @@ class Run:
         dump(self.p(".uploaded", "last.json"), {"time": time.strftime("%F %T"), "step": step.name if step else None,
                                                 "final": final})
 
-    def run_upload(self, step: Step) -> None:
-        self.upload(step, False)
-
     # ---------- summary ----------
     def summary(self) -> str:
         out = [f"BH{self.cfg.version} train harness, profile {self.cfg.profile}, base {self.cfg.base}, run {self.cfg.run}"]
@@ -965,7 +962,6 @@ class Run:
                               self.repair_done),
             "round2-rft": ("round 2: RFT and its smoke", {"": cfg.rft_minutes + cfg.smoke_minutes}, self.run_round2_rft,
                            self.rft_done),
-            "upload": ("upload", {"": 5}, self.run_upload, lambda: False),
         }
         allowed = C.WHERE[cfg.where]
         out = []
@@ -981,46 +977,66 @@ class Run:
 
 # ---------- the command line ----------
 
+USAGE = """usage: bh_run.py PROFILE [STAGES] [options]
+
+  PROFILE   g0 | s1 | laptop | s2   (where this runs; scripts/bh/README.md has the run sheet)
+  STAGES    none: the profile's whole plan, resuming (finished stages are skipped)
+            one or more stages, or a span of the plan: sft..smoke, data.., ..sft
+            round2 = round2-sample round2-repair round2-rft
+            status: the plan with what is done, and the results so far
+  --set key=value  override a config field (repeatable; scripts/bh/config.py)
+  --dry-run DIR    on the CPU with mocks: DIR/<profile> is the machine, DIR/bucket the bucket
+  --force          export even when the smoke said BROKEN
+  --shutdown       power the VM off once everything is uploaded
+
+stages: """ + " ".join(STAGES)
+
+
 def parse(argv: list[str]) -> dict:
-    a = {"stages": [], "profile": None, "config": None, "sets": [], "dry": None, "force": False, "shutdown": False,
-         "list": False, "summary": False}
-    it = iter(argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        raise SystemExit(USAGE)
+    a = {"profile": argv[0], "stages": [], "sets": [], "dry": None, "force": False, "shutdown": False,
+         "status": False}
+    if a["profile"] not in PLAN:
+        raise SystemExit(f"unknown profile {a['profile']!r}\n\n{USAGE}")
+    it = iter(argv[1:])
     for x in it:
-        if x == "--profile":
-            a["profile"] = next(it)
-        elif x == "--config":
-            a["config"] = Path(next(it))
-        elif x == "--set":
-            a["sets"].append(next(it))
+        if x == "--set":
+            a["sets"].append(next(it, ""))
         elif x == "--dry-run":
-            a["dry"] = Path(next(it))
+            a["dry"] = Path(next(it, "."))
         elif x == "--force":
             a["force"] = True
         elif x == "--shutdown":
             a["shutdown"] = True
-        elif x == "--list":
-            a["list"] = True
-        elif x == "summary":
-            a["summary"] = True
+        elif x == "status":
+            a["status"] = True
         elif x.startswith("-"):
-            raise SystemExit(f"unknown option {x}")
+            raise SystemExit(f"unknown option {x}\n\n{USAGE}")
         else:
             a["stages"].append(x)
-    if not a["profile"]:
-        raise SystemExit("--profile g0|s1|s2|laptop is required (it says where this runs)")
     return a
 
 
 def stage_names(asked: list[str], profile: str) -> list[str]:
-    if not asked or asked == ["all"]:
-        return list(PLAN[profile])
+    """The stages to run: the plan, named stages, or a span of the plan (a..b, a.., ..b)."""
+    plan = list(PLAN[profile])
+    if not asked:
+        return plan
     out = []
     for s in asked:
+        if ".." in s:
+            lo, hi = s.split("..", 1)
+            for n in (lo, hi):
+                if n and n not in plan:
+                    raise SystemExit(f"{n!r} is not in the {profile} plan: {' '.join(plan)}")
+            out += plan[plan.index(lo) if lo else 0:plan.index(hi) + 1 if hi else len(plan)]
+            continue
         for n in ALIASES.get(s, (s,)):
             if n not in STAGES:
-                raise SystemExit(f"unknown stage {n!r}; stages: {', '.join(STAGES)}, round2, all")
+                raise SystemExit(f"unknown stage {n!r}; stages: {' '.join(STAGES)}, round2")
             out.append(n)
-    return out
+    return list(dict.fromkeys(out))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1033,7 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
         d = a["dry"].resolve()
         m = d / a["profile"]
         env.update(NVME=str(m / "nvme"), BH_WORK=str(m / "work"), BH_LOGS=str(m / "logs"), BH_BUCKET=str(d / "bucket"))
-    cfg = C.load(a["profile"], env, a["config"], a["sets"])
+    cfg = C.load(a["profile"], env, None, a["sets"])
     if a["dry"]:
         from bh import mock as M
         upstream = M.FakeUpstream()
@@ -1046,8 +1062,10 @@ def main(argv: list[str] | None = None) -> int:
         run = Run(cfg, ex, force=a["force"])
     plan = run.steps(stage_names(a["stages"], cfg.profile))
     logs = Path(cfg.logs)
-    if a["list"] or a["summary"]:
-        return run_plan(plan, run.summary, logs, ["--list"] if a["list"] else ["summary"])
+    if a["status"]:
+        run_plan(plan, run.summary, logs, ["--list"])
+        print()
+        return run_plan(plan, run.summary, logs, ["summary"])
     if a["shutdown"] and not run.bucket.ok():
         print("Refusing --shutdown: no bucket login, so nothing could be uploaded before the VM powers off.")
         return 2

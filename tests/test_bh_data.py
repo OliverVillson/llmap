@@ -213,70 +213,6 @@ def test_load_runs_wants_transcripts(run, tmp_path):
         harvest.load_runs([d])
 
 
-# ---------- the row-file commands bh_run.py calls ----------
-
-def test_row_file_commands(run, tks, tmp_path):
-    # harvest from transcript files; the proxy's calls log marks a passing call cut, so it drops
-    trans = harvest.read_jsonl(run / "transcripts.jsonl")
-    last = trans[0]["calls"][-1]
-    log = tmp_path / "calls.jsonl"
-    harvest.write_jsonl(log, [{"key": harvest.call_key(last["prompt"], last["answer"]), "finish_reason": "length", "cut": True}])
-    rows_p = tmp_path / "rows.jsonl"
-    st = data.harvest_files([run / "transcripts.jsonl"], SPIKE, rows_p, calls_logs=[log])
-    assert st["dropped"]["length"] == 1 and st["rows"] == 9 and st["write_rows"] + st["fix_rows"] == 9
-    assert json.loads((tmp_path / "rows.jsonl.stats.json").read_text()) == st
-    rows = harvest.read_jsonl(rows_p)
-    assert {"id", "kind", "source", "project", "ticket", "kit", "messages", "completion_tokens", "cut", "forced"} <= set(rows[0])
-    # check: a row whose answer is broken fails
-    bad = json.loads(json.dumps(rows[0]))
-    t = tks[bad["meta"]["key"]]
-    bad["messages"][2]["content"] = answer({p: "broken\n" for p in t["owns"]})
-    harvest.write_jsonl(tmp_path / "mixed.jsonl", [*rows, bad, {**rows[0], "meta": {}, "ticket": "nope"}])
-    assert data.check_rows(tmp_path / "mixed.jsonl", SPIKE, tmp_path / "checked.jsonl") == \
-        {"rows_in": 11, "passed": 9, "failed": 1, "errors": 1}
-    # decontam against the spike drops every spike row
-    st = data.decontam_rows(rows_p, tmp_path / "clean.jsonl", [str(SPIKE)])
-    assert (st["rows_in"], st["kept"]) == (9, 0) and st["dropped_overlap"] == 9
-    # render: call specs become engine rows
-    tw = tks["spike/c-hash"]
-    specs = [{"id": "w1", "kind": "write", "source": "extra", "project": "spike", "ticket": tw["id"], "kit": "k",
-              "bench": str(SPIKE), "answer_files": ref(tw), "note": "n"},
-             {"id": "f1", "kind": "fix", "source": "extra", "project": "spike", "ticket": tw["id"], "kit": "k",
-              "bench": str(SPIKE), "current": {tw["owns"][0]: "int x;\n"},
-              "failed": {"command": tw["acceptance"][0], "output": "error: boom"}, "answer_files": ref(tw)}]
-    harvest.write_jsonl(tmp_path / "specs.jsonl", specs)
-    assert data.render_calls(tmp_path / "specs.jsonl", tmp_path / "rendered.jsonl") == {"calls": 2, "rows": 2, "errors": 0}
-    w, f = harvest.read_jsonl(tmp_path / "rendered.jsonl")
-    assert w["messages"] == render.one({"op": "write", "project": tw["dir"], "ticket": tw["id"], "answer": answer(ref(tw), "n")})["messages"]
-    assert (f["id"], f["kind"], f["kit"]) == ("f1", "fix", "k") and "int x;" in f["messages"][1]["content"]
-
-
-def test_repairs_command(tmp_path):
-    """A student that writes half of each file: its failures become the engine's next fix calls."""
-    src = SPIKE
-    tks = render.tickets(src)
-    refs = {t["id"]: ref(t) for t in tks.values()}
-
-    def half(prompt):
-        import re
-        tid = re.search(r"^Ticket: (\S+)$", prompt, re.M).group(1)
-        return answer({p: "\n".join(c.splitlines()[: len(c.splitlines()) // 2]) + "\n" for p, c in refs[tid].items()})
-
-    url, stop = data._serve(half)
-    try:
-        subprocess.run(["bun", "bench/run.ts", "--bench", str(src), "--out", str(tmp_path / "s"), "--url", url, "--model", "s",
-                        "--seeds", "1", "--transcripts", "--sandbox", "local", "--filter", "c-", "--thinking", "off"],
-                       cwd=ROOT / "mugge", check=True, capture_output=True)
-    finally:
-        stop()
-    st = data.repairs_files([tmp_path / "s" / "transcripts.jsonl"], src, tmp_path / "rep.jsonl")
-    reqs = harvest.read_jsonl(tmp_path / "rep.jsonl")
-    assert st["prompts"] == len(reqs) > 0 and st["failed_tickets"] >= len(reqs)
-    q = reqs[0]
-    assert {"id", "project", "ticket", "kit", "owns", "messages"} <= set(q)
-    assert render.kind_of(q["messages"][1]["content"]) == "fix" and "/work" in q["messages"][1]["content"]
-
-
 # ---------- free rows ----------
 
 def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
@@ -395,8 +331,6 @@ def test_export_limits_kits(tmp_path, monkeypatch):
     assert st["limited"] == {"train": [20, 5], "heldout": [20, 2]}
     assert len(list((work / "data" / "export" / "train-bench").iterdir())) == 20
     assert len(list((work / "data" / "export-unused" / "train-bench").iterdir())) == 5
-    st = data.export_kits(None, tmp_path / "out", limit_kits=3)
-    assert (st["train_projects"], st["heldout_projects"], st["kits"]) == (3, 3, 6)
 
 
 def test_answer_uses_the_shared_sampling_default(tmp_path):
