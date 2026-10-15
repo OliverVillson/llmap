@@ -12,7 +12,7 @@
  * `concurrency` slots, so a ticket never queues and nothing changes. With more agents than
  * worker slots, some agents run their checks while others use the model.
  */
-import { clashReason, findOwnershipClashes, type Plan, type Ticket } from '../tickets/schema.ts';
+import { clashReason, findOwnershipClashes, settledReason, type OwnershipClash, type Plan, type Ticket } from '../tickets/schema.ts';
 import type { EngineEvent, EventSink, RunSummary } from './events.ts';
 import { branchFor, DEFAULT_AUTHOR, Worktrees, type Author } from './git.ts';
 import { runTicket, thinkingOn, type TicketResult } from './harness.ts';
@@ -98,6 +98,9 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   const ownedByRunning = () => new Set(tickets.filter((t) => states.get(t.id) === 'running').flatMap((t) => t.owns));
 
   // plan order decides who keeps a file: the earlier ticket
+  // clashes the planner settled: the ticket waits on the others, and the run records why
+  const settled = new Map<string, OwnershipClash>((o.plan.settled ?? []).map((c) => [c.ticket, c]));
+  for (const c of settled.values()) emit({ type: 'clash', at: Date.now(), ...c, settled: true });
   const clashes = findOwnershipClashes(o.plan.tickets);
   for (const c of clashes) {
     const t = tickets.find((x) => x.id === c.ticket)!;
@@ -175,7 +178,8 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
         if (states.get(t.id) !== 'waiting') continue;
         const deps = t.depends_on.filter((d) => states.get(d) !== 'done');
         if (deps.length) {
-          waitState(t, 'waiting', { waitingOn: deps });
+          const s = settled.get(t.id);
+          waitState(t, 'waiting', { waitingOn: deps, ...(s && s.with.some((d) => deps.includes(d)) ? { reason: settledReason(s) } : {}) });
           continue;
         }
         const busy = ownedByRunning();

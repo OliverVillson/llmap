@@ -8,7 +8,7 @@ import { git, initRepo } from '../src/engine/git.ts';
 import { OpenAICompatible, parseJsonAnswer } from '../src/engine/inference.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
 import { runPlan } from '../src/engine/scheduler.ts';
-import { clashReason, PlanError, validatePlan } from '../src/tickets/schema.ts';
+import { clashReason, PlanError, settledReason, validatePlan } from '../src/tickets/schema.ts';
 
 const t = (id: string, extra: any = {}) => ({ id, title: `Write ${id}`, image: 'node', owns: [`${id}.txt`], acceptance: [`grep -q ok-${id} ${id}.txt`], ...extra });
 
@@ -18,6 +18,17 @@ describe('plan validation', () => {
     expect(p.tickets[0].budget.attempts).toBe(4);
     expect(p.tickets[0].role).toBe('implement');
   });
+  test('by default the planner settles a clash: the later ticket runs after the owners', () => {
+    const p = validatePlan({ tickets: [t('a', { owns: ['x', 'y'] }), t('b', { owns: ['x'] }), t('c', { owns: ['x', 'y', 'z'] }), t('d', { owns: ['w'] })] });
+    expect(p.clashes).toBeUndefined();
+    expect(p.settled).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }, { ticket: 'c', files: ['x', 'y'], with: ['a', 'b'] }]);
+    expect(p.tickets.map((x) => [x.id, x.depends_on])).toEqual([['a', []], ['b', ['a']], ['c', ['a', 'b']], ['d', []]]);
+    expect(settledReason(p.settled![1]!)).toBe('runs after a, b: they share x, y (settled by the planner)');
+    // a saved plan validated again keeps its record and needs nothing more
+    const again = validatePlan(JSON.parse(JSON.stringify(p)));
+    expect(again.settled).toEqual(p.settled);
+    expect(again.tickets.map((x) => x.depends_on)).toEqual(p.tickets.map((x) => x.depends_on));
+  });
   test('rejects unknown deps, cycles and unsafe paths', () => {
     expect(() => validatePlan({ tickets: [t('a', { depends_on: ['x'] })] })).toThrow(PlanError);
     expect(() => validatePlan({ tickets: [t('a', { depends_on: ['b'] }), t('b', { depends_on: ['a'] })] })).toThrow(/cycle/);
@@ -26,10 +37,11 @@ describe('plan validation', () => {
   });
   test('two tickets that can run at once and own the same file: the later one is a clash', () => {
     expect(() => validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] }, { clashes: 'reject' })).toThrow(/both own x/);
-    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] }).clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
-    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'], depends_on: ['a'] })] }).clashes).toBeUndefined();
+    const block = { clashes: 'block' } as const;
+    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'] })] }, block).clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
+    expect(validatePlan({ tickets: [t('a', { owns: ['x'] }), t('b', { owns: ['x'], depends_on: ['a'] })] }, block).clashes).toBeUndefined();
     // each later claimant is blocked once, against the tickets that keep their files
-    const three = validatePlan({ tickets: [t('a', { owns: ['x', 'y'] }), t('b', { owns: ['x'] }), t('c', { owns: ['x', 'y', 'z'] })] });
+    const three = validatePlan({ tickets: [t('a', { owns: ['x', 'y'] }), t('b', { owns: ['x'] }), t('c', { owns: ['x', 'y', 'z'] })] }, block);
     expect(three.clashes).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }, { ticket: 'c', files: ['x', 'y'], with: ['a'] }]);
     expect(clashReason(three.clashes![1]!)).toBe('two tickets need the same file: x, y (also owned by a)');
   });
