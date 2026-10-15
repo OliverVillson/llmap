@@ -132,6 +132,9 @@ def load_runs(runs: list[str | Path]) -> list[tuple[dict, list[dict]]]:
         for t in trans:
             r = results.get((t["key"], t["seed"]))
             if r is not None:
+                # the lead review undid a fix and put back an earlier answer (bench: answerAttempt)
+                if t.get("answerAttempt"):
+                    r = {**r, "answer_attempt": t["answerAttempt"]}
                 out.append((r, t.get("calls") or []))
     return out
 
@@ -160,22 +163,43 @@ def call_key(user: str, answer: str) -> str:
 FLAGS = ("clean", "cut", "forced", "drop", "loose", "error", "finish_reason")
 
 
-def read_calls_logs(paths: list[str | Path]) -> list[dict]:
-    """Per-call logs: the engine's telemetry calls.jsonl (CallRecord: ticket "<key>#s<seed>",
-    attempt, kind, clean...) and the recording proxy's (key = call_key, finish_reason, cut...)."""
-    return [r for p in paths or [] for r in read_jsonl(p)]
+def read_calls_logs(paths: list[str | Path]) -> dict[Path, list[dict]]:
+    """Per-call logs, by path: the engine's telemetry calls.jsonl (CallRecord: run id, ticket
+    "<key>#s<seed>", attempt, kind, clean...) and the recording proxy's (key = call_key,
+    finish_reason, cut...)."""
+    return {Path(p).resolve(): read_jsonl(p) for p in paths or []}
 
 
-def flag_calls(pairs: list[tuple[dict, list[dict]]], log: list[dict]) -> None:
+def load_run_dirs(runs: list[str | Path]) -> list[tuple[Path, dict, list[dict]]]:
+    """load_runs, with each pair's run dir: [(run dir, result row, its transcript calls)]."""
+    return [(d, r, calls) for d in map(Path, runs) for r, calls in load_runs([d])]
+
+
+def flag_calls(runs: list[tuple[Path, dict, list[dict]]], logs: dict[Path, list[dict]]) -> None:
     """Merges each log record's flags onto the transcript call it describes. Proxy records
     match by call_key; telemetry records by run (`<key>#s<seed>`) and attempt order: a run's
     worker calls that got an answer, in attempt order, are its transcript's calls in order
-    (a call that threw has a record with error and no transcript entry)."""
-    by_key = {r["key"]: r for r in log if r.get("key")}
-    by_run: dict[str, list[dict]] = defaultdict(list)
-    for r in log:
-        if r.get("ticket") and r.get("kind") in ("write", "fix") and not r.get("error"):
-            by_run[r["ticket"]].append(r)
+    (a call that threw has a record with error and no transcript entry). A pair's telemetry
+    records come from the calls log in its own run dir (`bench/run.ts --out DIR` writes
+    DIR/calls.jsonl) when that has any, else from the logs outside every run dir, grouped by
+    run id: a `<key>#s<seed>` that more than one run id logged there is ambiguous, and its
+    calls are all treated as unclean."""
+    by_key = {r["key"]: r for log in logs.values() for r in log if r.get("key")}
+    dirs = {d.resolve() for d, _, _ in runs}
+    inside: dict[Path, dict[str, list[dict]]] = {}
+    outside: dict[str, dict[str | None, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for p, log in logs.items():
+        for r in log:
+            if r.get("ticket") and r.get("kind") in ("write", "fix") and not r.get("error"):
+                if p.parent in dirs:
+                    inside.setdefault(p.parent, defaultdict(list))[r["ticket"]].append(r)
+                else:
+                    outside[r["ticket"]][r.get("run")].append(r)
+
+    def unclean_all(calls: list[dict], why: str) -> None:
+        print(f"[harvest] WARNING: {why}; the run's calls are all treated as unclean", flush=True)
+        for c in calls:
+            c["clean"] = False
 
     def merge(c: dict, e: dict) -> None:
         for k in FLAGS:
@@ -186,13 +210,19 @@ def flag_calls(pairs: list[tuple[dict, list[dict]]], log: list[dict]) -> None:
         if c.get("maxTokens") is None and e.get("maxTokens"):
             c["maxTokens"] = e["maxTokens"]
 
-    for r, calls in pairs:
-        recs = sorted(by_run.get(f"{r['key']}#s{r['seed']}", []), key=lambda x: x.get("attempt", 0))
+    for d, r, calls in runs:
+        ticket = f"{r['key']}#s{r['seed']}"
+        if d.resolve() in inside:
+            recs = inside[d.resolve()].get(ticket, [])
+        elif len(outside.get(ticket, {})) > 1:
+            unclean_all(calls, f"{ticket}: calls logged by runs {sorted(map(str, outside[ticket]))} outside the "
+                               f"run dirs; cannot tell which is {d}'s")
+            continue
+        else:
+            recs = next(iter(outside.get(ticket, {}).values()), [])
+        recs = sorted(recs, key=lambda x: x.get("attempt", 0))
         if recs and len(recs) != len(calls):
-            print(f"[harvest] WARNING: {r['key']}#s{r['seed']}: {len(recs)} logged calls for {len(calls)} transcript "
-                  f"calls; the run's calls are all treated as unclean", flush=True)
-            for c in calls:
-                c["clean"] = False
+            unclean_all(calls, f"{ticket}: {len(recs)} logged calls for {len(calls)} transcript calls")
             continue
         for c, e in zip(calls, recs):
             merge(c, e)
@@ -210,8 +240,9 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
     {"messages": [system, user, assistant], "meta": {...}}."""
     tks = render.tickets(bench)
     stats = Stats()
-    pairs = load_runs(runs)
-    flag_calls(pairs, read_calls_logs(calls_logs))
+    loaded = load_run_dirs(runs)
+    flag_calls(loaded, read_calls_logs(calls_logs))
+    pairs = [(r, calls) for _, r, calls in loaded]
     stats.runs = len(pairs)
     system = render.system_prompt()
 
@@ -243,7 +274,12 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
         if not r.get("solved") or not calls:
             continue
         stats.solved += 1
-        i = len(calls) - 1
+        # the last call passed, unless the review put an earlier answer back
+        at = r.get("answer_attempt")
+        i = next((j for j, cl in enumerate(calls) if cl.get("attempt") == at), None) if at else len(calls) - 1
+        if i is None:
+            stats.dropped["answer_not_in_transcript"] += 1
+            continue
         c, x = calls[i], canon_of[(key, r["seed"], i)]
         prompt = c.get("prompt") or ""
         kind = render.kind_of(prompt)
@@ -320,8 +356,9 @@ def repair_requests(bench: str | Path, runs: list[str | Path], *, broken: set[st
     tks = render.tickets(bench)
     counts: Counter = Counter()
     items = []
-    pairs = load_runs(runs)
-    flag_calls(pairs, read_calls_logs(calls_logs))
+    loaded = load_run_dirs(runs)
+    flag_calls(loaded, read_calls_logs(calls_logs))
+    pairs = [(r, calls) for _, r, calls in loaded]
     counts["runs"] = len(pairs)
     for r, calls in pairs:
         key = r["key"]
