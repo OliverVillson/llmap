@@ -67,7 +67,7 @@ def test_g0_end_to_end(tmp_path, capsys):
     assert cfg["sft_mode"] == "lora" and cfg["max_call_tokens"] == 1024 and cfg["limit_kits"] == 20
     ship = read(w / "footprint" / "sft" / "footprint.json")["ship"]
     assert ship["name"] == "BH0.1-1.0" and ship["type"] == "Q8_0"
-    assert (w / "ship" / "BH0.1-1.0.gguf").exists()
+    assert (w / "ship" / "sft" / "BH0.1-1.0.gguf").exists()
     assert read(w / "score" / "sft" / "score.json")["verdict"] in ("MEETS", "MISSES", "TOO CLOSE")
     assert (w / "sft" / "round2" / "model" / "sft.json").exists()
     out = capsys.readouterr().out
@@ -97,7 +97,7 @@ def test_sessions_hand_over_through_the_bucket(tmp_path):
     assert dry(tmp_path, "eval") == 0  # another machine: the ship comes from the bucket
     ev = machine(tmp_path, "eval")
     assert read(ev / "score" / "sft" / "score.json")["verdict"] in ("MEETS", "MISSES", "TOO CLOSE")
-    assert (ev / "ship" / f"{ship['name']}.gguf").exists()
+    assert (ev / "ship" / "sft" / f"{ship['name']}.gguf").exists()
     assert dry(tmp_path, "s2") == 0
     s2 = machine(tmp_path, "s2")
     r2 = read(s2 / "round2" / "round2.json")
@@ -206,6 +206,119 @@ def test_session_clock_skips_what_cannot_finish(tmp_path, capsys):
     assert "leave no time for it" in out
 
 
+def test_round2_ships_beside_round1_and_eval_scores_it(tmp_path):
+    """Round 2 can ship under round 1's name (same version and footprint): each model has its
+    own ship folder and bucket key, so the eval laptop scores the round-2 GGUF, not round 1's."""
+    for prof in (["s1"], ["laptop"], ["eval"], ["s2"], ["laptop", "--set", "student=round2"],
+                 ["eval", "--set", "student=round2"]):
+        assert dry(tmp_path, *prof) == 0, prof
+    bucket = tmp_path / "dry" / "bucket" / "blackhole" / "bh01" / "ship"
+    names = {p.relative_to(bucket).as_posix() for p in bucket.rglob("*.gguf")}
+    r1 = read(machine(tmp_path, "laptop") / "footprint" / "sft" / "footprint.json")["ship"]["name"]
+    r2 = read(machine(tmp_path, "laptop") / "footprint" / "round2" / "footprint.json")["ship"]["name"]
+    assert names == {f"sft/{r1}.gguf", f"round2/{r2}.gguf"}
+    ev = machine(tmp_path, "eval")
+    assert "/ship/round2/" in read(ev / "score" / "round2" / "score.json")["gguf"]
+    assert "/ship/sft/" in read(ev / "score" / "sft" / "score.json")["gguf"]
+
+
+def test_eval_waits_for_the_ship_from_the_other_laptop(tmp_path):
+    """laptop and eval at the same time on one bucket: eval starts first, waits, then scores
+    the GGUF the laptop's footprint uploads."""
+    import subprocess
+    import time
+    d = tmp_path / "dry"
+    assert dry(tmp_path, "s1") == 0
+    cmd = [sys.executable, str(ROOT / "scripts" / "bh_run.py")]
+    ev = subprocess.Popen(cmd + ["eval", "--dry-run", str(d)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2)
+    assert ev.poll() is None  # still waiting: nothing shipped yet
+    assert subprocess.run(cmd + ["laptop", "--dry-run", str(d)], capture_output=True).returncode == 0
+    out = ev.communicate(timeout=120)[0]
+    assert ev.returncode == 0, out
+    assert "waiting for footprint-sft.json from another machine" in out and "SCORE BH0.1-" in out
+
+
+def test_a_failed_handover_upload_is_retried_in_order(tmp_path, monkeypatch, capsys):
+    """The ship's GGUF fails to upload: footprint-sft.json (which tells eval it is there) is
+    held back too, both stay pending, and the next run sends them in order."""
+    from bh import exec as E
+    assert dry(tmp_path, "s1") == 0
+    real, sent = E.Bucket.put, []
+
+    def flaky(self, src, name):
+        if name.startswith("ship/"):
+            return False
+        sent.append(name)
+        return real(self, src, name)
+
+    monkeypatch.setattr(E.Bucket, "put", flaky)
+    assert dry(tmp_path, "laptop") == 0  # the run finishes; the upload failure is reported
+    out = capsys.readouterr().out
+    assert "hand-over file is still not in the bucket" in out
+    assert "footprint-sft.json" not in sent
+    bucket = tmp_path / "dry" / "bucket" / "blackhole" / "bh01"
+    assert not (bucket / "footprint-sft.json").exists()
+    assert bh_run().main(["laptop", "status", "--dry-run", str(tmp_path / "dry")]) == 0
+    assert "not in the bucket yet" in capsys.readouterr().out
+    monkeypatch.setattr(E.Bucket, "put", real)
+    assert dry(tmp_path, "laptop") == 0
+    assert (bucket / "footprint-sft.json").exists() and list((bucket / "ship" / "sft").glob("*.gguf"))
+    assert read(machine(tmp_path, "laptop") / ".uploaded" / "pending.json")["files"] == []
+
+
+def test_extra_rows_are_optional(tmp_path, capsys):
+    assert dry(tmp_path, "g0", "--set", 'extra={"dry_fail": ["data-extra"]}') == 0
+    assert "data.py extra failed" in capsys.readouterr().out
+    rows = [json.loads(x) for x in (machine(tmp_path, "g0") / "rows" / "train.jsonl").read_text().splitlines()]
+    assert {r["meta"]["source"] for r in rows} == {"teacher"}
+
+
+def test_round2_rft_restored_model_still_gets_its_smoke(tmp_path):
+    import shutil
+    for prof in ("s1", "laptop", "s2"):
+        assert dry(tmp_path, prof) == 0
+    s2 = machine(tmp_path, "s2")
+    shutil.rmtree(s2 / "sft" / "round2")
+    shutil.rmtree(s2 / "smoke" / "round2")
+    (tmp_path / "dry" / "bucket" / "blackhole" / "bh01" / "smoke-round2.json").unlink()
+    assert bh_run().main(["s2", "round2-rft", "--dry-run", str(tmp_path / "dry")]) == 0
+    assert (s2 / "smoke" / "round2" / "smoke.json").exists()
+
+
+def test_every_model_call_has_finite_top_k_and_min_p_0(tmp_path, monkeypatch):
+    """Every request the dry run's model server sees, from every stage (bench runs through
+    the proxy, data.py answer through it too): sampling.py's values, thinking off, the cap."""
+    from bh import mock as M
+    from bh import sampling as S
+    seen = []
+    real = M.FakeUpstream.chat
+    monkeypatch.setattr(M.FakeUpstream, "chat", lambda self, body: (seen.append(body), real(self, body))[1])
+    assert dry(tmp_path, "g0") == 0
+    assert len(seen) > 50
+    for b in seen:
+        assert (b["top_k"], b["top_p"], b["temperature"], b["min_p"]) == (S.TOP_K, S.TOP_P, S.TEMPERATURE, S.MIN_P)
+        assert b["chat_template_kwargs"]["enable_thinking"] is False and 0 < b["max_tokens"] <= 1024
+
+
+def test_watchdog_waits_for_the_first_progress_event_and_steps_stop_at_their_limit(tmp_path, monkeypatch):
+    """sft.py reads on the CPU before it loads the model: the idle-GPU watch starts at its
+    first progress event, not at launch. A step with a time limit stops there."""
+    import time
+    from bh import exec as E
+    monkeypatch.setattr(E, "WATCH_EVERY", 0.2)
+    cfg = C.load("s1", {"NVME": str(tmp_path)}, None, ["gpu_watch_minutes=0.01"])
+    ex = E.Exec(cfg, reading=lambda: (0, 100))
+    event = '{"stage": "train", "status": "running", "pct": 1}'
+    t = time.monotonic()
+    with pytest.raises(E.GpuIdle):  # idle after the event: stopped
+        ex.run(None, E.Cmd(f"sleep 1.5; echo '{event}'; sleep 30", "sft", gpu=True, watch_from_event=True))
+    assert 1.5 < time.monotonic() - t < 10
+    ex.run(None, E.Cmd("sleep 2", "sft", gpu=True, watch_from_event=True))  # no event yet: never judged
+    with pytest.raises(E.StepTimeout):
+        ex.run(None, E.Cmd("sleep 30", "bench", timeout_min=0.02))
+
+
 def test_every_dry_command_is_valid_bash_and_has_a_mock(tmp_path, monkeypatch):
     """The dry run fails on a command without a mock or with bad syntax; this pins that
     every stage's commands were exercised in G0."""
@@ -260,8 +373,13 @@ def test_command_line_spans_status_and_usage(tmp_path, capsys):
     assert r.stage_names(["..data", "round2"], "s2") == ["setup", "data", "round2-sample", "round2-repair", "round2-rft"]
     with pytest.raises(SystemExit, match="not in the s1 plan"):
         r.stage_names(["export.."], "s1")
-    with pytest.raises(SystemExit, match="usage: bh_run.py PROFILE"):
+    with pytest.raises(SystemExit) as e:
+        r.main(["--help"])
+    assert e.value.code == 0 and capsys.readouterr().out.startswith("usage: bh_run.py PROFILE")
+    assert len(r.USAGE.splitlines()) <= 24  # one screen
+    with pytest.raises(SystemExit) as e:
         r.main([])
+    assert e.value.code == 2
     with pytest.raises(SystemExit, match="unknown profile"):
         r.main(["all"])
     # a span on its own, then status: the finished stages show as done
@@ -271,6 +389,7 @@ def test_command_line_spans_status_and_usage(tmp_path, capsys):
     out = capsys.readouterr().out
     done = [line for line in out.splitlines() if line.endswith("[done]")]
     assert len(done) == 1 and "data:" in done[0] and "BH0.1 train harness, profile g0" in out  # setup re-checks
+    assert "last run (" in out and "finished" in out
 
 
 # ---------- config ----------
