@@ -52,11 +52,14 @@ class Exec:
         self.cfg, self.dry, self.mock, self.reading = cfg, dry, mock, reading
         self.commands: list[Cmd] = []  # every command run, in order (the dry run's record)
         self.notes: list[str] = []  # guard warnings, for the summary
+        self.on_warn = None  # called with each warning (bh/live.py keeps them for watch)
 
     def warn(self, msg: str) -> None:
         line = f"WARNING: {msg}"
         self.notes.append(msg)
         print(line, flush=True)
+        if self.on_warn:
+            self.on_warn(msg)
 
     def run(self, step: Step | None, cmd: Cmd) -> None:
         self.commands.append(cmd)

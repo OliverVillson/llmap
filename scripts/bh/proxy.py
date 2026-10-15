@@ -95,7 +95,7 @@ class Recorder:
         rec = {"key": key, "finish": finish, "cut": finish == "length", "prompt_tokens": usage.get("prompt_tokens"),
                "completion_tokens": usage.get("completion_tokens"), "ms": ms,
                "think": "<think>" in answer or bool(msg.get("reasoning_content") or msg.get("reasoning")),
-               "overrode": notes, "seed": body.get("seed")}
+               "overrode": notes, "seed": body.get("seed"), "t": round(time.time(), 1)}
         top = topk_record(key, lp) if lp and self.topk_f else None
         with self.lock:
             c = self.counts

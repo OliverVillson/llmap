@@ -72,6 +72,7 @@ from runner import REPO, Done, Skip, Step, run_plan  # noqa: E402
 
 from bh import bench as B  # noqa: E402
 from bh import config as C  # noqa: E402
+from bh import live  # noqa: E402
 from bh import export as X  # noqa: E402
 from bh import rows as R  # noqa: E402
 from bh import sampling as S  # noqa: E402
@@ -111,6 +112,7 @@ class Run:
         self.llama = self.nvme / "llama.cpp"
         self.bins = self.llama / "build" / "bin"
         self.t0 = time.monotonic()
+        self.stage_keys: list[str] = []
 
     # ---------- paths ----------
     def p(self, *parts) -> Path:
@@ -1015,14 +1017,39 @@ class Run:
         }
         allowed = C.WHERE[cfg.where]
         out = []
+        self.stage_keys = list(names)
         for n in names:
             label, mins, run, done = table[n]
             if n not in allowed:
                 def refuse(st, n=n):
                     raise Skip(f"{n} does not run on a {cfg.where} ({cfg.profile} profile)")
                 run = refuse
-            out.append(Step(label, mins, run, done))
+            out.append(Step(label, mins, self.tracked(n, run), done))
         return out
+
+    def tracked(self, name: str, fn):
+        """fn, recording the stage it is in for `watch` (bh/live.py)."""
+        def run(st: Step) -> None:
+            stages = live.read_state(self.cfg).get("stages") or {}
+            live.record(self.cfg, stage=name, stage_started=time.time(), stage_minutes=st.total,
+                        stage_log=str(st.log) if st.log else None, stages={**stages, name: "running"})
+            end = "failed"
+            try:
+                fn(st)
+                end = "done"
+            except Done:
+                end = "done"
+                raise
+            except Skip:
+                end = "skipped"
+                raise
+            except KeyboardInterrupt:
+                end = "stopped"
+                raise
+            finally:
+                stages = live.read_state(self.cfg).get("stages") or {}
+                live.record(self.cfg, stages={**stages, name: end})
+        return run
 
 
 # ---------- the command line ----------
@@ -1033,7 +1060,10 @@ USAGE = """usage: bh_run.py PROFILE [STAGES] [options]
   STAGES    none: the profile's whole plan, resuming (finished stages are skipped)
             one or more stages, or a span of the plan: sft..smoke, data.., ..sft
             round2 = round2-sample round2-repair round2-rft
-            status: the plan with what is done, and the results so far
+            status: the plan with what is done, and the results so far (one shot)
+  start [STAGES]   the same, detached: it keeps going when you log out (one log per run)
+  watch            the live view of this profile's run: stage, clock, gates, tok/s, log tail
+  stop             end the run cleanly (as Ctrl-C: uploads, then exits; rerun to resume)
   --set key=value  override a config field (repeatable; scripts/bh/config.py)
   --dry-run DIR    on the CPU with mocks: DIR/<profile> is the machine, DIR/bucket the bucket
   --force          export even when the smoke said BROKEN
@@ -1046,7 +1076,7 @@ def parse(argv: list[str]) -> dict:
     if not argv or argv[0] in ("-h", "--help", "help"):
         raise SystemExit(USAGE)
     a = {"profile": argv[0], "stages": [], "sets": [], "dry": None, "force": False, "shutdown": False,
-         "status": False}
+         "cmd": "run", "argv": [x for x in argv if x != "start"]}
     if a["profile"] not in PLAN:
         raise SystemExit(f"unknown profile {a['profile']!r}\n\n{USAGE}")
     it = iter(argv[1:])
@@ -1059,8 +1089,8 @@ def parse(argv: list[str]) -> dict:
             a["force"] = True
         elif x == "--shutdown":
             a["shutdown"] = True
-        elif x == "status":
-            a["status"] = True
+        elif x in ("status", "start", "watch", "stop") and not a["stages"]:
+            a["cmd"] = x
         elif x.startswith("-"):
             raise SystemExit(f"unknown option {x}\n\n{USAGE}")
         else:
@@ -1100,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
         m = d / a["profile"]
         env.update(NVME=str(m / "nvme"), BH_WORK=str(m / "work"), BH_LOGS=str(m / "logs"), BH_BUCKET=str(d / "bucket"))
     cfg = C.load(a["profile"], env, None, a["sets"])
-    if a["dry"]:
+    if a["dry"] and a["cmd"] == "run":
         from bh import mock as M
         upstream = M.FakeUpstream()
         mock = M.Mock(cfg, upstream)
@@ -1108,25 +1138,41 @@ def main(argv: list[str] | None = None) -> int:
         run = Run(cfg, ex, force=a["force"], url=upstream.url)
         mock.run = run
     else:
-        ex = Exec(cfg)
+        ex = Exec(cfg, dry=bool(a["dry"]))
         run = Run(cfg, ex, force=a["force"])
     plan = run.steps(stage_names(a["stages"], cfg.profile))
     logs = Path(cfg.logs)
-    if a["status"]:
+    if a["cmd"] == "status":
         run_plan(plan, run.summary, logs, ["--list"])
         print()
         return run_plan(plan, run.summary, logs, ["summary"])
+    if a["cmd"] == "start":
+        return live.start(cfg, a["argv"])
+    if a["cmd"] == "stop":
+        return live.stop(cfg)
+    if a["cmd"] == "watch":
+        return live.watch(cfg, run)
     if a["shutdown"] and not run.bucket.ok():
         print("Refusing --shutdown: no bucket login, so nothing could be uploaded before the VM powers off.")
         return 2
+    other = live.running(cfg)
+    if other and other != os.getpid():
+        print(f"a {cfg.profile} run is already going (pid {other}): bh_run.py {cfg.profile} watch, or stop it first")
+        return 2
+    live.record(cfg, state="running", pid=os.getpid(), argv=a["argv"], log=os.environ.get("BH_RUN_LOG"),
+                started=time.time(), stage=None, exit=None, stopping=False, warnings=[],
+                stages={k: "done" if s.done() else "waiting" for k, s in zip(run.stage_keys, plan)})
+    ex.on_warn = lambda m: live.record(cfg, warnings=ex.notes[-20:])
     os.environ["PATH"] = f"{Path.home() / '.bun' / 'bin'}:{os.environ['PATH']}"
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")  # centipede.py's: no FlashInfer JIT on the VMs
     logs.mkdir(parents=True, exist_ok=True)
     run.W.mkdir(parents=True, exist_ok=True)
     dump(run.W / "config.json", cfg.to_json())
+    code = 1
     try:
         code = run_plan(plan, run.summary, logs, ["run"], after_step=run.upload)
     finally:
+        live.record(cfg, state={0: "finished", 130: "stopped"}.get(code, "failed"), exit=code, stage=None)
         try:
             run.servers.stop()
         except Exception as e:  # noqa: BLE001

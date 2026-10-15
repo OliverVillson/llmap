@@ -273,6 +273,39 @@ def test_command_line_spans_status_and_usage(tmp_path, capsys):
     assert len(done) == 1 and "data:" in done[0] and "BH0.1 train harness, profile g0" in out  # setup re-checks
 
 
+def test_start_watch_stop_and_resume(tmp_path, capsys):
+    """A detached run (its own session, one log), the watch frame, a clean stop that leaves
+    it resumable, and a second start that finishes it."""
+    import time
+    from bh import live
+    r = bh_run()
+    d = str(tmp_path / "dry")
+    cfg = C.load("g0", {"BH_LOGS": str(tmp_path / "dry" / "g0" / "logs")})
+
+    def wait(pred, s=240):
+        t = time.time() + s
+        while time.time() < t and not pred():
+            time.sleep(0.5)
+        return pred()
+
+    assert r.main(["g0", "start", "--dry-run", d]) == 0
+    assert r.main(["g0", "start", "--dry-run", d]) == 2  # one run per profile
+    assert wait(lambda: (live.read_state(cfg).get("stages") or {}).get("teacher-serve") == "done")
+    capsys.readouterr()
+    assert r.main(["g0", "watch", "--dry-run", d]) == 0  # no terminal: one frame
+    out = capsys.readouterr().out
+    assert "BH0.1 g0 · running" in out and "✓ setup" in out and "G2 pass" in out
+    assert r.main(["g0", "stop", "--dry-run", d]) == 0
+    st = live.read_state(cfg)
+    assert st["state"] == "stopped" and st["exit"] == 130 and "Stopped during" in Path(st["log"]).read_text()
+    assert r.main(["g0", "start", "--dry-run", d]) == 0
+    assert wait(lambda: live.read_state(cfg).get("state") == "finished")
+    st = live.read_state(cfg)
+    assert st["exit"] == 0 and set(st["stages"].values()) == {"done"}
+    assert "(done before)" in Path(st["log"]).read_text()  # resumed, not redone
+    assert (tmp_path / "dry" / "g0" / "logs" / "g0-current.log").resolve() == Path(st["log"]).resolve()
+
+
 # ---------- config ----------
 
 def test_config_profiles_and_overrides(tmp_path):
