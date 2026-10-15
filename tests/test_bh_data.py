@@ -194,6 +194,43 @@ def test_harvest_skips_loose_and_unclean_calls(run, tmp_path, tks):
         assert harvest.harvest(SPIKE, [d])[1].dropped[why] == 10, flag
 
 
+def _telemetry(run_dir: Path, run_id: str, unclean_key: str = "") -> list[dict]:
+    """A CallRecord per transcript call of run_dir; unclean_key's last calls are unclean."""
+    return [{"v": 1, "run": run_id, "ticket": f"{t['key']}#s{t['seed']}", "attempt": i,
+             "kind": "write" if i == 1 else "fix", "clean": not (t["key"] == unclean_key and i == len(t["calls"]))}
+            for t in harvest.read_jsonl(run_dir / "transcripts.jsonl") for i, _ in enumerate(t["calls"], 1)]
+
+
+def test_calls_logs_join_their_own_run(run, tmp_path, capsys):
+    # two runs with the same tickets and seeds, each with its own calls.jsonl: each run's
+    # flags land on that run's calls, not pooled per ticket#seed (which dropped every row)
+    a, b = shutil.copytree(run, tmp_path / "A"), shutil.copytree(run, tmp_path / "B")
+    harvest.write_jsonl(a / "calls.jsonl", _telemetry(a, "20261015-000001", "spike/c-hash"))
+    harvest.write_jsonl(b / "calls.jsonl", _telemetry(b, "20261015-000002", "spike/c-short"))
+    logs = [a / "calls.jsonl", b / "calls.jsonl"]
+    loaded = harvest.load_run_dirs([a, b])
+    harvest.flag_calls(loaded, harvest.read_calls_logs(logs))
+    flagged = {(d.name, r["key"]) for d, r, calls in loaded if any(c.get("clean") is False for c in calls)}
+    assert flagged == {("A", "spike/c-hash"), ("B", "spike/c-short")}
+    rows, st = harvest.harvest(SPIKE, [a, b], calls_logs=logs)
+    assert st.dropped["unclean"] == 4 and dict(st.rows) == {"write": 5, "fix": 5}
+    # one run reads its own log just as it reads one outside its dir
+    rows, st = harvest.harvest(SPIKE, [a], calls_logs=[a / "calls.jsonl"])
+    assert st.dropped["unclean"] == 2 and len(rows) == 8
+    # a log outside the run dirs naming two run ids for one ticket#seed: ambiguous, so unclean
+    pooled = tmp_path / "pooled.jsonl"
+    harvest.write_jsonl(pooled, [*_telemetry(a, "20261015-000001"),
+                                 *(r for r in _telemetry(b, "20261015-000002") if r["ticket"] == "spike/c-hash#s0")])
+    capsys.readouterr()
+    loaded = harvest.load_run_dirs([run])
+    harvest.flag_calls(loaded, harvest.read_calls_logs([pooled]))
+    flagged = {f"{r['key']}#s{r['seed']}" for _, r, calls in loaded if any(c.get("clean") is False for c in calls)}
+    assert flagged == {"spike/c-hash#s0"}
+    assert all(c["clean"] is False for _, r, calls in loaded if (r["key"], r["seed"]) == ("spike/c-hash", 0) for c in calls)
+    out = capsys.readouterr().out
+    assert "WARNING: spike/c-hash#s0" in out and "20261015-000002" in out
+
+
 def test_harvest_write_from_fix_and_max_fix(run, tmp_path):
     # only the fixed seeds: no first-call pass, so the write row comes from the fix answer
     only_fix = tmp_path / "only-fix"
