@@ -21,6 +21,16 @@ export interface Completion<T> {
   reasoningTokens?: number;
   /** The answer stopped at max_tokens, so it is probably incomplete. */
   cut?: boolean;
+  /**
+   * The answer was forced: the server (MuggeBench's proxy in stages/eval.py) closed a thinking
+   * that ran out of tokens or stopped inside it and asked for the answer on top. The value says
+   * why ("length", "stop", "no_reasoning"). A forced answer must never become a training row.
+   */
+  forced?: string;
+  /** max_tokens the call was sent with, after MUGGE_MAX_CALL_TOKENS. */
+  maxTokens?: number;
+  /** Characters of thinking the server returned beside the answer (reasoning_content), when it splits them. */
+  reasoningChars?: number;
   ms: number;
 }
 
@@ -91,6 +101,8 @@ export class OpenAICompatible implements Inference {
     const choice = data?.choices?.[0];
     const raw: string = choice?.message?.content ?? '';
     const reasoning = data?.usage?.completion_tokens_details?.reasoning_tokens;
+    const forced = choice?.forced ?? data?.forced;
+    const thought = choice?.message?.reasoning_content ?? choice?.message?.reasoning;
     const out: Completion<string> = {
       value: raw,
       raw,
@@ -98,6 +110,9 @@ export class OpenAICompatible implements Inference {
       completionTokens: data?.usage?.completion_tokens ?? 0,
       reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
       cut: choice?.finish_reason === 'length' || undefined,
+      forced: typeof forced === 'string' && forced ? forced : forced === true ? 'yes' : undefined,
+      maxTokens: body.max_tokens as number,
+      reasoningChars: typeof thought === 'string' && thought ? thought.length : undefined,
       ms: Math.round(performance.now() - started),
     };
     if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));
@@ -108,7 +123,7 @@ export class OpenAICompatible implements Inference {
 /** The MUGGE_DEBUG_CALLS line: what one call cost and whether it finished. */
 export function describeCall(model: string, maxTokens: number, c: Completion<string>): string {
   const reasoning = c.reasoningTokens === undefined ? '' : ` reasoning ${c.reasoningTokens}`;
-  return `call ${model}: prompt ${c.promptTokens} completion ${c.completionTokens}${reasoning} of ${maxTokens} max, ${c.ms} ms, ${c.cut ? 'CUT at max_tokens' : 'finished'}, ${c.raw.length} chars`;
+  return `call ${model}: prompt ${c.promptTokens} completion ${c.completionTokens}${reasoning} of ${maxTokens} max, ${c.ms} ms, ${c.cut ? 'CUT at max_tokens' : 'finished'}${c.forced ? `, FORCED (${c.forced})` : ''}, ${c.raw.length} chars`;
 }
 
 /** Parses a JSON answer, tolerating a ```json fence or text around one object (for `guided: none`). */

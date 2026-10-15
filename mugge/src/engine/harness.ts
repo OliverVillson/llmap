@@ -16,6 +16,7 @@ import { parseFiles } from './files.ts';
 import type { Inference } from './inference.ts';
 import { buildPack, fixMessages, writeMessages } from './prompts.ts';
 import { tail, type Sandbox } from './sandbox.ts';
+import { classifyAnswer } from './telemetry.ts';
 
 export interface HarnessContext {
   plan: Plan;
@@ -81,10 +82,12 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
         r.completionTokens += c.completionTokens;
         r.inferenceMs += c.ms;
         out = parseFiles(c.value, ticket.owns);
-        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length });
+        const seen = classifyAnswer(c.value, ticket.owns, out, c.cut);
+        ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length, model, maxTokens: c.maxTokens, forced: c.forced, drop: seen.drop, missing: seen.missing.length || undefined, reasoningChars: c.reasoningChars });
       } catch (e) {
         failed = { command: '(model call)', output: String((e as Error).message ?? e) };
         r.error = failed.output;
+        ctx.emit({ type: 'call_error', at: Date.now(), ticket: ticket.id, attempt, kind, model, error: failed.output.slice(0, 500) });
         ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: ${failed.output}` });
         continue;
       }

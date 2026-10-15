@@ -3,13 +3,22 @@
  * log, the local API's event stream and the TUI all read the same shapes.
  */
 import type { Ticket } from '../tickets/schema.ts';
+import type { DropReason } from './telemetry.ts';
 
 export type TicketState = 'waiting' | 'running' | 'done' | 'failed' | 'skipped';
 
 export type EngineEvent =
   | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number }
-  | { type: 'start'; at: number; ticket: string; attempt: number; worktree: string }
-  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number }
+  /** `agent` and `machine` are set once the scheduler assigns crew agents; telemetry assigns them itself until then. */
+  | { type: 'start'; at: number; ticket: string; attempt: number; worktree: string; agent?: string; machine?: string }
+  /**
+   * One model call and what the parser made of it. `forced`: the server forced the answer after
+   * the thinking (never a training row). `drop`: why the answer gave the engine no usable file
+   * (telemetry.ts DropReason); `missing`: owned files the answer left out.
+   */
+  | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number; model?: string; maxTokens?: number; forced?: string; drop?: DropReason; missing?: number; reasoningChars?: number }
+  /** A model call that threw (HTTP error, timeout): no answer at all. */
+  | { type: 'call_error'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; model?: string; error: string }
   | { type: 'refused'; at: number; ticket: string; attempt: number; paths: string[] }
   | { type: 'check'; at: number; ticket: string; attempt: number; command: string; ok: boolean; ms: number; tail: string }
   | { type: 'finish'; at: number; ticket: string; state: 'done' | 'failed' | 'skipped'; attempts: number; error?: string; commit?: string }

@@ -23,6 +23,8 @@ import type { EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { runTicket } from '../src/engine/harness.ts';
 import { OpenAICompatible, type Inference } from '../src/engine/inference.ts';
+import { classifyAnswer, crewFromEnv, formatCallSummary, Telemetry } from '../src/engine/telemetry.ts';
+import { parseFiles } from '../src/engine/files.ts';
 import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/sandbox.ts';
 import type { WorkerOutput } from '../src/tickets/schema.ts';
 import { applyHidden, findProjects, prepare, solution, type BenchProject, type BenchTicket } from './load.ts';
@@ -44,7 +46,15 @@ export interface BenchOptions {
   transcripts?: boolean;
   /** Called after each row is written. */
   progress?: (row: Row, done: number, total: number) => void;
+  /**
+   * Per-call log and crew status (calls.jsonl, status.json). Each ticket × seed shows up as
+   * ticket `<project>/<id>#s<seed>`, started and finished like a scheduler ticket.
+   */
+  telemetry?: Telemetry;
 }
+
+/** The telemetry ticket id of one bench run of a ticket. */
+export const runKey = (key: string, seed: number) => `${key}#s${seed}`;
 
 /** Runs one hidden command list; the first failure, or null. */
 async function runHidden(sandbox: Sandbox, t: BenchTicket, worktree: string, timeoutMs?: number): Promise<string | null> {
@@ -65,17 +75,30 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
     complete: (m, msgs, schema, n) => base.complete(m, msgs, schema, cap(n)),
     text: async (m, msgs, n) => {
       const c = await base.text(m, msgs, cap(n));
-      if (o.transcripts) transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw });
+      if (o.transcripts) {
+        // cut, forced and drop mark answers that must never become training rows
+        const drop = classifyAnswer(c.raw, t.ticket.owns, parseFiles(c.raw, t.ticket.owns), c.cut).drop;
+        transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw, cut: !!c.cut, forced: c.forced ?? null, drop: drop ?? null, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null });
+      }
       return c;
     },
   };
+  const id = runKey(t.key, seed);
+  const tel = o.telemetry;
   const emit = (e: EngineEvent) => {
     if (e.type === 'model') {
       calls++;
       if (e.files === 0) empty++;
+      if (e.cut) cut++;
+      if (e.forced) forced++;
+      if (e.drop) dropped++;
     } else if (e.type === 'refused') refused++;
+    if (tel && 'ticket' in e) tel.emit({ ...e, ticket: id } as EngineEvent);
   };
+  let cut = 0, forced = 0, dropped = 0;
   const started = performance.now();
+  let finished = false;
+  tel?.emit({ type: 'start', at: Date.now(), ticket: id, attempt: 1, worktree });
   try {
     prepare(p, worktree, t.deps);
     const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs });
@@ -88,13 +111,16 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
       project: p.name, ticket: t.ticket.id, key: t.key, seed, split: p.split,
       theme: t.tags.theme, language: t.tags.language, role: t.tags.role,
       visible: r.ok, hidden: r.ok ? hiddenError === null : false, solved: r.ok && hiddenError === null,
-      attempts: r.attempts, firstTry: r.firstTry, calls, emptyAnswers: empty, refused,
+      attempts: r.attempts, firstTry: r.firstTry, calls, emptyAnswers: empty, refused, cutAnswers: cut, forcedAnswers: forced, droppedAnswers: dropped,
       promptTokens: r.promptTokens, completionTokens: r.completionTokens,
       inferenceMs: r.inferenceMs, checkMs: r.checkMs, wallMs: Math.round(performance.now() - started),
       error: r.ok ? hiddenError && `hidden: ${hiddenError}` : r.error && tail(r.error, 1500),
     };
+    finished = true;
+    tel?.emit({ type: 'finish', at: Date.now(), ticket: id, state: row.solved ? 'done' : 'failed', attempts: r.attempts, error: row.error ?? undefined });
     return { row, transcript };
   } finally {
+    if (!finished) tel?.emit({ type: 'finish', at: Date.now(), ticket: id, state: 'failed', attempts: 0, error: 'bench error' });
     rmSync(worktree, { recursive: true, force: true });
   }
 }
@@ -110,6 +136,8 @@ export async function runBench(o: BenchOptions): Promise<Row[]> {
   // short still scores every ticket once.
   const items: Array<[BenchProject, BenchTicket, number]> = [];
   for (let s = 0; s < o.seeds; s++) for (const p of o.projects) for (const t of p.tickets) items.push([p, t, s]);
+  o.telemetry?.setTickets(items.map(([, t, s]) => ({ id: runKey(t.key, s), owns: t.ticket.owns, depends_on: [], maxAttempts: t.ticket.budget.attempts * (t.ticket.escalate_to ? 2 : 1) })));
+  o.telemetry?.emit({ type: 'plan', at: Date.now(), tickets: [], concurrency: o.concurrency });
   const rows: Row[] = [];
   const started = performance.now();
   let next = 0;
@@ -197,17 +225,24 @@ if (import.meta.main) {
   const sandbox = values.sandbox ? sandboxFromEnv({ MUGGE_SANDBOX: values.sandbox }) : fake ? new LocalSandbox() : sandboxFromEnv();
   const tickets = projects.reduce((n, p) => n + p.tickets.length, 0);
   const seeds = Number(values.seeds ?? 3);
+  const concurrency = Number(values.concurrency ?? 16);
+  const telemetry = new Telemetry({
+    dir: values.out, crew: crewFromEnv(process.env, concurrency),
+    settings: { thinking: thinking === 'off' ? 'off' : 'on', maxCallTokens: values['max-tokens'] ? Number(values['max-tokens']) : cfg.maxCallTokens ?? null, model: values.model ?? (fake ? 'fake' : cfg.defaultModel) },
+  });
   console.log(`MuggeBench: ${tickets} tickets in ${projects.length} projects × ${seeds} seeds, ${sandbox.name} sandbox`);
   try {
     const rows = await runBench({
       projects, inference, sandbox, seeds,
-      concurrency: Number(values.concurrency ?? 16), out: values.out, name: values.name,
+      concurrency, out: values.out, name: values.name, telemetry,
       gpus: Number(values.gpus ?? 1), transcripts: values.transcripts,
       maxTokens: values['max-tokens'] ? Number(values['max-tokens']) : undefined,
       checkTimeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
       progress: (r, done, total) => console.log(`${String(done).padStart(5)}/${total} ${r.solved ? 'solved' : r.visible ? 'HIDDEN' : 'failed'} ${r.key} s${r.seed} (${r.attempts} attempt${r.attempts === 1 ? '' : 's'})`),
     });
     console.log('\n' + formatSummary(await Bun.file(join(values.out, 'report.json')).json()));
+    const status = telemetry.close();
+    console.log('\n' + formatCallSummary(status.calls) + `\n(per call: ${telemetry.callsPath})`);
     process.exit(rows.length ? 0 : 1);
   } finally {
     fake?.stop();

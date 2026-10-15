@@ -16,6 +16,12 @@ export interface FakeOptions {
   flaky?: string[];
   /** Ticket ids that never get a correct answer. */
   broken?: string[];
+  /** Ticket ids whose first answer is cut at max_tokens mid-file (finish_reason "length"). */
+  cut?: string[];
+  /** Ticket ids whose first answer is prose with no fenced file (a parser drop). */
+  prose?: string[];
+  /** Ticket ids whose first answer comes back marked forced, as MuggeBench's proxy marks one. */
+  forced?: string[];
   latencyMs?: number;
   port?: number;
 }
@@ -55,12 +61,18 @@ export function startFakeModel(o: FakeOptions) {
         if (o.broken?.includes(id)) answer = { files: {}, note: 'no idea' };
         else if (o.flaky?.includes(id) && n === 1) answer = { files: {}, note: 'first try, wrote nothing' };
         else answer = o.solutions[id] ?? { files: {}, note: `no canned answer for ${id || 'this prompt'}` };
-        const content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
+        let content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
+        let finish = 'stop', forced: string | undefined;
+        if (n === 1 && o.cut?.includes(id)) {
+          content = content.slice(0, Math.max(1, Math.floor(content.length / 2)));
+          finish = 'length';
+        } else if (n === 1 && o.prose?.includes(id)) content = 'I would write the function so that it handles every case, then run the tests.';
+        else if (n === 1 && o.forced?.includes(id)) forced = 'length';
         return Response.json({
           id: `fake-${requests}`,
           object: 'chat.completion',
           model: body.model,
-          choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }],
+          choices: [{ index: 0, finish_reason: finish, message: { role: 'assistant', content }, ...(forced ? { forced } : {}) }],
           usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(content), total_tokens: approxTokens(prompt) + approxTokens(content) },
         });
       } finally {
