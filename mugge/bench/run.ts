@@ -87,7 +87,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   const tel = o.telemetry;
   const emit = (e: EngineEvent) => {
     if (e.type === 'model') {
-      // which attempt each transcript call was: the review can put an earlier answer back
+      // which attempt each transcript call was, so harvest can pick the call that is the answer
       const last = transcript.at(-1) as { attempt?: number } | undefined;
       if (last && last.attempt === undefined) last.attempt = e.attempt;
       calls++;
