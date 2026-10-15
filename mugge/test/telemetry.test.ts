@@ -296,7 +296,7 @@ test('a log that cannot be written warns once and never stops the run', () => {
   expect(tel.calls().calls).toBe(2);
 });
 
-test('a bench transcript names the answer the review put back, so harvest takes that one', async () => {
+test('review problems whose fixes break the checks fail the ticket: no answer for harvest to take', async () => {
   const out = tmp('mugge-bench-restore-');
   const projects = findProjects(SPIKE_DIR).map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.ticket.id === 'c-hash') })).filter((p) => p.tickets.length);
   const owned = projects[0]!.tickets[0]!.ticket.owns[0]!;
@@ -307,10 +307,11 @@ test('a bench transcript names the answer the review put back, so harvest takes 
   try {
     await runBench({ projects, inference: () => new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), seeds: 1, concurrency: 1, out, transcripts: true });
     const line = JSON.parse(readFileSync(join(out, 'transcripts.jsonl'), 'utf8').trim());
-    expect(line.answerAttempt).toBe(1);
+    // the passing write is not put back: review is part of done
+    expect(line.answerAttempt).toBeUndefined();
     expect(line.calls.map((c: any) => c.attempt)).toEqual([1, 2, 3, 4]);
     const row = JSON.parse(readFileSync(join(out, 'results.jsonl'), 'utf8').trim());
-    expect(row).toMatchObject({ solved: true, attempts: 4 });
+    expect(row).toMatchObject({ solved: false, attempts: 4 });
   } finally {
     if (old === undefined) delete process.env.MUGGE_REVIEW;
     else process.env.MUGGE_REVIEW = old;

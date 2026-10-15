@@ -33,7 +33,7 @@ export type EngineEvent =
   /** Every change of a ticket's state (state.ts). `attempt` of `of`; `agent` while one works it. */
   | { type: 'state'; at: number; ticket: string; state: AgentState; attempt: number; of: number; agent?: number; reason?: string; waitingOn?: string[] }
   /** A ticket blocked because it claims a file an earlier ticket owns (schema.findOwnershipClashes). */
-  | { type: 'clash'; at: number; ticket: string; files: string[]; with: string[] }
+  | { type: 'clash'; at: number; ticket: string; files: string[]; with: string[]; settled?: boolean }
   /** The lead review of a passing ticket (review.ts); `error` when the call failed or did not parse. */
   | { type: 'review'; at: number; ticket: string; attempt: number; verdict: 'approve' | 'problems' | 'error'; problems: string[]; fix: string; error?: string; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number }
   | { type: 'integrate'; at: number; ok: boolean; branch: string; merged: string[]; failed: string[]; error?: string }
@@ -73,6 +73,8 @@ export interface RunView {
   }>;
   /** Tickets blocked because two tickets need the same file. */
   clashes?: OwnershipClash[];
+  /** Clashes the planner settled by running the later ticket after the others. */
+  settled?: OwnershipClash[];
   concurrency: number;
   running: number;
   startedAt: number | null;
@@ -122,6 +124,11 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       }
       break;
     case 'clash':
+      if (e.settled) {
+        (v.settled ??= []).push({ ticket: e.ticket, files: e.files, with: e.with });
+        line(`${e.ticket} runs after ${e.with.join(', ')}: they share ${e.files.join(', ')} (settled by the planner)`);
+        break;
+      }
       (v.clashes ??= []).push({ ticket: e.ticket, files: e.files, with: e.with });
       line(`${e.ticket} blocked: two tickets need ${e.files.join(', ')} (also ${e.with.join(', ')})`);
       break;

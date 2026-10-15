@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { machinesFromEnv, poolFromEnv, samplingFromEnv } from '../src/config.ts';
-import { BackendPool, MODEL_PRESETS, kvBytesPerToken, llamaServerArgs, resolveMachine, resolveMachines } from '../src/engine/backends.ts';
+import { BackendPool, describeProbe, MODEL_PRESETS, kvBytesPerToken, llamaServerArgs, probeMachines, resolveMachine, resolveMachines, usableMachines } from '../src/engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { initRepo } from '../src/engine/git.ts';
@@ -339,4 +339,61 @@ test('a fix call repeats the write call byte for byte up to the owned files, so 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+describe('remote and cloud machines', () => {
+  test('a key per machine goes out as a bearer header; a timeout per machine reaches its client', async () => {
+    const seen: Array<string | null> = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: (req) => {
+        seen.push(req.headers.get('authorization'));
+        if (req.headers.get('authorization') !== 'Bearer s3cret') return new Response('no', { status: 401 });
+        return new URL(req.url).pathname.endsWith('/models')
+          ? Response.json({ data: [] })
+          : Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+      },
+    });
+    try {
+      const url = `http://127.0.0.1:${server.port}/v1`;
+      const machines = resolveMachines([{ name: 'b200', url, api_key_env: 'EVROC_KEY', timeout_s: 3600, roles: ['worker'] }]);
+      const env = { EVROC_KEY: 's3cret' };
+      expect(await probeMachines(machines, env)).toMatchObject([{ name: 'b200', ok: true, detail: 'reachable' }]);
+      expect((await probeMachines(machines, { EVROC_KEY: 'wrong' }))[0]).toMatchObject({ ok: false, detail: 'the API key was refused (401)' });
+      expect((await probeMachines(machines, {}))[0]).toMatchObject({ ok: false, detail: 'EVROC_KEY is not set' });
+      const pool = BackendPool.fromMachines(machines, { baseUrl: url, defaultModel: 'm' }, env);
+      expect((pool.machines[0]!.client as OpenAICompatible).cfg.timeoutMs).toBe(3_600_000);
+      await pool.forAgent({}).text('m', [], 1);
+      expect(seen.at(-1)).toBe('Bearer s3cret');
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('an unreachable optional machine is left out; an unreachable required one stops the run', async () => {
+    const server = Bun.serve({ port: 0, fetch: () => new Response('not here', { status: 404 }) });
+    // a port nothing listens on
+    const dead = Bun.serve({ port: 0, fetch: () => new Response('') });
+    const deadUrl = `http://127.0.0.1:${dead.port}/v1`;
+    dead.stop(true);
+    try {
+      const up = `http://127.0.0.1:${server.port}/v1`;
+      const machines = resolveMachines([
+        { name: 'laptop', url: up, roles: ['worker'] },
+        { name: 'wifi-mac', url: deadUrl, roles: ['worker', 'lead'], optional: true },
+      ]);
+      const probes = await probeMachines(machines, {}, 2000);
+      // a server without /models still answers: reachable
+      expect(probes.map((p) => [p.name, p.ok])).toEqual([['laptop', true], ['wifi-mac', false]]);
+      expect(describeProbe(probes[1]!)).toContain('(optional: left out)');
+      expect(usableMachines(machines, probes).map((m) => m.name)).toEqual(['laptop']);
+      const required = resolveMachines([{ name: 'laptop', url: up }, { name: 'aws-l40s', url: deadUrl }]);
+      expect(() => usableMachines(required, [probes[0]!, { ...probes[1]!, name: 'aws-l40s', optional: false }])).toThrow(/aws-l40s .*cannot be reached/);
+      const onlyOptional = resolveMachines([{ name: 'wifi-mac', url: deadUrl, optional: true }]);
+      expect(() => usableMachines(onlyOptional, [probes[1]!])).toThrow(/no reachable backend serves worker calls/);
+      expect(() => resolveMachine({ name: 'x', url: up, optional: 'yes' as any })).toThrow(/optional must be true or false/);
+    } finally {
+      server.stop(true);
+    }
+  });
 });

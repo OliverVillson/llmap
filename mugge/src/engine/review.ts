@@ -3,8 +3,9 @@
  * ticket, the diff of its owned files and the check output, and gets back
  * {"verdict": "approve" | "problems", "problems": [...], "fix": "..."} (constrained JSON).
  *
- * A `problems` verdict with something to fix spends one more fix attempt of the ticket's
- * budget, sent as an ordinary fix call whose failing command is `(lead review)`. Off by default
+ * The review is part of done: a ticket finishes on an approve, or when a fix the review asked
+ * for passes the checks. A `problems` verdict with something to fix spends the ticket's next fix
+ * attempt, sent as an ordinary fix call whose failing command is `(lead review)`. Off by default
  * (MUGGE_REVIEW=on turns it on): BH0.1 is trained for worker calls only.
  *
  * The prompt lives in prompts.ts (REVIEW_SYSTEM, reviewMessages) next to the worker prompts so
@@ -27,7 +28,7 @@ export interface LeadReview {
 }
 
 export interface ReviewOutcome {
-  /** `error` when the call failed or the answer did not parse; the ticket then counts as approved. */
+  /** `error` when the call failed or the answer did not parse; the harness asks once more, then fails the ticket. */
   verdict: LeadReview['verdict'] | 'error';
   problems: string[];
   fix: string;
@@ -60,18 +61,6 @@ export function snapshot(worktree: string, paths: string[]): Snapshot {
   const out: Snapshot = {};
   for (const p of paths) out[p] = existsSync(join(worktree, p)) ? readFileSync(join(worktree, p), 'utf8') : null;
   return out;
-}
-
-/** Puts the owned files back the way a snapshot has them. */
-export function restore(worktree: string, snap: Snapshot): void {
-  for (const [p, content] of Object.entries(snap)) {
-    const abs = join(worktree, p);
-    if (content === null) rmSync(abs, { force: true });
-    else {
-      mkdirSync(dirname(abs), { recursive: true });
-      writeFileSync(abs, content);
-    }
-  }
 }
 
 /**

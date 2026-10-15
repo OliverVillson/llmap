@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from '../engine/events.ts';
 import { headCommit } from '../engine/git.ts';
 import type { Inference } from '../engine/inference.ts';
+import type { BackendPool } from '../engine/backends.ts';
 import type { Sandbox } from '../engine/sandbox.ts';
 import { runPlan } from '../engine/scheduler.ts';
 import { crewFromEnv, runId, Telemetry } from '../engine/telemetry.ts';
@@ -23,6 +24,8 @@ export interface EngineServerOptions {
   /** The project's code checkout on the VM. */
   repo: string;
   inference: Inference;
+  /** The crew's machines (MUGGE_BACKENDS); when given, calls go to them and `inference` is not used. */
+  pool?: BackendPool;
   sandbox: Sandbox;
   concurrency: number;
   worktreeRoot?: string;
@@ -87,6 +90,7 @@ export function startEngineServer(o: EngineServerOptions) {
           base: body.base ?? headCommit(o.repo),
           plan,
           inference: o.inference,
+          pool: o.pool,
           sandbox: o.sandbox,
           concurrency: body.concurrency ?? o.concurrency,
           worktreeRoot: o.worktreeRoot ?? join(o.repo, '..', '.mugge-worktrees'),
