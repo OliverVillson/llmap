@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startEngineServer, followEvents } from './api/server.ts';
-import { checkedPoolFromEnv, concurrencyFromEnv, inferenceFromEnv, machinesFromEnv, poolFromEnv } from './config.ts';
-import { describeMachine, describeProbe, llamaServerArgs, PROBE_TIMEOUT_MS, probeMachines } from './engine/backends.ts';
+import { checkedPoolFromEnv, concurrencyFromEnv, inferenceFromEnv, machinesFromEnv } from './config.ts';
+import { describeMachine, describeProbe, llamaServerArgs, PROBE_TIMEOUT_MS, probeMachines, usableMachines } from './engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from './engine/events.ts';
 import { headCommit, initRepo } from './engine/git.ts';
 import { OpenAICompatible } from './engine/inference.ts';
@@ -203,7 +203,8 @@ async function main(argv: string[]) {
     case 'plan': {
       const p = loadProject(rest[0] ?? die('which project?'));
       if (!p.request) die(`${p.name} has no request`);
-      const inf = poolFromEnv().forAgent({ role: 'manager' });
+      // the same start check as run: an optional manager machine that is down is left out
+      const inf = (await checkedPoolFromEnv(process.env, concurrencyFromEnv(), undefined, ['manager']).catch((e) => die(String((e as Error).message ?? e)))).forAgent({ role: 'manager' });
       const d = await design(inf, p.request);
       if (d.questions.length) {
         console.log('The architect asks:\n' + d.questions.map((q) => `  - ${q}`).join('\n'));
@@ -330,6 +331,12 @@ async function main(argv: string[]) {
         console.log(`  ${describeProbe(probes[i]!)}`);
         console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
         for (const w of m.warnings) console.log(`  warning: ${w}`);
+      }
+      // the verdict mugge run would reach, and a non-zero exit when it would not start
+      try {
+        usableMachines(machines, probes);
+      } catch (e) {
+        die(String((e as Error).message ?? e));
       }
       return;
     }

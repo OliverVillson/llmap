@@ -160,10 +160,13 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       try {
         c = await ctx.inference.text(model, messages, ticket.budget.max_tokens - spent, ctx.signal);
       } catch (e) {
-        failed = { command: '(model call)', output: String((e as Error).message ?? e) };
-        r.error = failed.output;
-        ctx.emit({ type: 'call_error', at: Date.now(), ticket: ticket.id, attempt, kind, model, error: failed.output.slice(0, 500) });
-        ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: ${failed.output}` });
+        const msg = String((e as Error).message ?? e);
+        // The review's feedback is sent again: a fix that only answered the error would finish
+        // the ticket (a pass after the review) without the model ever seeing what the lead asked.
+        if (failed?.command !== '(lead review)') failed = { command: '(model call)', output: msg };
+        r.error = msg;
+        ctx.emit({ type: 'call_error', at: Date.now(), ticket: ticket.id, attempt, kind, model, error: msg.slice(0, 500) });
+        ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: ${msg}` });
         continue;
       }
       // outside the try: a sink that throws is not a failed model call
@@ -201,11 +204,16 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       state('reviewing');
       let rv = await reviewOnce(attempt, checks, spent);
       spent += rv.completionTokens;
-      if (rv.verdict === 'error' && spent < ticket.budget.max_tokens) {
+      if (rv.verdict === 'error' && spent < ticket.budget.max_tokens && !ctx.signal?.aborted) {
         rv = await reviewOnce(attempt, checks, spent);
         spent += rv.completionTokens;
       }
       r.review = rv;
+      if (ctx.signal?.aborted) {
+        // a stopped run, not a review that failed
+        r.error = 'aborted';
+        return fail('aborted');
+      }
       if (rv.verdict === 'error') {
         r.error = `lead review failed: ${rv.error ?? 'no answer'}`;
         return fail('lead review failed');

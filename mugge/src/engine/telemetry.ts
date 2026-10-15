@@ -444,6 +444,8 @@ export class Telemetry {
   private readonly settings: CrewStatus['settings'];
   private agents: AgentStatus[] = [];
   private tickets = new Map<string, TicketRow>();
+  /** Ticket → the owners a settled clash made it wait for: only an order, so an owner that failed still lets it run. */
+  private settledWith = new Map<string, Set<string>>();
   private spans: Span[] = [];
   private summary = emptyCallSummary();
   private warnings: string[] = [];
@@ -551,6 +553,7 @@ export class Telemetry {
         if (e.settled) {
           // not a block: the ticket waits on the owners like any dependency
           for (const w of e.with) if (!t.dependsOn.includes(w)) t.dependsOn.push(w);
+          for (const w of e.with) (this.settledWith.get(e.ticket) ?? this.settledWith.set(e.ticket, new Set()).get(e.ticket)!).add(w);
           t.settled = settledReason(e);
           break;
         }
@@ -871,7 +874,11 @@ export class Telemetry {
     return rows.map(({ started: _s, ...t }) => {
       const out: TicketStatus = { ...t, owns: [...t.owns], dependsOn: [...t.dependsOn] };
       if (t.state === 'running' && this.agents.find((a) => a.id === t.agent && a.ticket === t.id)?.state === 'queued') out.state = 'queued';
-      if (t.state === 'waiting' && !this.ended && t.dependsOn.every((d) => this.tickets.get(d)?.state === 'done')) {
+      const met = (d: string) => {
+        const s = this.tickets.get(d)?.state;
+        return s === 'done' || (this.settledWith.get(t.id)?.has(d) === true && s !== undefined && s !== 'waiting' && s !== 'running');
+      };
+      if (t.state === 'waiting' && !this.ended && t.dependsOn.every(met)) {
         const clash = t.owns.map((p) => holder.get(p)).find(Boolean);
         out.state = clash ? 'blocked' : 'ready';
         if (clash) out.blockedBy = clash;

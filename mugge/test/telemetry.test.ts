@@ -123,6 +123,9 @@ describe('crew status', () => {
     const b = tel.status().tickets.find((t) => t.id === 'b')!;
     expect(b).toMatchObject({ state: 'waiting', dependsOn: ['a'], settled: 'runs after a: they share x (settled by the planner)' });
     expect(b.blockedBy).toBeUndefined();
+    // the settled dependency only orders them: when the owner fails, b is ready to run
+    tel.emit({ type: 'finish', at: 2, ticket: 'a', state: 'failed', attempts: 4 });
+    expect(tel.status().tickets.find((t) => t.id === 'b')!.state).toBe('ready');
   });
 
   test('slot events queue an agent and say which machine its call runs on; pool snapshots give real slot use', () => {

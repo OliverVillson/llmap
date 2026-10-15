@@ -44,7 +44,7 @@
  *                         (engine/review.ts); read by the harness itself
  */
 import { readFileSync } from 'node:fs';
-import { BackendPool, describeProbe, MODEL_PRESETS, PROBE_TIMEOUT_MS, probeMachines, resolveMachine, resolveMachines, usableMachines, type Machine, type MachineInput } from './engine/backends.ts';
+import { BackendPool, describeProbe, MODEL_PRESETS, PROBE_TIMEOUT_MS, probeMachines, resolveMachine, resolveMachines, usableMachines, type CallRole, type Machine, type MachineInput } from './engine/backends.ts';
 import { checkTopK, type InferenceConfig, type Sampling } from './engine/inference.ts';
 
 function num(env: NodeJS.ProcessEnv, key: string, check: (n: number) => boolean, what: string): number | undefined {
@@ -144,10 +144,10 @@ export function poolFromEnv(env: NodeJS.ProcessEnv = process.env, concurrency = 
  * poolFromEnv after a start check: says which machines answer (one line each to `say`), leaves
  * out unreachable optional ones and throws if a required one cannot be reached.
  */
-export async function checkedPoolFromEnv(env: NodeJS.ProcessEnv = process.env, concurrency = concurrencyFromEnv(env), say: (line: string) => void = (l) => console.error(l)): Promise<BackendPool> {
+export async function checkedPoolFromEnv(env: NodeJS.ProcessEnv = process.env, concurrency = concurrencyFromEnv(env), say: (line: string) => void = (l) => console.error(l), needed: CallRole[] = ['worker']): Promise<BackendPool> {
   const machines = machinesFromEnv(env, concurrency);
   const base = inferenceFromEnv(env);
   const probes = await probeMachines(machines, env, PROBE_TIMEOUT_MS, base.apiKey);
   for (const p of probes) say(describeProbe(p));
-  return BackendPool.fromMachines(usableMachines(machines, probes), base, env);
+  return BackendPool.fromMachines(usableMachines(machines, probes, needed), base, env);
 }

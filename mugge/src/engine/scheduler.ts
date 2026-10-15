@@ -101,6 +101,13 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   // clashes the planner settled: the ticket waits on the others, and the run records why
   const settled = new Map<string, OwnershipClash>((o.plan.settled ?? []).map((c) => [c.ticket, c]));
   for (const c of settled.values()) emit({ type: 'clash', at: Date.now(), ...c, settled: true });
+  // A settled dependency only orders two tickets that share a file: the later one runs once the
+  // owner has ended, and runs on base's version of the file when the owner failed, instead of
+  // being skipped with it (one failure would otherwise skip every ticket that shares the file).
+  const after = new Map<string, Set<string>>();
+  for (const c of o.plan.settled ?? []) for (const w of c.with) (after.get(c.ticket) ?? after.set(c.ticket, new Set()).get(c.ticket)!).add(w);
+  const ended = (d: string) => states.get(d) !== 'waiting' && states.get(d) !== 'running';
+  const pending = (t: Ticket) => t.depends_on.filter((d) => (after.get(t.id)?.has(d) ? !ended(d) : states.get(d) !== 'done'));
   const clashes = findOwnershipClashes(o.plan.tickets);
   for (const c of clashes) {
     const t = tickets.find((x) => x.id === c.ticket)!;
@@ -131,7 +138,8 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       try {
         let path: string;
         try {
-          path = wt.create(t.id, branch, o.base, t.depends_on.map(branchFor));
+          // every dependency that finished (a settled owner that failed has nothing to bring)
+          path = wt.create(t.id, branch, o.base, t.depends_on.filter((d) => states.get(d) === 'done').map(branchFor));
         } catch (e) {
           // the finally below still frees the agent number, or the next ticket would get agent -1
           finish(t.id, 'failed', { error: String((e as Error).message) });
@@ -165,7 +173,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       changed = false;
       for (const t of tickets) {
         if (states.get(t.id) !== 'waiting') continue;
-        const bad = t.depends_on.find((d) => states.get(d) === 'failed' || states.get(d) === 'skipped' || states.get(d) === 'blocked');
+        const bad = t.depends_on.find((d) => !after.get(t.id)?.has(d) && (states.get(d) === 'failed' || states.get(d) === 'skipped' || states.get(d) === 'blocked'));
         if (bad) {
           waitState(t, 'blocked', { reason: `dependency ${bad} did not finish`, waitingOn: [bad] });
           finish(t.id, 'skipped', { error: `dependency ${bad} did not finish` });
@@ -176,7 +184,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
     if (!o.signal?.aborted) {
       for (const t of tickets) {
         if (states.get(t.id) !== 'waiting') continue;
-        const deps = t.depends_on.filter((d) => states.get(d) !== 'done');
+        const deps = pending(t);
         if (deps.length) {
           const s = settled.get(t.id);
           waitState(t, 'waiting', { waitingOn: deps, ...(s && s.with.some((d) => deps.includes(d)) ? { reason: settledReason(s) } : {}) });
