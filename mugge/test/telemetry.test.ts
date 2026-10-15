@@ -115,6 +115,16 @@ describe('crew status', () => {
     expect(s.teams.map((t) => t.working)).toEqual([2, 1, 2, 1]);
   });
 
+  test('a clash the planner settled leaves the ticket waiting on the owners, not blocked', () => {
+    const tel = new Telemetry({ warn: null });
+    tel.setPlan(validatePlan({ tickets: [{ id: 'a', title: 'a', owns: ['x'], acceptance: ['true'] }, { id: 'b', title: 'b', owns: ['x'], acceptance: ['true'] }] }));
+    tel.emit({ type: 'clash', at: 1, ticket: 'b', files: ['x'], with: ['a'], settled: true });
+    tel.emit({ type: 'clash', at: 1, ticket: 'b', files: ['x'], with: ['a'], settled: true });
+    const b = tel.status().tickets.find((t) => t.id === 'b')!;
+    expect(b).toMatchObject({ state: 'waiting', dependsOn: ['a'], settled: 'runs after a: they share x (settled by the planner)' });
+    expect(b.blockedBy).toBeUndefined();
+  });
+
   test('slot events queue an agent and say which machine its call runs on; pool snapshots give real slot use', () => {
     const tel = new Telemetry({ warn: null, crew: crewFromEnv({ MUGGE_BACKENDS: JSON.stringify([{ name: '4060', url: 'http://127.0.0.1:8080/v1', roles: ['worker'], slots: 1 }, { name: 'mac', url: 'http://127.0.0.1:8081/v1', roles: ['worker', 'lead', 'manager'], slots: 1 }]) }) });
     tel.setTickets([{ id: 'x', owns: ['x.c'], depends_on: [] }, { id: 'y', owns: ['y.c'], depends_on: [] }]);

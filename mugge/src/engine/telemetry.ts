@@ -29,7 +29,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { machinesFromEnv } from '../config.ts';
-import type { Plan, WorkerOutput } from '../tickets/schema.ts';
+import { settledReason, type Plan, type WorkerOutput } from '../tickets/schema.ts';
 import type { Machine, ServingSnapshot } from './backends.ts';
 import type { EngineEvent } from './events.ts';
 import type { AgentState } from './state.ts';
@@ -362,6 +362,8 @@ export interface TicketStatus {
   dependsOn: string[];
   /** Why it is blocked: the running ticket that holds a file it owns. */
   blockedBy?: string;
+  /** A clash the planner settled: this ticket runs after those that share its files. */
+  settled?: string;
   error?: string;
 }
 
@@ -546,6 +548,12 @@ export class Telemetry {
       }
       case 'clash': {
         const t = this.ticket(e.ticket);
+        if (e.settled) {
+          // not a block: the ticket waits on the owners like any dependency
+          for (const w of e.with) if (!t.dependsOn.includes(w)) t.dependsOn.push(w);
+          t.settled = settledReason(e);
+          break;
+        }
         t.state = 'blocked';
         t.blockedBy = e.with[0];
         t.error = `needs ${e.files.join(', ')}, also claimed by ${e.with.join(', ')}`;
