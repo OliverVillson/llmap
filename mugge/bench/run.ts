@@ -22,7 +22,7 @@ import { inferenceFromEnv } from '../src/config.ts';
 import type { EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { runTicket, thinkingOn } from '../src/engine/harness.ts';
-import { OpenAICompatible, type Inference } from '../src/engine/inference.ts';
+import { checkTopK, OpenAICompatible, type Inference } from '../src/engine/inference.ts';
 import { classifyAnswer, crewFromEnv, formatCallSummary, Telemetry } from '../src/engine/telemetry.ts';
 import { parseFiles } from '../src/engine/files.ts';
 import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/sandbox.ts';
@@ -206,6 +206,15 @@ if (import.meta.main) {
     projects = projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.key.includes(f)) })).filter((p) => p.tickets.length);
   }
   if (values.tickets) projects = firstTickets(projects, Number(values.tickets));
+  // refused before any call: a top_k of 0 would otherwise score every ticket 0% on call errors
+  if (values['top-k'] !== undefined) {
+    try {
+      checkTopK(Number(values['top-k']), '--top-k');
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(2);
+    }
+  }
   const fake = values.fake ? startFakeModel({ solutions: fakeSolutions(projects) }) : null;
   const cfg = inferenceFromEnv();
   // --thinking wins; otherwise MUGGE_THINKING (config.ts); otherwise on, the Centipede setting

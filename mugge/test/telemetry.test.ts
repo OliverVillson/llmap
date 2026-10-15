@@ -318,3 +318,23 @@ test('a bench transcript names the answer the review put back, so harvest takes 
     rmSync(out, { recursive: true, force: true });
   }
 }, 120_000);
+
+test('settings the smoke cannot run with are no score before any call', async () => {
+  const out = tmp('mugge-smoke-noscore-');
+  try {
+    expect((await runSmoke({ fake: true, out, quiet: true, topK: 2.5 })).verdict).toBe('NO SCORE');
+    const old = process.env.MUGGE_TOP_K;
+    process.env.MUGGE_TOP_K = '0';
+    try {
+      const r = await runSmoke({ fake: true, out, quiet: true });
+      expect(r.verdict).toBe('NO SCORE');
+      expect(r.reasons[0]).toContain('MUGGE_TOP_K');
+    } finally {
+      if (old === undefined) delete process.env.MUGGE_TOP_K;
+      else process.env.MUGGE_TOP_K = old;
+    }
+    expect(existsSync(join(out, 'smoke.json'))).toBe(true);
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});

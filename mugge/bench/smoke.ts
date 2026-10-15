@@ -33,7 +33,7 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { inferenceFromEnv } from '../src/config.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
-import { OpenAICompatible } from '../src/engine/inference.ts';
+import { checkTopK, OpenAICompatible } from '../src/engine/inference.ts';
 import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/sandbox.ts';
 import { crewFromEnv, emptyCallSummary, formatCallSummary, LOST_WARN_SHARE, runId, statusLine, Telemetry, type CallSummary } from '../src/engine/telemetry.ts';
 import type { WorkerOutput } from '../src/tickets/schema.ts';
@@ -128,8 +128,6 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const tickets = projects.reduce((n, p) => n + p.tickets.length, 0);
   const seeds = o.seeds ?? 1;
   const thinking = o.thinking ?? 'off';
-  const cfg = inferenceFromEnv();
-  const maxTokens = o.maxTokens ?? cfg.maxCallTokens ?? (thinking === 'on' ? 8192 : 4096);
   const bar = o.bar ?? 0.5;
   const sandbox = o.sandbox ?? (o.fake ? new LocalSandbox() : sandboxFromEnv());
   const concurrency = o.concurrency ?? 12;
@@ -139,7 +137,17 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
     writeFileSync(join(o.out, 'smoke.json'), JSON.stringify(r, null, 2) + '\n');
     return r;
   };
-  if (o.topK !== undefined && !(o.topK > 0)) return noScore([`top_k must be finite and above 0 (got ${o.topK}): top_k 0 was one of the three bugs that scored run 1's agent 0%`]);
+  // settings the run cannot start with are no score, before any call (not a MISSES of call errors)
+  let cfg: ReturnType<typeof inferenceFromEnv>, crew: ReturnType<typeof crewFromEnv>;
+  try {
+    if (o.topK !== undefined) checkTopK(o.topK, 'top_k (--top-k)');
+    cfg = inferenceFromEnv();
+    crew = crewFromEnv(process.env, concurrency);
+  } catch (e) {
+    const why = String((e as Error).message ?? e);
+    return noScore([/top_k/i.test(why) ? `${why}: top_k 0 was one of the three bugs that scored run 1's agent 0%` : why]);
+  }
+  const maxTokens = o.maxTokens ?? cfg.maxCallTokens ?? (thinking === 'on' ? 8192 : 4096);
   const url = o.url ?? cfg.baseUrl;
   if (!o.fake) {
     const down = await reachable(url);
@@ -163,7 +171,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const model = o.model ?? (fake ? 'fake' : cfg.defaultModel);
   const telemetry = new Telemetry({
     dir: o.out,
-    crew: crewFromEnv(process.env, concurrency),
+    crew,
     settings: { thinking, maxCallTokens: maxTokens, model },
     warn: o.quiet ? null : undefined,
   });
