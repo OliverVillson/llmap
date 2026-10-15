@@ -319,6 +319,8 @@ def repair_requests(bench: str | Path, runs: list[str | Path], *, broken: set[st
         if key in broken or key in excluded:
             counts["broken_or_excluded"] += 1
             continue
+        if unclean(calls[-1]):  # still repaired: the engine applies a cut answer's files too
+            counts[f"last_call_{unclean(calls[-1])}"] += 1
         owns = tks[key]["owns"]
         files: dict[str, str] = {}
         parsed = render.call([{"op": "parse", "answer": c.get("answer") or "", "owns": owns} for c in calls])

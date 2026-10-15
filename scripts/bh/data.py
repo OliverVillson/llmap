@@ -170,11 +170,11 @@ def _guards(cfg: DataConfig, which: str) -> tuple[set[str], set[str]]:
 
 # ---------- 3: the teacher's rows ----------
 
-def teacher_rows(cfg: DataConfig, runs: list[str | Path]) -> Path:
+def teacher_rows(cfg: DataConfig, runs: list[str | Path], calls_logs: list[str | Path] = ()) -> Path:
     broken, excluded = _guards(cfg, "train")
     rows, stats = harvest.harvest(cfg.bench("train"), runs, source="teacher", broken=broken, excluded=excluded,
                                   max_fix=cfg.max_fix, write_from_fix=cfg.write_from_fix, sandbox=cfg.sandbox,
-                                  workers=cfg.workers or None, timeout=cfg.timeout)
+                                  workers=cfg.workers or None, timeout=cfg.timeout, calls_logs=calls_logs)
     harvest.write_jsonl(cfg.rows("teacher"), rows)
     _dump(cfg.stats("teacher"), stats.as_dict())
     return cfg.rows("teacher")
@@ -286,10 +286,11 @@ def extra_rows(cfg: DataConfig, path: Path | None = None) -> Path:
 
 # ---------- round 2 ----------
 
-def repair_requests(cfg: DataConfig, runs: list[str | Path]) -> Path:
+def repair_requests(cfg: DataConfig, runs: list[str | Path], calls_logs: list[str | Path] = ()) -> Path:
     broken, excluded = _guards(cfg, "heldout")
     reqs, counts = harvest.repair_requests(cfg.bench("heldout"), runs, broken=broken, excluded=excluded,
-                                           sandbox=cfg.sandbox, workers=cfg.workers or None, timeout=cfg.timeout)
+                                           sandbox=cfg.sandbox, workers=cfg.workers or None, timeout=cfg.timeout,
+                                           calls_logs=calls_logs)
     p = cfg.d / "round2" / "repair-requests.jsonl"
     harvest.write_jsonl(p, reqs)
     _dump(cfg.stats("repair-requests"), counts)
@@ -347,11 +348,11 @@ def repair(cfg: DataConfig, answers: Path, requests: Path | None = None) -> Path
     return cfg.rows("own-repair")
 
 
-def rft_rows(cfg: DataConfig, runs: list[str | Path]) -> Path:
+def rft_rows(cfg: DataConfig, runs: list[str | Path], calls_logs: list[str | Path] = ()) -> Path:
     broken, excluded = _guards(cfg, "heldout")
     rows, stats = harvest.harvest(cfg.bench("heldout"), runs, source="rft", broken=broken, excluded=excluded,
                                   max_fix=cfg.max_fix, write_from_fix=cfg.write_from_fix, sandbox=cfg.sandbox,
-                                  workers=cfg.workers or None, timeout=cfg.timeout)
+                                  workers=cfg.workers or None, timeout=cfg.timeout, calls_logs=calls_logs)
     harvest.write_jsonl(cfg.rows("rft"), rows)
     _dump(cfg.stats("rft"), stats.as_dict())
     return cfg.rows("rft")
@@ -751,11 +752,11 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "repairs":
         repairs_files(a.transcripts, bench, a.out, calls_logs=a.calls_log, cfg=cfg)
     elif a.cmd == "teacher":
-        teacher_rows(cfg, a.runs)
+        teacher_rows(cfg, a.runs, a.calls_log)
     elif a.cmd == "extra":
         extra_rows(cfg)
     elif a.cmd == "repair-requests":
-        repair_requests(cfg, a.runs)
+        repair_requests(cfg, a.runs, a.calls_log)
     elif a.cmd == "answer":
         answer_requests(a.requests or cfg.d / "round2" / "repair-requests.jsonl",
                         a.out or cfg.d / "round2" / "repair-answers.jsonl", url=a.url, model=a.model,
@@ -764,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "repair":
         repair(cfg, a.answers or cfg.d / "round2" / "repair-answers.jsonl", a.requests)
     elif a.cmd == "rft":
-        rft_rows(cfg, a.runs)
+        rft_rows(cfg, a.runs, a.calls_log)
     elif a.cmd == "build":
         build(cfg, a.round, tokenizer=a.tokenizer)
     elif a.cmd == "smoke":

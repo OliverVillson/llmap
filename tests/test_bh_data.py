@@ -434,3 +434,23 @@ def test_answer_uses_the_shared_sampling_default(tmp_path):
     assert harvest.read_jsonl(out)[0]["answers"][0]["cut"] is True
     with pytest.raises(ValueError, match="finite"):
         data.answer_requests(q, tmp_path / "b.jsonl", url="http://x", model="t", top_k=0)
+
+
+def test_teacher_command_reads_the_proxy_calls_log(run, tmp_path):
+    """bh_run.py passes --calls-log to teacher, rft and repair-requests: the proxy's cap is the
+    one that cuts, so its log is the only place a cut shows."""
+    cfg = data.DataConfig(work=tmp_path)
+    for w in ("train", "heldout"):
+        cfg.bench(w).mkdir(parents=True)
+        shutil.copytree(SPIKE / "project", cfg.bench(w) / "spike" / "project")
+        for part in ("plan.json", "solutions", "hidden"):
+            (shutil.copytree if (SPIKE / part).is_dir() else shutil.copyfile)(SPIKE / part, cfg.bench(w) / "spike" / part)
+        data._dump(cfg.stats(f"check-{w}"), {"broken": {}, "excluded": {}})
+    log = tmp_path / "calls.jsonl"
+    harvest.write_jsonl(log, [{"key": harvest.call_key(t["calls"][-1]["prompt"], t["calls"][-1]["answer"]), "cut": True}
+                              for t in harvest.read_jsonl(run / "transcripts.jsonl")])
+    assert data.main(["teacher", "--work", str(tmp_path), "--runs", str(run), "--calls-log", str(log)]) == 0
+    assert harvest.read_jsonl(cfg.rows("teacher")) == []
+    assert json.loads(cfg.stats("teacher").read_text())["dropped"]["cut"] == 10
+    assert data.main(["rft", "--work", str(tmp_path), "--runs", str(run), "--calls-log", str(log)]) == 0
+    assert json.loads(cfg.stats("rft").read_text())["dropped"]["cut"] == 10
