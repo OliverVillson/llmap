@@ -209,6 +209,42 @@ describe('the pool', () => {
     expect(pool.snapshot().total).toMatchObject({ busy: 0, queued: 0, calls: 1 });
   });
 
+  test('a listener or slot hook that throws never keeps the slot', async () => {
+    const m = slowModel(1);
+    const pool = new BackendPool([{ machine: machine('gpu', 1), client: m.inf }]);
+    pool.subscribe(() => { throw new Error('status.json: ENOSPC'); });
+    const err = console.error;
+    console.error = () => {};
+    try {
+      await expect(pool.forAgent({ agent: 'a', onSlot: (e) => { if (e.state === 'got') throw new Error('hook'); } }).text('c', [], 1)).rejects.toThrow('hook');
+      // the one slot is free again: the next call gets it instead of queueing forever
+      await pool.forAgent({ agent: 'b' }).text('c', [], 1);
+    } finally {
+      console.error = err;
+    }
+    expect(pool.snapshot().total).toMatchObject({ busy: 0, queued: 0, calls: 1 });
+  });
+
+  test('an abort ends a call already sent, and its slot is free at once', async () => {
+    // a server that never answers
+    const server = Bun.serve({ port: 0, fetch: () => new Promise<Response>(() => {}) });
+    try {
+      const client = new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm', timeoutMs: 60_000 });
+      const pool = new BackendPool([{ machine: machine('gpu', 1), client }]);
+      const ac = new AbortController();
+      const call = pool.forAgent({ agent: 'a', signal: ac.signal }).text('c', [], 10);
+      await Bun.sleep(50);
+      expect(pool.snapshot().total.busy).toBe(1);
+      const t0 = Date.now();
+      ac.abort();
+      await expect(call).rejects.toThrow();
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(pool.snapshot().total).toMatchObject({ busy: 0, queued: 0 });
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test('tok/s per agent, team and machine over the last minute', async () => {
     const m = slowModel(1);
     const pool = new BackendPool([{ machine: machine('gpu', 4), client: m.inf }]);
