@@ -80,7 +80,8 @@ def gpu_free_sh(tries: int = 120, every: int = 5, limit_mib: int = 2000) -> str:
             f"for i in $(seq {tries}); do m=$({used}); [ -n \"$m\" ] && [ \"$m\" -lt {limit_mib} ] && break; "
             f"sleep {every}; done; "
             f"m=$({used}); if [ -z \"$m\" ] || [ \"$m\" -ge {limit_mib} ]; then "
-            f"echo \"GPU not free after {tries * every}s: ${{m:-no reading of}} MiB in use. Holders:\"; "
+            f"echo \"GPU not free after {tries * every}s: ${{m:-no reading of}} MiB in use (free means under "
+            f"{limit_mib}: --set gpu_free_mib=N). Holders:\"; "
             "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; exit 1; fi")
 
 
@@ -99,7 +100,7 @@ class Servers:
         cur = load(self.pidfile)
         if not cur:
             return None
-        if self.ex.dry or _alive(cur.get("pid", 0)):
+        if self.ex.dry or (_alive(cur.get("pid", 0)) and _ours(cur.get("pid", 0))):
             return cur
         self.pidfile.unlink(missing_ok=True)
         return None
@@ -111,7 +112,7 @@ class Servers:
         if spec.same(cur) and (self.ex.dry or _healthy(self.url)):
             return cur
         self.stop(step)
-        self.ex.run(step, Cmd(gpu_free_sh(), "gpu-free"))
+        self.ex.run(step, Cmd(gpu_free_sh(limit_mib=self.cfg.gpu_free_mib), "gpu-free"))
         self.dir.mkdir(parents=True, exist_ok=True)
         log = self.dir / f"{spec.kind}-{spec.name}.log"
         info = {"kind": spec.kind, "model": spec.model, "name": spec.name, "sh": spec.sh, "log": str(log),
@@ -122,7 +123,7 @@ class Servers:
             return load(self.pidfile)
         self.ex.commands.append(Cmd(spec.sh, f"serve-{spec.kind}", {"model": spec.model, "name": spec.name}))
         repo = Path(__file__).resolve().parents[2]
-        full = f"cd {repo} && {{ [ -f .env.vm ] && source .env.vm; true; }} && exec {spec.sh}"
+        full = f"cd {shlex.quote(str(repo))} && {{ [ -f .env.vm ] && source .env.vm; true; }} && exec {spec.sh}"
         with open(log, "a") as f:
             f.write(f"\n===== {time.strftime('%F %T')} $ {spec.sh}\n")
             f.flush()
@@ -159,7 +160,7 @@ class Servers:
                     break
         self.ex.commands.append(Cmd(f"# stop {cur.get('kind')} {cur.get('model')}", "serve-stop"))
         self.pidfile.unlink(missing_ok=True)
-        self.ex.run(step, Cmd(gpu_free_sh(), "gpu-free"))
+        self.ex.run(step, Cmd(gpu_free_sh(limit_mib=self.cfg.gpu_free_mib), "gpu-free"))
 
 
 def _alive(pid: int) -> bool:
@@ -172,6 +173,18 @@ def _alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def _ours(pid: int) -> bool:
+    """The pid is still a server this harness starts (vLLM or llama-server), not another
+    process that reused the pid of a stale pidfile (after a reboot, say)."""
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except FileNotFoundError:  # no /proc (macOS)
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return "vllm" in cmd or "llama-server" in cmd
 
 
 def _healthy(url: str) -> bool:

@@ -136,6 +136,7 @@ class Config:
     # ---- guards
     gpu_idle_abort: bool = True
     gpu_watch_minutes: float = 5.0
+    gpu_free_mib: int = 2000  # the GPU counts as free (our last server let go) under this much memory in use
     session_minutes: float = 0.0  # 0: no session clock; else stop starting steps that cannot finish in it
     # ---- paths (filled from the environment by load())
     nvme: str = "/mnt/nvme"
@@ -177,16 +178,18 @@ PROFILE_SETTINGS: dict[str, dict] = {
            "sft_mode": "lora", "epochs": 1.0, "max_len": 8192, "batch_tokens": 8192, "sft_minutes": 10.0,
            "save_minutes": 5.0, "smoke_tickets": 3, "smoke_minutes": 5.0, "score_seeds": 1, "slots": 4,
            "footprint_prompt": 6000, "imatrix_chunks": 20, "round2_tickets": 5, "round2_seeds": 1,
-           "round2_minutes": 5.0, "repair_samples": 1, "rft_minutes": 5.0, "gpu_idle_abort": False},
+           "round2_minutes": 5.0, "repair_samples": 1, "rft_minutes": 5.0, "gpu_idle_abort": False,
+           "gpu_free_mib": 3000},
     # B200 session 1 (about 3 h 20): teacher, G2, answers, SFT, spike smoke
     "s1": {"where": "b200", "session_minutes": 200.0},
     # B200 session 2 (about 2 h 30): the own-mistakes round
     "s2": {"where": "b200", "session_minutes": 150.0},
     # the laptops: export, footprint, student sampling between sessions
-    "laptop": {"where": "laptop", "gpu_idle_abort": False, "vllm_seqs": 32},
+    # (a laptop's own desktop holds some of the GPU's memory, under WSL2 too: gpu_free_mib)
+    "laptop": {"where": "laptop", "gpu_idle_abort": False, "vllm_seqs": 32, "gpu_free_mib": 3000},
     # the scoring laptop: MuggeBench on the shipped GGUF; a second laptop runs it while the
     # first samples, so it waits for the ship to reach the bucket
-    "eval": {"where": "laptop", "gpu_idle_abort": False, "wait_minutes": 240.0},
+    "eval": {"where": "laptop", "gpu_idle_abort": False, "wait_minutes": 240.0, "gpu_free_mib": 3000},
 }
 
 # Which stages a place may run.
@@ -214,8 +217,9 @@ def _coerce(cur, raw: str):
 
 def load(profile: str, env: dict, config_file: Path | None = None, sets: list[str] = ()) -> Config:
     """The profile's config, then the file's keys, then each --set key=value; paths from
-    the environment (NVME, BH_WORK, BH_LOGS, BH_BUCKET, CODEBENCH, MUGGEBENCH_SH,
-    FOOTPRINT_SH) unless set already."""
+    the environment (NVME, BH_BUCKET, BH_BACKENDS, MUGGEBENCH_SH, FOOTPRINT_SH; the dry run
+    also sets BH_WORK and BH_LOGS) unless set already. NVME defaults to /mnt/nvme, or to
+    ~/bh on a laptop without one."""
     if profile not in PROFILES:
         raise ValueError(f"profile must be one of {', '.join(PROFILES)}, not {profile!r}")
     over: dict = {"profile": profile, **PROFILE_SETTINGS[profile]}
@@ -232,7 +236,9 @@ def load(profile: str, env: dict, config_file: Path | None = None, sets: list[st
         if not sep or k not in names:
             raise ValueError(f"--set wants key=value; unknown key or no value in {s!r}")
         setattr(cfg, k, _coerce(getattr(cfg, k), raw))
-    cfg.nvme = env.get("NVME", cfg.nvme)
+    cfg.nvme = env.get("NVME") or cfg.nvme
+    if cfg.nvme == Config.nvme and cfg.where == "laptop" and not Path(cfg.nvme).is_dir():
+        cfg.nvme = str(Path(env.get("HOME") or Path.home()) / "bh")  # a laptop has no /mnt/nvme: ~/bh
     cfg.work = cfg.work or env.get("BH_WORK") or str(Path(cfg.nvme) / "jobs" / "bh" / cfg.run)
     cfg.logs = cfg.logs or env.get("BH_LOGS") or str(Path(env.get("HOME", "/tmp")) / "bh-logs" / cfg.run)
     cfg.bucket = env.get("BH_BUCKET", cfg.bucket)
