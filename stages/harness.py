@@ -132,6 +132,11 @@ def _base(path: str) -> str:
     return path.rsplit("/", 1)[-1]
 
 
+def _ext(path: str) -> str:
+    name = _base(path)
+    return name[name.rfind("."):] if "." in name else ""
+
+
 def _mentioned(text: str, owns: list[str]) -> str:
     """The one owned path a line names (the longest when several match), else the one
     owned path whose file name it names, else ""."""
@@ -147,7 +152,8 @@ def parse_files(raw: str, owns: list[str] | None = None) -> tuple[dict[str, str]
     path, or when its info string names one. With owns (the ticket's files), a file
     written under the bare name of an owned path moves to that path, a block also counts
     for an owned path that the line before it or its own first line mentions ("Here is the
-    fixed `src/a.py`:"), and a ticket that owns one file takes its last unlabelled block.
+    fixed `src/a.py`:"), and a ticket that owns one file takes a lone answer file of the
+    same type under another name, else its last unlabelled block.
     Other blocks are not files. Mirrors files.ts parseFiles."""
     owns = owns or []
     lines = _THINK.sub("", raw).split("\n")
@@ -177,6 +183,9 @@ def parse_files(raw: str, owns: list[str] | None = None) -> tuple[dict[str, str]
         same = [o for o in owns if _base(o) == _base(path)]  # "a.py" for an owned "src/a.py"
         if len(same) == 1 and same[0] not in files:
             files[same[0]] = files.pop(path)
+    others = [p for p in files if p not in owns]
+    if len(owns) == 1 and owns[0] not in files and len(others) == 1 and _ext(others[0]) == _ext(owns[0]):
+        files[owns[0]] = files.pop(others[0])  # "prog.ts" for the one owned "src/money.ts"
     rest = []
     for before, first, content in loose:
         path = _mentioned(before, owns) or _mentioned(first, owns)

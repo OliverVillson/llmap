@@ -74,7 +74,9 @@ export class OpenAICompatible implements Inference {
       headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 600_000),
-    });
+      // Bun (1.3) also cuts every fetch at 300 s unless told not to; timeoutMs is the limit
+      timeout: false,
+    } as RequestInit);
     if (!res.ok) throw new Error(`inference ${res.status}: ${(await res.text()).slice(0, 500)}`);
     const data: any = await res.json();
     const raw: string = data?.choices?.[0]?.message?.content ?? '';

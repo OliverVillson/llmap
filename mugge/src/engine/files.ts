@@ -45,6 +45,7 @@ function names(text: string, path: string): boolean {
 }
 
 const base = (path: string) => path.slice(path.lastIndexOf('/') + 1);
+const ext = (path: string) => (base(path).includes('.') ? base(path).slice(base(path).lastIndexOf('.')) : '');
 
 /** The one owned path a line names (the longest when several match), else the one owned path whose file name it names, else ''. */
 function mentioned(text: string, owns: string[]): string {
@@ -59,7 +60,8 @@ function mentioned(text: string, owns: string[]): string {
  * when its info string names one. With `owns` (the ticket's files), a file written under the bare
  * name of an owned path moves to that path, a block also counts for an owned path that the line
  * before it or its own first line mentions ("Here is the fixed `src/a.py`:"), and a ticket that
- * owns one file takes its last unlabelled block. Other blocks are not files. Thinking
+ * owns one file takes a lone answer file of the same type under another name, else its last
+ * unlabelled block. Other blocks are not files. Thinking
  * (`<think>…</think>`) is ignored.
  */
 export function parseFiles(raw: string, owns: string[] = []): WorkerOutput {
@@ -89,6 +91,11 @@ export function parseFiles(raw: string, owns: string[] = []): WorkerOutput {
       files[same[0]!] = files[path]!;
       delete files[path];
     }
+  }
+  const others = Object.keys(files).filter((p) => !owns.includes(p));
+  if (owns.length === 1 && !(owns[0]! in files) && others.length === 1 && ext(others[0]!) === ext(owns[0]!)) {
+    files[owns[0]!] = files[others[0]!]!; // "prog.ts" for the one owned "src/money.ts"
+    delete files[others[0]!];
   }
   const rest: string[] = [];
   for (const b of loose) {

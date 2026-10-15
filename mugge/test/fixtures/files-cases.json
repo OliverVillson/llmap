@@ -113,6 +113,30 @@
       "answer": "Changes to data.py:\n```python\nz = 1\n```",
       "files": {},
       "note": ""
+    },
+    {
+      "why": "a ticket that owns one file takes a lone answer file of its type under another name",
+      "owns": [
+        "ledger/src/money.ts"
+      ],
+      "answer": "prog.ts\n```ts\nexport const a = 1;\n```",
+      "files": {
+        "ledger/src/money.ts": "export const a = 1;\n"
+      },
+      "note": ""
+    },
+    {
+      "why": "a lone answer file of another type, or one of several, is not moved",
+      "owns": [
+        "src/a.ts"
+      ],
+      "answer": "prog.py\n```python\nx = 1\n```\nb.ts\n```ts\ny\n```\nc.ts\n```ts\nz\n```",
+      "files": {
+        "prog.py": "x = 1\n",
+        "b.ts": "y\n",
+        "c.ts": "z\n"
+      },
+      "note": ""
     }
   ],
   "render": [
