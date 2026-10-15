@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The train harness's data path: tickets in, training rows out, every row a real engine call.
 
-    python3 scripts/bh/data.py export     --work W          # bhdata kits -> train-bench, heldout-bench, extra rows
+    python3 scripts/bh/data.py export     --work W [--limit-kits 20]   # bhdata kits -> train-bench, heldout-bench, extra rows
     python3 scripts/bh/data.py check      --work W          # reference answers + decontam of both benches
     python3 scripts/bh/data.py teacher    --work W --runs R1 [R2 ...]   # harvest the teacher's bench runs
     python3 scripts/bh/data.py extra      --work W          # bhdata's free rows, checked and decontaminated
@@ -59,7 +59,7 @@ if __package__ in (None, ""):  # run as a script: python3 scripts/bh/data.py
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "bh"
 
-from . import bhdata_io, check, decontam, harvest, render  # noqa: E402
+from . import bhdata_io, check, decontam, harvest, render, sampling  # noqa: E402
 
 SPIKE = render.MUGGE / "spike"  # public MuggeBench example: smoke data only, never training data
 
@@ -111,10 +111,30 @@ def _index(cfg: DataConfig) -> decontam.Index:
 
 # ---------- 1-2: export and check ----------
 
-def export(cfg: DataConfig) -> bhdata_io.Export:
+def export(cfg: DataConfig, limit_kits: int | None = None) -> bhdata_io.Export:
     e = bhdata_io.export(cfg.export_dir)
-    _dump(cfg.stats("export"), {k: str(v) for k, v in asdict(e).items()})
+    st = {k: str(v) for k, v in asdict(e).items()}
+    if limit_kits:
+        st["limited"] = limit_export(e, limit_kits, cfg.d / "export-unused")
+    _dump(cfg.stats("export"), st)
     return e
+
+
+def limit_export(e: bhdata_io.Export, n: int, unused: Path) -> dict:
+    """Keeps the first n kits of each split (projects in name order: bhdata splits by kit, one
+    project per kit) and moves the rest to `unused`, so a small run (G0: 20 kits) exports
+    only those. The extra rows are not tied to kits and stay. Returns {split: [kept, moved]}."""
+    out = {}
+    for name, b in (("train", e.train_bench), ("heldout", e.heldout_bench)):
+        projects = sorted(p for p in b.iterdir() if (p / "plan.json").exists())
+        for p in projects[n:]:
+            dst = unused / b.name / p.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.move(str(p), dst)
+        out[name] = [min(n, len(projects)), max(0, len(projects) - n)]
+    print(f"[export] kept the first {n} kits of each split: {out}", flush=True)
+    return out
 
 
 def check_benches(cfg: DataConfig, which: tuple[str, ...] = ("train", "heldout")) -> dict:
@@ -277,12 +297,14 @@ def repair_requests(cfg: DataConfig, runs: list[str | Path]) -> Path:
 
 
 def answer_requests(requests: Path, out: Path, *, url: str, model: str, samples: int = 2, max_tokens: int = 4096,
-                    temperature: float = 0.7, top_p: float = 0.95, top_k: int = 20, thinking: bool = False,
+                    temperature: float = sampling.TEMPERATURE, top_p: float = sampling.TOP_P,
+                    top_k: int = sampling.TOP_K, min_p: float = sampling.MIN_P, thinking: bool = False,
                     concurrency: int = 64, timeout: float = 3600.0) -> Path:
     """The teacher's answers to a requests file ([{"id", "messages"}]), `samples` per request,
     from any OpenAI-compatible server: [{"id", "answers": [{"content", "cut", "completionTokens",
     "maxTokens"}]}]. Thinking off by default and top_k always finite (run 1's top_k 0 was one of
-    its three bugs); a long read timeout, since a big prefill can take minutes."""
+    its three bugs); sampling defaults from sampling.py, the pipeline's proxy's too; a long read
+    timeout, since a big prefill can take minutes."""
     reqs = harvest.read_jsonl(requests)
     if top_k <= 0:
         raise ValueError("top_k must be finite (>0)")
@@ -294,7 +316,7 @@ def answer_requests(requests: Path, out: Path, *, url: str, model: str, samples:
         answers = []
         for s in range(samples):
             body = {"model": model, "messages": q["messages"], "max_tokens": max_tokens, "temperature": temperature,
-                    "top_p": top_p, "top_k": top_k, "seed": s, "chat_template_kwargs": {"enable_thinking": thinking}}
+                    "top_p": top_p, "top_k": top_k, "min_p": min_p, "seed": s, "chat_template_kwargs": {"enable_thinking": thinking}}
             req = urllib.request.Request(url.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
                                          headers={"content-type": "application/json"})
             try:
@@ -546,11 +568,13 @@ def export_kits(kits: Path | None, out: Path, *, limit_kits: int | None = None, 
                 seed: int | None = None) -> dict:
     """bhdata's export into out (train-bench/, heldout-bench/, extra_rows.jsonl) and
     out/export.json with its counts. canary_hits: practice tickets carrying MuggeBench's canary."""
-    args = [*(["--kits", str(kits)] if kits else []), *(["--limit-kits", str(limit_kits)] if limit_kits else []),
+    args = [*(["--kits", str(kits)] if kits else []),
             *(["--heldout-share", str(heldout_share)] if heldout_share is not None else []),
             *(["--seed", str(seed)] if seed is not None else [])]
     e = bhdata_io.export(out, args=args + shlex.split(os.environ.get("BHDATA_EXPORT_ARGS", "")))
     st = {"kits": 0, "extra_rows": len(harvest.read_jsonl(e.extra_rows)), "canary_hits": 0}
+    if limit_kits:
+        st["limited"] = limit_export(e, limit_kits, out.parent / f"{out.name}-unused")
     for name, b in (("train", e.train_bench), ("heldout", e.heldout_bench)):
         tks = render.tickets(b)
         st[f"{name}_projects"] = len({t["project"] for t in tks.values()})
@@ -688,7 +712,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model")
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=4096)
-    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--top-k", type=int, default=sampling.TOP_K)
+    ap.add_argument("--top-p", type=float, default=sampling.TOP_P)
+    ap.add_argument("--temperature", type=float, default=sampling.TEMPERATURE)
+    ap.add_argument("--min-p", type=float, default=sampling.MIN_P)
     ap.add_argument("--thinking", choices=["on", "off"], default="off")
     # the row-file commands
     ap.add_argument("--kits", type=Path)
@@ -709,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.out:
             export_kits(a.kits, a.out, limit_kits=a.limit_kits, heldout_share=a.heldout_share, seed=a.seed)
         else:
-            export(cfg)
+            export(cfg, limit_kits=a.limit_kits)
     elif a.cmd == "check":
         if a.rows:
             check_rows(a.rows, bench, a.out, cfg=cfg)
@@ -732,7 +759,8 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "answer":
         answer_requests(a.requests or cfg.d / "round2" / "repair-requests.jsonl",
                         a.out or cfg.d / "round2" / "repair-answers.jsonl", url=a.url, model=a.model,
-                        samples=a.samples, max_tokens=a.max_tokens, top_k=a.top_k, thinking=a.thinking == "on")
+                        samples=a.samples, max_tokens=a.max_tokens, top_k=a.top_k, top_p=a.top_p,
+                        temperature=a.temperature, min_p=a.min_p, thinking=a.thinking == "on")
     elif a.cmd == "repair":
         repair(cfg, a.answers or cfg.d / "round2" / "repair-answers.jsonl", a.requests)
     elif a.cmd == "rft":
