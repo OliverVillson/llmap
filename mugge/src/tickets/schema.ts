@@ -49,6 +49,22 @@ export interface Plan {
   /** Repo-relative paths of the scaffold's interface files, packed into every ticket's context. */
   interfaces: string[];
   tickets: Ticket[];
+  /** Tickets the plan blocks because they claim a file another ticket owns (validatePlan fills it). */
+  clashes?: OwnershipClash[];
+}
+
+/**
+ * A ticket that claims a file another ticket already owns while both could run at once. The
+ * ticket listed earlier in the plan keeps the file; this one is blocked until the owner changes
+ * the plan. The engine never resolves a clash by itself.
+ */
+export interface OwnershipClash {
+  /** The blocked ticket. */
+  ticket: string;
+  /** The files it shares. */
+  files: string[];
+  /** The earlier tickets that own them. */
+  with: string[];
 }
 
 export const DEFAULT_BUDGET: Budget = { attempts: 4, max_tokens: 60000 };
@@ -108,11 +124,13 @@ export function safePath(p: string): boolean {
 }
 
 /**
- * Validates a whole plan: every ticket, unique ids, known dependencies, no cycles, and no two
- * tickets owning the same file unless one depends (transitively) on the other, because only
- * then can they never run at the same time. Throws PlanError listing every problem.
+ * Validates a whole plan: every ticket, unique ids, known dependencies and no cycles. Two
+ * tickets owning the same file while they could run at once (neither depends on the other,
+ * even transitively) is an ownership clash: with `clashes: 'block'` (the default) the later
+ * ticket is listed in `plan.clashes` and the scheduler blocks it; with `'reject'` it is one more
+ * problem. Throws PlanError listing every problem.
  */
-export function validatePlan(raw: any): Plan {
+export function validatePlan(raw: any, o: { clashes?: 'block' | 'reject' } = {}): Plan {
   const problems: string[] = [];
   if (!raw || !Array.isArray(raw.tickets)) throw new PlanError(['plan.tickets must be a list']);
   const interfaces = raw.interfaces ?? [];
@@ -132,18 +150,43 @@ export function validatePlan(raw: any): Plan {
   if (problems.length) throw new PlanError(problems);
   const cycle = findCycle(tickets);
   if (cycle) throw new PlanError([`dependency cycle: ${cycle.join(' -> ')}`]);
+  const clashes = findOwnershipClashes(tickets);
+  if (o.clashes === 'reject' && clashes.length) {
+    throw new PlanError(clashes.map((c) => `tickets ${c.with.join(', ')} and ${c.ticket} can run at once and both own ${c.files.join(', ')}`));
+  }
+  return clashes.length ? { interfaces, tickets, clashes } : { interfaces, tickets };
+}
+
+/**
+ * Ownership clashes in plan order: each ticket is checked against the earlier tickets that are
+ * not blocked themselves, so the first claimant keeps a file and every later one is blocked once.
+ */
+export function findOwnershipClashes(tickets: Ticket[]): OwnershipClash[] {
   const anc = ancestors(tickets);
-  for (let i = 0; i < tickets.length; i++) {
-    for (let j = i + 1; j < tickets.length; j++) {
-      const a = tickets[i], b = tickets[j];
-      const shared = a.owns.filter((p: string) => b.owns.includes(p));
-      if (shared.length && !anc.get(a.id)!.has(b.id) && !anc.get(b.id)!.has(a.id)) {
-        problems.push(`tickets ${a.id} and ${b.id} can run at once and both own ${shared.join(', ')}`);
-      }
+  const out: OwnershipClash[] = [];
+  const blocked = new Set<string>();
+  for (let j = 0; j < tickets.length; j++) {
+    const b = tickets[j]!;
+    const files = new Set<string>(), owners: string[] = [];
+    for (let i = 0; i < j; i++) {
+      const a = tickets[i]!;
+      if (blocked.has(a.id) || anc.get(a.id)!.has(b.id) || anc.get(b.id)!.has(a.id)) continue;
+      const shared = a.owns.filter((p) => b.owns.includes(p));
+      if (!shared.length) continue;
+      shared.forEach((p) => files.add(p));
+      owners.push(a.id);
+    }
+    if (owners.length) {
+      blocked.add(b.id);
+      out.push({ ticket: b.id, files: [...files], with: owners });
     }
   }
-  if (problems.length) throw new PlanError(problems);
-  return { interfaces, tickets };
+  return out;
+}
+
+/** The reason a clash gives for blocking its ticket, as the console shows it. */
+export function clashReason(c: OwnershipClash): string {
+  return `two tickets need the same file: ${c.files.join(', ')} (also owned by ${c.with.join(', ')})`;
 }
 
 function findCycle(tickets: Ticket[]): string[] | null {

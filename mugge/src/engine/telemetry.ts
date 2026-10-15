@@ -32,6 +32,7 @@ import { machinesFromEnv } from '../config.ts';
 import type { Plan, WorkerOutput } from '../tickets/schema.ts';
 import type { Machine, ServingSnapshot } from './backends.ts';
 import type { EngineEvent } from './events.ts';
+import type { AgentState } from './state.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Parser drops
@@ -88,7 +89,8 @@ export interface CallRecord {
   at: number;
   ticket: string;
   attempt: number;
-  kind: 'write' | 'fix';
+  /** write and fix are worker calls; review is the lead's review of a passing ticket. */
+  kind: 'write' | 'fix' | 'review';
   agent: string | null;
   team: string | null;
   machine: string | null;
@@ -134,6 +136,7 @@ export interface CallSummary {
   lostShare: number;
   write: number;
   fix: number;
+  review: number;
   promptTokens: number;
   completionTokens: number;
   reasoningTokens: number;
@@ -143,7 +146,7 @@ export function emptyCallSummary(): CallSummary {
   return {
     calls: 0, errors: 0, clean: 0, cut: 0, forced: 0, dropped: 0,
     dropReasons: { cut: 0, empty: 0, no_fence: 0, unlabelled: 0, not_owned: 0 },
-    lost: 0, lostShare: 0, write: 0, fix: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
+    lost: 0, lostShare: 0, write: 0, fix: 0, review: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
   };
 }
 
@@ -287,14 +290,14 @@ export const STATUS_SCHEMA = 'centipede.status/1';
 export type CrewState = 'ready' | 'working' | 'paused' | 'needs_you' | 'finished';
 
 /**
- * idle: no ticket yet. queued: its call waits for a free machine slot. writing: first attempt.
- * checking: its acceptance commands run. fixing: attempt n of max. finished / failed: its last
- * ticket ended so. `waiting`, `blocked` and `thinking` exist for when the scheduler binds agents
- * before a ticket is ready and the server streams; today waiting and blocked show on tickets.
+ * An agent's state is the console's (state.ts), taken from the engine's `state` events when it
+ * sends them. For an agent, `queued` means its model call waits for a free machine slot (a `slot`
+ * event); a ticket that could start but has no agent yet is `ready` on the ticket list instead,
+ * and `waiting` and `blocked` before a ticket starts show there too.
  */
-export type AgentState = 'idle' | 'queued' | 'writing' | 'checking' | 'fixing' | 'waiting' | 'thinking' | 'blocked' | 'finished' | 'failed';
+export type { AgentState };
 /** Has a ticket in progress. */
-const WORKING: AgentState[] = ['writing', 'checking', 'fixing', 'thinking', 'queued'];
+const WORKING: AgentState[] = ['writing', 'checking', 'fixing', 'thinking', 'reviewing', 'queued'];
 /** Is in a model call (holds a machine slot, when the pool does not say otherwise). */
 const CALLING: AgentState[] = ['writing', 'fixing', 'thinking'];
 
@@ -320,6 +323,10 @@ export interface AgentStatus {
   attempt: number;
   maxAttempts: number;
   kind: 'write' | 'fix' | null;
+  /** The engine's slot number while it holds one (state events), else null. */
+  slot: number | null;
+  /** Why it is in this state, when the engine says (blocked, failed). */
+  reason: string | null;
   /** Its own completion tok/s over the last minute, and of its last call. */
   tokS: number;
   lastCallTokS: number | null;
@@ -431,6 +438,10 @@ export class Telemetry {
   private lastWrite = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private pool: ServingSnapshot | null = null;
+  /** The engine sends `state` events: take agent states from them, not from model and check events. */
+  private stated = false;
+  /** An agent's call state while its call waits for a slot, to go back to once it gets one. */
+  private beforeQueue = new Map<string, AgentState>();
 
   constructor(private readonly o: TelemetryOptions = {}) {
     this.now = o.now ?? Date.now;
@@ -440,7 +451,7 @@ export class Telemetry {
     this.settings = { thinking: 'server', maxCallTokens: null, model: null, backend: this.crew.machines[0]?.backend ?? 'local', ...o.settings };
     for (const t of this.crew.teams)
       for (let i = 1; i <= t.agents; i++)
-        this.agents.push({ id: `${t.id}${i}`, role: 'worker', team: t.id, machine: t.machine, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, tokS: 0, lastCallTokS: null, lastNote: '', since: this.now(), calls: 0 });
+        this.agents.push({ id: `${t.id}${i}`, role: 'worker', team: t.id, machine: t.machine, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, slot: null, reason: null, tokS: 0, lastCallTokS: null, lastNote: '', since: this.now(), calls: 0 });
     this.dir = o.dir ?? null;
     this.callsPath = this.dir ? join(this.dir, 'calls.jsonl') : null;
     this.statusPath = this.dir ? join(this.dir, 'status.json') : null;
@@ -474,10 +485,67 @@ export class Telemetry {
         const t = this.ticket(e.ticket);
         const a = this.agentFor(t, e.at);
         if (e.machine) a.machine = e.machine;
+        if (this.stated) break; // the engine's state events carry queued themselves
         if (e.state === 'queued') {
           t.state = 'running'; // shown as queued below while the agent waits
+          if (a.state !== 'queued') this.beforeQueue.set(a.id, a.state);
           this.set(a, 'queued', e.at, {});
-        } else this.set(a, a.kind === 'fix' ? 'fixing' : 'writing', e.at, {});
+        } else if (a.state === 'queued') {
+          this.set(a, this.beforeQueue.get(a.id) ?? (a.kind === 'fix' ? 'fixing' : 'writing'), e.at, {});
+          this.beforeQueue.delete(a.id);
+        }
+        break;
+      }
+      case 'state': {
+        this.stated = true;
+        this.startedAt ??= e.at;
+        const t = this.ticket(e.ticket);
+        t.maxAttempts = e.of || t.maxAttempts;
+        if (e.attempt) t.attempt = e.attempt;
+        if (!t.started && !t.agent && (e.state === 'waiting' || e.state === 'queued' || e.state === 'blocked')) {
+          // not started: the ticket list shows it (ready, when only a free agent is missing)
+          t.state = e.state === 'blocked' ? 'blocked' : 'waiting';
+          if (e.reason) t.error = e.reason;
+          break;
+        }
+        const final = e.state === 'finished' || e.state === 'failed' || e.state === 'blocked';
+        if (final) {
+          t.state = e.state === 'finished' ? 'done' : e.state === 'blocked' ? 'blocked' : 'failed';
+          const a = t.agent ? this.agents.find((x) => x.id === t.agent && x.ticket === t.id) : undefined;
+          if (a) {
+            this.set(a, e.state, e.at, { attempt: e.attempt || a.attempt });
+            a.reason = e.reason ?? null;
+            a.slot = null;
+          }
+          break;
+        }
+        t.state = 'running';
+        t.started = true;
+        const a = this.agentFor(t, e.at, e.agent === undefined ? undefined : this.crewAgent(e.agent));
+        a.maxAttempts = t.maxAttempts;
+        if (e.agent !== undefined) a.slot = e.agent;
+        this.set(a, e.state, e.at, { attempt: e.attempt || a.attempt, kind: e.state === 'writing' ? 'write' : e.state === 'fixing' ? 'fix' : undefined });
+        break;
+      }
+      case 'clash': {
+        const t = this.ticket(e.ticket);
+        t.state = 'blocked';
+        t.blockedBy = e.with[0];
+        t.error = `needs ${e.files.join(', ')}, also claimed by ${e.with.join(', ')}`;
+        break;
+      }
+      case 'review': {
+        const t = this.ticket(e.ticket);
+        const a = this.agentFor(t, e.at);
+        this.record({
+          v: 1, run: this.run, at: e.at, ticket: e.ticket, attempt: e.attempt, kind: 'review',
+          agent: a.id, team: a.team, machine: a.machine, model: null,
+          promptTokens: e.promptTokens, completionTokens: e.completionTokens, reasoningTokens: e.reasoningTokens ?? null, reasoningChars: null, maxTokens: null,
+          ms: e.ms, tokS: e.ms > 0 ? round1((1000 * e.completionTokens) / e.ms) : 0, cut: !!e.cut, forced: null,
+          files: 0, missing: 0, drop: null, error: e.verdict === 'error' ? e.error ?? 'review failed' : null, clean: !e.cut && e.verdict !== 'error',
+        });
+        this.spans.push({ start: e.at - e.ms, end: e.at, tokens: e.completionTokens, agent: a.id, team: a.team, machine: a.machine });
+        this.sessionTokens += e.completionTokens;
         break;
       }
       case 'start': {
@@ -486,6 +554,7 @@ export class Telemetry {
         t.state = 'running';
         t.started = true;
         t.attempt = e.attempt;
+        if (this.stated && e.agent === undefined) break; // its first state event names the agent
         const a = this.bind(t, e.agent, e.machine, e.at);
         this.set(a, 'writing', e.at, { attempt: e.attempt, kind: 'write' });
         break;
@@ -509,7 +578,7 @@ export class Telemetry {
         a.lastCallTokS = Math.round(tokS * 10) / 10;
         a.lastNote = e.note;
         t.attempt = e.attempt;
-        this.set(a, 'checking', e.at, { attempt: e.attempt, kind: e.kind });
+        if (!this.stated) this.set(a, 'checking', e.at, { attempt: e.attempt, kind: e.kind });
         break;
       }
       case 'call_error': {
@@ -542,7 +611,10 @@ export class Telemetry {
         t.attempt = e.attempts || t.attempt;
         if (e.error) t.error = e.error.split('\n')[0]!.slice(0, 300);
         const a = t.agent ? this.agents.find((x) => x.id === t.agent) : undefined;
-        if (a && a.ticket === t.id) this.set(a, e.state === 'done' ? 'finished' : 'failed', e.at, { attempt: t.attempt });
+        if (a && a.ticket === t.id) {
+          this.set(a, e.state === 'done' ? 'finished' : e.state === 'blocked' ? 'blocked' : 'failed', e.at, { attempt: t.attempt });
+          a.slot = null;
+        }
         break;
       }
       case 'integrate':
@@ -687,12 +759,29 @@ export class Telemetry {
     return t;
   }
 
-  /** The agent working on t, binding one if a call arrives for a ticket that never started (integration fixes). */
-  private agentFor(t: TicketRow, at: number): AgentStatus {
+  /**
+   * The crew agent for the engine's agent number n (0 … concurrency-1): the teams in turn, so
+   * agents 0–3 are a1 b1 c1 d1, 4–7 are a2 b2 c2 d2, and so on.
+   */
+  crewAgent(n: number): string {
+    const teams = this.crew.teams;
+    return `${teams[n % teams.length]!.id}${Math.floor(n / teams.length) + 1}`;
+  }
+
+  /**
+   * The agent working on t: `want` when the engine names one, else the one bound already, else a
+   * new binding (a call for a ticket that never started: integration fixes).
+   */
+  private agentFor(t: TicketRow, at: number, want?: string): AgentStatus {
     const a = t.agent ? this.agents.find((x) => x.id === t.agent && x.ticket === t.id) : undefined;
-    if (a) return a;
+    if (a && (!want || a.id === want)) return a;
+    if (a) {
+      // the engine moved it: free the agent telemetry had picked
+      a.ticket = null;
+      this.set(a, 'idle', at, {});
+    }
     if (t.state === 'waiting') t.state = 'running';
-    const b = this.bind(t, undefined, undefined, at);
+    const b = this.bind(t, want, undefined, at);
     this.set(b, 'writing', at, { attempt: Math.max(1, t.attempt), kind: 'write' });
     return b;
   }
@@ -701,7 +790,7 @@ export class Telemetry {
     let a = agentId ? this.agents.find((x) => x.id === agentId) : undefined;
     if (agentId && !a) {
       const team = /^[a-z]+/.exec(agentId)?.[0] ?? '?';
-      a = { id: agentId, role: 'worker', team, machine: machine ?? this.crew.teams.find((x) => x.id === team)?.machine ?? this.crew.machines[0]!.id, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, tokS: 0, lastCallTokS: null, lastNote: '', since: at, calls: 0 };
+      a = { id: agentId, role: 'worker', team, machine: machine ?? this.crew.teams.find((x) => x.id === team)?.machine ?? this.crew.machines[0]!.id, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, slot: null, reason: null, tokS: 0, lastCallTokS: null, lastNote: '', since: at, calls: 0 };
       this.agents.push(a);
     }
     if (!a) a = this.pick();
@@ -710,6 +799,7 @@ export class Telemetry {
     a.owns = t.owns;
     a.maxAttempts = t.maxAttempts;
     a.lastNote = '';
+    a.reason = null;
     t.agent = a.id;
     return a;
   }
@@ -724,7 +814,7 @@ export class Telemetry {
     if (!from.length) {
       // more tickets running than agents: grow the last team
       const t = this.crew.teams[this.crew.teams.length - 1]!;
-      const a: AgentStatus = { id: `${t.id}${this.agents.filter((x) => x.team === t.id).length + 1}`, role: 'worker', team: t.id, machine: t.machine, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, tokS: 0, lastCallTokS: null, lastNote: '', since: this.now(), calls: 0 };
+      const a: AgentStatus = { id: `${t.id}${this.agents.filter((x) => x.team === t.id).length + 1}`, role: 'worker', team: t.id, machine: t.machine, state: 'idle', ticket: null, owns: [], attempt: 0, maxAttempts: 0, kind: null, slot: null, reason: null, tokS: 0, lastCallTokS: null, lastNote: '', since: this.now(), calls: 0 };
       this.agents.push(a);
       return a;
     }
@@ -742,6 +832,7 @@ export class Telemetry {
 
   /** After a failed attempt: the next one is a fix, if any are left. */
   private next(t: TicketRow, a: AgentStatus, attempt: number, at: number): void {
+    if (this.stated) return; // the engine's state events say what comes next
     if (attempt < t.maxAttempts) {
       t.attempt = attempt + 1;
       this.set(a, 'fixing', at, { attempt: attempt + 1, kind: 'fix' });

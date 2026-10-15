@@ -252,7 +252,7 @@ async function main(argv: string[]) {
       const report = await run;
       const s = report.summary;
       const status = telemetry.close();
-      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
+      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped${s.blocked ? `, ${s.blocked} blocked (two tickets need the same file)` : ''}; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
       console.log(`\n${formatCallSummary(status.calls)}\n(per call: ${telemetry.callsPath}; crew status: ${telemetry.statusPath})`);
       process.exit(s.done === s.tickets && s.integrated ? 0 : 1);
     }

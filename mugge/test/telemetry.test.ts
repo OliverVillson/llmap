@@ -6,11 +6,14 @@ import { findProjects } from '../bench/load.ts';
 import { runBench } from '../bench/run.ts';
 import { MESS, runSmoke, SPIKE_DIR } from '../bench/smoke.ts';
 import type { EngineEvent } from '../src/engine/events.ts';
-import { startFakeModel } from '../src/engine/fake-model.ts';
+import { loadSolutions, startFakeModel } from '../src/engine/fake-model.ts';
 import { parseFiles } from '../src/engine/files.ts';
 import { OpenAICompatible } from '../src/engine/inference.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
-import { classifyAnswer, crewFromEnv, defaultCrew, lostWarning, statusLine, summarizeCallLog, Telemetry, type CallRecord, type CrewStatus } from '../src/engine/telemetry.ts';
+import { classifyAnswer, crewFromEnv, defaultCrew, lostWarning, statusLine, summarizeCallLog, Telemetry, type AgentState, type CallRecord, type CrewStatus } from '../src/engine/telemetry.ts';
+import { initRepo } from '../src/engine/git.ts';
+import { runPlan } from '../src/engine/scheduler.ts';
+import { validatePlan } from '../src/tickets/schema.ts';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 const check = (raw: string, owns: string[], cut = false) => classifyAnswer(raw, owns, parseFiles(raw, owns), cut);
@@ -222,3 +225,45 @@ test('bench transcripts mark cut, forced and dropped answers so harvest can skip
     rmSync(out, { recursive: true, force: true });
   }
 }, 120_000);
+
+test('a real engine run: agents come from the engine state events, review calls get their own lines', async () => {
+  const plan = validatePlan(JSON.parse(readFileSync(join(SPIKE_DIR, 'plan.json'), 'utf8')));
+  const work = tmp('mugge-tel-run-');
+  const repo = join(work, 'repo');
+  cpSync(join(SPIKE_DIR, 'project'), repo, { recursive: true });
+  const base = initRepo(repo, { name: 't', email: 't@t' }, 'Scaffold');
+  const fake = startFakeModel({ solutions: loadSolutions(join(SPIKE_DIR, 'solutions')), latencyMs: 20, flaky: ['c-hash'], forced: ['py-store'] });
+  const tel = new Telemetry({ dir: join(work, 'run'), warn: null, crew: defaultCrew(4) });
+  tel.setPlan(plan);
+  const seen: AgentState[] = [];
+  const before = process.env.MUGGE_REVIEW;
+  process.env.MUGGE_REVIEW = 'on';
+  try {
+    const report = await runPlan({
+      repo, base, plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(),
+      worktreeRoot: join(work, 'wt'), concurrency: 4, author: { name: 't', email: 't@t' },
+      emit: (e) => {
+        tel.emit(e);
+        for (const a of tel.status().agents) if (!seen.includes(a.state)) seen.push(a.state);
+      },
+    });
+    expect(report.summary.done).toBe(15);
+  } finally {
+    if (before === undefined) delete process.env.MUGGE_REVIEW;
+    else process.env.MUGGE_REVIEW = before;
+    fake.stop();
+  }
+  const s = tel.close();
+  expect(s.crew.state).toBe('finished');
+  expect(seen).toEqual(expect.arrayContaining(['writing', 'checking', 'reviewing', 'fixing', 'finished']));
+  // engine agents 0–3 are a1 b1 c1 d1; nobody is left working
+  expect(new Set(s.agents.filter((a) => a.calls).map((a) => a.id))).toEqual(new Set(['a1', 'b1', 'c1', 'd1']));
+  expect(s.crew.agents.working).toBe(0);
+  const rows: CallRecord[] = readFileSync(join(work, 'run', 'calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  expect(rows.filter((r) => r.kind === 'review').length).toBe(15);
+  expect(rows.filter((r) => r.kind === 'write').length).toBe(15);
+  expect(rows.filter((r) => r.kind === 'fix').map((r) => r.ticket)).toEqual(['c-hash']);
+  expect(rows.filter((r) => !r.clean).map((r) => `${r.ticket} ${r.forced ?? r.drop}`).sort()).toEqual(['c-hash no_fence', 'py-store length']);
+  expect(s.calls.review).toBe(15);
+  rmSync(work, { recursive: true, force: true });
+}, 180_000);
