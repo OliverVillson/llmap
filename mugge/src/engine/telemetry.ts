@@ -457,6 +457,7 @@ export class Telemetry {
   private stated = false;
   /** An agent's call state while its call waits for a slot, to go back to once it gets one. */
   private beforeQueue = new Map<string, AgentState>();
+  private writeFailed = new Set<string>();
 
   constructor(private readonly o: TelemetryOptions = {}) {
     this.now = o.now ?? Date.now;
@@ -872,8 +873,24 @@ export class Telemetry {
 
   private record(r: CallRecord): void {
     addCall(this.summary, r);
-    if (this.callsPath) appendFileSync(this.callsPath, JSON.stringify(r) + '\n');
+    if (this.callsPath) this.safely('calls.jsonl', () => appendFileSync(this.callsPath!, JSON.stringify(r) + '\n'));
     this.checkLost(false);
+  }
+
+  /**
+   * A log that cannot be written (disk full, run folder removed) never stops the run: it warns
+   * once per file. A calls.jsonl short of lines makes harvest treat the run's calls as unclean.
+   */
+  private safely(what: string, write: () => void): void {
+    try {
+      write();
+    } catch (e) {
+      if (this.writeFailed.has(what)) return;
+      this.writeFailed.add(what);
+      const w = `could not write ${what}: ${(e as Error).message ?? e}`;
+      this.warnings.push(w);
+      this.warnSink?.(w);
+    }
   }
 
   private checkLost(final: boolean): void {
@@ -903,8 +920,10 @@ export class Telemetry {
     this.lastWrite = this.now();
     if (!this.statusPath) return;
     const tmp = `${this.statusPath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(s) + '\n');
-    renameSync(tmp, this.statusPath);
+    this.safely('status.json', () => {
+      writeFileSync(tmp, JSON.stringify(s) + '\n');
+      renameSync(tmp, this.statusPath!);
+    });
   }
 }
 

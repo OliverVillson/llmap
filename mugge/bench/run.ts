@@ -21,7 +21,7 @@ import { parseArgs } from 'node:util';
 import { inferenceFromEnv } from '../src/config.ts';
 import type { EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
-import { runTicket } from '../src/engine/harness.ts';
+import { runTicket, thinkingOn } from '../src/engine/harness.ts';
 import { OpenAICompatible, type Inference } from '../src/engine/inference.ts';
 import { classifyAnswer, crewFromEnv, formatCallSummary, Telemetry } from '../src/engine/telemetry.ts';
 import { parseFiles } from '../src/engine/files.ts';
@@ -65,7 +65,7 @@ async function runHidden(sandbox: Sandbox, t: BenchTicket, worktree: string, tim
   return null;
 }
 
-export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: BenchOptions, work: string): Promise<{ row: Row; transcript: unknown[] }> {
+export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: BenchOptions, work: string): Promise<{ row: Row; transcript: unknown[]; answerAttempt: number | null }> {
   const worktree = mkdtempSync(join(work, `${p.name}-${t.ticket.id}-s${seed}-`));
   const transcript: unknown[] = [];
   let calls = 0, empty = 0, refused = 0;
@@ -87,6 +87,9 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   const tel = o.telemetry;
   const emit = (e: EngineEvent) => {
     if (e.type === 'model') {
+      // which attempt each transcript call was: the review can put an earlier answer back
+      const last = transcript.at(-1) as { attempt?: number } | undefined;
+      if (last && last.attempt === undefined) last.attempt = e.attempt;
       calls++;
       if (e.files === 0) empty++;
       if (e.cut) cut++;
@@ -101,7 +104,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   tel?.emit({ type: 'start', at: Date.now(), ticket: id, attempt: 1, worktree });
   try {
     prepare(p, worktree, t.deps);
-    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs });
+    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs, thinking: thinkingOn(base) });
     let hiddenError: string | null = null;
     if (r.ok && t.tags.hidden.length) {
       applyHidden(p, t.ticket.id, worktree);
@@ -118,7 +121,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
     };
     finished = true;
     tel?.emit({ type: 'finish', at: Date.now(), ticket: id, state: row.solved ? 'done' : 'failed', attempts: r.attempts, error: row.error ?? undefined });
-    return { row, transcript };
+    return { row, transcript, answerAttempt: r.answerAttempt };
   } finally {
     if (!finished) tel?.emit({ type: 'finish', at: Date.now(), ticket: id, state: 'failed', attempts: 0, error: 'bench error' });
     rmSync(worktree, { recursive: true, force: true });
@@ -144,10 +147,10 @@ export async function runBench(o: BenchOptions): Promise<Row[]> {
   const worker = async () => {
     while (next < items.length) {
       const [p, t, s] = items[next++];
-      const { row, transcript } = await runOne(p, t, s, o, work);
+      const { row, transcript, answerAttempt } = await runOne(p, t, s, o, work);
       rows.push(row);
       appendFileSync(resultsPath, JSON.stringify(row) + '\n');
-      if (o.transcripts) appendFileSync(transcriptsPath, JSON.stringify({ key: row.key, seed: s, calls: transcript }) + '\n');
+      if (o.transcripts) appendFileSync(transcriptsPath, JSON.stringify({ key: row.key, seed: s, ...(answerAttempt !== null && answerAttempt < row.attempts ? { answerAttempt } : {}), calls: transcript }) + '\n');
       o.progress?.(row, rows.length, items.length);
     }
   };

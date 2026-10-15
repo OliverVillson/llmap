@@ -97,7 +97,11 @@ export function startEngineServer(o: EngineServerOptions) {
           .catch((e) => emit({ type: 'log', at: Date.now(), level: 'error', message: String(e?.message ?? e) }))
           .finally(() => {
             abort = null;
-            telemetry.close();
+            try {
+              telemetry.close();
+            } catch (e) {
+              console.error(`telemetry: ${(e as Error).message ?? e}`);
+            }
           });
         return Response.json({ started: true, tickets: plan.tickets.length });
       }

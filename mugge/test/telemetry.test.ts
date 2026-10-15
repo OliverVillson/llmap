@@ -278,3 +278,43 @@ test('an answer whose path the parser had to guess is usable but never a clean r
   t.emit({ type: 'model', at: 1, ticket: 'h', attempt: 1, kind: 'write', promptTokens: 1, completionTokens: 1, ms: 1, note: '', files: 1, loose: 1 });
   expect([t.calls().clean, t.calls().loose, t.calls().dropped]).toEqual([0, 1, 0]);
 });
+
+test('a log that cannot be written warns once and never stops the run', () => {
+  const dir = tmp('mugge-tel-gone-');
+  const warned: string[] = [];
+  const tel = new Telemetry({ dir, warn: (l) => warned.push(l), statusIntervalMs: 0 });
+  rmSync(dir, { recursive: true, force: true });
+  const model = (ticket: string): EngineEvent => ({ type: 'model', at: 1000, ticket, attempt: 1, kind: 'write', promptTokens: 10, completionTokens: 5, ms: 10, note: '', files: 1 });
+  expect(() => {
+    tel.emit({ type: 'start', at: 1000, ticket: 't1', attempt: 1, worktree: '/x' });
+    tel.emit(model('t1'));
+    tel.emit(model('t2'));
+    tel.close();
+  }).not.toThrow();
+  expect(warned.filter((w) => w.startsWith('could not write calls.jsonl'))).toHaveLength(1);
+  expect(warned.filter((w) => w.startsWith('could not write status.json'))).toHaveLength(1);
+  expect(tel.calls().calls).toBe(2);
+});
+
+test('a bench transcript names the answer the review put back, so harvest takes that one', async () => {
+  const out = tmp('mugge-bench-restore-');
+  const projects = findProjects(SPIKE_DIR).map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.ticket.id === 'c-hash') })).filter((p) => p.tickets.length);
+  const owned = projects[0]!.tickets[0]!.ticket.owns[0]!;
+  const solutions = { 'c-hash': { files: JSON.parse(readFileSync(join(SPIKE_DIR, 'solutions', 'c-hash.json'), 'utf8')).files, note: '' } };
+  const fake = startFakeModel({ solutions, reviews: { 'c-hash': [{ verdict: 'problems', problems: ['p'], fix: 'f' }] }, fixes: { 'c-hash': [{ files: { [owned]: 'broken\n' }, note: '' }] } });
+  const old = process.env.MUGGE_REVIEW;
+  process.env.MUGGE_REVIEW = 'on';
+  try {
+    await runBench({ projects, inference: () => new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), seeds: 1, concurrency: 1, out, transcripts: true });
+    const line = JSON.parse(readFileSync(join(out, 'transcripts.jsonl'), 'utf8').trim());
+    expect(line.answerAttempt).toBe(1);
+    expect(line.calls.map((c: any) => c.attempt)).toEqual([1, 2, 3, 4]);
+    const row = JSON.parse(readFileSync(join(out, 'results.jsonl'), 'utf8').trim());
+    expect(row).toMatchObject({ solved: true, attempts: 4 });
+  } finally {
+    if (old === undefined) delete process.env.MUGGE_REVIEW;
+    else process.env.MUGGE_REVIEW = old;
+    fake.stop();
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 120_000);

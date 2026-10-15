@@ -322,6 +322,20 @@ describe('runTicket', () => {
     expect(events.find((e) => e.type === 'review')).toMatchObject({ verdict: 'error', cut: true, completionTokens: 300 });
   });
 
+  test('an event sink that throws is not a failed model call', async () => {
+    const fake = startFakeModel({ solutions: { a: ok('a') } });
+    try {
+      const run = runTicket(ticket, folder('sink-throws'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), review: false, emit: (e) => {
+        if (e.type === 'model') throw new Error('calls.jsonl: ENOSPC');
+      } });
+      await expect(run).rejects.toThrow('ENOSPC');
+      // one call, not a good answer thrown away and retried as "(model call) failed"
+      expect(fake.calls().map((c) => c.kind)).toEqual(['write']);
+    } finally {
+      fake.stop();
+    }
+  });
+
   test('a review on the last attempt cannot fix; a broken review answer counts as approval', async () => {
     const one = validatePlan({ tickets: [t('a', { budget: { attempts: 1 } })] });
     const fake = startFakeModel({ solutions: { a: ok('a') }, reviews: { a: [{ verdict: 'problems', problems: ['p'], fix: 'f' }] } });
