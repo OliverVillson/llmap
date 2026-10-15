@@ -73,6 +73,7 @@ from bh import bench as B  # noqa: E402
 from bh import config as C  # noqa: E402
 from bh import export as X  # noqa: E402
 from bh import rows as R  # noqa: E402
+from bh import sampling as S  # noqa: E402
 from bh.exec import Bucket, Cmd, Exec, dump, load, read_jsonl, write_jsonl  # noqa: E402
 from bh.proxy import recording  # noqa: E402
 from bh.servers import Servers, llama_spec, vllm_spec  # noqa: E402
@@ -176,7 +177,7 @@ class Run:
         b = self.cfg.base_model
         return recording(self.url, out, top_k=self.cfg.top_k, top_p=self.cfg.top_p, temperature=self.cfg.temperature,
                          thinking=self.cfg.thinking, max_tokens=self.cfg.max_call_tokens,
-                         min_p=b.min_p if not logprobs else None,
+                         min_p=S.MIN_P if b.min_p is None else b.min_p,
                          logprobs=self.cfg.teacher_logprobs if logprobs and self.cfg.kd else 0)
 
     def bench(self, step, bench: Path, out: Path, name: str, *, seeds: int, concurrency: int, logprobs=False,
@@ -271,12 +272,11 @@ class Run:
     def run_data(self, step: Step) -> None:
         """data.py export (bhdata's kits as MuggeBench-format projects, split by kit, and its
         free rows), then data.py check (every reference answer in the sandbox; MuggeBench
-        decontam). G0 keeps the first limit_kits projects of each split."""
+        decontam). G0 keeps the first limit_kits kits of each split (data.py --limit-kits)."""
         if self.need("data.tar", self.data / "stats" / "check-heldout.json", untar=self.data):
             raise Done("restored from the bucket")
-        self.ex.run(step, self.data_cmd("export", "data-export"))
-        if self.cfg.limit_kits:
-            self.trim_export(self.cfg.limit_kits)
+        limit = f"--limit-kits {self.cfg.limit_kits}" if self.cfg.limit_kits else ""
+        self.ex.run(step, self.data_cmd("export", "data-export", limit, limit_kits=self.cfg.limit_kits))
         if not B.projects(self.bench_dir("train")):
             raise RuntimeError(f"no bench project in {self.bench_dir('train')}")
         self.ex.run(step, self.data_cmd("check", "data-check"))
@@ -287,14 +287,6 @@ class Run:
                 self.ex.warn(f"data: {len(rep.get('broken') or {})} broken and {len(rep.get('excluded') or {})} "
                              f"decontam-excluded of {n} {w} tickets; none of them become rows")
         self.tar_up(self.data, "data.tar", self.DATA_TAR)
-
-    def trim_export(self, limit: int) -> None:
-        """The first `limit` projects of each split stay; the rest move to W/data/export-unused."""
-        for w in ("train", "heldout"):
-            for p in B.projects(self.bench_dir(w))[limit:]:
-                dst = self.data / "export-unused" / f"{w}-bench" / p.name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(p), str(dst))
 
     # ---------- the teacher ----------
     def teacher_json(self) -> Path:

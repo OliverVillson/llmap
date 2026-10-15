@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bh import sampling as S  # the one sampling default, shared with data.py answer
+
 
 @dataclass(frozen=True)
 class Base:
@@ -76,9 +78,9 @@ class Config:
     uv_exclude_newer: str = "2026-10-12T00:00:00Z"
     # ---- serving and sampling (every server, every bench run)
     thinking: bool = False  # the worker is trained thinking-off (BlackHole, 2026-10-15)
-    temperature: float = 0.7  # Qwen's non-thinking card: 0.7 / 0.8 / 20
-    top_p: float = 0.8
-    top_k: int = 20  # finite everywhere: run 1's top_k 0 was one of the three bugs that scored 0%
+    temperature: float = S.TEMPERATURE  # Qwen's non-thinking card: 0.7 / 0.8 / 20
+    top_p: float = S.TOP_P
+    top_k: int = S.TOP_K  # finite everywhere: run 1's top_k 0 was one of the three bugs that scored 0%
     slot_ctx: int = 16384  # one agent's working memory, the footprint's 16K
     max_call_tokens: int = 4096  # per call; thinking-off answers are ~1-2K
     kv_type: str = "q8_0"
