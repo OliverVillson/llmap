@@ -93,6 +93,11 @@ def test_sessions_hand_over_through_the_bucket(tmp_path):
     ship = read(lap / "footprint" / "sft" / "footprint.json")["ship"]
     assert ship["type"] == "Q6_K" and ship["footprint"] <= 2e9  # Q8_0 does not fit 2 GB
     assert (lap / "round2" / "samples" / "transcripts.jsonl").exists()
+    assert not (lap / "score").exists()  # scoring is the eval laptop's
+    assert dry(tmp_path, "eval") == 0  # another machine: the ship comes from the bucket
+    ev = machine(tmp_path, "eval")
+    assert read(ev / "score" / "sft" / "score.json")["verdict"] in ("MEETS", "MISSES", "TOO CLOSE")
+    assert (ev / "ship" / f"{ship['name']}.gguf").exists()
     assert dry(tmp_path, "s2") == 0
     s2 = machine(tmp_path, "s2")
     r2 = read(s2 / "round2" / "round2.json")
@@ -105,6 +110,26 @@ def test_sessions_hand_over_through_the_bucket(tmp_path):
     assert (s2 / "sft" / "round2" / "model" / "sft.json").exists()
     assert dry(tmp_path, "laptop", "--set", "student=round2") == 0
     assert read(lap / "footprint" / "round2" / "footprint.json")["ship"]["name"].startswith("BH0.1-")
+
+
+def test_a_role_served_by_another_machine(tmp_path):
+    """Two laptops: the eval laptop's llama-server serves the student for the first one's
+    round-2 sampling; no server starts here and every call goes there through the proxy."""
+    from bh import mock as M
+    other = M.FakeUpstream()
+    try:
+        backends = json.dumps([{"name": "laptop2", "url": f"{other.url}/v1", "roles": ["student"], "model": "bh"}])
+        assert dry(tmp_path, "s1") == 0
+        assert dry(tmp_path, "laptop", "--set", f"backends={backends}") == 0
+    finally:
+        other.close()
+    lap = machine(tmp_path, "laptop")
+    assert other.requests  # laptop2 answered the student's calls
+    st = read(lap / "round2" / "samples" / "stats.json")
+    assert st["proxy"]["calls"] == len(other.requests)
+    with pytest.raises(ValueError, match="served by both"):
+        C.load("laptop", {"BH_BACKENDS": json.dumps([{"name": "a", "url": "http://a/v1", "roles": ["eval"]},
+                                                      {"name": "b", "url": "http://b/v1", "roles": ["eval"]}])})
 
 
 def test_minicpm_path(tmp_path):

@@ -6,7 +6,8 @@ after every step.
 
     python3 scripts/bh_run.py g0                 # the G0 smoke: end to end on the 4060
     python3 scripts/bh_run.py s1                 # B200 session 1: teacher, G2, answers, SFT, smoke
-    python3 scripts/bh_run.py laptop             # export, footprint, score, student samples
+    python3 scripts/bh_run.py laptop             # export, footprint, student samples
+    python3 scripts/bh_run.py eval               # MuggeBench score (a second laptop, at the same time)
     python3 scripts/bh_run.py s2                 # B200 session 2: the own-mistakes round
     python3 scripts/bh_run.py s1 sft..smoke      # a span of the plan (also: data.., ..sft, one stage)
     python3 scripts/bh_run.py s1 status          # the plan, what is done, the results so far
@@ -28,7 +29,7 @@ machine made are fetched from the bucket):
   smoke            the bf16 student on the public spike through bench/run.ts, ~10 minutes
   export           (laptop) vocab cut, BF16 GGUF, imatrix on training-shaped tickets, quant ladder
   footprint        (laptop) each quant's footprint; the best that fits 2 GB ships as BH<v>-<GB>
-  score            (laptop) MuggeBench: the dev set via muggebench.sh, else bench/run.ts
+  score            (eval) MuggeBench: the dev set via muggebench.sh, else bench/run.ts
   round2-sample    the student answers the held-out tickets (laptop GGUF or B200 bf16)
   round2-repair    data.py repair-requests / answer (teacher, via the proxy) / repair / rft /
                    build --round 2: own-repair and the student's own passes join round 1's rows
@@ -84,7 +85,8 @@ ALIASES = {"round2": ("round2-sample", "round2-repair", "round2-rft")}
 PLAN = {
     "g0": STAGES,
     "s1": ("setup", "data", "teacher-serve", "teacher-answers", "sft", "smoke"),
-    "laptop": ("export", "footprint", "score", "round2-sample"),
+    "laptop": ("export", "footprint", "round2-sample"),
+    "eval": ("score",),
     "s2": ("setup", "data", "teacher-serve", "round2-sample", "round2-repair", "round2-rft"),
 }
 SANDBOX_IMAGES = ("c", "node", "python", "web", "dotnet")
@@ -101,7 +103,9 @@ class Run:
         self.cfg, self.ex, self.force = cfg, ex, force
         self.W = Path(cfg.work)
         self.servers = Servers(cfg, ex)
-        self.url = url or self.servers.url  # where servers answer (the dry run's stand-in elsewhere)
+        self.local_url = url or self.servers.url  # where this machine's servers answer (the dry run's stand-in)
+        self.url = self.local_url  # where the current role's model answers: here, or another machine
+        self.model = ""  # the served name on another machine, when it is not the role's own
         self.bucket = Bucket(cfg.bucket, cfg.run)
         self.nvme = Path(cfg.nvme)
         self.llama = self.nvme / "llama.cpp"
@@ -172,6 +176,34 @@ class Run:
         tar.unlink()
         return path.exists()
 
+    def wait_for(self, name: str, path: Path, *, untar: Path | None = None) -> bool:
+        """need(), polling the bucket for up to wait_minutes while another machine is still
+        making it (the eval laptop waits for the ship)."""
+        deadline = time.monotonic() + 60 * self.cfg.wait_minutes
+        while not self.need(name, path, untar=untar):
+            if time.monotonic() >= deadline or self.ex.dry:
+                return False
+            print(f"waiting for {name} from another machine (up to {self.cfg.wait_minutes:g} min)", flush=True)
+            time.sleep(60)
+        return True
+
+    # ---------- machines ----------
+    def serve(self, step, role: str, start) -> dict:
+        """The role's model (teacher, student, eval): on the machine config.backends names for
+        it, which serves it already, else started here by start()."""
+        b = C.backend(self.cfg, role)
+        if b is None:
+            self.url, self.model = self.local_url, ""
+            return start()
+        self.url, self.model = b["url"].rstrip("/").removesuffix("/v1"), b.get("model", "")
+        from bh.servers import get_json
+        try:
+            get_json(f"{self.url}/v1/models", timeout=30)
+        except OSError as e:
+            raise RuntimeError(f"{b['name']} ({b['url']}) serves {role} but does not answer: {e}") from e
+        print(f"{role}: served by {b['name']} at {b['url']}", flush=True)
+        return {"remote": b["name"], "url": b["url"]}
+
     # ---------- the proxy ----------
     def recorder(self, out: Path, *, logprobs: bool = False):
         b = self.cfg.base_model
@@ -185,7 +217,8 @@ class Run:
         """One bench run through the recording proxy; its stats and the proxy's counts."""
         out.mkdir(parents=True, exist_ok=True)
         with self.recorder(out / "proxy", logprobs=logprobs) as (url, rec):
-            self.ex.run(step, B.command(self.cfg, bench, out, url, name, seeds=seeds, concurrency=concurrency,
+            self.ex.run(step, B.command(self.cfg, bench, out, url, name, model=self.model, seeds=seeds,
+                                        concurrency=concurrency,
                                         transcripts=transcripts, tickets=tickets))
         st = {**B.stats(out), "proxy": dict(rec.counts)}
         if st["proxy"]["think"]:
@@ -303,7 +336,7 @@ class Run:
     def serve_teacher(self, step, key: str) -> dict:
         t = C.TEACHERS[key]
         spec = vllm_spec(self.cfg, self.teacher_dir(key), "teacher", extra=t.vllm_args)
-        return self.servers.ensure(step, spec, health_s=1800)
+        return self.serve(step, "teacher", lambda: self.servers.ensure(step, spec, health_s=1800))
 
     def run_teacher_serve(self, step: Step) -> None:
         """Boot each teacher of the ladder in turn until one passes G2: >= g2_min_pass % of
@@ -491,7 +524,7 @@ class Run:
         else:
             from bh.servers import post_json
             try:
-                r = post_json(f"{self.url}/tokenize", {"model": "teacher", "messages": row["messages"][:-1],
+                r = post_json(f"{self.url}/tokenize", {"model": self.model or "teacher", "messages": row["messages"][:-1],
                                                        "add_generation_prompt": True,
                                                        "chat_template_kwargs": {"enable_thinking": self.cfg.thinking}},
                               timeout=120)
@@ -561,15 +594,22 @@ class Run:
             raise RuntimeError(f"no {name} model at {model}")
         out = self.p("smoke", name)
         served = "vllm"
-        try:
-            self.servers.ensure(step, vllm_spec(cfg, str(model), "student", seqs=64), health_s=900)
-        except Exception as e:  # noqa: BLE001
-            self.ex.warn(f"smoke: vLLM would not serve the student ({str(e)[:200]}); trying llama-server on a BF16 GGUF")
-            gguf = out / "student-bf16.gguf"
-            self.servers.stop(step)
-            self.ex.run(step, X.convert_cmd(str(self.llama), model, gguf))
-            self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=16), health_s=900)
-            served = "llama-server"
+
+        def start():
+            nonlocal served
+            try:
+                return self.servers.ensure(step, vllm_spec(cfg, str(model), "student", seqs=64), health_s=900)
+            except Exception as e:  # noqa: BLE001
+                self.ex.warn(f"smoke: vLLM would not serve the student ({str(e)[:200]}); trying llama-server on a "
+                             "BF16 GGUF")
+                gguf = out / "student-bf16.gguf"
+                self.servers.stop(step)
+                self.ex.run(step, X.convert_cmd(str(self.llama), model, gguf))
+                served = "llama-server"
+                return self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=16), health_s=900)
+
+        if self.serve(step, "student", start).get("remote"):
+            served = C.backend(cfg, "student")["name"]
         try:
             self.cap(cfg.smoke_minutes, after=5)
             spike = self.p("smoke", "spike")
@@ -688,14 +728,19 @@ class Run:
         dump(self.footprint_json(), {"model": self.student, "ladder": results, "ship": ship,
                                      "limit": cfg.footprint_limit})
         self.upload_once(dst, f"ship/{dst.name}")
+        self.upload_once(self.footprint_json(), f"footprint-{self.student}.json")  # after the GGUF: it says it is there
         print(f"ships as {ship['name']}: {ship['type']}, footprint {ship['footprint'] / 1e9:.3f} GB "
               f"(file {ship['file_bytes'] / 1e9:.3f} GB)", flush=True)
 
     def shipped(self) -> Path:
-        f = load(self.footprint_json()) or {}
-        if not f.get("ship"):
+        """The shipped GGUF, here or from the bucket (waiting for it on the eval laptop)."""
+        if not self.wait_for(f"footprint-{self.student}.json", self.footprint_json()):
             raise RuntimeError("nothing shipped yet: run footprint first")
-        return Path(f["ship"]["shipped"])
+        ship = (load(self.footprint_json()) or {})["ship"]
+        p = self.p("ship", Path(ship["shipped"]).name)  # this machine's copy
+        if not p.exists() and not self.need(f"ship/{p.name}", p):
+            raise RuntimeError(f"the shipped {p.name} is neither here nor in the bucket")
+        return p
 
     # ---------- score (laptop) ----------
     def score_json(self) -> Path:
@@ -719,7 +764,7 @@ class Run:
             dump(self.score_json(), {"gguf": str(gguf), "via": "muggebench.sh",
                                      "report": (out / "muggebench.txt").read_text()[-3000:]})
             return
-        self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=cfg.slots))
+        self.serve(step, "eval", lambda: self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=cfg.slots)))
         self.template_check(step, out)
         bench = Path(cfg.score_bench) if cfg.score_bench else self.p("score", "spike")
         if not cfg.score_bench and not (bench / "spike").exists():
@@ -753,6 +798,9 @@ class Run:
                 return
         dump(out / "probe.json", rec)
         hf = self.model_dir(self.student)
+        if not self.ex.dry and not (hf / "config.json").exists():
+            self.ex.warn("template check skipped: the HF model is not on this machine (it runs where export ran)")
+            return
         try:
             self.ex.run(step, Cmd(f"python scripts/bh/export.py roundtrip --hf {q(hf)} --probe {q(out / 'probe.json')}",
                                   "roundtrip", {"probe": str(out / "probe.json")}))
@@ -776,13 +824,15 @@ class Run:
         self.need_data()
         out = self.r2("samples")
         if cfg.where == "laptop":
-            self.servers.ensure(step, llama_spec(cfg, str(self.shipped()), "student", slots=cfg.slots))
+            gguf = self.shipped()
+            self.serve(step, "student", lambda: self.servers.ensure(step, llama_spec(cfg, str(gguf), "student",
+                                                                                    slots=cfg.slots)))
             conc = cfg.slots
         else:
             model = self.model_dir("sft")
             if not self.need("sft-model.tar", model / "sft.json", untar=model):
                 raise RuntimeError("no sft model to sample")
-            self.servers.ensure(step, vllm_spec(cfg, str(model), "student"))
+            self.serve(step, "student", lambda: self.servers.ensure(step, vllm_spec(cfg, str(model), "student")))
             conc = cfg.bench_concurrency
         self.cap(cfg.round2_minutes, after=cfg.rft_minutes + 20)
         self.bench(step, self.bench_dir("heldout"), out, "student", seeds=cfg.round2_seeds, concurrency=conc,
@@ -979,7 +1029,7 @@ class Run:
 
 USAGE = """usage: bh_run.py PROFILE [STAGES] [options]
 
-  PROFILE   g0 | s1 | laptop | s2   (where this runs; scripts/bh/README.md has the run sheet)
+  PROFILE   g0 | s1 | laptop | eval | s2   (where this runs; scripts/bh/README.md has the run sheet)
   STAGES    none: the profile's whole plan, resuming (finished stages are skipped)
             one or more stages, or a span of the plan: sft..smoke, data.., ..sft
             round2 = round2-sample round2-repair round2-rft

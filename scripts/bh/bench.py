@@ -42,10 +42,10 @@ def shard(bench: Path, out: Path, size: int) -> list[Path]:
 
 
 def command(cfg, bench: Path, out: Path, url: str, name: str, *, seeds: int, concurrency: int,
-            transcripts: bool = False, tickets: int = 0, split: str = "", fake: bool = False) -> Cmd:
+            transcripts: bool = False, tickets: int = 0, split: str = "", fake: bool = False, model: str = "") -> Cmd:
     """`bun bench/run.ts` with thinking off, a finite top_k and the per-call cap; no Bun
     fetch cap (MUGGE_TIMEOUT_S an hour: a call may wait for a slot, then prefill 10K)."""
-    args = ["--bench", str(bench), "--out", str(out), "--url", url, "--model", name, "--name", name,
+    args = ["--bench", str(bench), "--out", str(out), "--url", url, "--model", model or name, "--name", name,
             "--seeds", str(seeds), "--concurrency", str(concurrency), "--sandbox", cfg.sandbox,
             "--thinking", "on" if cfg.thinking else "off", "--temperature", str(cfg.temperature),
             "--top-p", str(cfg.top_p), "--top-k", str(cfg.top_k), "--max-tokens", str(cfg.max_call_tokens)]

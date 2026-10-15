@@ -58,7 +58,7 @@ TEACHERS = {
 }
 
 # Lowercase: the profile names on the command line.
-PROFILES = ("g0", "s1", "s2", "laptop")
+PROFILES = ("g0", "s1", "s2", "laptop", "eval")
 
 
 @dataclass
@@ -145,6 +145,13 @@ class Config:
     codebench: str = ""
     muggebench_sh: str = ""  # BlackHole's eval/muggebench/muggebench.sh, for the dev set on a laptop
     footprint_sh: str = ""  # BlackHole's serving/footprint.sh, the reference measurement
+    # ---- machines
+    # Other machines serving a role, in the engine's MUGGE_BACKENDS shape (a JSON array or
+    # @file; BH_BACKENDS): [{"name": "laptop2", "url": "http://laptop2:8080/v1", "roles":
+    # ["eval"], "model": "student"}]. A stage whose role (teacher, student, eval) is listed
+    # sends its calls there and starts no server here.
+    backends: str = ""
+    wait_minutes: float = 0.0  # how long a stage waits for an input another machine is still making
     extra: dict = field(default_factory=dict)
 
     # ---- derived
@@ -175,8 +182,11 @@ PROFILE_SETTINGS: dict[str, dict] = {
     "s1": {"where": "b200", "session_minutes": 200.0},
     # B200 session 2 (about 2 h 30): the own-mistakes round
     "s2": {"where": "b200", "session_minutes": 150.0},
-    # the laptops: export, footprint, score, student sampling between sessions
+    # the laptops: export, footprint, student sampling between sessions
     "laptop": {"where": "laptop", "gpu_idle_abort": False, "vllm_seqs": 32},
+    # the scoring laptop: MuggeBench on the shipped GGUF; a second laptop runs it while the
+    # first samples, so it waits for the ship to reach the bucket
+    "eval": {"where": "laptop", "gpu_idle_abort": False, "wait_minutes": 240.0},
 }
 
 # Which stages a place may run.
@@ -229,6 +239,7 @@ def load(profile: str, env: dict, config_file: Path | None = None, sets: list[st
     cfg.codebench = cfg.codebench or env.get("CODEBENCH") or str(Path(cfg.nvme) / "codebench")
     cfg.muggebench_sh = cfg.muggebench_sh or env.get("MUGGEBENCH_SH", "")
     cfg.footprint_sh = cfg.footprint_sh or env.get("FOOTPRINT_SH", "")
+    cfg.backends = cfg.backends or env.get("BH_BACKENDS", "")
     validate(cfg)
     return cfg
 
@@ -249,6 +260,40 @@ def validate(cfg: Config) -> None:
         raise ValueError(f"where must be one of {', '.join(WHERE)}")
     if not 2 <= cfg.samples <= 4 and cfg.profile != "g0":
         raise ValueError(f"samples is 2-4 per ticket, not {cfg.samples}")
+    backends(cfg)
+
+
+ROLES = ("teacher", "student", "eval")
+
+
+def backends(cfg: Config) -> list[dict]:
+    """The machines in cfg.backends (MUGGE_BACKENDS' shape: name, url up to /v1, roles,
+    optional model); each role served at most once."""
+    raw = cfg.backends.strip()
+    if not raw:
+        return []
+    try:
+        ms = json.loads(Path(raw[1:]).read_text() if raw.startswith("@") else raw)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"backends must be a JSON array of machines or @file: {e}") from e
+    if not isinstance(ms, list):
+        raise ValueError("backends must be a JSON array of machines")
+    seen: dict[str, str] = {}
+    for m in ms:
+        if not isinstance(m, dict) or not m.get("name") or not str(m.get("url", "")).startswith("http"):
+            raise ValueError(f"each backend needs a name and an http(s) url: {m!r}")
+        for r in m.get("roles") or []:
+            if r not in ROLES:
+                raise ValueError(f"backend {m['name']}: role {r!r} is not one of {', '.join(ROLES)}")
+            if r in seen:
+                raise ValueError(f"role {r} is served by both {seen[r]} and {m['name']}")
+            seen[r] = m["name"]
+    return ms
+
+
+def backend(cfg: Config, role: str) -> dict | None:
+    """The machine serving role, or None (this machine serves it)."""
+    return next((m for m in backends(cfg) if role in (m.get("roles") or [])), None)
 
 
 def pins_problems(cfg: Config) -> list[str]:

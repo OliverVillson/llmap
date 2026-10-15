@@ -9,7 +9,7 @@ This page is the whole run sheet. Everything it names lives in this repository, 
 ```
 python3 scripts/bh_run.py PROFILE [STAGES] [options]
 
-  PROFILE   g0 | s1 | laptop | s2
+  PROFILE   g0 | s1 | laptop | eval | s2
   STAGES    none: the profile's whole plan, resuming (finished stages are skipped)
             one or more stages, or a span of the plan: sft..smoke, data.., ..sft
             round2 = round2-sample round2-repair round2-rft
@@ -28,10 +28,11 @@ That is the whole interface. `scripts/bh/data.py` is the data path that bh_run.p
 |---|---|---|---|
 | `g0` | any Linux GPU box (the 4060, WSL2 too) | every stage; Qwen3.5-0.8B taught by Qwen3.5-2B, 20 kits, LoRA, tiny caps; its G2 only reports | an hour or two |
 | `s1` | B200 session 1 | setup, data, teacher-serve, teacher-answers, sft, smoke | 200 min, billed from boot |
-| `laptop` | a laptop between sessions | export, footprint, score, round2-sample | none |
+| `laptop` | the 4060 laptop between sessions | export, footprint, round2-sample | none |
+| `eval` | the second laptop (or the same one afterwards) | score; waits up to 4 h for the shipped GGUF to reach the bucket | none |
 | `s2` | B200 session 2 | setup, data, teacher-serve, round2-sample (if the laptops didn't), round2-repair, round2-rft | 150 min |
 
-Run them in order: `s1`, then `laptop`, then `s2`, then `laptop --set student=round2` to ship the round-2 model. The machines hand over through the bucket. Each one fetches what an earlier machine made, so a fresh machine needs only the clone and the bucket login.
+Run them in order: `s1`, then `laptop` and `eval` (at the same time on two laptops, or one after the other on one), then `s2`, then `laptop --set student=round2` and `eval --set student=round2` to ship and score the round-2 model. The machines hand over through the bucket. Each one fetches what an earlier machine made, so a fresh machine needs only the clone and the bucket login.
 
 ## Before a run
 
@@ -47,7 +48,7 @@ Run them in order: `s1`, then `laptop`, then `s2`, then `laptop --set student=ro
   - Set `BHDATA` to its package directory (the folder holding `llmap.py`), unless it sits at `/mnt/project-files/blackhole/data/bhdata`, `~/blackhole/data/bhdata` or `~/bhdata`.
 - **Score on the Mac:** set `MUGGEBENCH_SH` to MuggeBench's `muggebench.sh`. Without it, score runs `mugge/bench/run.ts` on the dev set given by `--set score_bench=DIR`.
 
-To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_run.py g0 --dry-run /tmp/bh-dry`. Running `s1`, `laptop` and `s2` in turn with the same DIR exercises the real hand-over.
+To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_run.py g0 --dry-run /tmp/bh-dry`. Running `s1`, `laptop`, `eval` and `s2` in turn with the same DIR exercises the real hand-over.
 
 ## Stages
 
@@ -83,6 +84,39 @@ To check the plumbing first, with no GPU, models or bucket: `python3 scripts/bh_
   - **Drops:** when more than 20% of answers drop for length or parsing, the run warns and prints the counts. Cut, forced and thinking answers never become rows.
 - **Read the results:** `python3 scripts/bh_run.py PROFILE status`, or `results-<profile>.tar` in the bucket.
 
+## Two laptops
+
+Two laptops on one network split the work **by role**. They cannot pool their GPUs into one model, so neither can serve the teacher: the 27B NVFP4 teacher (and its fallbacks) needs the B200, and it stays there. The laptops share the work between sessions.
+
+**By profile (the default).** Run both at once with the same bucket:
+
+```
+laptop1 (the 4060):   python3 scripts/bh_run.py laptop   # export, footprint, then round-2 samples
+laptop2:              python3 scripts/bh_run.py eval     # waits for the shipped GGUF, then MuggeBench
+```
+
+Each laptop serves its own llama-server. laptop2's score starts when laptop1's footprint uploads the ship, and it runs while laptop1 samples the held-out tickets.
+
+**By machine (a role served elsewhere).** Every stage that talks to a model has a role:
+- `teacher`: teacher-serve, teacher-answers and round2-repair.
+- `student`: smoke and round2-sample.
+- `eval`: score.
+
+`BH_BACKENDS` (or `--set backends=...`) names the machines that serve roles. It uses the same JSON shape as the engine's `MUGGE_BACKENDS`: `name`, `url` up to `/v1`, `roles`, and an optional served `model`. A listed role sends its calls to that URL, through this machine's recording proxy (so the sampling and logs stay the same), and starts no server here. The bench's sandboxes still run on the machine that runs the stage.
+
+```
+# laptop1 drives round-2 sampling (the sandboxes run here) while laptop2's GPU serves the student
+export BH_BACKENDS='[{"name": "laptop2", "url": "http://laptop2:8080/v1", "roles": ["student"]}]'
+python3 scripts/bh_run.py laptop round2-sample
+
+# on laptop2: the shipped GGUF as the harness serves it (12 slots of 16K, q8 KV; the proxy
+# sends the sampling with every call)
+llama-server -m BH0.1-1.7.gguf -a student -ngl 999 --host 0.0.0.0 --port 8080 -c 196608 -np 12 \
+  --kv-unified --jinja -fa on -ctk q8_0 -ctv q8_0
+```
+
+A role served elsewhere must already be up: the stage checks `/v1/models` and stops with the machine's name if it does not answer. The file form works too: `BH_BACKENDS=@backends.json`.
+
 ## Config
 
 All settings are in `scripts/bh/config.py` (`Config` and `PROFILE_SETTINGS`). The ones most often changed:
@@ -92,11 +126,11 @@ All settings are in `scripts/bh/config.py` (`Config` and `PROFILE_SETTINGS`). Th
 --set teachers=qwen3.6-35b-a3b-fp8
 --set samples=4                 # teacher seeds per ticket
 --set run=bh02 --set version=0.2
---set student=round2            # laptop: export/footprint/score the round-2 model
+--set student=round2            # laptop and eval: ship and score the round-2 model
 --set score_bench=/path/to/dev  # score without muggebench.sh
 ```
 
-Environment variables: `NVME` (the fast disk), `BH_WORK`, `BH_LOGS`, `BH_BUCKET`, `BHDATA`, `MUGGEBENCH_SH`, `FOOTPRINT_SH` and `CODEBENCH`.
+Environment variables: `NVME` (the fast disk), `BH_WORK`, `BH_LOGS`, `BH_BUCKET`, `BH_BACKENDS`, `BHDATA`, `MUGGEBENCH_SH`, `FOOTPRINT_SH` and `CODEBENCH`.
 
 ## The contract with the model (BlackHole)
 
