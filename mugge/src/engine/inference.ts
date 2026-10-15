@@ -112,7 +112,12 @@ export class OpenAICompatible implements Inference {
 
   async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>> {
     const c = await this.text(model, messages, maxTokens, signal, schema);
-    return { ...c, value: parseJsonAnswer<T>(c.raw) };
+    try {
+      return { ...c, value: parseJsonAnswer<T>(c.raw) };
+    } catch (e) {
+      // the caller can still count what the answer cost and see whether it was cut
+      throw Object.assign(e as Error, { completion: c });
+    }
   }
 
   async text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object): Promise<Completion<string>> {

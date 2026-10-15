@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyEvent, emptyView, agentStates, type EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
-import { initRepo } from '../src/engine/git.ts';
+import { gitOk, initRepo } from '../src/engine/git.ts';
 import { runTicket } from '../src/engine/harness.ts';
 import { OpenAICompatible } from '../src/engine/inference.ts';
 import { REVIEW_SYSTEM, reviewMessages } from '../src/engine/prompts.ts';
@@ -157,6 +157,27 @@ describe('ticket states', () => {
   });
 });
 
+describe('scheduler agents', () => {
+  test('a ticket whose worktree cannot be made frees its agent number', async () => {
+    const { repo, base } = await repoWith('no-worktree');
+    // the repo has mugge/a checked out, so a worktree for ticket a cannot take that branch
+    gitOk(repo, ['checkout', '-q', '-b', 'mugge/a']);
+    const plan = validatePlan({ tickets: [t('a'), t('b'), t('c')] });
+    const fake = startFakeModel({ solutions: { b: ok('b'), c: ok('c') } });
+    const events: EngineEvent[] = [];
+    try {
+      const report = await runPlan({ repo, base, plan, concurrency: 1, worktreeRoot: join(dir, 'wt-no-worktree'), sandbox: new LocalSandbox(), inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), emit: (e) => events.push(e), integrate: false });
+      expect(report.summary).toMatchObject({ done: 2, failed: 1 });
+    } finally {
+      fake.stop();
+    }
+    const agents = events.filter((e) => e.type === 'state' && e.ticket !== 'a').map((e) => (e as any).agent).filter((x) => x !== undefined);
+    expect(agents.length).toBeGreaterThan(0);
+    expect(agents.every((x) => x === 0)).toBe(true);
+    expectLegal(events);
+  });
+});
+
 describe('runTicket', () => {
   const plan = validatePlan({ tickets: [t('a')] });
   const ticket = plan.tickets[0]!;
@@ -248,7 +269,7 @@ describe('runTicket', () => {
     const events: EngineEvent[] = [];
     try {
       const r = await runTicket(ticket, wt, { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
-      expect(r).toMatchObject({ ok: true, attempts: 4, firstTry: true, reviewUnresolved: true, error: null });
+      expect(r).toMatchObject({ ok: true, attempts: 4, firstTry: true, reviewUnresolved: true, error: null, answerAttempt: 1 });
       expect(readFileSync(join(wt, 'a.txt'), 'utf8')).toBe('ok-a\n');
     } finally {
       fake.stop();
@@ -256,6 +277,49 @@ describe('runTicket', () => {
     const last = events.filter((e) => e.type === 'state').at(-1);
     expect(last).toMatchObject({ state: 'finished', reason: 'lead review problems left unfixed' });
     expectLegal(events);
+  });
+
+  test('a review fix whose calls are refused or fail still ends through checking, on the restored files', async () => {
+    const fake = startFakeModel({
+      solutions: { a: ok('a') },
+      reviews: { a: [{ verdict: 'problems', problems: ['wrong'], fix: 'rewrite it' }] },
+      // every fix writes a file the ticket does not own: refused, so the last state is a call state
+      fixes: { a: [{ files: { 'a.txt': 'ok-a\n', 'b.txt': 'x\n' }, note: '' }] },
+    });
+    const wt = folder('refused-fix');
+    const events: EngineEvent[] = [];
+    try {
+      const r = await runTicket(ticket, wt, { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+      expect(r).toMatchObject({ ok: true, attempts: 4, reviewUnresolved: true, answerAttempt: 1 });
+      expect(readFileSync(join(wt, 'a.txt'), 'utf8')).toBe('ok-a\n');
+    } finally {
+      fake.stop();
+    }
+    expect(statesOf(events).get('a')!.slice(-3)).toEqual(['fixing', 'checking', 'finished']);
+    // the restored files were checked again
+    expect(events.filter((e) => e.type === 'check').length).toBe(2);
+    expectLegal(events);
+  });
+
+  test('a review answer cut at the cap counts its tokens and shows cut', async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        const body: any = await req.json();
+        const review = body.messages[0].content === REVIEW_SYSTEM;
+        const content = review ? '{"verdict": "probl' : '```a.txt\nok-a\n```';
+        return Response.json({ choices: [{ finish_reason: review ? 'length' : 'stop', message: { content } }], usage: { prompt_tokens: 50, completion_tokens: review ? 300 : 5 } });
+      },
+    });
+    const events: EngineEvent[] = [];
+    try {
+      const r = await runTicket(ticket, folder('review-cut'), { plan, inference: new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm', maxCallTokens: 300 }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+      expect(r).toMatchObject({ ok: true, completionTokens: 305 });
+      expect(r.review).toMatchObject({ verdict: 'error', cut: true, completionTokens: 300 });
+    } finally {
+      server.stop(true);
+    }
+    expect(events.find((e) => e.type === 'review')).toMatchObject({ verdict: 'error', cut: true, completionTokens: 300 });
   });
 
   test('a review on the last attempt cannot fix; a broken review answer counts as approval', async () => {
