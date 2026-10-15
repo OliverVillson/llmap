@@ -15,20 +15,23 @@ Per ticket, from 2-4 seeds:
 Then every chosen row is checked again in the sandbox (check.py: acceptance and hidden
 tests) and dropped if it fails.
 
-Never a row: answers cut at max_tokens or forced after the thinking (the call's cut/forced
-flags; without them, an answer that used its whole cap counts as cut), answers that do not
-write every owned file (parser drops), fix calls after a failed model call, tickets whose
+Never a row: any call the per-call log marks unclean (telemetry.ts CallRecord: cut, forced,
+drop, loose, error; or the recording proxy's cut/finish_reason; without flags, an answer that
+used its whole cap counts as cut), answers that do not write every owned file (parser drops),
+answers whose file paths the parser had to guess (loose: `prog.c`, `**a.py**`), fix calls after
+a failed model call, tickets whose
 reference answer fails (broken), and tickets decontam flags. Drops are counted, and a warning
 is printed when more than DROP_WARN of all answers drop for length or parsing.
 
 Also here, for round 2: repair_requests turns the student's failed held-out runs into the fix
 call the engine would make next (its files as it left them, the check's real output), for
 the teacher to answer; repair_rows keeps the teacher's shortest passing repair per ticket
-(own-repair rows). The student's own passes go through harvest() as RFT rows.
+(source "repair"). The student's own passes go through harvest() as source "rft".
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from collections import Counter, defaultdict
@@ -53,14 +56,30 @@ def write_jsonl(p: str | Path, rows: list[dict]) -> None:
     tmp.replace(p)
 
 
-def is_cut(call: dict) -> bool:
-    """The engine's cut flag (PR #10 / the per-attempt log: cut, or answer_cut), the bench
-    proxy's forced flag, else an answer that used its whole cap."""
-    for k in ("cut", "answer_cut", "forced", "truncated"):
-        if call.get(k):
-            return True
+def unclean(call: dict) -> str:
+    """Why this call may never become a row, or "". The flags come from the transcript entry
+    (bench/run.ts) or a per-call log merged in by flag_calls: telemetry.ts's CallRecord
+    (clean, cut, forced, drop, loose, error) or the recording proxy's log (cut, finish_reason,
+    forced). Without any flag, an answer that used its whole cap counts as cut."""
+    if call.get("forced"):
+        return "forced"
+    if call.get("cut") or call.get("answer_cut") or call.get("truncated") or call.get("finish_reason") == "length":
+        return "cut"
+    if call.get("drop"):
+        return "drop"
+    if call.get("loose"):
+        return "loose"
+    if call.get("error"):
+        return "error"
+    if call.get("clean") is False:
+        return "unclean"
     n, cap = call.get("completionTokens"), call.get("maxTokens")
-    return bool(n and cap and n >= cap)
+    return "cut" if n and cap and n >= cap else ""
+
+
+def is_cut(call: dict) -> bool:
+    """Cut at the cap or forced after the thinking."""
+    return unclean(call) in ("cut", "forced")
 
 
 @dataclass
@@ -69,6 +88,7 @@ class Stats:
     answers: int = 0  # every model call in the transcripts
     cut: int = 0  # of those, cut at the cap or forced
     parser: int = 0  # of those, missing an owned file after parsing
+    loose: int = 0  # of those, a file whose path the parser had to guess
     solved: int = 0  # (ticket, seed) runs that passed
     candidates: Counter = field(default_factory=Counter)  # passing last calls, by kind
     dropped: Counter = field(default_factory=Counter)  # why a passing last call made no row
@@ -80,7 +100,7 @@ class Stats:
         return (self.cut + self.parser) / self.answers if self.answers else 0.0
 
     def as_dict(self) -> dict:
-        return {"runs": self.runs, "answers": self.answers, "cut_or_forced": self.cut, "parser_drops": self.parser,
+        return {"runs": self.runs, "answers": self.answers, "cut_or_forced": self.cut, "parser_drops": self.parser, "loose": self.loose,
                 "drop_share": round(self.drop_share(), 4), "solved_runs": self.solved,
                 "candidates": dict(self.candidates), "dropped": dict(self.dropped), "rows": dict(self.rows),
                 "tickets_with_rows": self.tickets_with_rows, "warnings": self.warnings}
@@ -110,14 +130,78 @@ def _meta(tk: dict, **kw) -> dict:
     return {"key": tk["key"], "split": tk["split"], "theme": tk["theme"], "language": tk["language"], "role": tk["role"], **kw}
 
 
+def make_row(tk: dict, messages: list[dict], *, kind: str, source: str, seed: int | None = None,
+             call: dict | None = None) -> dict:
+    """A training row: the call's messages, flat fields scripts/bh_run.py reads, and meta.
+    kind is the engine call (write | fix); meta.kind also names write-from-fix."""
+    call = call or {}
+    rid = hashlib.sha256((messages[1]["content"] + "\0" + messages[2]["content"]).encode()).hexdigest()[:24]
+    return {"id": rid, "kind": "fix" if kind == "fix" else "write", "source": source, "project": tk["project"],
+            "ticket": tk["id"], "kit": tk.get("kit") or tk["project"], "messages": messages,
+            "completion_tokens": call.get("completionTokens"), "cut": False, "forced": False,
+            "meta": _meta(tk, kind=kind, source=source, seed=seed)}
+
+
+def call_key(user: str, answer: str) -> str:
+    """scripts/bh/wire.py call_key: how the recording proxy's calls.jsonl names a call."""
+    return hashlib.sha256((user + "\x00" + answer).encode()).hexdigest()[:24]
+
+
+FLAGS = ("clean", "cut", "forced", "drop", "loose", "error", "finish_reason")
+
+
+def read_calls_logs(paths: list[str | Path]) -> list[dict]:
+    """Per-call logs: the engine's telemetry calls.jsonl (CallRecord: ticket "<key>#s<seed>",
+    attempt, kind, clean...) and the recording proxy's (key = call_key, finish_reason, cut...)."""
+    return [r for p in paths or [] for r in read_jsonl(p)]
+
+
+def flag_calls(pairs: list[tuple[dict, list[dict]]], log: list[dict]) -> None:
+    """Merges each log record's flags onto the transcript call it describes. Proxy records
+    match by call_key; telemetry records by run (`<key>#s<seed>`) and attempt order: a run's
+    worker calls that got an answer, in attempt order, are its transcript's calls in order
+    (a call that threw has a record with error and no transcript entry)."""
+    by_key = {r["key"]: r for r in log if r.get("key")}
+    by_run: dict[str, list[dict]] = defaultdict(list)
+    for r in log:
+        if r.get("ticket") and r.get("kind") in ("write", "fix") and not r.get("error"):
+            by_run[r["ticket"]].append(r)
+
+    def merge(c: dict, e: dict) -> None:
+        for k in FLAGS:
+            if e.get(k) not in (None, False, 0, "") or (k == "clean" and e.get(k) is False):
+                c[k] = e[k] if k not in ("cut", "loose") else bool(c.get(k) or e[k])
+        if c.get("completionTokens") is None:
+            c["completionTokens"] = e.get("completion_tokens", e.get("completionTokens"))
+        if c.get("maxTokens") is None and e.get("maxTokens"):
+            c["maxTokens"] = e["maxTokens"]
+
+    for r, calls in pairs:
+        recs = sorted(by_run.get(f"{r['key']}#s{r['seed']}", []), key=lambda x: x.get("attempt", 0))
+        if recs and len(recs) != len(calls):
+            print(f"[harvest] WARNING: {r['key']}#s{r['seed']}: {len(recs)} logged calls for {len(calls)} transcript "
+                  f"calls; the run's calls are all treated as unclean", flush=True)
+            for c in calls:
+                c["clean"] = False
+            continue
+        for c, e in zip(calls, recs):
+            merge(c, e)
+        for c in calls:
+            e = by_key.get(call_key(c.get("prompt") or "", c.get("answer") or ""))
+            if e:
+                merge(c, e)
+
+
 def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher", broken: set[str] = frozenset(),
             excluded: set[str] = frozenset(), max_fix: int = 2, write_from_fix: bool = True, sandbox: str = "local",
-            workers: int | None = None, timeout: float = check.TIMEOUT) -> tuple[list[dict], Stats]:
+            workers: int | None = None, timeout: float = check.TIMEOUT,
+            calls_logs: list[str | Path] = ()) -> tuple[list[dict], Stats]:
     """(rows, stats) from bench runs over the tickets in bench. Rows are
     {"messages": [system, user, assistant], "meta": {...}}."""
     tks = render.tickets(bench)
     stats = Stats()
     pairs = load_runs(runs)
+    flag_calls(pairs, read_calls_logs(calls_logs))
     stats.runs = len(pairs)
     system = render.system_prompt()
 
@@ -130,8 +214,10 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
     for (r, i, c), x in zip(flat, canon):
         if is_cut(c):
             stats.cut += 1
-        elif x["parsed"]["missing"]:
+        elif x["parsed"]["missing"] or c.get("drop"):
             stats.parser += 1
+        elif x["parsed"]["loose"] or c.get("loose"):
+            stats.loose += 1
 
     # the start worktree's write prompt per ticket: the drift check and the write-from-fix prompt
     keys = sorted({r["key"] for r, calls in pairs if r["key"] in tks and r.get("solved") and calls})
@@ -152,8 +238,11 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
         prompt = c.get("prompt") or ""
         kind = render.kind_of(prompt)
         stats.candidates[kind] += 1
-        why = ("broken_reference" if key in broken else "decontam" if key in excluded else "cut" if is_cut(c)
+        bad = unclean(c)
+        why = ("broken_reference" if key in broken else "decontam" if key in excluded
+               else "parser" if bad == "drop" else bad if bad
                else "parser" if x["parsed"]["missing"] or x["parsed"]["extra"]
+               else "loose" if x["parsed"]["loose"]
                else "system_drift" if c.get("system") not in (None, system)
                else "after_model_error" if kind == "fix" and render.failed_command(prompt) == "(model call)"
                else "prompt_drift" if (prompt != write_prompt[key] if kind == "write"
@@ -163,7 +252,7 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
             stats.dropped[why] += 1
             continue
         cands[key].append({"kind": kind, "prompt": prompt, "content": x["content"], "files": x["parsed"]["files"],
-                           "seed": r["seed"], "tokens": c.get("completionTokens") or 0})
+                           "seed": r["seed"], "completionTokens": c.get("completionTokens")})
     drift = stats.dropped["prompt_drift"] + stats.dropped["system_drift"]
     if drift:
         _warn(stats, f"{drift} passing calls do not match what this engine renders for the same ticket: the run "
@@ -191,9 +280,9 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
         if not res.ok:
             stats.dropped[f"sandbox_{res.stage}"] += 1
             continue
-        rows.append({"messages": [{"role": "system", "content": system}, {"role": "user", "content": c["prompt"]},
+        rows.append(make_row(tk, [{"role": "system", "content": system}, {"role": "user", "content": c["prompt"]},
                                   {"role": "assistant", "content": c["content"]}],
-                     "meta": _meta(tk, kind=c["kind"], source=source, seed=c["seed"])})
+                             kind=c["kind"], source=source, seed=c["seed"], call=c))
         stats.rows[c["kind"]] += 1
         with_rows.add(tk["key"])
     stats.tickets_with_rows = len(with_rows)
@@ -210,7 +299,7 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
 
 def repair_requests(bench: str | Path, runs: list[str | Path], *, broken: set[str] = frozenset(),
                     excluded: set[str] = frozenset(), sandbox: str = "local", workers: int | None = None,
-                    timeout: float = check.TIMEOUT) -> tuple[list[dict], dict]:
+                    timeout: float = check.TIMEOUT, calls_logs: list[str | Path] = ()) -> tuple[list[dict], dict]:
     """The fix calls the engine would make next on the student's failed runs: [{"id", "key",
     "seed", "messages": [system, user]}], and counts. The student's files are rebuilt by
     replaying its answers over the start worktree (each call's owned files, as applyOutput
@@ -220,7 +309,10 @@ def repair_requests(bench: str | Path, runs: list[str | Path], *, broken: set[st
     tks = render.tickets(bench)
     counts: Counter = Counter()
     items = []
-    for r, calls in load_runs(runs):
+    pairs = load_runs(runs)
+    flag_calls(pairs, read_calls_logs(calls_logs))
+    counts["runs"] = len(pairs)
+    for r, calls in pairs:
         key = r["key"]
         if r.get("solved") or key not in tks or not calls:
             continue
@@ -245,7 +337,10 @@ def repair_requests(bench: str | Path, runs: list[str | Path], *, broken: set[st
                                  "failed": {"command": x.command, "output": x.output, "timedOut": x.timed_out, "raw": True}}
                                 for r, it, x in todo])
         for (r, it, x), rep in zip(todo, rendered):
-            reqs.append({"id": f"{r['key']}#s{r['seed']}", "key": r["key"], "seed": r["seed"], "messages": rep["messages"]})
+            tk = tks[r["key"]]
+            reqs.append({"id": f"{r['key']}#s{r['seed']}", "key": r["key"], "seed": r["seed"], "project": tk["project"],
+                         "ticket": tk["id"], "kit": tk.get("kit") or tk["project"], "owns": tk["owns"],
+                         "messages": rep["messages"]})
     finally:
         for x in res:
             if x.worktree:
@@ -267,30 +362,29 @@ def repair_rows(bench: str | Path, requests: list[dict], answers: list[dict], *,
     for q in requests:
         for a in by_id.get(q["id"], []):
             counts["answers"] += 1
-            if is_cut(a):
-                counts["cut"] += 1
-                continue
             flat.append((q, a))
     canon = render.call([{"op": "canonical", "answer": a.get("content") or "", "owns": tks[q["key"]]["owns"]} for q, a in flat])
     ok = []
     for (q, a), x in zip(flat, canon):
         if x["parsed"]["missing"] or x["parsed"]["extra"]:
             counts["parser"] += 1
+        elif x["parsed"]["loose"] or unclean(a):
+            counts[unclean(a) or "loose"] += 1
         else:
-            ok.append((q, x))
+            ok.append((q, x, a))
     res = check.check_many([check.Item(tks[q["key"]]["dir"], tks[q["key"]]["id"], x["parsed"]["files"], key=q["key"])
-                            for q, x in ok], tks, kind=sandbox, workers=workers, timeout=timeout)
-    best: dict[str, tuple[dict, dict]] = {}
-    for (q, x), r in zip(ok, res):
+                            for q, x, _ in ok], tks, kind=sandbox, workers=workers, timeout=timeout)
+    best: dict[str, tuple[dict, dict, dict]] = {}
+    for (q, x, a), r in zip(ok, res):
         if not r.ok:
             counts[f"sandbox_{r.stage}"] += 1
         elif q["id"] not in best or len(x["content"]) < len(best[q["id"]][1]["content"]):
-            best[q["id"]] = (q, x)
-    rows = [{"messages": [*q["messages"][:2], {"role": "assistant", "content": x["content"]}],
-             "meta": _meta(tks[q["key"]], kind="fix", source="own-repair", seed=q["seed"])}
-            for q, x in (best[k] for k in sorted(best))]
+            best[q["id"]] = (q, x, a)
+    rows = [make_row(tks[q["key"]], [*q["messages"][:2], {"role": "assistant", "content": x["content"]}],
+                     kind="fix", source="repair", seed=q["seed"], call=a)
+            for q, x, a in (best[k] for k in sorted(best))]
     counts["rows"] = len(rows)
-    if counts["answers"] and (counts["cut"] + counts["parser"]) / counts["answers"] > DROP_WARN:
+    if counts["answers"] and (counts["cut"] + counts["forced"] + counts["parser"]) / counts["answers"] > DROP_WARN:
         print(f"[repair] WARNING: {counts['cut'] + counts['parser']} of {counts['answers']} teacher answers dropped "
               f"({counts['cut']} cut, {counts['parser']} parser)", flush=True)
     print(f"[repair] {len(rows)} own-repair rows; {dict(counts)}", flush=True)

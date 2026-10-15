@@ -166,6 +166,34 @@ def test_harvest_guards(run, tmp_path):
     assert st.dropped == {"broken_reference": 2, "decontam": 2} and len(rows) == 6
 
 
+def test_harvest_skips_loose_and_unclean_calls(run, tmp_path, tks):
+    # a passing answer whose path the parser had to guess (Centipede run 1's prog.c) is never a row
+    def loosen(t):
+        c = t["calls"][-1]
+        owns = tks[t["key"]]["owns"]
+        if len(owns) == 1:
+            c["answer"] = c["answer"].replace(owns[0] + "\n```", "**" + owns[0].rsplit("/", 1)[-1] + "**\n```", 1)
+    loose = _edit(run, tmp_path / "loose", loosen)
+    rows, st = harvest.harvest(SPIKE, [loose])
+    assert st.dropped["loose"] == 10 and rows == [] and st.loose >= 10
+    # the engine's per-call log (telemetry.ts CallRecord) marks a call unclean: it drops,
+    # and so does every flag the observability PR writes into transcripts
+    recs = []
+    for t in harvest.read_jsonl(run / "transcripts.jsonl"):
+        for i, _ in enumerate(t["calls"], 1):
+            recs.append({"v": 1, "ticket": f"{t['key']}#s{t['seed']}", "attempt": i, "kind": "write" if i == 1 else "fix",
+                         "cut": False, "forced": None, "drop": None, "loose": 0, "error": None,
+                         "clean": not (t["key"] == "spike/c-hash" and i == len(t["calls"]))})
+    recs.append({"v": 1, "ticket": "spike/c-hash#s0", "attempt": 9, "kind": "fix", "error": "inference 500", "clean": False})
+    log = tmp_path / "calls.jsonl"
+    harvest.write_jsonl(log, recs)
+    rows, st = harvest.harvest(SPIKE, [run], calls_logs=[log])
+    assert st.dropped["unclean"] == 2 and len(rows) == 8
+    for flag, val, why in (("forced", "length", "forced"), ("drop", "unlabelled", "parser"), ("loose", True, "loose")):
+        d = _edit(run, tmp_path / f"flag-{flag}", lambda t: t["calls"][-1].update({flag: val}))
+        assert harvest.harvest(SPIKE, [d])[1].dropped[why] == 10, flag
+
+
 def test_harvest_write_from_fix_and_max_fix(run, tmp_path):
     # only the fixed seeds: no first-call pass, so the write row comes from the fix answer
     only_fix = tmp_path / "only-fix"
@@ -185,6 +213,70 @@ def test_load_runs_wants_transcripts(run, tmp_path):
         harvest.load_runs([d])
 
 
+# ---------- the row-file commands bh_run.py calls ----------
+
+def test_row_file_commands(run, tks, tmp_path):
+    # harvest from transcript files; the proxy's calls log marks a passing call cut, so it drops
+    trans = harvest.read_jsonl(run / "transcripts.jsonl")
+    last = trans[0]["calls"][-1]
+    log = tmp_path / "calls.jsonl"
+    harvest.write_jsonl(log, [{"key": harvest.call_key(last["prompt"], last["answer"]), "finish_reason": "length", "cut": True}])
+    rows_p = tmp_path / "rows.jsonl"
+    st = data.harvest_files([run / "transcripts.jsonl"], SPIKE, rows_p, calls_logs=[log])
+    assert st["dropped"]["length"] == 1 and st["rows"] == 9 and st["write_rows"] + st["fix_rows"] == 9
+    assert json.loads((tmp_path / "rows.jsonl.stats.json").read_text()) == st
+    rows = harvest.read_jsonl(rows_p)
+    assert {"id", "kind", "source", "project", "ticket", "kit", "messages", "completion_tokens", "cut", "forced"} <= set(rows[0])
+    # check: a row whose answer is broken fails
+    bad = json.loads(json.dumps(rows[0]))
+    t = tks[bad["meta"]["key"]]
+    bad["messages"][2]["content"] = answer({p: "broken\n" for p in t["owns"]})
+    harvest.write_jsonl(tmp_path / "mixed.jsonl", [*rows, bad, {**rows[0], "meta": {}, "ticket": "nope"}])
+    assert data.check_rows(tmp_path / "mixed.jsonl", SPIKE, tmp_path / "checked.jsonl") == \
+        {"rows_in": 11, "passed": 9, "failed": 1, "errors": 1}
+    # decontam against the spike drops every spike row
+    st = data.decontam_rows(rows_p, tmp_path / "clean.jsonl", [str(SPIKE)])
+    assert (st["rows_in"], st["kept"]) == (9, 0) and st["dropped_overlap"] == 9
+    # render: call specs become engine rows
+    tw = tks["spike/c-hash"]
+    specs = [{"id": "w1", "kind": "write", "source": "extra", "project": "spike", "ticket": tw["id"], "kit": "k",
+              "bench": str(SPIKE), "answer_files": ref(tw), "note": "n"},
+             {"id": "f1", "kind": "fix", "source": "extra", "project": "spike", "ticket": tw["id"], "kit": "k",
+              "bench": str(SPIKE), "current": {tw["owns"][0]: "int x;\n"},
+              "failed": {"command": tw["acceptance"][0], "output": "error: boom"}, "answer_files": ref(tw)}]
+    harvest.write_jsonl(tmp_path / "specs.jsonl", specs)
+    assert data.render_calls(tmp_path / "specs.jsonl", tmp_path / "rendered.jsonl") == {"calls": 2, "rows": 2, "errors": 0}
+    w, f = harvest.read_jsonl(tmp_path / "rendered.jsonl")
+    assert w["messages"] == render.one({"op": "write", "project": tw["dir"], "ticket": tw["id"], "answer": answer(ref(tw), "n")})["messages"]
+    assert (f["id"], f["kind"], f["kit"]) == ("f1", "fix", "k") and "int x;" in f["messages"][1]["content"]
+
+
+def test_repairs_command(tmp_path):
+    """A student that writes half of each file: its failures become the engine's next fix calls."""
+    src = SPIKE
+    tks = render.tickets(src)
+    refs = {t["id"]: ref(t) for t in tks.values()}
+
+    def half(prompt):
+        import re
+        tid = re.search(r"^Ticket: (\S+)$", prompt, re.M).group(1)
+        return answer({p: "\n".join(c.splitlines()[: len(c.splitlines()) // 2]) + "\n" for p, c in refs[tid].items()})
+
+    url, stop = data._serve(half)
+    try:
+        subprocess.run(["bun", "bench/run.ts", "--bench", str(src), "--out", str(tmp_path / "s"), "--url", url, "--model", "s",
+                        "--seeds", "1", "--transcripts", "--sandbox", "local", "--filter", "c-", "--thinking", "off"],
+                       cwd=ROOT / "mugge", check=True, capture_output=True)
+    finally:
+        stop()
+    st = data.repairs_files([tmp_path / "s" / "transcripts.jsonl"], src, tmp_path / "rep.jsonl")
+    reqs = harvest.read_jsonl(tmp_path / "rep.jsonl")
+    assert st["prompts"] == len(reqs) > 0 and st["failed_tickets"] >= len(reqs)
+    q = reqs[0]
+    assert {"id", "project", "ticket", "kit", "owns", "messages"} <= set(q)
+    assert render.kind_of(q["messages"][1]["content"]) == "fix" and "/work" in q["messages"][1]["content"]
+
+
 # ---------- free rows ----------
 
 def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
@@ -193,10 +285,12 @@ def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
     path = t["owns"][0]
     good = render.one({"op": "write", "project": t["dir"], "ticket": t["id"], "answer": answer(ref(t))})["messages"]
     loose = [*good[:2], {"role": "assistant", "content": f"Here it is:\n\n**{path}**\n```c\n{ref(t)[path]}```"}]
+    relaid = [*good[:2], {"role": "assistant", "content": f"{path}\n```\n{ref(t)[path]}```\n\n"}]
     wrong = render.one({"op": "write", "project": t["dir"], "ticket": t["id"], "answer": answer({path: "int nope;\n"})})["messages"]
     rows = [
         {"messages": good, "meta": {"project": t["dir"], "ticket": t["id"]}},
         {"messages": loose},
+        {"messages": relaid},
         {"messages": wrong, "meta": {"project": t["dir"], "ticket": t["id"]}},
         {"messages": [{"role": "system", "content": "You review."}, *good[1:]], "meta": {"kind": "review"}},
         {"messages": [{"role": "system", "content": "Other"}, *good[1:]]},
@@ -208,7 +302,7 @@ def test_extra_rows_are_held_to_the_wire(tks, tmp_path):
     st = json.loads(cfg.stats("extra").read_text())
     assert len(out) == 2 and out[0]["meta"]["checked"] is True and out[1]["meta"]["checked"] is False
     assert out[1]["messages"][2]["content"] == good[2]["content"]  # re-rendered canonical
-    assert st["recanonicalised"] == 1 and st["sandbox_acceptance"] == 1 and st["review"] == 1
+    assert st["loose"] == 1 and st["recanonicalised"] == 1 and st["sandbox_acceptance"] == 1 and st["review"] == 1
     assert st["system_drift"] == 1 and st["parser"] == 1 and st["unchecked"] == 1
     assert len(harvest.read_jsonl(cfg.rows("extra-review"))) == 1
     strict = data.DataConfig(work=tmp_path / "strict", benches=[], extra_require_check=True)
@@ -264,6 +358,6 @@ def test_smoke_dry_run(tmp_path):
     assert rep["references"] == "15/15"
     assert rep["smoke_guard"].startswith("ok")
     assert rep["by_kind"]["teacher/write"] == 15 and rep["by_kind"]["teacher/fix"] == 15
-    assert rep["by_kind"].get("own-repair/fix", 0) > 0 and rep["by_kind"].get("student-rft/write", 0) > 0
+    assert rep["by_kind"].get("repair/fix", 0) > 0 and rep["by_kind"].get("rft/write", 0) > 0
     n, total = map(int, rep["write_rows_rerendered_identical"].split("/"))
     assert n == total > 0

@@ -27,7 +27,7 @@
  *       it is used as given (already trimmed, e.g. "(write files)").
  *       answer (the model's raw text) adds the canonical assistant message: the files parsed
  *       with the ticket's owns (parseFiles) and rendered back (renderFiles) in owns order.
- *       → {messages, parsed?: {files, note, missing, extra}}
+ *       → {messages, parsed?: {files, note, missing, extra, loose}}
  *   {op: "hidden", project, ticket, dest}       copies the ticket's hidden files over dest (after
  *       its acceptance ran, as bench/run.ts does) → {dest}
  *   {op: "canonical", answer, owns}             → {content, parsed}   (as `answer` on write/fix)
@@ -66,7 +66,16 @@ export interface Parsed {
   missing: string[];
   /** Files the answer wrote that the ticket does not own. */
   extra: string[];
+  /**
+   * Owned paths the parser had to guess: not written the way renderFiles writes them (the path
+   * alone on its line, then the fence), e.g. `prog.c` for `src/hash.c` or `**src/a.py**`. Such
+   * an answer never becomes a row (telemetry.ts classifyAnswer calls them loose).
+   */
+  loose: string[];
 }
+
+/** Whether raw writes path as the training format does: the path alone on its line, then a fence. */
+const strict = (raw: string, path: string) => new RegExp(`^${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*\\r?\\n\`{3,}`, 'm').test(raw);
 
 /** The answer as training wants it: parsed as the engine parses it, rendered back in owns order. */
 export function canonicalAnswer(raw: string, owns: string[]): { content: string; parsed: Parsed } {
@@ -78,6 +87,7 @@ export function canonicalAnswer(raw: string, owns: string[]): { content: string;
     note: String(out.note ?? ''),
     missing: owns.filter((p) => !(p in out.files)),
     extra: Object.keys(out.files).filter((p) => !owns.includes(p)),
+    loose: Object.keys(files).filter((p) => !strict(raw, p)),
   };
   return { content: renderFiles(files, parsed.note), parsed };
 }
