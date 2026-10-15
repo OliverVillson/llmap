@@ -193,12 +193,13 @@ export interface RunOpts {
   now?: number;
 }
 
-const STATE_ROLE: Record<TicketState, Role> = { waiting: 'chrome', running: 'accent', done: 'ok', failed: 'error', skipped: 'chrome', blocked: 'warn' };
+const STATE_ROLE: Record<TicketState, Role> = { waiting: 'chrome', running: 'accent', queued: 'paused', done: 'ok', failed: 'error', skipped: 'chrome', blocked: 'warn' };
 
 function stateIcon(s: TicketState, frame: number): string {
   switch (s) {
     case 'waiting': return GLYPHS.todo;
     case 'running': return GLYPHS.spinner[frame % GLYPHS.spinner.length]!;
+    case 'queued': return GLYPHS.paused;
     case 'done': return GLYPHS.done;
     case 'failed': return GLYPHS.failed;
     case 'skipped': return GLYPHS.backlog;
@@ -300,7 +301,7 @@ export function renderRun(view: RunView, o: RunOpts): string[] {
     const hidden = n - shown;
     if (hidden > 0) shown = Math.max(0, shown - 1);
     // keep running and failed tickets in view first, then the rest in plan order
-    const rank: Record<TicketState, number> = { running: 0, failed: 1, blocked: 1, waiting: 2, done: 3, skipped: 4 };
+    const rank: Record<TicketState, number> = { running: 0, queued: 0, failed: 1, blocked: 1, waiting: 2, done: 3, skipped: 4 };
     const pick = hidden > 0
       ? new Set([...view.tickets].sort((a, b) => rank[a.state] - rank[b.state]).slice(0, shown))
       : new Set(view.tickets);

@@ -5,18 +5,23 @@
 import type { OwnershipClash, Ticket } from '../tickets/schema.ts';
 import { ACTIVE_STATES, type AgentState } from './state.ts';
 
-/** A ticket's coarse state; `phase` (state.ts) says what it is doing within it. */
-export type TicketState = 'waiting' | 'running' | 'done' | 'failed' | 'skipped' | 'blocked';
+/**
+ * A ticket's coarse state; `phase` (state.ts) says what it is doing within it. `queued`: running,
+ * but its model call is waiting for a free slot (backends.ts). `blocked`: needs the owner.
+ */
+export type TicketState = 'waiting' | 'running' | 'queued' | 'done' | 'failed' | 'skipped' | 'blocked';
 
 export type EngineEvent =
-  | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number }
+  | { type: 'plan'; at: number; tickets: Array<Pick<Ticket, 'id' | 'title' | 'depends_on' | 'model' | 'image'>>; concurrency: number; slots?: number }
+  /** A ticket's model call waits for a slot (`queued`) or gets one (`got`, on `machine`). */
+  | { type: 'slot'; at: number; ticket: string; state: 'queued' | 'got'; machine?: string; waitedMs?: number }
   | { type: 'start'; at: number; ticket: string; attempt: number; worktree: string }
   | { type: 'model'; at: number; ticket: string; attempt: number; kind: 'write' | 'fix'; promptTokens: number; completionTokens: number; reasoningTokens?: number; cut?: boolean; ms: number; note: string; files?: number }
   | { type: 'refused'; at: number; ticket: string; attempt: number; paths: string[] }
   | { type: 'check'; at: number; ticket: string; attempt: number; command: string; ok: boolean; ms: number; tail: string }
   | { type: 'finish'; at: number; ticket: string; state: 'done' | 'failed' | 'skipped' | 'blocked'; attempts: number; error?: string; commit?: string }
-  /** Every change of a ticket's state (state.ts). `attempt` of `of`; `slot` while it holds one. */
-  | { type: 'state'; at: number; ticket: string; state: AgentState; attempt: number; of: number; slot?: number; reason?: string; waitingOn?: string[] }
+  /** Every change of a ticket's state (state.ts). `attempt` of `of`; `agent` while one works it. */
+  | { type: 'state'; at: number; ticket: string; state: AgentState; attempt: number; of: number; agent?: number; reason?: string; waitingOn?: string[] }
   /** A ticket blocked because it claims a file an earlier ticket owns (schema.findOwnershipClashes). */
   | { type: 'clash'; at: number; ticket: string; files: string[]; with: string[] }
   /** The lead review of a passing ticket (review.ts); `error` when the call failed or did not parse. */
@@ -52,8 +57,8 @@ export interface RunSummary {
 export interface RunView {
   tickets: Array<{
     id: string; title: string; model: string; state: TicketState; attempt: number; lastNote: string; error?: string;
-    /** What it is doing now (state.ts); `of` is its attempt budget, `slot` the slot working it. */
-    phase?: AgentState; of?: number; slot?: number; reason?: string; waitingOn?: string[];
+    /** What it is doing now (state.ts); `of` is its attempt budget, `agent` the agent working it. */
+    phase?: AgentState; of?: number; agent?: number; reason?: string; waitingOn?: string[];
     review?: 'approve' | 'problems' | 'error';
   }>;
   /** Tickets blocked because two tickets need the same file. */
@@ -91,6 +96,9 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       if (t) { t.attempt = e.attempt; t.lastNote = e.note; }
       line(`${e.ticket} #${e.attempt} ${e.kind} ${e.completionTokens} tok ${e.note}`);
       break;
+    case 'slot':
+      if (t && (t.state === 'running' || t.state === 'queued')) t.state = e.state === 'queued' ? 'queued' : 'running';
+      break;
     case 'refused':
       line(`${e.ticket} #${e.attempt} refused ${e.paths.join(', ')}`);
       break;
@@ -99,7 +107,7 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       break;
     case 'state':
       if (t) {
-        t.phase = e.state; t.of = e.of; t.slot = e.slot; t.reason = e.reason; t.waitingOn = e.waitingOn;
+        t.phase = e.state; t.of = e.of; t.agent = e.agent; t.reason = e.reason; t.waitingOn = e.waitingOn;
         if (e.attempt) t.attempt = e.attempt;
       }
       break;
@@ -125,14 +133,14 @@ export function applyEvent(v: RunView, e: EngineEvent): RunView {
       v.summary = e.summary;
       break;
   }
-  v.running = v.tickets.filter((x) => x.state === 'running').length;
+  v.running = v.tickets.filter((x) => x.state === 'running' || x.state === 'queued').length;
   return v;
 }
 
-/** Each slot (agent) and what it is doing: the ticket it works, or idle. */
-export function slotStates(v: RunView): Array<{ slot: number; state: AgentState; ticket?: string; attempt?: number; of?: number }> {
-  return Array.from({ length: v.concurrency }, (_, slot) => {
-    const t = v.tickets.find((x) => x.slot === slot && x.phase !== undefined && ACTIVE_STATES.includes(x.phase));
-    return t ? { slot, state: t.phase!, ticket: t.id, attempt: t.attempt, of: t.of } : { slot, state: 'idle' as const };
+/** Each agent (0 … concurrency-1) and what it is doing: its ticket's state, or idle. */
+export function agentStates(v: RunView): Array<{ agent: number; state: AgentState; ticket?: string; attempt?: number; of?: number }> {
+  return Array.from({ length: v.concurrency }, (_, agent) => {
+    const t = v.tickets.find((x) => x.agent === agent && x.phase !== undefined && ACTIVE_STATES.includes(x.phase));
+    return t ? { agent, state: t.phase!, ticket: t.id, attempt: t.attempt, of: t.of } : { agent, state: 'idle' as const };
   });
 }

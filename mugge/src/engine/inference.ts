@@ -24,6 +24,49 @@ export interface Completion<T> {
   ms: number;
 }
 
+/**
+ * Sampling fields sent on every call. Every engine call goes out with a finite top_k: a top_k
+ * of 0 (or none, which vLLM and SGLang read as the whole vocabulary) makes llama.cpp sort the
+ * full vocabulary on the CPU for every token of every slot, and it was one of the three bugs
+ * that scored Centipede run 1's agent 0%. Fields left undefined are not sent, so the server's
+ * own default applies (llama-server's min_p is 0.05; MiniCPM5-2B needs 0, see backends.ts).
+ */
+export interface Sampling {
+  temperature?: number;
+  top_k?: number;
+  top_p?: number;
+  min_p?: number;
+}
+
+/**
+ * The engine's sampling defaults, the one place they live. top_k 40 is llama-server's own
+ * default, so on llama-server nothing changes; on vLLM and SGLang it replaces "all tokens".
+ */
+export const DEFAULT_SAMPLING: Readonly<Required<Pick<Sampling, 'temperature' | 'top_k'>>> = { temperature: 0.2, top_k: 40 };
+
+/** Default for InferenceConfig.timeoutMs: long enough for a 16K prefill on a busy laptop GPU. */
+export const DEFAULT_TIMEOUT_MS = 1_800_000;
+
+/** Throws unless top_k is a positive integer: finite, so llama.cpp never sorts the whole vocabulary. */
+export function checkTopK(topK: unknown, where = 'top_k'): number {
+  if (typeof topK !== 'number' || !Number.isInteger(topK) || topK <= 0) {
+    throw new Error(`${where} must be a positive integer (got ${JSON.stringify(topK)}): 0 or none means the whole vocabulary`);
+  }
+  return topK;
+}
+
+/** The sampling fields of a request: defaults, then `cfg.sampling`, then `cfg.temperature`. */
+export function samplingFields(cfg: Pick<InferenceConfig, 'sampling' | 'temperature'>): Record<string, number> {
+  const s: Sampling = { ...DEFAULT_SAMPLING, ...dropUndefined(cfg.sampling ?? {}), ...(cfg.temperature !== undefined ? { temperature: cfg.temperature } : {}) };
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(s)) if (v !== undefined) out[k] = v;
+  return out;
+}
+
+function dropUndefined<T extends object>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
 export interface InferenceConfig {
   /** Base URL up to and including `/v1`, e.g. http://127.0.0.1:8000/v1. */
   baseUrl: string;
@@ -36,9 +79,16 @@ export interface InferenceConfig {
    * and most hosts accept; `guided_json` is vLLM's older extra field; `none` relies on the prompt.
    */
   guided?: 'response_format' | 'guided_json' | 'none';
+  /** Overrides `sampling.temperature` (kept for callers that set only this). */
   temperature?: number;
-  /** Extra request fields sent as they are, e.g. seed, top_p, top_k, chat_template_kwargs. */
+  /** temperature, top_k, top_p, min_p; unset fields take DEFAULT_SAMPLING or the server's default. */
+  sampling?: Sampling;
+  /** Extra request fields sent as they are, e.g. seed, chat_template_kwargs; a top_k here must still be finite. */
   extra?: Record<string, unknown>;
+  /**
+   * Most milliseconds one call may take once it is sent (default DEFAULT_TIMEOUT_MS). Time spent
+   * waiting for a slot (backends.ts) does not count. Bun's own 300 s fetch cut is always off.
+   */
   timeoutMs?: number;
   /** Most tokens one call may write, however much the caller offers (MUGGE_MAX_CALL_TOKENS). */
   maxCallTokens?: number;
@@ -72,9 +122,10 @@ export class OpenAICompatible implements Inference {
       model: this.served(model),
       messages,
       max_tokens: cap && cap < maxTokens ? cap : maxTokens,
-      temperature: this.cfg.temperature ?? 0.2,
+      ...samplingFields(this.cfg),
       ...this.cfg.extra,
     };
+    checkTopK(body.top_k);
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
     else if (schema && guided === 'guided_json') body.guided_json = schema;
@@ -82,8 +133,8 @@ export class OpenAICompatible implements Inference {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 600_000),
-      // Bun (1.3) also cuts every fetch at 300 s unless told not to; timeoutMs is the limit
+      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
       timeout: false,
     } as RequestInit);
     if (!res.ok) throw new Error(`inference ${res.status}: ${(await res.text()).slice(0, 500)}`);

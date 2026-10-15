@@ -3,9 +3,9 @@
  * scheduler emit a `state` event on every change; the run view, the console and the smoke
  * command fold them (events.ts). The states are the Centipede console's:
  *
- *   idle       a slot with no ticket (slots only)
- *   queued     its dependencies are done; waiting for a free slot
- *   waiting    on a ticket it depends on, or on a file a running ticket holds
+ *   idle       an agent with no ticket (agents only)
+ *   waiting    not started: on a ticket it depends on, a file a running ticket holds, or a free agent
+ *   queued     its agent's model call waits for a free slot on a machine (backends.ts)
  *   writing    attempt 1: the write call
  *   thinking   a model call while thinking is on (MUGGE_THINKING=on). Calls do not stream, so
  *              the whole call shows as thinking; the debug line says how much of it was
@@ -26,19 +26,20 @@ export type AgentState = (typeof AGENT_STATES)[number];
 /** States a ticket never leaves. */
 export const FINAL_STATES: readonly AgentState[] = ['blocked', 'finished', 'failed'];
 
-/** States in which a ticket holds a slot. */
-export const ACTIVE_STATES: readonly AgentState[] = ['writing', 'thinking', 'checking', 'fixing', 'reviewing'];
+/** States in which an agent works the ticket. */
+export const ACTIVE_STATES: readonly AgentState[] = ['queued', 'writing', 'thinking', 'checking', 'fixing', 'reviewing'];
 
 /** Where each state may go next. `idle` is a slot's state and never a ticket's. */
 export const NEXT: Record<AgentState, readonly AgentState[]> = {
   idle: [],
-  waiting: ['waiting', 'queued', 'writing', 'thinking', 'blocked', 'failed'],
-  queued: ['waiting', 'writing', 'thinking', 'blocked', 'failed'],
-  writing: ['checking', 'fixing', 'thinking', 'failed'],
-  thinking: ['checking', 'fixing', 'thinking', 'failed'],
-  fixing: ['checking', 'fixing', 'thinking', 'failed'],
+  waiting: ['waiting', 'writing', 'thinking', 'blocked', 'failed'],
+  // back to the call it was waiting to make, or on when the call fails
+  queued: ['writing', 'thinking', 'fixing', 'reviewing', 'failed'],
+  writing: ['queued', 'checking', 'fixing', 'thinking', 'failed'],
+  thinking: ['queued', 'checking', 'fixing', 'thinking', 'failed'],
+  fixing: ['queued', 'checking', 'fixing', 'thinking', 'failed'],
   checking: ['fixing', 'thinking', 'reviewing', 'finished', 'failed'],
-  reviewing: ['fixing', 'thinking', 'finished', 'failed'],
+  reviewing: ['queued', 'fixing', 'thinking', 'finished', 'failed'],
   blocked: [],
   finished: [],
   failed: [],

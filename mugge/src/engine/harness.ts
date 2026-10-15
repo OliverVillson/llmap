@@ -36,6 +36,8 @@ export interface HarnessContext {
   signal?: AbortSignal;
   /** Lead review after the checks pass; unset: MUGGE_REVIEW. */
   review?: boolean;
+  /** Where the review call goes (the scheduler gives a lead slot when the crew has one); unset: `inference`. */
+  reviewInference?: Inference;
   /**
    * Model name for the review. Names the inference config does not map fall back to its default
    * model, which is the plan: one model for every role, the role is in the prompt.
@@ -165,7 +167,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
 
       // One lead review per ticket, on the first version that passes.
       state('reviewing');
-      const rv = await leadReview(ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent);
+      const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent);
       spent += rv.completionTokens;
       r.promptTokens += rv.promptTokens;
       r.completionTokens += rv.completionTokens;

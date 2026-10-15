@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyEvent, emptyView, slotStates, type EngineEvent } from '../src/engine/events.ts';
+import { applyEvent, emptyView, agentStates, type EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { initRepo } from '../src/engine/git.ts';
 import { runTicket } from '../src/engine/harness.ts';
@@ -11,6 +11,7 @@ import { REVIEW_SYSTEM, reviewMessages } from '../src/engine/prompts.ts';
 import { diffOwned, normalizeReview, REVIEW_MAX_TOKENS, reviewFeedback, reviewFromEnv, snapshot } from '../src/engine/review.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
 import { runPlan } from '../src/engine/scheduler.ts';
+import { BackendPool, resolveMachine } from '../src/engine/backends.ts';
 import { canMove, type AgentState } from '../src/engine/state.ts';
 import { validatePlan, type WorkerOutput } from '../src/tickets/schema.ts';
 
@@ -46,7 +47,7 @@ async function repoWith(name: string) {
 }
 
 describe('ticket states', () => {
-  test('every ticket moves through legal states; slots are never shared', async () => {
+  test('every ticket moves through legal states; agents are never shared', async () => {
     const { repo, base } = await repoWith('states');
     const plan = validatePlan({ tickets: [t('a'), t('b'), t('c', { depends_on: ['a'] }), t('d'), t('x', { budget: { attempts: 2 } })] });
     const fake = startFakeModel({ solutions: { a: ok('a'), b: ok('b'), c: ok('c'), d: ok('d') }, flaky: ['b'], broken: ['x'], latencyMs: 30 });
@@ -61,19 +62,71 @@ describe('ticket states', () => {
     expect(seq.get('b')!.filter((s) => s !== 'queued' && s !== 'waiting')).toEqual(['writing', 'checking', 'fixing', 'checking', 'finished']);
     expect(seq.get('c')![0]).toBe('waiting');
     expect(seq.get('x')!.at(-1)).toBe('failed');
-    // five tickets, two slots: someone had to queue
-    expect([...seq.values()].some((s) => s.includes('queued'))).toBe(true);
+    // five tickets, two agents: someone waited for an agent; one machine with two slots: no call queued
+    expect(events.some((e) => e.type === 'state' && e.state === 'waiting' && e.reason === 'waiting for a free agent')).toBe(true);
+    expect([...seq.values()].some((s) => s.includes('queued'))).toBe(false);
     const fix = events.find((e) => e.type === 'state' && e.ticket === 'b' && e.state === 'fixing');
     expect(fix).toMatchObject({ attempt: 2, of: 4 });
-    // replaying the events, a slot never works two tickets at once
+    // replaying the events, an agent never works two tickets at once
     const view = emptyView();
     for (const e of events) {
       applyEvent(view, e);
-      const busy = slotStates(view).filter((s) => s.state !== 'idle').map((s) => s.ticket);
+      const busy = agentStates(view).filter((s) => s.state !== 'idle').map((s) => s.ticket);
       expect(new Set(busy).size).toBe(busy.length);
-      for (const s of view.tickets) if (s.slot !== undefined) expect(s.slot).toBeLessThan(2);
+      for (const s of view.tickets) if (s.agent !== undefined) expect(s.agent).toBeLessThan(2);
     }
-    expect(slotStates(view).every((s) => s.state === 'idle')).toBe(true);
+    expect(agentStates(view).every((s) => s.state === 'idle')).toBe(true);
+  });
+
+  test('a call waiting for a model slot shows queued, then goes back to its call', async () => {
+    const { repo, base } = await repoWith('queued');
+    const plan = validatePlan({ tickets: [t('a'), t('b'), t('c')] });
+    const fake = startFakeModel({ solutions: { a: ok('a'), b: ok('b'), c: ok('c') }, flaky: ['b'], latencyMs: 40 });
+    const events: EngineEvent[] = [];
+    try {
+      const pool = BackendPool.single(new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), 1);
+      const report = await runPlan({ repo, base, plan, concurrency: 3, pool, worktreeRoot: join(dir, 'wt-queued'), sandbox: new LocalSandbox(), emit: (e) => events.push(e), integrate: false });
+      expect(report.summary.done).toBe(3);
+    } finally {
+      fake.stop();
+    }
+    expectLegal(events);
+    const seq = statesOf(events);
+    const queuedOnes = [...seq.entries()].filter(([, s]) => s.includes('queued'));
+    expect(queuedOnes.length).toBeGreaterThan(0);
+    for (const [, s] of queuedOnes) {
+      const i = s.indexOf('queued');
+      expect(['writing', 'fixing']).toContain(s[i + 1]!);
+      expect(s[i + 1]).toBe(s[i - 1]!);
+    }
+    const q = events.find((e) => e.type === 'state' && e.state === 'queued');
+    expect(q).toMatchObject({ agent: expect.any(Number) });
+  });
+
+  test('with MUGGE_REVIEW on, the review goes to the machine that serves leads', async () => {
+    const { repo, base } = await repoWith('lead');
+    const plan = validatePlan({ tickets: [t('a')] });
+    const laptop = startFakeModel({ solutions: { a: ok('a') } });
+    const mac = startFakeModel({ solutions: {} });
+    try {
+      const at = (url: string, name: string, roles: Array<'worker' | 'lead' | 'manager'>) =>
+        ({ machine: resolveMachine({ name, url, slots: 2, roles }), client: new OpenAICompatible({ baseUrl: url, defaultModel: 'fake' }) });
+      const pool = new BackendPool([at(laptop.url, 'laptop', ['worker']), at(mac.url, 'mac', ['manager', 'lead'])]);
+      const old = process.env.MUGGE_REVIEW;
+      process.env.MUGGE_REVIEW = 'on';
+      try {
+        const report = await runPlan({ repo, base, plan, concurrency: 1, pool, worktreeRoot: join(dir, 'wt-lead'), sandbox: new LocalSandbox(), integrate: false });
+        expect(report.results.get('a')!.review?.verdict).toBe('approve');
+      } finally {
+        if (old === undefined) delete process.env.MUGGE_REVIEW;
+        else process.env.MUGGE_REVIEW = old;
+      }
+      expect(laptop.calls().map((c) => c.kind)).toEqual(['write']);
+      expect(mac.calls().map((c) => c.kind)).toEqual(['review']);
+    } finally {
+      laptop.stop();
+      mac.stop();
+    }
   });
 
   test('a file-ownership clash blocks the later ticket for the owner and is recorded', async () => {
