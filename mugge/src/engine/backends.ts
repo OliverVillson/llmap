@@ -73,10 +73,13 @@ export interface MachineInput {
   ctx?: number;
   /** Served model name for calls not mapped by MUGGE_MODELS (default MUGGE_MODEL). */
   model?: string;
-  /** Name of the environment variable holding this machine's API key (keys stay out of the JSON). */
+  /** Name of the environment variable holding this machine's API key, sent as `Authorization: Bearer` (keys stay out of the JSON). */
   api_key_env?: string;
   sampling?: Sampling;
+  /** Most seconds one call may take on this machine once sent (a far cloud GPU may need more than the crew default). */
   timeout_s?: number;
+  /** A machine the crew can do without (a laptop on wifi that may be asleep): unreachable at start, it is left out instead of failing the run. */
+  optional?: boolean;
 }
 
 export interface Machine {
@@ -100,6 +103,7 @@ export interface Machine {
   apiKeyEnv?: string;
   sampling: Sampling;
   timeoutMs?: number;
+  optional: boolean;
   /** Things worth a look, e.g. explicit slots that overrun the memory budget. */
   warnings: string[];
 }
@@ -132,6 +136,8 @@ export function resolveMachine(raw: MachineInput, base: Sampling = {}): Machine 
   const kv = positive(raw.kv_bytes_per_token, `${where}: kv_bytes_per_token`) ?? (preset ? kvBytesPerToken(preset, cacheType) : undefined);
   const state = raw.state_bytes_per_slot === undefined ? 0 : positive(raw.state_bytes_per_slot, `${where}: state_bytes_per_slot`)!;
   const timeoutS = positive(raw.timeout_s, `${where}: timeout_s`);
+  if (raw.optional !== undefined && typeof raw.optional !== 'boolean') throw new Error(`${where}: optional must be true or false`);
+  if (raw.api_key_env !== undefined && (typeof raw.api_key_env !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(raw.api_key_env))) throw new Error(`${where}: api_key_env must name an environment variable`);
   const sampling: Sampling = { ...preset?.sampling, ...base, ...raw.sampling };
   if (sampling.top_k !== undefined) checkTopK(sampling.top_k, `${where}: sampling.top_k`);
 
@@ -156,8 +162,62 @@ export function resolveMachine(raw: MachineInput, base: Sampling = {}): Machine 
   return {
     name: raw.name, url: raw.url, roles, slots: n, slotSource, ctxPerCall, cacheType,
     preset: raw.preset?.toLowerCase(), kvBytesPerToken: kv, stateBytesPerSlot: state, bytesPerSlot, memoryBytes, slotsFromMemory,
-    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, warnings,
+    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, optional: raw.optional ?? false, warnings,
   };
+}
+
+/** Whether a machine answered at start, and if not, why. */
+export interface MachineProbe {
+  name: string;
+  url: string;
+  optional: boolean;
+  ok: boolean;
+  /** "reachable", or what went wrong (no answer, a refused key, a key variable that is not set). */
+  detail: string;
+  ms: number;
+}
+
+/** Most milliseconds the start check waits for one machine. */
+export const PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Asks every machine for GET /models, with its API key when it has one, all at once. Any HTTP
+ * answer but 401/403 counts as reachable (some hosts serve no /models); no answer, a refused
+ * key, or an api_key_env that is not set does not.
+ */
+export async function probeMachines(machines: Machine[], env: NodeJS.ProcessEnv = process.env, timeoutMs = PROBE_TIMEOUT_MS, crewKey?: string): Promise<MachineProbe[]> {
+  return Promise.all(machines.map(async (m): Promise<MachineProbe> => {
+    const started = Date.now();
+    const done = (ok: boolean, detail: string): MachineProbe => ({ name: m.name, url: m.url, optional: m.optional, ok, detail, ms: Date.now() - started });
+    // the crew-wide key (MUGGE_API_KEY) for a machine without its own, as fromMachines sends it
+    const key = m.apiKeyEnv ? env[m.apiKeyEnv] : crewKey;
+    if (m.apiKeyEnv && !key) return done(false, `${m.apiKeyEnv} is not set`);
+    try {
+      const r = await fetch(`${m.url.replace(/\/$/, '')}/models`, { headers: key ? { authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(timeoutMs) });
+      if (r.status === 401 || r.status === 403) return done(false, `the API key was refused (${r.status})`);
+      return done(true, 'reachable');
+    } catch (e) {
+      return done(false, `no answer: ${(e as Error).message ?? e}`);
+    }
+  }));
+}
+
+/** One line per probe, for the start of a run and `mugge backends`. */
+export function describeProbe(p: MachineProbe): string {
+  return `${p.ok ? 'up  ' : 'DOWN'}  ${p.name}  ${p.url}  ${p.detail}${p.ok ? ` (${p.ms} ms)` : ''}${!p.ok && p.optional ? ' (optional: left out)' : ''}`;
+}
+
+/**
+ * The machines a run starts with: every reachable one. An unreachable optional machine is left
+ * out; an unreachable required one, or no reachable machine serving workers, stops the run.
+ */
+export function usableMachines(machines: Machine[], probes: MachineProbe[]): Machine[] {
+  const down = new Set(probes.filter((p) => !p.ok).map((p) => p.name));
+  const required = probes.filter((p) => !p.ok && !p.optional);
+  if (required.length) throw new Error(`backend ${required.map((p) => `${p.name} (${p.detail})`).join(', ')} cannot be reached; mark a machine "optional": true to run without it`);
+  const up = machines.filter((m) => !down.has(m.name));
+  if (!up.some((m) => m.roles.includes('worker'))) throw new Error('no reachable backend serves worker calls');
+  return up;
 }
 
 /** Validates a crew's machines: unique names, and every kind of call served somewhere. */
@@ -188,7 +248,7 @@ export function fmtBytes(n: number): string {
 export function describeMachine(m: Machine): string {
   const mem = m.bytesPerSlot !== undefined ? `, ${fmtBytes(m.bytesPerSlot)}/slot at ${m.ctxPerCall} ctx ${m.cacheType}` : '';
   const budget = m.memoryBytes !== undefined ? ` of ${fmtBytes(m.memoryBytes)} (fits ${m.slotsFromMemory})` : '';
-  return `${m.name}  ${m.url}  ${m.roles.join('+')}  ${m.slots} slots (${m.slotSource})${mem}${budget}`;
+  return `${m.name}  ${m.url}  ${m.roles.join('+')}  ${m.slots} slots (${m.slotSource})${mem}${budget}${m.optional ? ', optional' : ''}${m.apiKeyEnv ? `, key from ${m.apiKeyEnv}` : ''}${m.timeoutMs ? `, ${m.timeoutMs / 1000} s timeout` : ''}`;
 }
 
 // ---- the pool --------------------------------------------------------------------------------

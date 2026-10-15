@@ -23,7 +23,13 @@
  *   MUGGE_BACKENDS        JSON array of machines, or @path/to/backends.json, e.g.
  *                         [{"name":"laptop","url":"http://10.0.0.2:8080/v1","roles":["worker"],
  *                           "preset":"qwen3.5-2b","memory_gb":5.3,"ctx":12288},
- *                          {"name":"mac","url":"http://10.0.0.3:8080/v1","roles":["manager","lead"],"slots":5}]
+ *                          {"name":"mac","url":"http://10.0.0.3:8080/v1","roles":["manager","lead"],"slots":5,"optional":true},
+ *                          {"name":"evroc-b200","url":"https://b200.example/v1","roles":["worker"],"slots":40,
+ *                           "api_key_env":"EVROC_KEY","timeout_s":3600}]
+ *                         api_key_env names the variable holding that machine's key (sent as a bearer
+ *                         header); timeout_s overrides MUGGE_TIMEOUT_S for that machine; an optional
+ *                         machine that does not answer at start is left out (`mugge run` and
+ *                         `mugge engine serve` check every machine first; `mugge backends` lists them)
  *   MUGGE_SLOTS, MUGGE_MEMORY_GB, MUGGE_CTX
  *                         the single-URL machine's slots, working-memory budget and context per call
  *   MUGGE_SANDBOX         local | podman | docker (see engine/sandbox.ts)
@@ -38,7 +44,7 @@
  *                         (engine/review.ts); read by the harness itself
  */
 import { readFileSync } from 'node:fs';
-import { BackendPool, MODEL_PRESETS, resolveMachine, resolveMachines, type Machine, type MachineInput } from './engine/backends.ts';
+import { BackendPool, describeProbe, MODEL_PRESETS, PROBE_TIMEOUT_MS, probeMachines, resolveMachine, resolveMachines, usableMachines, type Machine, type MachineInput } from './engine/backends.ts';
 import { checkTopK, type InferenceConfig, type Sampling } from './engine/inference.ts';
 
 function num(env: NodeJS.ProcessEnv, key: string, check: (n: number) => boolean, what: string): number | undefined {
@@ -132,4 +138,16 @@ export function machinesFromEnv(env: NodeJS.ProcessEnv = process.env, concurrenc
 /** The machines with a client each, sharing MUGGE_MODELS, thinking and the call cap; sampling is per machine (preset, then MUGGE_*, then its own). */
 export function poolFromEnv(env: NodeJS.ProcessEnv = process.env, concurrency = concurrencyFromEnv(env)): BackendPool {
   return BackendPool.fromMachines(machinesFromEnv(env, concurrency), inferenceFromEnv(env), env);
+}
+
+/**
+ * poolFromEnv after a start check: says which machines answer (one line each to `say`), leaves
+ * out unreachable optional ones and throws if a required one cannot be reached.
+ */
+export async function checkedPoolFromEnv(env: NodeJS.ProcessEnv = process.env, concurrency = concurrencyFromEnv(env), say: (line: string) => void = (l) => console.error(l)): Promise<BackendPool> {
+  const machines = machinesFromEnv(env, concurrency);
+  const base = inferenceFromEnv(env);
+  const probes = await probeMachines(machines, env, PROBE_TIMEOUT_MS, base.apiKey);
+  for (const p of probes) say(describeProbe(p));
+  return BackendPool.fromMachines(usableMachines(machines, probes), base, env);
 }
