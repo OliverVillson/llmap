@@ -8,7 +8,7 @@
  *   bun bench/run.ts --bench <dir> --url http://127.0.0.1:8000/v1 --model <served name> --out <dir>
  *   options: --seeds 3, --concurrency 16, --sandbox local|podman|docker, --temperature 0.6,
  *            --top-p 0.95, --top-k 20, --thinking on|off, --gpus 1, --name <label>,
- *            --filter <text in project/ticket>, --split dev|test, --transcripts, --fake,
+ *            --filter <text in project/ticket>, --split dev|test, --transcripts, --fake, --fake-flaky,
  *            --max-tokens <most tokens one model call may write>, --tickets <n: a quick run on n tickets>
  *
  * Writes <out>/results.jsonl (one row per ticket and seed), <out>/report.json and, with
@@ -65,7 +65,16 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
     complete: (m, msgs, schema, n) => base.complete(m, msgs, schema, cap(n)),
     text: async (m, msgs, n) => {
       const c = await base.text(m, msgs, cap(n));
-      if (o.transcripts) transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw });
+      // what the train harness needs to turn a call into a row (scripts/bh/harvest.py): the
+      // whole message pair, and whether the answer ran into its cap or was forced
+      if (o.transcripts) {
+        const f = c as { cut?: boolean; forced?: boolean | string };
+        transcript.push({
+          prompt: msgs[msgs.length - 1]?.content, answer: c.raw, system: msgs[0]?.role === 'system' ? msgs[0].content : undefined,
+          maxTokens: cap(n), promptTokens: c.promptTokens, completionTokens: c.completionTokens,
+          ...(f.cut !== undefined ? { cut: f.cut } : {}), ...(f.forced !== undefined ? { forced: f.forced } : {}),
+        });
+      }
       return c;
     },
   };
@@ -160,7 +169,7 @@ if (import.meta.main) {
       seeds: { type: 'string' }, concurrency: { type: 'string' }, sandbox: { type: 'string' },
       temperature: { type: 'string' }, 'top-p': { type: 'string' }, 'top-k': { type: 'string' },
       thinking: { type: 'string' }, gpus: { type: 'string' }, name: { type: 'string' }, filter: { type: 'string' },
-      split: { type: 'string' }, transcripts: { type: 'boolean' }, fake: { type: 'boolean' }, timeout: { type: 'string' },
+      split: { type: 'string' }, transcripts: { type: 'boolean' }, fake: { type: 'boolean' }, 'fake-flaky': { type: 'boolean' }, timeout: { type: 'string' },
       'max-tokens': { type: 'string' }, tickets: { type: 'string' },
     },
   });
@@ -175,7 +184,9 @@ if (import.meta.main) {
     projects = projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.key.includes(f)) })).filter((p) => p.tickets.length);
   }
   if (values.tickets) projects = firstTickets(projects, Number(values.tickets));
-  const fake = values.fake ? startFakeModel({ solutions: fakeSolutions(projects) }) : null;
+  // --fake-flaky: each ticket's first call overall gets an empty answer, so its first seed runs a real fix call
+  const fakeSols = values.fake ? fakeSolutions(projects) : {};
+  const fake = values.fake ? startFakeModel({ solutions: fakeSols, flaky: values['fake-flaky'] ? Object.keys(fakeSols) : [] }) : null;
   const cfg = inferenceFromEnv();
   const thinking = values.thinking ?? 'on';
   const extra = (seed: number): Record<string, unknown> => ({

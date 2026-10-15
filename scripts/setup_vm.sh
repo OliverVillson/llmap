@@ -10,6 +10,8 @@
 # fetches only the livecodebench, codecontests and apps suites: ~15-20 minutes less
 # per boot, which a B200 pays for by the minute.
 # SKIP_POLYGLOT=1 keeps the extras but leaves out Aider Polyglot (its Docker image build).
+# NVME_LOCAL=1: NVME is a plain folder on a machine's own disk (a laptop); nothing is
+# formatted or mounted.
 # SKIP_SUITES=1 fetches no code suite: the caller restores them from the bucket once the
 # NVMe is mounted (scripts/event_horizon.py, after the first session's fetch).
 # TEACHER_REVISION: the revision the teacher is downloaded at (default: the hub's main).
@@ -23,7 +25,7 @@ set -euo pipefail
 
 NVME=${NVME:-/mnt/nvme}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TEACHER=${TEACHER:-Qwen/Qwen3-30B-A3B-Instruct-2507}
+TEACHER=${TEACHER-Qwen/Qwen3-30B-A3B-Instruct-2507}  # TEACHER= (empty) skips it
 STUDENT=${STUDENT-google/gemma-4-E4B-it}  # STUDENT= (empty) skips it
 TEACHER_REVISION=${TEACHER_REVISION:-}
 SKIP_EXTRAS=${SKIP_EXTRAS:-}
@@ -119,7 +121,9 @@ say "GPU"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
 say "Local NVMe at $NVME"
-if ! mountpoint -q "$NVME"; then
+if [ -n "${NVME_LOCAL:-}" ]; then
+  mkdir -p "$NVME"  # a laptop (the 4060, WSL2 too): a folder on its own disk, nothing to format or mount
+elif ! mountpoint -q "$NVME"; then
   # The local disk arrives blank. Only a disk with no filesystem or partitions is formatted.
   DISK=$(lsblk -dbno NAME,SIZE,TYPE | awk '$3=="disk" && $2>1e12 {print "/dev/"$1}' | while read -r d; do
     [ -z "$(sudo blkid -o value -s TYPE "$d")" ] && [ "$(lsblk -no NAME "$d" | wc -l)" = 1 ] && echo "$d"; done | head -1)
@@ -129,7 +133,7 @@ if ! mountpoint -q "$NVME"; then
   grep -q "LABEL=nvme" /etc/fstab || echo "LABEL=nvme $NVME ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab
   sudo mount "$NVME"
 fi
-sudo chown "$(id -u):$(id -g)" "$NVME"
+[ -n "${NVME_LOCAL:-}" ] || sudo chown "$(id -u):$(id -g)" "$NVME"
 df -h "$NVME"
 mkdir -p "$NVME/models" "$NVME/jobs"
 # .env.vm (sourced before this script) points TMPDIR and the caches here; after a stop
@@ -152,8 +156,10 @@ elif pgrep -f "hf download" >/dev/null; then
 else
 say "Downloading weights in the background (log: $NVME/download.log)"
 (
-  uv tool run --from huggingface_hub hf download "$TEACHER" ${TEACHER_REVISION:+--revision "$TEACHER_REVISION"} \
-    --local-dir "$NVME/models/${TEACHER##*/}"
+  if [ -n "$TEACHER" ]; then
+    uv tool run --from huggingface_hub hf download "$TEACHER" ${TEACHER_REVISION:+--revision "$TEACHER_REVISION"} \
+      --local-dir "$NVME/models/${TEACHER##*/}"
+  fi
   if [ -n "$STUDENT" ]; then
     uv tool run --from huggingface_hub hf download "$STUDENT" --local-dir "$NVME/models/${STUDENT##*/}"
   fi
