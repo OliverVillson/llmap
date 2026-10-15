@@ -73,7 +73,9 @@ mugge new "<what to build>"    make a project
 mugge vm <project> --host H --user U [--driver command --start "evroc ..." --stop "evroc ..."]
 mugge open <project>           boot the VM, push state, start the engine, follow it live
 mugge plan <project>           architect → ARCHITECTURE.md, scaffold, tickets
-mugge run <plan.json> --repo <dir>
+mugge run <plan.json> --repo <dir> [--out <run dir>]   per-call log and crew status in the run dir
+mugge status <run dir> [--watch]   the crew status a run is writing
+mugge smoke [--fake] [--url U --model M]   the 15 spike tickets through the loop: MEETS / MISSES
 mugge ship --repo <dir> (--to <folder> | --github <remote> --branch <b>) -m "message"
 mugge close <project>          pull state, stop the VM
 mugge dog

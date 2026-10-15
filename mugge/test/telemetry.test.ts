@@ -62,7 +62,7 @@ describe('crew status', () => {
     const a = s.agents.find((x) => x.ticket === 'one')!;
     expect([a.state, a.attempt, a.owns]).toEqual(['writing', 1, ['a.c']]);
     expect(s.tickets.find((x) => x.id === 'two')!.state).toBe('waiting');
-    expect(s.tickets.find((x) => x.id === 'three')!.state).toBe('queued');
+    expect(s.tickets.find((x) => x.id === 'three')!.state).toBe('ready');
     expect(s.crew.state).toBe('working');
 
     now += 10_000; // a 10 s call writing 1000 tokens: 100 tok/s while it ran
@@ -85,7 +85,7 @@ describe('crew status', () => {
     tel.emit({ type: 'finish', at: now, ticket: 'one', state: 'done', attempts: 2 });
     s = tel.status();
     expect(s.agents.find((x) => x.id === a.id)!.state).toBe('finished');
-    expect(s.tickets.find((x) => x.id === 'two')!.state).toBe('queued');
+    expect(s.tickets.find((x) => x.id === 'two')!.state).toBe('ready');
 
     now += 120_000; // two quiet minutes later the window is empty
     expect(tel.status().tokS.total).toBe(0);
@@ -110,6 +110,27 @@ describe('crew status', () => {
     expect(s.agents.filter((a) => a.state === 'writing').map((a) => a.id)).toEqual(['a1', 'a2', 'b1', 'c1', 'c7', 'd1']);
     expect(s.agents.find((a) => a.id === 'c7')!.machine).toBe('mac');
     expect(s.teams.map((t) => t.working)).toEqual([2, 1, 2, 1]);
+  });
+
+  test('slot events queue an agent and say which machine its call runs on; pool snapshots give real slot use', () => {
+    const tel = new Telemetry({ warn: null, crew: crewFromEnv({ MUGGE_BACKENDS: JSON.stringify([{ name: '4060', url: 'http://127.0.0.1:8080/v1', roles: ['worker'], slots: 1 }, { name: 'mac', url: 'http://127.0.0.1:8081/v1', roles: ['worker', 'lead', 'manager'], slots: 1 }]) }) });
+    tel.setTickets([{ id: 'x', owns: ['x.c'], depends_on: [] }, { id: 'y', owns: ['y.c'], depends_on: [] }]);
+    tel.emit({ type: 'start', at: 1, ticket: 'x', attempt: 1, worktree: '' });
+    tel.emit({ type: 'start', at: 1, ticket: 'y', attempt: 1, worktree: '' });
+    tel.emit({ type: 'slot', at: 2, ticket: 'x', state: 'got', machine: 'mac' });
+    tel.emit({ type: 'slot', at: 2, ticket: 'y', state: 'queued' });
+    let s = tel.status();
+    const ax = s.agents.find((a) => a.ticket === 'x')!, ay = s.agents.find((a) => a.ticket === 'y')!;
+    expect([ax.state, ax.machine, ay.state]).toEqual(['writing', 'mac', 'queued']);
+    expect(s.tickets.map((t) => t.state)).toEqual(['running', 'queued']);
+    expect([s.crew.agents.working, s.crew.agents.queued]).toEqual([2, 1]);
+    tel.serving({ at: 3, windowS: 1, agents: [], teams: [], total: { slots: 2, busy: 1, queued: 1, calls: 0, completionTokens: 0, tokPerSec: 0, promptTokPerSec: 0 },
+      machines: [{ name: '4060', url: 'http://127.0.0.1:8080/v1', roles: ['worker'], slots: 1, busy: 0, occupancy: 0, queued: 1, calls: 0, promptTokens: 0, completionTokens: 0, tokPerSec: 0, promptTokPerSec: 0 },
+        { name: 'mac', url: 'http://127.0.0.1:8081/v1', roles: ['worker'], slots: 1, busy: 1, occupancy: 1, queued: 0, calls: 0, promptTokens: 0, completionTokens: 0, tokPerSec: 0, promptTokPerSec: 250 }] });
+    s = tel.status();
+    expect(s.machines.map((m) => [m.id, m.slotsUsed, m.queued, m.promptTokS])).toEqual([['4060', 0, 1, 0], ['mac', 1, 0, 250]]);
+    tel.emit({ type: 'slot', at: 4, ticket: 'y', state: 'got', machine: '4060' });
+    expect(tel.status().agents.find((a) => a.ticket === 'y')!.state).toBe('writing');
   });
 
   test('MUGGE_CREW sets machines and teams', () => {

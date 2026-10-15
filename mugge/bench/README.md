@@ -48,3 +48,45 @@ job's config and the eval stage runs the bench on every served candidate (`stage
   first-call solves, answers with no owned file, writes outside `owns`, and the share of
   acceptance passes that failed hidden tests.
 - All of it by theme, language, role and project.
+
+## The spike smoke
+
+One command, about ten minutes against a local llama-server: the 15 public spike tickets through
+the engine's own loop. BlackHole runs it before exporting anything.
+
+```bash
+bun bench/smoke.ts --url http://127.0.0.1:8080/v1 --model BH0.1-1.3 --sandbox local   # or: mugge smoke …
+bun bench/smoke.ts --fake --fake-mess        # no model: the fake server, with four messy first answers (CI)
+```
+
+1. The reference answers must pass acceptance and hidden tests in the sandbox, 15/15; otherwise
+   it stops with NO SCORE (exit 2), because the sandbox is broken, not the model.
+2. Every ticket runs once through `runTicket` (write → check → fix, 4 attempts), thinking off by
+   default, `top_k` 20 (0 is refused), 4096 tokens per call (`--max-tokens`, or
+   `MUGGE_MAX_CALL_TOKENS`). `--min-p 0` for MiniCPM5-2B.
+3. It prints tickets passing, parser drops (by reason), forced and cut answers, call errors, wall
+   time and **MEETS** (exit 0) when at least `--bar` (default 0.5) of the tickets pass, at most
+   20% of answers were lost to the parser or the cap, and no call failed; **MISSES** (exit 1)
+   otherwise, with the reasons.
+
+Writes `calls.jsonl`, `status.json`, `smoke.json` and the bench's `results.jsonl` / `report.json`
+in `--out` (default `runs/smoke-<time>`).
+
+## Per-call log and crew status
+
+Every run (`mugge run`, `bench/run.ts`, the smoke, the engine API) writes, through
+`src/engine/telemetry.ts`:
+
+- `calls.jsonl`: one line per model call with ticket, attempt, write/fix, agent/team/machine,
+  prompt, completion and reasoning tokens, max_tokens, ms, tok/s, `cut` (stopped at max_tokens),
+  `forced` (the bench proxy closed the thinking and forced the answer: why, or null), `drop` (the
+  parser got no usable file: `cut`, `empty`, `no_fence`, `unlabelled`, `not_owned`), `error`, and
+  `clean`: false for every call that must never become a training row. A warning goes to stderr
+  when more than 20% of answers are dropped or cut. `bench/run.ts --transcripts` carries the same
+  `cut`, `forced` and `drop` on every transcript call.
+- `status.json` (schema `centipede.status/1`, also `GET /telemetry` on the engine API): crew state,
+  every agent (a1–d10: state, ticket, owned files, attempt n/4, own tok/s), tickets, total tok/s
+  over one minute with a 60-point sparkline and its split by team and machine, slots used and
+  queued per machine. The types are `CrewStatus` in telemetry.ts.
+
+`MUGGE_DEBUG_CALLS=1` still prints the one human line per call.

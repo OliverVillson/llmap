@@ -15,9 +15,12 @@
  *                 the parser or the token cap: exp02 lost 670 of 900 teacher fix answers that way
  *                 without anyone noticing.
  *
- * The crew layout (machines, teams a–d, agents a1…d10) comes from MUGGE_CREW or defaults to one
- * machine. Until the scheduler assigns agents itself (`start.agent`), telemetry binds each
- * started ticket to an idle agent of the least busy team whose machine has a free slot.
+ * The crew layout (teams a–d, agents a1…d10, the machine each team uses) comes from MUGGE_CREW,
+ * else from the backend machines (MUGGE_BACKENDS, backends.ts) with the teams spread over the
+ * machines that serve workers. Until the scheduler assigns agents itself (`start.agent`),
+ * telemetry binds each started ticket to an idle agent of the least busy team whose machine has
+ * a free slot. The backend pool's snapshots (`serving()`) supply each machine's real slot use,
+ * and `slot` events say when an agent's call waits for a slot (queued) and where it runs.
  *
  * tok/s counts completion tokens. Calls are not streamed, so a call's tokens are spread evenly
  * over its own duration once it ends: the one-minute figure trails the live rate by up to one
@@ -25,7 +28,9 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { machinesFromEnv } from '../config.ts';
 import type { Plan, WorkerOutput } from '../tickets/schema.ts';
+import type { Machine, ServingSnapshot } from './backends.ts';
 import type { EngineEvent } from './events.ts';
 
 // ---------------------------------------------------------------------------------------------
@@ -238,10 +243,31 @@ export function defaultCrew(slots = 12, backend = 'local'): CrewLayout {
   };
 }
 
-/** MUGGE_CREW: a CrewLayout as JSON, inline or in a file. */
-export function crewFromEnv(env: NodeJS.ProcessEnv = process.env, slots = 12, backend = 'local'): CrewLayout {
+/** Teams a–d over the machines that serve worker calls, in turn. */
+export function crewFromMachines(machines: Machine[]): CrewLayout {
+  const workers = machines.filter((m) => m.roles.includes('worker'));
+  const on = workers.length ? workers : machines;
+  return {
+    machines: machines.map((m) => ({ id: m.name, slots: m.slots, backend: backendLabel(m.url), url: m.url, memoryBytes: m.memoryBytes, perAgentBytes: m.bytesPerSlot })),
+    teams: ['a', 'b', 'c', 'd'].map((id, i) => ({ id, machine: on[i % on.length]!.name, agents: 10 })),
+    manager: machines.find((m) => m.roles.includes('manager')) ? { machine: machines.find((m) => m.roles.includes('manager'))!.name } : undefined,
+  };
+}
+
+/** `local · llama-server` for a URL on this machine or the LAN, `remote` otherwise. */
+export function backendLabel(url: string): string {
+  try {
+    const h = new URL(url).hostname;
+    return /^(127\.|localhost$|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1)/.test(h) || h.endsWith('.local') ? 'local · llama-server' : `remote · ${h}`;
+  } catch {
+    return 'local';
+  }
+}
+
+/** MUGGE_CREW (a CrewLayout as JSON, inline or in a file), else the backend machines. */
+export function crewFromEnv(env: NodeJS.ProcessEnv = process.env, slots = 12): CrewLayout {
   const raw = env.MUGGE_CREW?.trim();
-  if (!raw) return defaultCrew(slots, backend);
+  if (!raw) return crewFromMachines(machinesFromEnv(env, slots));
   let c: CrewLayout;
   try {
     c = JSON.parse(raw.startsWith('{') ? raw : readFileSync(raw, 'utf8'));
@@ -261,19 +287,23 @@ export const STATUS_SCHEMA = 'centipede.status/1';
 export type CrewState = 'ready' | 'working' | 'paused' | 'needs_you' | 'finished';
 
 /**
- * idle: no ticket yet. writing: first attempt. checking: its acceptance commands run.
- * fixing: attempt n of max. finished / failed: its last ticket ended so. `queued`, `waiting`,
- * `blocked` and `thinking` exist for when the scheduler binds agents before a slot is free and
- * the server streams; today those show on tickets instead.
+ * idle: no ticket yet. queued: its call waits for a free machine slot. writing: first attempt.
+ * checking: its acceptance commands run. fixing: attempt n of max. finished / failed: its last
+ * ticket ended so. `waiting`, `blocked` and `thinking` exist for when the scheduler binds agents
+ * before a ticket is ready and the server streams; today waiting and blocked show on tickets.
  */
 export type AgentState = 'idle' | 'queued' | 'writing' | 'checking' | 'fixing' | 'waiting' | 'thinking' | 'blocked' | 'finished' | 'failed';
-const WORKING: AgentState[] = ['writing', 'checking', 'fixing', 'thinking'];
+/** Has a ticket in progress. */
+const WORKING: AgentState[] = ['writing', 'checking', 'fixing', 'thinking', 'queued'];
+/** Is in a model call (holds a machine slot, when the pool does not say otherwise). */
+const CALLING: AgentState[] = ['writing', 'fixing', 'thinking'];
 
 /**
- * waiting: a dependency has not finished. queued: ready, no free slot. blocked: ready, but a
- * running ticket owns one of its files. running, done, failed, skipped as the engine says.
+ * waiting: a dependency has not finished. ready: could start, every agent slot is taken.
+ * blocked: ready, but a running ticket owns one of its files. queued: running, its model call
+ * waits for a machine slot (events.ts). running, done, failed, skipped as the engine says.
  */
-export type TicketStatusState = 'waiting' | 'queued' | 'blocked' | 'running' | 'done' | 'failed' | 'skipped';
+export type TicketStatusState = 'waiting' | 'ready' | 'blocked' | 'running' | 'queued' | 'done' | 'failed' | 'skipped';
 
 /** idle: nothing written in the window. warming: under a minute in. steady. peak: a new high in the last 5 s. drop: under half the 10-minute rate while agents work. */
 export type TokSState = 'idle' | 'warming' | 'steady' | 'peak' | 'drop';
@@ -320,7 +350,8 @@ export interface CrewStatus {
   elapsedMs: number;
   crew: {
     state: CrewState;
-    agents: { total: number; working: number; idle: number; finished: number; failed: number };
+    /** working: has a ticket (queued ones included); queued: waiting for a machine slot. */
+    agents: { total: number; working: number; queued: number; idle: number; finished: number; failed: number };
     tickets: Record<TicketStatusState, number> & { total: number };
   };
   settings: { thinking: 'on' | 'off' | 'server'; maxCallTokens: number | null; model: string | null; backend: string };
@@ -336,7 +367,8 @@ export interface CrewStatus {
     byTeam: Record<string, number>;
     byMachine: Record<string, number>;
   };
-  machines: Array<MachineSpec & { slotsUsed: number; agents: number; tokS: number }>;
+  /** slotsUsed and queued come from the backend pool when it reports (serving()), else from agent states. */
+  machines: Array<MachineSpec & { slotsUsed: number; queued: number; agents: number; tokS: number; promptTokS: number | null }>;
   teams: Array<{ id: string; domain: string | null; machine: string; agents: string[]; working: number; tokS: number; tickets: string[] }>;
   agents: AgentStatus[];
   tickets: TicketStatus[];
@@ -398,6 +430,7 @@ export class Telemetry {
   private sessionTokens = 0;
   private lastWrite = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private pool: ServingSnapshot | null = null;
 
   constructor(private readonly o: TelemetryOptions = {}) {
     this.now = o.now ?? Date.now;
@@ -437,6 +470,16 @@ export class Telemetry {
         this.startedAt ??= e.at;
         for (const t of e.tickets) if (!this.tickets.has(t.id)) this.ticket(t.id, t.depends_on);
         break;
+      case 'slot': {
+        const t = this.ticket(e.ticket);
+        const a = this.agentFor(t, e.at);
+        if (e.machine) a.machine = e.machine;
+        if (e.state === 'queued') {
+          t.state = 'running'; // shown as queued below while the agent waits
+          this.set(a, 'queued', e.at, {});
+        } else this.set(a, a.kind === 'fix' ? 'fixing' : 'writing', e.at, {});
+        break;
+      }
       case 'start': {
         this.startedAt ??= e.at;
         const t = this.ticket(e.ticket);
@@ -518,6 +561,14 @@ export class Telemetry {
     this.touch();
   };
 
+  /** The backend pool's latest numbers (BackendPool.subscribe): real slot use per machine. */
+  serving(s: ServingSnapshot): void {
+    this.pool = s;
+    for (const m of s.machines)
+      if (!this.crew.machines.some((x) => x.id === m.name)) this.crew.machines.push({ id: m.name, slots: m.slots, backend: backendLabel(m.url), url: m.url, memoryBytes: m.memoryBytes, perAgentBytes: m.bytesPerSlot });
+    this.touch();
+  }
+
   /** Completion tokens a streaming serving layer saw, for a live rate (instead of whole calls). */
   tokens(n: number, startMs: number, endMs: number, agent: string | null = null): void {
     const a = agent ? this.agents.find((x) => x.id === agent) : undefined;
@@ -564,7 +615,7 @@ export class Telemetry {
     for (const a of this.agents) a.tokS = rate((s) => s.agent === a.id);
 
     const tickets = this.ticketStatuses();
-    const tcount = { total: tickets.length, waiting: 0, queued: 0, blocked: 0, running: 0, done: 0, failed: 0, skipped: 0 } as CrewStatus['crew']['tickets'];
+    const tcount = { total: tickets.length, waiting: 0, ready: 0, blocked: 0, running: 0, queued: 0, done: 0, failed: 0, skipped: 0 } as CrewStatus['crew']['tickets'];
     for (const t of tickets) tcount[t.state]++;
     let crewState: CrewState = 'ready';
     if (this.ended) crewState = tcount.done === tcount.total ? 'finished' : 'needs_you';
@@ -581,6 +632,7 @@ export class Telemetry {
         agents: {
           total: this.agents.length,
           working: working.length,
+          queued: this.agents.filter((a) => a.state === 'queued').length,
           idle: this.agents.filter((a) => a.state === 'idle').length,
           finished: this.agents.filter((a) => a.state === 'finished').length,
           failed: this.agents.filter((a) => a.state === 'failed').length,
@@ -591,7 +643,16 @@ export class Telemetry {
       tokS: { total, state, peak: this.peak, tenMinutes: ten, session: elapsed ? round1((1000 * this.sessionTokens) / elapsed) : 0, spark, byTeam, byMachine },
       machines: this.crew.machines.map((m) => {
         const on = this.agents.filter((a) => a.machine === m.id);
-        return { ...m, slotsUsed: on.filter((a) => WORKING.includes(a.state)).length, agents: on.length, tokS: byMachine[m.id] ?? 0 };
+        const pool = this.pool?.machines.find((x) => x.name === m.id);
+        return {
+          ...m,
+          slots: pool?.slots ?? m.slots,
+          slotsUsed: pool ? pool.busy : on.filter((a) => CALLING.includes(a.state)).length,
+          queued: pool ? pool.queued : on.filter((a) => a.state === 'queued').length,
+          agents: on.length,
+          tokS: byMachine[m.id] ?? 0,
+          promptTokS: pool ? pool.promptTokPerSec : null,
+        };
       }),
       teams: this.crew.teams.map((t) => {
         const on = this.agents.filter((a) => a.team === t.id);
@@ -657,7 +718,7 @@ export class Telemetry {
   private pick(): AgentStatus {
     const free = this.agents.filter((a) => !WORKING.includes(a.state));
     const busy = (pred: (a: AgentStatus) => boolean) => this.agents.filter((a) => pred(a) && WORKING.includes(a.state)).length;
-    const slotFree = (m: string) => busy((a) => a.machine === m) < (this.crew.machines.find((x) => x.id === m)?.slots ?? Infinity);
+    const slotFree = (m: string) => this.agents.filter((a) => a.machine === m && CALLING.includes(a.state)).length < (this.crew.machines.find((x) => x.id === m)?.slots ?? Infinity);
     const pool = free.filter((a) => slotFree(a.machine));
     const from = pool.length ? pool : free;
     if (!from.length) {
@@ -693,9 +754,10 @@ export class Telemetry {
     for (const t of rows) if (t.state === 'running') for (const p of t.owns) holder.set(p, t.id);
     return rows.map(({ started: _s, ...t }) => {
       const out: TicketStatus = { ...t, owns: [...t.owns], dependsOn: [...t.dependsOn] };
+      if (t.state === 'running' && this.agents.find((a) => a.id === t.agent && a.ticket === t.id)?.state === 'queued') out.state = 'queued';
       if (t.state === 'waiting' && !this.ended && t.dependsOn.every((d) => this.tickets.get(d)?.state === 'done')) {
         const clash = t.owns.map((p) => holder.get(p)).find(Boolean);
-        out.state = clash ? 'blocked' : 'queued';
+        out.state = clash ? 'blocked' : 'ready';
         if (clash) out.blockedBy = clash;
       }
       return out;

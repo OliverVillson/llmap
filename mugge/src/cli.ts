@@ -7,7 +7,8 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startEngineServer, followEvents } from './api/server.ts';
-import { concurrencyFromEnv, inferenceFromEnv } from './config.ts';
+import { concurrencyFromEnv, inferenceFromEnv, machinesFromEnv, poolFromEnv } from './config.ts';
+import { describeMachine, llamaServerArgs } from './engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from './engine/events.ts';
 import { headCommit, initRepo } from './engine/git.ts';
 import { OpenAICompatible } from './engine/inference.ts';
@@ -39,9 +40,10 @@ const HELP = `mugge ${VERSION}: parallel coding with small specialist models
   mugge spike [--fake]           the engine spike on the polyglot test project
   mugge bench run|check|report … MuggeBench (see bench/run.ts, check.ts, report.ts)
   mugge engine serve --port N --project <dir>    (on the VM) the engine API
+  mugge backends                 the crew's machines, their slots and matching llama-server flags
   mugge dog                      the dog
 
-Model endpoint: MUGGE_INFERENCE_URL, MUGGE_MODEL, MUGGE_MODELS (see src/config.ts).`;
+Model endpoint: MUGGE_INFERENCE_URL, MUGGE_MODEL, MUGGE_MODELS, or MUGGE_BACKENDS for several machines (see src/config.ts).`;
 
 function die(msg: string): never {
   console.error(`mugge: ${msg}`);
@@ -201,7 +203,7 @@ async function main(argv: string[]) {
     case 'plan': {
       const p = loadProject(rest[0] ?? die('which project?'));
       if (!p.request) die(`${p.name} has no request`);
-      const inf = new OpenAICompatible(inferenceFromEnv());
+      const inf = poolFromEnv().forAgent({ role: 'manager' });
       const d = await design(inf, p.request);
       if (d.questions.length) {
         console.log('The architect asks:\n' + d.questions.map((q) => `  - ${q}`).join('\n'));
@@ -227,16 +229,17 @@ async function main(argv: string[]) {
       const feed = viewFeed();
       const cfg = inferenceFromEnv();
       const concurrency = values.concurrency ? Number(values.concurrency) : concurrencyFromEnv();
+      const pool = poolFromEnv(process.env, concurrency);
       const id = runId();
       const telemetry = new Telemetry({
         run: id, dir: resolve(values.out ?? join(repo, '..', '.mugge-runs', id)), crew: crewFromEnv(process.env, concurrency),
         settings: { thinking: thinkingOf(cfg.extra), maxCallTokens: cfg.maxCallTokens ?? null, model: cfg.defaultModel },
       });
       telemetry.setPlan(plan);
+      pool.subscribe((s) => telemetry.serving(s));
       const show = values.plain || !process.stdout.isTTY ? plainEvent : feed.emit;
       const run = runPlan({
-        repo, base: headCommit(repo), plan,
-        inference: new OpenAICompatible(cfg),
+        repo, base: headCommit(repo), plan, pool,
         sandbox: sandboxFromEnv(),
         concurrency,
         worktreeRoot: join(repo, '..', '.mugge-worktrees'),
@@ -315,6 +318,14 @@ async function main(argv: string[]) {
         runsDir: join(dir, 'runs'),
       });
       console.log(`engine on ${s.url}, repo ${repo}`);
+      return;
+    }
+    case 'backends': {
+      for (const m of machinesFromEnv()) {
+        console.log(describeMachine(m));
+        console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
+        for (const w of m.warnings) console.log(`  warning: ${w}`);
+      }
       return;
     }
     default:
