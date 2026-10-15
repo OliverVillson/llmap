@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startEngineServer, followEvents } from './api/server.ts';
-import { concurrencyFromEnv, inferenceFromEnv, machinesFromEnv, poolFromEnv } from './config.ts';
-import { describeMachine, llamaServerArgs } from './engine/backends.ts';
+import { checkedPoolFromEnv, concurrencyFromEnv, inferenceFromEnv, machinesFromEnv, poolFromEnv } from './config.ts';
+import { describeMachine, describeProbe, llamaServerArgs, PROBE_TIMEOUT_MS, probeMachines } from './engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from './engine/events.ts';
 import { headCommit, initRepo } from './engine/git.ts';
 import { OpenAICompatible } from './engine/inference.ts';
@@ -208,7 +208,7 @@ async function main(argv: string[]) {
       const concurrency = values.concurrency ? Number(values.concurrency) : concurrencyFromEnv();
       const run = runPlan({
         repo, base: headCommit(repo), plan,
-        pool: poolFromEnv(process.env, concurrency),
+        pool: await checkedPoolFromEnv(process.env, concurrency).catch((e) => die(String((e as Error).message ?? e))),
         sandbox: sandboxFromEnv(),
         concurrency,
         worktreeRoot: join(repo, '..', '.mugge-worktrees'),
@@ -259,6 +259,8 @@ async function main(argv: string[]) {
       const s = startEngineServer({
         port: Number(values.port ?? 7341), repo,
         inference: new OpenAICompatible(inferenceFromEnv()),
+        // a crew of machines (laptops on wifi, cloud GPUs) when MUGGE_BACKENDS lists them
+        pool: process.env.MUGGE_BACKENDS?.trim() ? await checkedPoolFromEnv().catch((e) => die(String((e as Error).message ?? e))) : undefined,
         sandbox: sandboxFromEnv(),
         concurrency: values.concurrency ? Number(values.concurrency) : concurrencyFromEnv(),
         worktreeRoot: join(dir, 'worktrees'),
@@ -267,8 +269,11 @@ async function main(argv: string[]) {
       return;
     }
     case 'backends': {
-      for (const m of machinesFromEnv()) {
+      const machines = machinesFromEnv();
+      const probes = await probeMachines(machines, process.env, PROBE_TIMEOUT_MS, inferenceFromEnv().apiKey);
+      for (const [i, m] of machines.entries()) {
         console.log(describeMachine(m));
+        console.log(`  ${describeProbe(probes[i]!)}`);
         console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
         for (const w of m.warnings) console.log(`  warning: ${w}`);
       }
