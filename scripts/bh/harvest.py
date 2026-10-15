@@ -44,8 +44,17 @@ DROP_WARN = 0.20
 
 
 def read_jsonl(p: str | Path) -> list[dict]:
+    """The file's records; a last line cut short (a run stopped while appending) is left out."""
     p = Path(p)
-    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+    lines = [x for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+    out = []
+    for i, x in enumerate(lines):
+        try:
+            out.append(json.loads(x))
+        except ValueError:
+            if i < len(lines) - 1:
+                raise
+    return out
 
 
 def write_jsonl(p: str | Path, rows: list[dict]) -> None:
@@ -97,7 +106,8 @@ class Stats:
     warnings: list[str] = field(default_factory=list)
 
     def drop_share(self) -> float:
-        return (self.cut + self.parser) / self.answers if self.answers else 0.0
+        """Answers that can never be rows for their form: cut or forced, unparsed, loose."""
+        return (self.cut + self.parser + self.loose) / self.answers if self.answers else 0.0
 
     def as_dict(self) -> dict:
         return {"runs": self.runs, "answers": self.answers, "cut_or_forced": self.cut, "parser_drops": self.parser, "loose": self.loose,
@@ -287,8 +297,9 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
         with_rows.add(tk["key"])
     stats.tickets_with_rows = len(with_rows)
     if stats.drop_share() > DROP_WARN:
-        _warn(stats, f"{stats.cut + stats.parser} of {stats.answers} answers ({stats.drop_share():.0%}) dropped: "
-                     f"{stats.cut} cut at the cap or forced, {stats.parser} missing an owned file after parsing")
+        _warn(stats, f"{stats.cut + stats.parser + stats.loose} of {stats.answers} answers ({stats.drop_share():.0%}) "
+                     f"dropped: {stats.cut} cut at the cap or forced, {stats.parser} missing an owned file after "
+                     f"parsing, {stats.loose} with a path the parser had to guess")
     print(f"[harvest] {source}: {sum(stats.rows.values())} rows ({dict(stats.rows)}) from {stats.solved} passing runs "
           f"of {stats.runs}; {stats.cut} cut, {stats.parser} parser drops of {stats.answers} answers; "
           f"dropped {dict(stats.dropped)}", flush=True)

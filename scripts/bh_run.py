@@ -61,8 +61,10 @@ import gzip
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -76,7 +78,7 @@ from bh import live  # noqa: E402
 from bh import export as X  # noqa: E402
 from bh import rows as R  # noqa: E402
 from bh import sampling as S  # noqa: E402
-from bh.exec import Bucket, Cmd, Exec, dump, load, read_jsonl, write_jsonl  # noqa: E402
+from bh.exec import Bucket, Cmd, Exec, StepTimeout, dump, load, read_jsonl, write_jsonl  # noqa: E402
 from bh.proxy import recording  # noqa: E402
 from bh.servers import Servers, llama_spec, vllm_spec  # noqa: E402
 
@@ -113,6 +115,8 @@ class Run:
         self.bins = self.llama / "build" / "bin"
         self.t0 = time.monotonic()
         self.stage_keys: list[str] = []
+        self.uploaded = False  # the run's last upload went through, every hand-over file included
+        self.live = False  # this process runs stages (status only reads what earlier runs left)
 
     # ---------- paths ----------
     def p(self, *parts) -> Path:
@@ -169,7 +173,10 @@ class Run:
         if not self.bucket.ok():
             return False
         if untar is None:
-            return self.bucket.get(name, path)
+            if not self.bucket.get(name, path):
+                return False
+            self.mark(path, name)  # it is in the bucket already: never sent back
+            return True
         tar = untar.with_name(untar.name + ".tar")
         if not self.bucket.get(name, tar):
             return False
@@ -181,12 +188,16 @@ class Run:
     def wait_for(self, name: str, path: Path, *, untar: Path | None = None) -> bool:
         """need(), polling the bucket for up to wait_minutes while another machine is still
         making it (the eval laptop waits for the ship)."""
-        deadline = time.monotonic() + 60 * self.cfg.wait_minutes
+        minutes, every = (min(self.cfg.wait_minutes, 2), 1) if self.ex.dry else (self.cfg.wait_minutes, 60)
+        deadline = time.monotonic() + 60 * minutes
+        said = False
         while not self.need(name, path, untar=untar):
-            if time.monotonic() >= deadline or self.ex.dry:
+            if time.monotonic() >= deadline:
                 return False
-            print(f"waiting for {name} from another machine (up to {self.cfg.wait_minutes:g} min)", flush=True)
-            time.sleep(60)
+            if not said:
+                print(f"waiting for {name} from another machine (up to {minutes:g} min)", flush=True)
+                said = True
+            time.sleep(every)
         return True
 
     # ---------- machines ----------
@@ -215,14 +226,26 @@ class Run:
                          logprobs=self.cfg.teacher_logprobs if logprobs and self.cfg.kd else 0)
 
     def bench(self, step, bench: Path, out: Path, name: str, *, seeds: int, concurrency: int, logprobs=False,
-              transcripts=False, tickets=0) -> dict:
-        """One bench run through the recording proxy; its stats and the proxy's counts."""
+              transcripts=False, tickets=0, minutes: float = 0, partial_ok: bool = False) -> dict:
+        """One bench run through the recording proxy; its stats and the proxy's counts.
+        minutes: stopped there (the session clock's share); with partial_ok what finished
+        by then counts, else StepTimeout."""
         out.mkdir(parents=True, exist_ok=True)
+        stopped = None
         with self.recorder(out / "proxy", logprobs=logprobs) as (url, rec):
-            self.ex.run(step, B.command(self.cfg, bench, out, url, name, model=self.model, seeds=seeds,
-                                        concurrency=concurrency,
-                                        transcripts=transcripts, tickets=tickets))
+            cmd = B.command(self.cfg, bench, out, url, name, model=self.model, seeds=seeds, concurrency=concurrency,
+                            transcripts=transcripts, tickets=tickets)
+            cmd.timeout_min = minutes
+            try:
+                self.ex.run(step, cmd)
+            except StepTimeout as e:
+                if not partial_ok:
+                    raise
+                stopped = str(e)
         st = {**B.stats(out), "proxy": dict(rec.counts)}
+        if stopped:
+            st["stopped"] = stopped
+            self.ex.warn(f"{name}: {stopped}; {st['runs']} runs finished by then count")
         if st["proxy"]["think"]:
             self.ex.warn(f"{name}: {st['proxy']['think']} of {st['proxy']['calls']} answers opened a thinking block "
                          "with thinking off")
@@ -289,7 +312,7 @@ class Run:
     def data_cmd(self, sub: str, kind: str, extra: str = "", **args) -> Cmd:
         """One data.py command (scripts/bh/data.py, the data thread's); everything it
         writes is under W/data."""
-        env = {"BHDATA": self.cfg.kits} if self.cfg.kits else {}
+        env = {"NVME": self.cfg.nvme, **({"BHDATA": self.cfg.kits} if self.cfg.kits else {})}  # NVME: decontam finds the dev set
         return Cmd(f"{DATA_PY} {sub} --work {q(self.W)} --sandbox {self.cfg.sandbox} {extra}".rstrip(), kind,
                    {"work": str(self.W), **args}, env=env)
 
@@ -360,7 +383,7 @@ class Run:
                 minutes = self.cap(cfg.g2_minutes, after=0)
                 st = self.bench(step, self.bench_dir("train"), g2, "teacher", seeds=1,
                                 concurrency=cfg.bench_concurrency, logprobs=True, transcripts=True,
-                                tickets=cfg.g2_tickets)
+                                tickets=cfg.g2_tickets, minutes=minutes)
                 rec.update(g2=st, minutes=minutes)
                 ok_pass = (st["score"] or 0) >= cfg.g2_min_pass
                 ok_apm = (st["answers_per_min"] or 0) >= cfg.g2_min_apm
@@ -421,31 +444,41 @@ class Run:
             outs.append(out)
             if (out / "stats.json").exists():
                 continue
-            if (time.monotonic() - t0) / 60 > minutes:
+            left = minutes - (time.monotonic() - t0) / 60
+            if left < 1:
                 self.ex.warn(f"teacher answers: the {minutes:.0f}-minute cap left {len(shards) - i} of "
                              f"{len(shards)} shards unanswered; training on what is in")
                 break
-            self.bench(step, sh, out, "teacher", seeds=cfg.samples, concurrency=cfg.bench_concurrency,
-                       logprobs=True, transcripts=True)
+            st = self.bench(step, sh, out, "teacher", seeds=cfg.samples, concurrency=cfg.bench_concurrency,
+                            logprobs=True, transcripts=True, minutes=left, partial_ok=True)
+            if st.get("stopped"):
+                (out / "stats.json").unlink(missing_ok=True)  # a resume answers this shard again
+                break
         outs = [o for o in outs if (o / "transcripts.jsonl").exists()]
         if not outs:
             raise RuntimeError("no teacher transcripts to harvest")
         self.ex.run(step, self.data_cmd("teacher", "data-teacher", self.runs_args(outs), runs=[str(o) for o in outs]))
+        extra = False
         if cfg.extra_rows and (self.data / "export" / "extra_rows.jsonl").exists():
-            self.ex.run(step, self.data_cmd("extra", "data-extra"))
-        else:
+            try:  # optional: bhdata's free rows are a bonus on top of the teacher's
+                self.ex.run(step, self.data_cmd("extra", "data-extra"))
+                extra = True
+            except Exception as e:  # noqa: BLE001
+                self.ex.warn(f"data.py extra failed ({str(e)[:300]}); training on the teacher's rows alone")
+        if not extra:
             write_jsonl(self.data / "rows" / "extra.jsonl", [])
         st = self.build_rows(step, 1)
         hv = load(self.data / "stats" / "teacher.json") or {}
         w = R.drop_warning(hv, cfg.drop_warn)
         if w:
             self.ex.warn(f"teacher harvest: {w}")
-        dump(self.rows / "rows.json", {**st, "harvest": hv, "extra": load(self.data / "stats" / "extra.json")})
-        self.topk(outs)
+        rows_st = {**st, "harvest": hv, "extra": load(self.data / "stats" / "extra.json")}
+        rows_st.update(self.topk(outs))
         self.probe(step)
         self.upload_once(self.rows / "train.jsonl", "train-rows.jsonl")
         for n in ("teacher", "extra"):
             self.upload_once(self.data / "rows" / f"{n}.jsonl", f"data-rows-{n}.jsonl")
+        dump(self.rows / "rows.json", rows_st)  # last: it marks the stage done
 
     @staticmethod
     def runs_args(runs: list[Path]) -> str:
@@ -481,14 +514,14 @@ class Run:
             raise RuntimeError(f"no round {round_} rows survived; see {self.data / 'stats'}")
         return st
 
-    def topk(self, outs: list[Path]) -> None:
+    def topk(self, outs: list[Path]) -> dict:
         """The teacher's top-k log-probs of the kept rows only, from the proxy logs, as one
         gzipped file (the SFT's logit KL; the rest of the log stays on this disk). A row
         matches its call by (user, answer): harvest renders answers in the canonical form,
         so a teacher answer laid out otherwise, and every write-from-fix row (its answer was
         written for the fix prompt), trains on CE alone."""
         if not self.cfg.kd:
-            return
+            return {}
         from bh.wire import call_key
         teacher = [r for r in read_jsonl(self.rows / "train.jsonl") if R.meta(r).get("source") == "teacher"]
         keys = {call_key(r["messages"][1]["content"], r["messages"][2]["content"]) for r in teacher}
@@ -505,11 +538,9 @@ class Run:
                         f.write(line)
                         n += 1
         out.with_name(out.name + ".tmp").replace(out)
-        st = load(self.rows / "rows.json") or {}
-        st["topk_rows"], st["teacher_rows"] = n, len(teacher)
-        dump(self.rows / "rows.json", st)
         if n < 0.5 * len(teacher):
             self.ex.warn(f"top-k log-probs for only {n} of {len(teacher)} teacher rows: the logit KL covers few rows")
+        return {"topk_rows": n, "teacher_rows": len(teacher)}
 
     def probe(self, step) -> None:
         """One real row and the teacher server's own prompt ids for it (vLLM /tokenize with
@@ -531,7 +562,7 @@ class Run:
                                                        "chat_template_kwargs": {"enable_thinking": self.cfg.thinking}},
                               timeout=120)
                 rec["prompt_ids"] = r.get("tokens")
-            except OSError as e:
+            except Exception as e:  # noqa: BLE001  (optional: the SFT's round trip runs without the served ids)
                 self.ex.warn(f"probe: the teacher server's /tokenize failed ({e}); the SFT's round-trip runs without it")
         dump(self.rows / "probe.json", rec)
 
@@ -557,8 +588,9 @@ class Run:
             self.need(n, self.rows / n)
         topk = self.rows / "topk.jsonl"
         if cfg.kd and (self.rows / "topk.jsonl.gz").exists() and not topk.exists():
-            with gzip.open(self.rows / "topk.jsonl.gz", "rb") as src, open(topk, "wb") as dst:
+            with gzip.open(self.rows / "topk.jsonl.gz", "rb") as src, open(topk.with_suffix(".part"), "wb") as dst:
                 shutil.copyfileobj(src, dst)
+            topk.with_suffix(".part").replace(topk)
         minutes = self.cap(cfg.sft_minutes if name == "sft" else cfg.rft_minutes, after=cfg.smoke_minutes + 10)
         full = cfg.sft_mode == "full"
         args = [f"--base {q(self.base_dir())}", *(f"--rows {q(r)}" for r in rows), f"--out {q(self.model_dir(name))}",
@@ -573,7 +605,7 @@ class Run:
             args.append("--thinking")
         self.ex.run(step, Cmd("python scripts/bh/sft.py " + " ".join(args), "sft",
                               {"out": str(self.model_dir(name)), "rows": [str(r) for r in rows], "base": str(self.base_dir()),
-                               "mode": cfg.sft_mode, "kd": cfg.kd and topk.exists()}, gpu=True))
+                               "mode": cfg.sft_mode, "kd": cfg.kd and topk.exists()}, gpu=True, watch_from_event=True))
         rep = load(self.model_dir(name) / "sft.json") or {}
         if rep.get("arch") not in cfg.base_model.archs:
             raise RuntimeError(f"the SFT model is {rep.get('arch')}, not one of {cfg.base_model.archs}")
@@ -610,16 +642,16 @@ class Run:
                 served = "llama-server"
                 return self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=16), health_s=900)
 
-        if self.serve(step, "student", start).get("remote"):
-            served = C.backend(cfg, "student")["name"]
         try:
-            self.cap(cfg.smoke_minutes, after=5)
+            minutes = self.cap(cfg.smoke_minutes, after=5)
+            if self.serve(step, "student", start).get("remote"):
+                served = C.backend(cfg, "student")["name"]
             spike = self.p("smoke", "spike")
             spike.mkdir(parents=True, exist_ok=True)
             if not (spike / "spike").exists():
                 os.symlink(REPO / "mugge" / "spike", spike / "spike")
             st = self.bench(step, spike, out, "student", seeds=cfg.smoke_seeds, concurrency=16,
-                            tickets=cfg.smoke_tickets)
+                            tickets=cfg.smoke_tickets, minutes=minutes, partial_ok=True)
         except Skip:
             raise
         except Exception as e:  # noqa: BLE001  (optional: reported, never fatal)
@@ -658,6 +690,7 @@ class Run:
         if str(sm.get("verdict", "")).startswith("BROKEN") and not self.force:
             raise RuntimeError(f"the {name} smoke says {sm['verdict']}; --force exports anyway")
         rows = self.train_rows(name)
+        self.servers.stop(step)  # imatrix and the vocab trim need the GPU (a smoke's server may still be up)
         d = self.export_dir()
         d.mkdir(parents=True, exist_ok=True)
         hf = model
@@ -673,7 +706,8 @@ class Run:
             except Exception as e:  # noqa: BLE001  (optional)
                 self.ex.warn(f"export: vocab cut skipped ({str(e)[:300]}); the full vocab ships")
         bf16 = d / "bf16.gguf"
-        self.ex.run(step, X.convert_cmd(str(self.llama), hf, bf16))
+        if not bf16.exists():  # written as bf16.part.gguf, so it is whole when it is there
+            self.ex.run(step, X.convert_cmd(str(self.llama), hf, bf16))
         try:  # llama-tokenize == HF on rows and edge texts (optional, reported)
             self.ex.run(step, X.tokcheck_cmd(str(self.llama), hf, bf16))
         except Exception as e:  # noqa: BLE001
@@ -681,7 +715,8 @@ class Run:
         calib = d / "calib.txt"
         self.ex.run(step, X.calib_cmd(hf, [rows], calib, 400))
         imat = d / "imatrix.gguf"
-        self.ex.run(step, X.imatrix_cmd(self.bins, bf16, calib, imat, cfg.imatrix_chunks))
+        if not imat.exists():
+            self.ex.run(step, X.imatrix_cmd(self.bins, bf16, calib, imat, cfg.imatrix_chunks))
         ladder = []
         for qt in cfg.base_model.quant_ladder:
             out = d / f"{qt}.gguf"
@@ -700,21 +735,22 @@ class Run:
 
     def run_footprint(self, step: Step) -> None:
         """Each quant, best first, measured as Oliver defined the footprint; the first at or
-        under the limit ships as BH<version>-<GB>.gguf."""
+        under the limit ships as BH<version>-<GB>.gguf (round 2: BH<version>.1-<GB>.gguf)."""
         cfg = self.cfg
         ex = load(self.export_dir() / "export.json")
         if not ex:
             raise RuntimeError("no export: run export first")
+        self.servers.stop(step)  # each quant is measured alone on the GPU
         calib = self.export_dir() / "calib.txt"
         results, ship = [], None
         for rung in ex["ladder"]:
             out = self.p("footprint", self.student, f"{rung['type']}.json")
-            if not out.exists():
+            if load(out) is None:  # missing, or cut short by a stopped run
                 self.ex.run(step, Cmd(f"python3 scripts/bh/footprint.py --gguf {q(rung['path'])} --llama-cpp {q(self.llama)} "
                                       f"--text {q(calib)} --out {q(out)} --prompt-tokens {cfg.footprint_prompt} "
-                                      f"--version {cfg.version}" + (f" --footprint-sh {q(cfg.footprint_sh)}"
+                                      f"--version {cfg.ship_version(self.student)}" + (f" --footprint-sh {q(cfg.footprint_sh)}"
                                                                     if cfg.footprint_sh else ""),
-                                      "footprint", {"gguf": rung["path"], "out": str(out), "version": cfg.version}))
+                                      "footprint", {"gguf": rung["path"], "out": str(out), "version": cfg.ship_version(self.student)}))
             r = load(out) or {}
             results.append({"type": rung["type"], **{k: r.get(k) for k in ("footprint", "file_bytes", "name", "source")}})
             if r.get("footprint") and r["footprint"] <= cfg.footprint_limit:
@@ -723,24 +759,34 @@ class Run:
         if not ship:
             raise RuntimeError(f"no quant of the ladder fits {cfg.footprint_limit / 1e9:g} GB: "
                                + ", ".join(f"{r['type']} {r['footprint']}" for r in results))
-        dst = self.p("ship", f"{ship['name']}.gguf")
+        dst = self.ship_path(ship["name"])
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ship["gguf"], dst)
+        shutil.copyfile(ship["gguf"], dst.with_suffix(".part"))
+        dst.with_suffix(".part").replace(dst)
         ship["shipped"] = str(dst)
         dump(self.footprint_json(), {"model": self.student, "ladder": results, "ship": ship,
                                      "limit": cfg.footprint_limit})
-        self.upload_once(dst, f"ship/{dst.name}")
-        self.upload_once(self.footprint_json(), f"footprint-{self.student}.json")  # after the GGUF: it says it is there
+        # the GGUF first: footprint-<student>.json tells the eval laptop it is there
+        self.upload_once(dst, self.ship_key(dst.name))
+        self.upload_once(self.footprint_json(), f"footprint-{self.student}.json")
         print(f"ships as {ship['name']}: {ship['type']}, footprint {ship['footprint'] / 1e9:.3f} GB "
               f"(file {ship['file_bytes'] / 1e9:.3f} GB)", flush=True)
+
+    def ship_path(self, name: str) -> Path:
+        """This machine's copy of the shipped GGUF. Round 1 and round 2 can ship under the
+        same name (same version, same footprint), so each model has its own folder."""
+        return self.p("ship", self.student, f"{name}.gguf")
+
+    def ship_key(self, filename: str) -> str:
+        return f"ship/{self.student}/{filename}"
 
     def shipped(self) -> Path:
         """The shipped GGUF, here or from the bucket (waiting for it on the eval laptop)."""
         if not self.wait_for(f"footprint-{self.student}.json", self.footprint_json()):
-            raise RuntimeError("nothing shipped yet: run footprint first")
+            raise RuntimeError(f"nothing shipped yet: run footprint first (waited {self.cfg.wait_minutes:g} min)")
         ship = (load(self.footprint_json()) or {})["ship"]
-        p = self.p("ship", Path(ship["shipped"]).name)  # this machine's copy
-        if not p.exists() and not self.need(f"ship/{p.name}", p):
+        p = self.ship_path(ship["name"])
+        if not p.exists() and not self.need(self.ship_key(p.name), p):
             raise RuntimeError(f"the shipped {p.name} is neither here nor in the bucket")
         return p
 
@@ -749,7 +795,11 @@ class Run:
         return self.p("score", self.student, "score.json")
 
     def score_done(self) -> bool:
-        return self.score_json().exists()
+        """Scored, and for the GGUF that ships now (a new export and footprint re-score)."""
+        sc, fp = load(self.score_json()), load(self.footprint_json())
+        if not sc:
+            return False
+        return not fp or Path(sc.get("gguf", "")).name == f"{fp['ship']['name']}.gguf"
 
     def run_score(self, step: Step) -> None:
         """MuggeBench on the shipped GGUF: BlackHole's muggebench.sh when it is here (the
@@ -761,7 +811,7 @@ class Run:
         out.mkdir(parents=True, exist_ok=True)
         if cfg.muggebench_sh:
             self.servers.stop(step)
-            self.ex.run(step, Cmd(f"bash {q(cfg.muggebench_sh)} {q(gguf)} | tee {q(out / 'muggebench.txt')}",
+            self.ex.run(step, Cmd(f"( set -o pipefail; bash {q(cfg.muggebench_sh)} {q(gguf)} | tee {q(out / 'muggebench.txt')} )",
                                   "muggebench-sh", {"gguf": str(gguf), "out": str(out)}, gpu=True))
             dump(self.score_json(), {"gguf": str(gguf), "via": "muggebench.sh",
                                      "report": (out / "muggebench.txt").read_text()[-3000:]})
@@ -836,9 +886,10 @@ class Run:
                 raise RuntimeError("no sft model to sample")
             self.serve(step, "student", lambda: self.servers.ensure(step, vllm_spec(cfg, str(model), "student")))
             conc = cfg.bench_concurrency
-        self.cap(cfg.round2_minutes, after=cfg.rft_minutes + 20)
+        minutes = self.cap(cfg.round2_minutes, after=cfg.rft_minutes + 20)
         self.bench(step, self.bench_dir("heldout"), out, "student", seeds=cfg.round2_seeds, concurrency=conc,
-                   transcripts=True, tickets=cfg.round2_tickets)
+                   transcripts=True, tickets=cfg.round2_tickets, minutes=minutes if cfg.session_minutes else 0,
+                   partial_ok=True)
         self.tar_up(out, "round2-samples.tar", None)
 
     def repair_done(self) -> bool:
@@ -869,14 +920,19 @@ class Run:
         answers = self.data / "round2" / "repair-answers.jsonl"
         if read_jsonl(reqs):
             self.serve_teacher(step, self.chosen_teacher())
-            self.cap(cfg.round2_minutes, after=cfg.rft_minutes + 15)
+            minutes = self.cap(cfg.round2_minutes, after=cfg.rft_minutes + 15)
             with self.recorder(self.r2("repairs", "proxy")) as (url, rec):
-                self.ex.run(step, self.data_cmd(
+                cmd = self.data_cmd(
                     "answer", "data-answer",
-                    f"--requests {q(reqs)} --out {q(answers)} --url {q(url)} --model teacher "
+                    f"--requests {q(reqs)} --out {q(answers)} --url {q(url)} --model {q(self.model or 'teacher')} "
                     f"--samples {cfg.repair_samples} --max-tokens {cfg.max_call_tokens} --top-k {cfg.top_k} "
                     f"--thinking {'on' if cfg.thinking else 'off'}",
-                    requests=str(reqs), out=str(answers), url=url, samples=cfg.repair_samples))
+                    requests=str(reqs), out=str(answers), url=url, samples=cfg.repair_samples)
+                cmd.timeout_min = minutes if cfg.session_minutes else 0
+                try:
+                    self.ex.run(step, cmd)
+                except StepTimeout as e:
+                    self.ex.warn(f"round 2: teacher repairs {e}; the answers in by then count")
             pc = dict(rec.counts)
             if pc["calls"] and pc["cut"] / pc["calls"] > cfg.drop_warn:
                 self.ex.warn(f"round 2: {pc['cut']} of {pc['calls']} teacher repairs cut at the "
@@ -901,36 +957,86 @@ class Run:
         """Round 2's SFT from the base on teacher + extra + own-repair + rft rows, then its smoke."""
         self.train_rows("round2")
         if not self.sft_done("round2"):
-            self.run_sft(step, "round2")
+            try:
+                self.run_sft(step, "round2")
+            except Done:  # restored from the bucket: its smoke still runs
+                pass
         self.run_smoke(step, "round2")
 
     # ---------- upload ----------
     def tar_up(self, d: Path, name: str, members) -> None:
-        """d (or its members) as name.tar in the bucket, once per content size."""
-        if not self.bucket.ok():
-            return
+        """d (or its members) as name.tar in the bucket; kept here until it is sent."""
         tar = d.with_name(d.name + ".up.tar")
         ms = [m for m in (members or [p.name for p in d.iterdir()]) if (d / m).exists()]
         subprocess.run(["tar", "cf", str(tar), "-C", str(d), *ms], check=True)
-        self.upload_once(tar, name)
-        tar.unlink(missing_ok=True)
+        if self.upload_once(tar, name):
+            tar.unlink(missing_ok=True)
 
-    def upload_once(self, src: Path, name: str) -> None:
-        mark = self.p(".uploaded", name.replace("/", "_"))
-        size = str(src.stat().st_size) if src.exists() else ""
-        if not size or (mark.exists() and mark.read_text() == size):
-            return
-        if self.bucket.put(src, name):
-            mark.parent.mkdir(parents=True, exist_ok=True)
-            mark.write_text(size)
-        else:
-            self.ex.warn(f"upload of {src} to {self.bucket.key(name)} failed")
+    # A hand-over file (the data, a model, rows, the ship) that fails to upload stays on the
+    # pending list, and every later upload sends the list first, in order, so a file that
+    # says another is there (footprint-*.json after its GGUF) never arrives before it.
+    def pending(self) -> list[list[str]]:
+        return (load(self.p(".uploaded", "pending.json")) or {}).get("files", [])
+
+    def set_pending(self, files: list[list[str]]) -> None:
+        dump(self.p(".uploaded", "pending.json"), {"files": files})
+
+    @staticmethod
+    def signature(src: Path) -> str:
+        st = src.stat()
+        return f"{st.st_size}:{st.st_mtime_ns}"
+
+    def mark(self, src: Path, name: str) -> None:
+        m = self.p(".uploaded", name.replace("/", "_"))
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text(self.signature(src))
+
+    def upload_once(self, src: Path, name: str) -> bool:
+        """src as name in the bucket unless this very file was sent already; False (and the
+        file on the pending list) when it could not be sent now."""
+        if not src.exists():
+            return True
+        m = self.p(".uploaded", name.replace("/", "_"))
+        if m.exists() and m.read_text() == self.signature(src):
+            return True
+        pend = [x for x in self.pending() if x[1] != name]
+        if not pend and self.bucket.ok() and self.bucket.put(src, name):
+            self.mark(src, name)
+            if len(pend) != len(self.pending()):
+                self.set_pending(pend)
+            return True
+        self.set_pending(pend + [[str(src), name]])
+        self.ex.warn(f"upload of {src} to {self.bucket.key(name)} " + ("waits for an earlier one" if pend else "failed")
+                     + "; it is retried after every step")
+        return False
+
+    def send_pending(self) -> bool:
+        """The pending hand-over files, in order, stopping at the first that still fails."""
+        files = self.pending()
+        while files:
+            src, name = Path(files[0][0]), files[0][1]
+            if src.exists() and not (self.bucket.ok() and self.bucket.put(src, name)):
+                self.set_pending(files)
+                return False
+            if src.exists():
+                self.mark(src, name)
+                if src.name.endswith(".up.tar"):
+                    src.unlink(missing_ok=True)
+            files = files[1:]
+        self.set_pending([])
+        return True
 
     def upload(self, step: Step | None, final: bool) -> None:
         """After every step: every small result and the logs as results-<profile>.tar, and
         the files later stages or machines need, once each."""
+        self.uploaded = False
+        dump(self.p("state.json"), {"time": time.strftime("%F %T"), "step": step.name if step else None,
+                                    "state": step.state if step else "finished", "final": final,
+                                    "log": str(step.log) if step and step.log else None, "warnings": self.ex.notes})
         if not self.bucket.ok():
             raise RuntimeError("no bucket login: nothing uploaded (evroc login --oidc-port 8765)")
+        if not self.send_pending():
+            raise RuntimeError("a hand-over file is still not in the bucket: " + " ".join(n for _, n in self.pending()))
         self.W.mkdir(parents=True, exist_ok=True)
         tar = self.W.with_name(f"{self.W.name}-results.tar")
         big = ("*.safetensors", "*.gguf", "*.pt", "*.bin", "*.part", "*.tmp", "*.tar", "topk.jsonl")
@@ -948,8 +1054,11 @@ class Run:
                           (self.p("smoke", "round2", "smoke.json"), "smoke-round2.json")):
             if src.exists():
                 self.upload_once(src, name)
+        if self.pending():
+            raise RuntimeError("a hand-over file is still not in the bucket: " + " ".join(n for _, n in self.pending()))
         dump(self.p(".uploaded", "last.json"), {"time": time.strftime("%F %T"), "step": step.name if step else None,
                                                 "final": final})
+        self.uploaded = True
 
     # ---------- summary ----------
     def summary(self) -> str:
@@ -990,8 +1099,19 @@ class Run:
             out.append(f"round 2 rows: {r2['rows']} {r2['sources']}; {(r2.get('requests') or {}).get('requests', 0)} "
                        f"repair requests, {(r2.get('own_repair') or {}).get('rows', 0)} own-repair rows, "
                        f"{sum(((r2.get('rft') or {}).get('rows') or {}).values())} rft rows")
-        if self.ex.notes:
-            out += ["", "Warnings:"] + [f"  {n}" for n in self.ex.notes]
+        notes = self.ex.notes
+        last = None if self.live else load(self.p("state.json"))
+        if last:
+            how = {"failed": "stopped at", "stopped": "interrupted during", "finished": "finished"}.get(last["state"],
+                                                                                                   "last step")
+            out.append(f"last run ({last['time']}): {how}" + (f" {last['step']}" if last["state"] != "finished" else "")
+                       + (f"; log: {last['log']}" if last["state"] in ("failed", "stopped") and last.get("log") else ""))
+            notes = last.get("warnings") or []
+        pend = self.pending()
+        if pend:
+            out.append("not in the bucket yet (sent by the next run): " + " ".join(n for _, n in pend))
+        if notes:
+            out += ["", "Warnings:"] + [f"  {n}" for n in notes]
         return "\n".join(out)
 
     # ---------- the plan ----------
@@ -1074,7 +1194,8 @@ stages: """ + " ".join(STAGES)
 
 def parse(argv: list[str]) -> dict:
     if not argv or argv[0] in ("-h", "--help", "help"):
-        raise SystemExit(USAGE)
+        print(USAGE)
+        raise SystemExit(0 if argv else 2)
     a = {"profile": argv[0], "stages": [], "sets": [], "dry": None, "force": False, "shutdown": False,
          "cmd": "run", "argv": [x for x in argv if x != "start"]}
     if a["profile"] not in PLAN:
@@ -1163,6 +1284,14 @@ def main(argv: list[str] | None = None) -> int:
                 started=time.time(), stage=None, exit=None, stopping=False, warnings=[],
                 stages={k: "done" if s.done() else "waiting" for k, s in zip(run.stage_keys, plan)})
     ex.on_warn = lambda m: live.record(cfg, warnings=ex.notes[-20:])
+
+    def stop(signum, frame):  # ssh dropped or killed: the run ends the way Ctrl-C ends it (upload, server stop)
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    run.live = True
     os.environ["PATH"] = f"{Path.home() / '.bun' / 'bin'}:{os.environ['PATH']}"
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")  # centipede.py's: no FlashInfer JIT on the VMs
     logs.mkdir(parents=True, exist_ok=True)
@@ -1179,8 +1308,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"stopping the server: {e}")
         if mock:
             mock.close()
+        for sig, h in handlers.items():
+            signal.signal(sig, h)
     if a["shutdown"]:
-        if code == 0 and (run.W / ".uploaded" / "last.json").exists():
+        if code == 0 and run.uploaded:
             print("Results uploaded; powering off in 1 minute (sudo shutdown -c cancels).")
             subprocess.run(["sudo", "shutdown", "-h", "+1"], check=False)
         else:

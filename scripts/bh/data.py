@@ -328,6 +328,8 @@ def answer_requests(requests: Path, out: Path, *, url: str, model: str, samples:
             ch = data["choices"][0]
             answers.append({"content": ch["message"].get("content") or "", "cut": ch.get("finish_reason") == "length",
                             "completionTokens": (data.get("usage") or {}).get("completion_tokens"), "maxTokens": max_tokens})
+        if not answers:  # every call failed (the server was down, say): a resume asks again
+            return
         with lock, out.open("a") as f:
             f.write(json.dumps({"id": q["id"], "answers": answers}, ensure_ascii=False) + "\n")
 
@@ -391,7 +393,11 @@ def build(cfg: DataConfig, round_: int = 1, *, parts: tuple[str, ...] | None = N
     counts["rows"] = len(uniq)
     counts.update({f"kind_{k}": v for k, v in Counter((r.get("meta") or {}).get("kind") for r in uniq).items()})
     if tokenizer and uniq:
-        counts["tokenizer_check"] = tokenizer_roundtrip(uniq[0], tokenizer)
+        try:  # reported, never fatal here: sft.py's own round trip (against the served ids) is the gate
+            counts["tokenizer_check"] = tokenizer_roundtrip(uniq[0], tokenizer)
+        except Exception as e:  # noqa: BLE001
+            counts["tokenizer_check"] = f"FAILED: {e}"[:600]
+            print(f"[build] WARNING: {counts['tokenizer_check']}", flush=True)
     _dump(cfg.stats(out.stem), dict(counts))
     print(f"[build] {len(uniq)} rows -> {out}; {dict(counts)}", flush=True)
     return out

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -17,7 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from runner import REPO, Step, on_line
+from runner import REPO, Step, on_line  # puts the repo on sys.path
+
+from common.progress import parse  # noqa: E402
 
 
 @dataclass
@@ -29,10 +32,21 @@ class Cmd:
     args: dict = field(default_factory=dict)
     gpu: bool = False  # a long GPU step: the watchdog checks the GPU works in its first minutes
     env: dict = field(default_factory=dict)
+    # gpu steps that read on the CPU first (sft.py tokenizes every row): the watch window
+    # starts at the command's first progress event instead of its launch
+    watch_from_event: bool = False
+    timeout_min: float = 0.0  # stopped (StepTimeout) after this many minutes; 0: no limit
+
+
+class StepTimeout(RuntimeError):
+    """A command stopped at its time limit (the session clock's share for it)."""
 
 
 class GpuIdle(RuntimeError):
     """A long GPU step whose GPU stayed idle for the watch window."""
+
+
+WATCH_EVERY = 15.0  # seconds between the GPU watchdog's readings
 
 
 def gpu_reading() -> tuple[int, int] | None:
@@ -76,7 +90,7 @@ class Exec:
         self._sh(step, cmd)
 
     def _sh(self, step: Step | None, cmd: Cmd) -> None:
-        full = f"cd {REPO} && {{ [ -f .env.vm ] && source .env.vm; true; }} && {cmd.sh}"
+        full = f"cd {shlex.quote(str(REPO))} && {{ [ -f .env.vm ] && source .env.vm; true; }} && {cmd.sh}"
         log = open(step.log, "a") if step and step.log else open(os.devnull, "w")
         with log:
             log.write(f"\n===== {time.strftime('%F %T')} $ {cmd.sh}\n")
@@ -85,8 +99,16 @@ class Exec:
                                     bufsize=1, errors="replace", env={**os.environ, **cmd.env}, start_new_session=True)
             idle = threading.Event()
             stop = threading.Event()
+            armed = threading.Event()
+            if not cmd.watch_from_event:
+                armed.set()
             if cmd.gpu:
-                threading.Thread(target=self._watch, args=(proc, idle, stop, cmd.kind), daemon=True).start()
+                threading.Thread(target=self._watch, args=(proc, idle, stop, armed, cmd.kind), daemon=True).start()
+            timer, fired = None, threading.Event()
+            if cmd.timeout_min > 0:
+                timer = threading.Timer(cmd.timeout_min * 60, lambda: (fired.set(), _killpg(proc)))
+                timer.daemon = True
+                timer.start()
             tail: list[str] = []
             try:
                 for line in proc.stdout:
@@ -94,6 +116,8 @@ class Exec:
                     log.flush()
                     if step:
                         on_line(step, line)
+                    if not armed.is_set() and parse(line) is not None:
+                        armed.set()
                     if line.strip():
                         tail = (tail + [line.rstrip()])[-15:]
                 code = proc.wait()
@@ -102,19 +126,28 @@ class Exec:
                 raise
             finally:
                 stop.set()
+                if timer:
+                    timer.cancel()
+        if fired.is_set() and code != 0 and not idle.is_set():
+            raise StepTimeout(f"{cmd.kind}: stopped at its {cmd.timeout_min:.1f}-minute limit")
         if idle.is_set():
             raise GpuIdle(f"{cmd.kind}: the GPU stayed idle for the first {self.cfg.gpu_watch_minutes:g} minutes "
                           f"(utilization under 5% the whole time), so it was stopped; is it running on the CPU?")
         if code != 0:
             raise RuntimeError(f"`{cmd.sh}` failed:\n" + "\n".join("    " + t for t in tail[-8:]))
 
-    def _watch(self, proc: subprocess.Popen, idle: threading.Event, stop: threading.Event, what: str) -> None:
-        """The GPU-busy check: readings every 15 s over the step's first minutes; if every
-        one shows the GPU under 5% busy, warn, and stop the step when gpu_idle_abort."""
+    def _watch(self, proc: subprocess.Popen, idle: threading.Event, stop: threading.Event, armed: threading.Event,
+               what: str) -> None:
+        """The GPU-busy check: readings every 15 s over the step's first minutes (from its
+        first progress event when it reads on the CPU first); if every one shows the GPU
+        under 5% busy, warn, and stop the step when gpu_idle_abort."""
+        while not armed.wait(min(5.0, WATCH_EVERY)):
+            if stop.is_set():
+                return
         window, seen = self.cfg.gpu_watch_minutes * 60, []
         t0 = time.monotonic()
         while time.monotonic() - t0 < window:
-            if stop.wait(15):
+            if stop.wait(WATCH_EVERY):
                 return
             r = self.reading()
             if r is None:

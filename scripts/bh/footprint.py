@@ -95,7 +95,7 @@ def measure(gguf: str, llama_cpp: str, text: str, prompt_tokens: int, ub: int | 
                 peak[0] = max(peak[0], _gpu_mib() or 0)
 
         threading.Thread(target=watch, daemon=True).start()
-        r = _get(f"{url}/completion", {"prompt": ids, "n_predict": 16, "temperature": 0, "top_k": 20,
+        r = _get(f"{url}/completion", {"prompt": ids, "n_predict": 16, "temperature": 0, "top_k": 20, "min_p": 0.0,
                                        "cache_prompt": False})
         stop.set()
         n_prompt = (r.get("timings") or {}).get("prompt_n") or len(ids)
@@ -140,7 +140,8 @@ def main(argv=None) -> int:
         if r.returncode == 0 and m:
             rep.update(footprint=int(m.group(1)), source=a.footprint_sh)
     rep["name"] = name(a.version, rep["footprint"])
-    out.write_text(json.dumps(rep, indent=2) + "\n")
+    out.with_suffix(".part").write_text(json.dumps(rep, indent=2) + "\n")
+    out.with_suffix(".part").replace(out)
     print(json.dumps({k: rep[k] for k in ("footprint", "file_bytes", "name", "source")}))
     return 0
 

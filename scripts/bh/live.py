@@ -116,7 +116,7 @@ def stop(cfg, wait_s: float = 600) -> int:
     while alive(pid) and time.monotonic() < deadline:
         time.sleep(1)
     if alive(pid):
-        print(f"still stopping after {wait_s:.0f}s (an upload, probably); `stop` again forces it")
+        print(f"still stopping after {wait_s:.0f}s (an upload, probably); `stop` again interrupts that too")
         return 1
     argv = st.get("argv") or [cfg.profile]
     print(f"stopped; `python3 scripts/bh_run.py {' '.join([argv[0], 'start', *argv[1:]])}` resumes it")
