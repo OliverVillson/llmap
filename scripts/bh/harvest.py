@@ -122,6 +122,9 @@ def load_runs(runs: list[str | Path]) -> list[tuple[dict, list[dict]]]:
         for t in trans:
             r = results.get((t["key"], t["seed"]))
             if r is not None:
+                # the lead review undid a fix and put back an earlier answer (bench: answerAttempt)
+                if t.get("answerAttempt"):
+                    r = {**r, "answer_attempt": t["answerAttempt"]}
                 out.append((r, t.get("calls") or []))
     return out
 
@@ -261,7 +264,12 @@ def harvest(bench: str | Path, runs: list[str | Path], *, source: str = "teacher
         if not r.get("solved") or not calls:
             continue
         stats.solved += 1
-        i = len(calls) - 1
+        # the last call passed, unless the review put an earlier answer back
+        at = r.get("answer_attempt")
+        i = next((j for j, cl in enumerate(calls) if cl.get("attempt") == at), None) if at else len(calls) - 1
+        if i is None:
+            stats.dropped["answer_not_in_transcript"] += 1
+            continue
         c, x = calls[i], canon_of[(key, r["seed"], i)]
         prompt = c.get("prompt") or ""
         kind = render.kind_of(prompt)

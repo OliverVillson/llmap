@@ -491,3 +491,21 @@ def test_teacher_command_reads_the_proxy_calls_log(run, tmp_path):
     assert json.loads(cfg.stats("teacher").read_text())["dropped"]["cut"] == 10
     assert data.main(["rft", "--work", str(tmp_path), "--runs", str(run), "--calls-log", str(log)]) == 0
     assert json.loads(cfg.stats("rft").read_text())["dropped"]["cut"] == 10
+
+
+def test_harvest_takes_the_answer_the_review_put_back(run, tmp_path):
+    # with MUGGE_REVIEW=on a review's fix can fail and the passing answer is put back: the
+    # transcript's last call is then the failing fix; bench marks the kept one (answerAttempt)
+    base_rows, _ = harvest.harvest(SPIKE, [run])
+
+    def undo(t):
+        if t["key"] != "spike/c-hash":
+            return
+        for i, c in enumerate(t["calls"], 1):
+            c["attempt"] = i
+        t["answerAttempt"] = len(t["calls"])
+        t["calls"].append({**t["calls"][-1], "answer": "no files here", "attempt": len(t["calls"]) + 1})
+    d = _edit(run, tmp_path / "restored", undo)
+    rows, st = harvest.harvest(SPIKE, [d])
+    assert sorted(r["id"] for r in rows) == sorted(r["id"] for r in base_rows)
+    assert not st.dropped
