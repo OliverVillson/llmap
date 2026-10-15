@@ -12,8 +12,10 @@
  *   checking   its acceptance commands are running
  *   fixing     attempt n of N: a fix call with the failing output
  *   reviewing  the lead reviews the passing diff (MUGGE_REVIEW=on only)
- *   blocked    needs the owner: two tickets claim the same file, or a dependency failed
- *   finished   its checks pass
+ *   blocked    needs the owner: two tickets claim the same file and the plan blocks it (clashes:
+ *              block; by default the planner settles a clash and the later ticket waits), or a
+ *              dependency failed
+ *   finished   its checks pass, and with MUGGE_REVIEW=on the lead approved or its fix passed
  *   failed     every attempt or the token budget used, or the run was stopped
  *
  * Every attempt is one fresh one-shot call; nothing but the attempt counter (and, for a fix,

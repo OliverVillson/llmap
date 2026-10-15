@@ -129,9 +129,30 @@ describe('ticket states', () => {
     }
   });
 
-  test('a file-ownership clash blocks the later ticket for the owner and is recorded', async () => {
+  test('a clash the planner settled runs the later ticket after the owner, on its version of the file', async () => {
+    const { repo, base } = await repoWith('settled');
+    const plan = validatePlan({ tickets: [t('a', { owns: ['shared.txt'], acceptance: ['grep -q ok-a shared.txt'] }), t('b', { owns: ['shared.txt'], acceptance: ['grep -q ok-b shared.txt'] })] });
+    const fake = startFakeModel({ solutions: { a: { files: { 'shared.txt': 'ok-a\n' }, note: '' }, b: { files: { 'shared.txt': 'ok-a\nok-b\n' }, note: '' } } });
+    const events: EngineEvent[] = [];
+    try {
+      const report = await runPlan({ repo, base, plan, concurrency: 4, worktreeRoot: join(dir, 'wt-settled'), sandbox: new LocalSandbox(), inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), emit: (e) => events.push(e) });
+      expect(report.summary).toMatchObject({ done: 2, blocked: 0, integrated: true });
+      // b's write call saw a's file as it is now
+      expect(fake.calls().find((c) => c.ticket === 'b')!.prompt).toContain('--- shared.txt\nok-a');
+    } finally {
+      fake.stop();
+    }
+    expectLegal(events);
+    const view = events.reduce(applyEvent, emptyView());
+    expect(view.settled).toEqual([{ ticket: 'b', files: ['shared.txt'], with: ['a'] }]);
+    expect(view.clashes ?? []).toEqual([]);
+    const waits = events.filter((e) => e.type === 'state' && e.ticket === 'b' && e.state === 'waiting');
+    expect(waits[0]).toMatchObject({ reason: 'runs after a: they share shared.txt (settled by the planner)', waitingOn: ['a'] });
+  });
+
+  test('with clashes: block, a file-ownership clash blocks the later ticket for the owner and is recorded', async () => {
     const { repo, base } = await repoWith('clash');
-    const plan = validatePlan({ tickets: [t('a', { owns: ['shared.txt'], acceptance: ['grep -q ok-a shared.txt'] }), t('b', { owns: ['shared.txt'] }), t('c', { depends_on: ['b'] }), t('d')] });
+    const plan = validatePlan({ tickets: [t('a', { owns: ['shared.txt'], acceptance: ['grep -q ok-a shared.txt'] }), t('b', { owns: ['shared.txt'] }), t('c', { depends_on: ['b'] }), t('d')] }, { clashes: 'block' });
     const fake = startFakeModel({ solutions: { a: { files: { 'shared.txt': 'ok-a\n' }, note: '' }, d: ok('d') } });
     const events: EngineEvent[] = [];
     try {
@@ -259,49 +280,62 @@ describe('runTicket', () => {
     expectLegal(events);
   });
 
-  test('a review fix that never passes again keeps the version that passed', async () => {
+  test('the review is part of done: a ticket whose review fix never passes fails', async () => {
     const fake = startFakeModel({
       solutions: { a: ok('a') },
       reviews: { a: [{ verdict: 'problems', problems: ['wrong'], fix: 'rewrite it' }] },
       fixes: { a: [{ files: { 'a.txt': 'broken\n' }, note: '' }] },
     });
-    const wt = folder('unresolved');
     const events: EngineEvent[] = [];
     try {
-      const r = await runTicket(ticket, wt, { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
-      expect(r).toMatchObject({ ok: true, attempts: 4, firstTry: true, reviewUnresolved: true, error: null, answerAttempt: 1 });
-      expect(readFileSync(join(wt, 'a.txt'), 'utf8')).toBe('ok-a\n');
+      const r = await runTicket(ticket, folder('unresolved'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+      expect(r).toMatchObject({ ok: false, attempts: 4, reviewUnresolved: true, answerAttempt: null });
+      expect(fake.calls().map((c) => c.kind)).toEqual(['write', 'review', 'fix', 'fix', 'fix']); // one review per ticket
     } finally {
       fake.stop();
     }
-    const last = events.filter((e) => e.type === 'state').at(-1);
-    expect(last).toMatchObject({ state: 'finished', reason: 'lead review problems left unfixed' });
+    expect(events.filter((e) => e.type === 'state').at(-1)).toMatchObject({ state: 'failed', reason: 'lead review problems left unfixed' });
     expectLegal(events);
   });
 
-  test('a review fix whose calls are refused or fail still ends through checking, on the restored files', async () => {
+  test('a review fix whose calls are refused or fail ends failed, through legal states', async () => {
     const fake = startFakeModel({
       solutions: { a: ok('a') },
       reviews: { a: [{ verdict: 'problems', problems: ['wrong'], fix: 'rewrite it' }] },
-      // every fix writes a file the ticket does not own: refused, so the last state is a call state
+      // every fix also writes a file the ticket does not own: refused, so the last state is a call state
       fixes: { a: [{ files: { 'a.txt': 'ok-a\n', 'b.txt': 'x\n' }, note: '' }] },
     });
-    const wt = folder('refused-fix');
     const events: EngineEvent[] = [];
     try {
-      const r = await runTicket(ticket, wt, { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
-      expect(r).toMatchObject({ ok: true, attempts: 4, reviewUnresolved: true, answerAttempt: 1 });
-      expect(readFileSync(join(wt, 'a.txt'), 'utf8')).toBe('ok-a\n');
+      const r = await runTicket(ticket, folder('refused-fix'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+      expect(r).toMatchObject({ ok: false, attempts: 4, reviewUnresolved: true });
     } finally {
       fake.stop();
     }
-    expect(statesOf(events).get('a')!.slice(-3)).toEqual(['fixing', 'checking', 'finished']);
-    // the restored files were checked again
-    expect(events.filter((e) => e.type === 'check').length).toBe(2);
+    expect(statesOf(events).get('a')!.slice(-2)).toEqual(['fixing', 'failed']);
     expectLegal(events);
   });
 
-  test('a review answer cut at the cap counts its tokens and shows cut', async () => {
+  test('review problems with no attempt left escalate like a failing check', async () => {
+    const one = validatePlan({ tickets: [t('a', { budget: { attempts: 1 }, escalate_to: 'big' })] });
+    const fake = startFakeModel({
+      solutions: { a: ok('a') },
+      reviews: { a: [{ verdict: 'problems', problems: ['p'], fix: 'f' }] },
+      fixes: { a: [ok('a', 'fixed\n')] },
+    });
+    const events: EngineEvent[] = [];
+    try {
+      const r = await runTicket(one.tickets[0]!, folder('escalate'), { plan: one, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+      expect(r).toMatchObject({ ok: true, attempts: 2, model: 'big', reviewUnresolved: false, answerAttempt: 2 });
+      expect(fake.calls().map((c) => c.kind)).toEqual(['write', 'review', 'fix']);
+    } finally {
+      fake.stop();
+    }
+    expect(statesOf(events).get('a')).toEqual(['writing', 'checking', 'reviewing', 'fixing', 'checking', 'finished']);
+    expectLegal(events);
+  });
+
+  test('a review answer cut at the cap counts its tokens and shows cut; a review that fails twice fails the ticket', async () => {
     const server = Bun.serve({
       port: 0,
       fetch: async (req) => {
@@ -314,20 +348,23 @@ describe('runTicket', () => {
     const events: EngineEvent[] = [];
     try {
       const r = await runTicket(ticket, folder('review-cut'), { plan, inference: new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm', maxCallTokens: 300 }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
-      expect(r).toMatchObject({ ok: true, completionTokens: 305 });
+      expect(r).toMatchObject({ ok: false, completionTokens: 605 });
+      expect(r.error).toStartWith('lead review failed: ');
       expect(r.review).toMatchObject({ verdict: 'error', cut: true, completionTokens: 300 });
     } finally {
       server.stop(true);
     }
-    expect(events.find((e) => e.type === 'review')).toMatchObject({ verdict: 'error', cut: true, completionTokens: 300 });
+    expect(events.filter((e) => e.type === 'review')).toMatchObject([{ verdict: 'error', cut: true, completionTokens: 300 }, { verdict: 'error', cut: true }]);
+    expect(events.filter((e) => e.type === 'state').at(-1)).toMatchObject({ state: 'failed', reason: 'lead review failed' });
+    expectLegal(events);
   });
 
-  test('a review on the last attempt cannot fix; a broken review answer counts as approval', async () => {
+  test('a review on the last attempt cannot fix: the ticket fails', async () => {
     const one = validatePlan({ tickets: [t('a', { budget: { attempts: 1 } })] });
     const fake = startFakeModel({ solutions: { a: ok('a') }, reviews: { a: [{ verdict: 'problems', problems: ['p'], fix: 'f' }] } });
     try {
       const r = await runTicket(one.tickets[0]!, folder('last'), { plan: one, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: () => {}, review: true });
-      expect(r).toMatchObject({ ok: true, attempts: 1, reviewUnresolved: true });
+      expect(r).toMatchObject({ ok: false, attempts: 1, reviewUnresolved: true });
     } finally {
       fake.stop();
     }
