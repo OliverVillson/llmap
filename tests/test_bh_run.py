@@ -109,7 +109,7 @@ def test_sessions_hand_over_through_the_bucket(tmp_path):
     assert not (s2 / "teacher" / "g2").exists()  # G2 is session 1's; session 2 reuses the choice
     assert (s2 / "sft" / "round2" / "model" / "sft.json").exists()
     assert dry(tmp_path, "laptop", "--set", "student=round2") == 0
-    assert read(lap / "footprint" / "round2" / "footprint.json")["ship"]["name"].startswith("BH0.1-")
+    assert read(lap / "footprint" / "round2" / "footprint.json")["ship"]["name"].startswith("BH0.1.1-")
 
 
 def test_a_role_served_by_another_machine(tmp_path):
@@ -217,6 +217,7 @@ def test_round2_ships_beside_round1_and_eval_scores_it(tmp_path):
     r1 = read(machine(tmp_path, "laptop") / "footprint" / "sft" / "footprint.json")["ship"]["name"]
     r2 = read(machine(tmp_path, "laptop") / "footprint" / "round2" / "footprint.json")["ship"]["name"]
     assert names == {f"sft/{r1}.gguf", f"round2/{r2}.gguf"}
+    assert r1.startswith("BH0.1-") and r2.startswith("BH0.1.1-") and r2[len("BH0.1.1"):] == r1[len("BH0.1"):]
     ev = machine(tmp_path, "eval")
     assert "/ship/round2/" in read(ev / "score" / "round2" / "score.json")["gguf"]
     assert "/ship/sft/" in read(ev / "score" / "sft" / "score.json")["gguf"]

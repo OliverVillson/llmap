@@ -733,7 +733,7 @@ class Run:
 
     def run_footprint(self, step: Step) -> None:
         """Each quant, best first, measured as Oliver defined the footprint; the first at or
-        under the limit ships as BH<version>-<GB>.gguf."""
+        under the limit ships as BH<version>-<GB>.gguf (round 2: BH<version>.1-<GB>.gguf)."""
         cfg = self.cfg
         ex = load(self.export_dir() / "export.json")
         if not ex:
@@ -746,9 +746,9 @@ class Run:
             if load(out) is None:  # missing, or cut short by a stopped run
                 self.ex.run(step, Cmd(f"python3 scripts/bh/footprint.py --gguf {q(rung['path'])} --llama-cpp {q(self.llama)} "
                                       f"--text {q(calib)} --out {q(out)} --prompt-tokens {cfg.footprint_prompt} "
-                                      f"--version {cfg.version}" + (f" --footprint-sh {q(cfg.footprint_sh)}"
+                                      f"--version {cfg.ship_version(self.student)}" + (f" --footprint-sh {q(cfg.footprint_sh)}"
                                                                     if cfg.footprint_sh else ""),
-                                      "footprint", {"gguf": rung["path"], "out": str(out), "version": cfg.version}))
+                                      "footprint", {"gguf": rung["path"], "out": str(out), "version": cfg.ship_version(self.student)}))
             r = load(out) or {}
             results.append({"type": rung["type"], **{k: r.get(k) for k in ("footprint", "file_bytes", "name", "source")}})
             if r.get("footprint") and r["footprint"] <= cfg.footprint_limit:

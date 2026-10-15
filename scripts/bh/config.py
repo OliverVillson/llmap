@@ -66,6 +66,7 @@ class Config:
     profile: str = "s1"
     run: str = "bh01"  # bucket://mugge-library/blackhole/<run>/
     version: str = "0.1"  # BH<version>-<GB>
+    round2_suffix: str = ".1"  # round 2's model ships as BH<version><round2_suffix>-<GB>: BH0.1.1-<GB>
     where: str = "b200"  # b200 | laptop: which stages may run here (preflight refuses the rest)
     # ---- models
     base: str = "qwen3.5-2b"
@@ -159,6 +160,11 @@ class Config:
     @property
     def base_model(self) -> Base:
         return BASES[self.base]
+
+    def ship_version(self, student: str) -> str:
+        """The version in the shipped name: round 1's is the run's, round 2's carries the
+        round-2 suffix, so the two models of one run never share a name."""
+        return self.version if student == "sft" else self.version + self.round2_suffix
 
     @property
     def kd(self) -> bool:

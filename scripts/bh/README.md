@@ -160,7 +160,7 @@ These are fixed by the harness. Change them only together with BlackHole.
   - KL applies where a row's (user, answer) matches a logged call.
   - write-from-fix rows and re-laid-out answers train on CE alone. `rows.json` reports the coverage.
 - **Round 2:** an own-repair row's prompt is the fix call the engine would make next on the student's own failed files, with the real failing check. Round-2 RFT trains from the base.
-- **Name:** `BH<v>-<GB>`. GB is the measured footprint, rounded up to one decimal.
+- **Name:** `BH<v>-<GB>`, no hyphen after BH. GB is the measured footprint, rounded up to one decimal. Round 2's model of the same run ships as `BH<v>.1-<GB>` (for example `BH0.1-1.7`, then `BH0.1.1-1.7`); `--set round2_suffix=...` renames it. Eval scores the exact GGUF that run's footprint shipped for `--set student=sft` or `round2`, never the newest file under a name.
 - **Never trained on:** MuggeBench tickets, the spike, or anything carrying the `MUGGE-BENCH-` canary. data.py's decontam and the row guards both check.
 
 ## Files
