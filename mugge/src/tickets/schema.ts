@@ -62,7 +62,8 @@ export interface Plan {
  * A ticket that claims a file another ticket already owns while both could run at once. The
  * ticket listed earlier in the plan keeps the file. By default the planner settles it (Oliver,
  * 2026-10-15): the later ticket is made to depend on the earlier ones, so it waits instead of
- * being blocked, and the plan records it in `settled`. With `clashes: 'block'` the later ticket
+ * being blocked, and the plan records it in `settled`. Such a dependency only orders the two: if
+ * the owner fails, the later ticket still runs (scheduler.ts). With `clashes: 'block'` the later ticket
  * is blocked for the owner instead, which is the choice when both must change the file at once.
  */
 export interface OwnershipClash {

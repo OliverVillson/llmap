@@ -161,9 +161,12 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
         out = parseFiles(c.value, ticket.owns);
         ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length });
       } catch (e) {
-        failed = { command: '(model call)', output: String((e as Error).message ?? e) };
-        r.error = failed.output;
-        ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: ${failed.output}` });
+        const msg = String((e as Error).message ?? e);
+        // The review's feedback is sent again: a fix that only answered the error would finish
+        // the ticket (a pass after the review) without the model ever seeing what the lead asked.
+        if (failed?.command !== '(lead review)') failed = { command: '(model call)', output: msg };
+        r.error = msg;
+        ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: ${msg}` });
         continue;
       }
 
@@ -193,11 +196,16 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       state('reviewing');
       let rv = await reviewOnce(attempt, checks, spent);
       spent += rv.completionTokens;
-      if (rv.verdict === 'error' && spent < ticket.budget.max_tokens) {
+      if (rv.verdict === 'error' && spent < ticket.budget.max_tokens && !ctx.signal?.aborted) {
         rv = await reviewOnce(attempt, checks, spent);
         spent += rv.completionTokens;
       }
       r.review = rv;
+      if (ctx.signal?.aborted) {
+        // a stopped run, not a review that failed
+        r.error = 'aborted';
+        return fail('aborted');
+      }
       if (rv.verdict === 'error') {
         r.error = `lead review failed: ${rv.error ?? 'no answer'}`;
         return fail('lead review failed');
