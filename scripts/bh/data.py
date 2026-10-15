@@ -591,6 +591,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-p", type=float, default=sampling.MIN_P, help=argparse.SUPPRESS)
     ap.add_argument("--thinking", choices=["on", "off"], default="off")
     a = ap.parse_args(argv)
+    # the engine renders every row from mugge/ (its own cwd): paths must not be relative to here
+    a.work = a.work.resolve()
+    os.environ["PATH"] = f"{Path.home() / '.bun' / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+    if a.cmd != "answer" and not shutil.which(render.bun()):
+        raise SystemExit(f"data.py {a.cmd} needs bun (the engine renders every row): install it with "
+                         "`curl -fsSL https://bun.sh/install | bash`, then `cd mugge && bun install`")
     cfg = DataConfig(work=a.work, sandbox=a.sandbox, workers=a.workers, timeout=a.timeout)
     if a.cmd == "export":
         export(cfg, limit_kits=a.limit_kits)

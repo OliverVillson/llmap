@@ -101,7 +101,7 @@ Then, once per machine:
 Start a run detached on the machine, log out, and check on it from the Mac whenever you like. Each command takes the same profile and options the run was started with.
 
 ```
-ssh laptop1                                          # or the B200, or WSL2 (below)
+ssh laptop1                                          # or the B200; on a WSL2 laptop, then `wsl` (below)
 cd llmap
 python3 scripts/bh_run.py g0 start                   # detached; prints its log, pid and these hints
 python3 scripts/bh_run.py g0 watch                   # live: Ctrl-C leaves the view, not the run
@@ -120,15 +120,28 @@ Or in one line from the Mac: `ssh -t laptop1 'cd llmap && python3 scripts/bh_run
 - **One run per profile.** A second `start` of the same profile is refused while one is going, and so is a plain run in the foreground.
 - **Stop.** `stop` sends Ctrl-C: the step in flight stops, the servers stop, the results upload, and the run exits 130. A second `stop` while it is still uploading interrupts that too. A dropped ssh or a kill ends a foreground run the same way.
 - **Files**, in `~/bh-logs/<run>/` (BH_LOGS):
-  - `<profile>-current.log` is the newest run's whole output: `tail -f ~/bh-logs/*/g0-current.log`.
+  - `<profile>-current.log` is the newest detached run's whole output: `tail -F ~/bh-logs/*/g0-current.log`. A run in the foreground prints to its terminal; watch then shows its step's log.
   - `NN-<stage>.log` holds each step's own output.
   - `<profile>-run.json` is what watch reads: the state, the stage and when it started, each stage's state, and the exit code.
-- **Crew and smoke runs.** With the engine's telemetry (PR #14), each bench run also writes the engine's own `status.json` (agents working and queued, tickets done, tok/s) next to its results under W. watch shows it as a `crew` line. To see it whole, run `cd mugge && bun src/cli.ts status <that folder> --watch`. A smoke started by hand (`cd mugge && bun bench/smoke.ts`) writes it to `mugge/runs/smoke-<time>/`.
-- **Keep the machine awake.** A detached run outlives the ssh session, but not a laptop that sleeps.
-  - **Linux:** `sudo systemctl mask sleep.target suspend.target`, or set the lid to do nothing.
-  - **macOS:** `caffeinate -dims python3 scripts/bh_run.py g0 watch` keeps it awake while you watch; for a whole run, use `sudo pmset -a sleep 0`.
-  - **Windows:** turn sleep off in Windows (Power settings). WSL2 also stops when its last terminal closes. Either keep one WSL window open, or set `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig`.
-  - **SSH into WSL2:** run `sshd` inside WSL, then port-forward from Windows: `netsh interface portproxy add v4tov4 listenport=2222 connectport=22 connectaddress=<WSL IP>`. Then `ssh -p 2222 you@laptop1`.
+- **Crew line (not yet).** Once the engine's telemetry (PR #14) is merged, each bench run also writes the engine's own `status.json` (agents working and queued, tickets done, tok/s) under W, and watch shows it as a `crew` line. Until then that line is absent.
+- **Keep the machine running.** A detached run outlives the ssh session, but not a laptop that sleeps, reboots, or (WSL2) stops its distro. Do these once per laptop, plugged in:
+  - **Windows (the WSL2 laptops),** in a Windows prompt:
+    ```
+    powercfg /change standby-timeout-ac 0
+    powercfg /change hibernate-timeout-ac 0
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+    powercfg /setactive SCHEME_CURRENT
+    ```
+    Stay signed in to Windows (lock the screen, don't sign out), and set Windows Update's active hours to cover the run so it does not restart the laptop.
+  - **WSL2 stops an idle distro after 15 s,** detached runs included. Run `wsl --update` (WSL 2.5.4 or later), put these two lines in `%UserProfile%\.wslconfig`, then run `wsl --shutdown` once:
+    ```
+    [general]
+    instanceIdleTimeout=-1
+    ```
+    (`vmIdleTimeout` under `[wsl2]` is not enough: it only counts once every distro has stopped.) To check it, log out after `start` and run `wsl --list --running` from Windows: the distro must still be listed.
+  - **SSH into WSL2:** the simplest way is Windows' own OpenSSH Server (Settings → Optional features → OpenSSH Server; set the `sshd` service to Automatic, it opens the firewall itself). Then from the Mac: `ssh laptop1` and type `wsl` for the Linux shell, or in one line `ssh -t laptop1 'wsl -- bash -lc "cd ~/llmap && python3 scripts/bh_run.py g0 watch"'`. A Windows admin account reads its key from `%ProgramData%\ssh\administrators_authorized_keys`, not `~/.ssh`.
+  - **Linux laptops:** set `HandleLidSwitch=ignore` and `HandleLidSwitchExternalPower=ignore` in `/etc/systemd/logind.conf`, then `sudo systemctl restart systemd-logind`. If `loginctl show-user $USER -p KillUserProcesses` says yes (not Ubuntu's default), logging out kills the run: run `loginctl enable-linger` once and start with `systemd-run --user python3 scripts/bh_run.py g0 start`.
+  - **The B200 VM** does not sleep. Its session clock is billed from boot.
 
 ## Two laptops
 

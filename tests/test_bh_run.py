@@ -408,7 +408,12 @@ def test_start_watch_stop_and_resume(tmp_path, capsys):
             time.sleep(0.5)
         return pred()
 
-    assert r.main(["g0", "start", "--dry-run", d]) == 0
+    import signal
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)  # as `ssh host 'cmd &'` leaves it: stop must still work
+    try:
+        assert r.main(["g0", "start", "--dry-run", d]) == 0
+    finally:
+        signal.signal(signal.SIGINT, old)
     assert r.main(["g0", "start", "--dry-run", d]) == 2  # one run per profile
     assert wait(lambda: (live.read_state(cfg).get("stages") or {}).get("teacher-serve") == "done")
     capsys.readouterr()
@@ -424,6 +429,61 @@ def test_start_watch_stop_and_resume(tmp_path, capsys):
     assert st["exit"] == 0 and set(st["stages"].values()) == {"done"}
     assert "(done before)" in Path(st["log"]).read_text()  # resumed, not redone
     assert (tmp_path / "dry" / "g0" / "logs" / "g0-current.log").resolve() == Path(st["log"]).resolve()
+
+
+def test_command_words_and_the_run_state_file(tmp_path, monkeypatch, capsys):
+    """status/start/watch/stop anywhere after the profile, one at a time; start drops only its
+    own word; a pid from before a reboot is not the run; the state file never fails the run."""
+    from bh import live
+    r = bh_run()
+    assert r.parse(["s1", "sft", "status"])["cmd"] == "status"
+    a = r.parse(["g0", "--dry-run", "start", "sft", "start"])
+    assert a["cmd"] == "start" and a["dry"] == Path("start") and a["argv"] == ["g0", "--dry-run", "start", "sft"]
+    with pytest.raises(SystemExit):
+        r.parse(["g0", "status", "start"])
+    cfg = C.load("g0", {"BH_LOGS": str(tmp_path / "logs")})
+    live.record(cfg, state="running", pid=1, boot="another-boot")
+    assert live.running(cfg) is None and not live.alive(1, "another-boot")
+    assert r.main(["g0", "stop", "--dry-run", str(tmp_path / "dry")]) == 0
+
+    def full(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(live, "record", full)
+    live.note(cfg, state="failed")  # reported, not raised
+    assert "No space left" in capsys.readouterr().out
+
+
+def test_a_remote_eval_must_serve_the_shipped_file(tmp_path):
+    """Scoring on another machine checks llama-server's /props: another file stops the stage."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    served = {"model_path": "/models/BH0.1-1.7.gguf"}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"data": [{"id": "student"}]} if self.path == "/v1/models" else served).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        r = bh_run()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        cfg = C.load("eval", {"NVME": str(tmp_path), "BH_WORK": str(tmp_path / "w"), "BH_LOGS": str(tmp_path / "l")},
+                     None, [f'backends=[{{"name": "laptop2", "url": "{url}", "roles": ["eval"]}}]'])
+        run = r.Run(cfg, r.Exec(cfg))
+        assert run.serve(None, "eval", None, gguf=Path("ship/sft/BH0.1-1.7.gguf"))["remote"] == "laptop2"
+        with pytest.raises(RuntimeError, match="serves BH0.1-1.7.gguf, not BH0.1.1-1.7.gguf"):
+            run.serve(None, "eval", None, gguf=Path("ship/round2/BH0.1.1-1.7.gguf"))
+        served.clear()
+        run.serve(None, "eval", None, gguf=Path("BH0.1.1-1.7.gguf"))
+        assert "does not say which file" in run.ex.notes[-1]
+    finally:
+        srv.shutdown()
 
 
 # ---------- config ----------

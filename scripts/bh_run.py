@@ -77,6 +77,7 @@ from bh import bench as B  # noqa: E402
 from bh import config as C  # noqa: E402
 from bh import live  # noqa: E402
 from bh import export as X  # noqa: E402
+from bh import footprint as F  # noqa: E402
 from bh import rows as R  # noqa: E402
 from bh import sampling as S  # noqa: E402
 from bh.exec import Bucket, Cmd, Exec, StepTimeout, dump, load, read_jsonl, write_jsonl  # noqa: E402
@@ -202,9 +203,10 @@ class Run:
         return True
 
     # ---------- machines ----------
-    def serve(self, step, role: str, start) -> dict:
+    def serve(self, step, role: str, start, gguf: Path | None = None) -> dict:
         """The role's model (teacher, student, eval): on the machine config.backends names for
-        it, which serves it already, else started here by start()."""
+        it, which serves it already, else started here by start(). gguf: the file the stage
+        means to score or sample; a machine serving another file stops the stage."""
         b = C.backend(self.cfg, role)
         if b is None:
             self.url, self.model = self.local_url, ""
@@ -215,6 +217,17 @@ class Run:
             get_json(f"{self.url}/v1/models", timeout=30)
         except OSError as e:
             raise RuntimeError(f"{b['name']} ({b['url']}) serves {role} but does not answer: {e}") from e
+        if gguf is not None and not self.ex.dry:
+            try:  # llama-server's /props names the file it loaded
+                served = Path(str(get_json(f"{self.url}/props", timeout=30).get("model_path") or "")).name
+            except (OSError, ValueError):
+                served = ""
+            if not served:
+                self.ex.warn(f"{role}: {b['name']} does not say which file it serves (no /props model_path); "
+                             f"make sure it is {gguf.name}")
+            elif served != gguf.name:
+                raise RuntimeError(f"{b['name']} serves {served}, not {gguf.name}: restart its llama-server with "
+                                   f"{gguf.name} (bucket key {self.ship_key(gguf.name)})")
         print(f"{role}: served by {b['name']} at {b['url']}", flush=True)
         return {"remote": b["name"], "url": b["url"]}
 
@@ -753,6 +766,8 @@ class Run:
                                                                     if cfg.footprint_sh else ""),
                                       "footprint", {"gguf": rung["path"], "out": str(out), "version": cfg.ship_version(self.student)}))
             r = load(out) or {}
+            if r.get("footprint"):  # named here, not by the measurement: it may predate a round or version change
+                r["name"] = F.name(cfg.ship_version(self.student), r["footprint"])
             results.append({"type": rung["type"], **{k: r.get(k) for k in ("footprint", "file_bytes", "name", "source")}})
             if r.get("footprint") and r["footprint"] <= cfg.footprint_limit:
                 ship = {"type": rung["type"], "gguf": rung["path"], **results[-1]}
@@ -817,7 +832,8 @@ class Run:
             dump(self.score_json(), {"gguf": str(gguf), "via": "muggebench.sh",
                                      "report": (out / "muggebench.txt").read_text()[-3000:]})
             return
-        self.serve(step, "eval", lambda: self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=cfg.slots)))
+        self.serve(step, "eval", lambda: self.servers.ensure(step, llama_spec(cfg, str(gguf), "student", slots=cfg.slots)),
+                   gguf=gguf)
         self.template_check(step, out)
         bench = Path(cfg.score_bench) if cfg.score_bench else self.p("score", "spike")
         if not cfg.score_bench and not (bench / "spike").exists():
@@ -879,7 +895,7 @@ class Run:
         if cfg.where == "laptop":
             gguf = self.shipped()
             self.serve(step, "student", lambda: self.servers.ensure(step, llama_spec(cfg, str(gguf), "student",
-                                                                                    slots=cfg.slots)))
+                                                                                    slots=cfg.slots)), gguf=gguf)
             conc = cfg.slots
         else:
             model = self.model_dir("sft")
@@ -1152,8 +1168,8 @@ class Run:
         """fn, recording the stage it is in for `watch` (bh/live.py)."""
         def run(st: Step) -> None:
             stages = live.read_state(self.cfg).get("stages") or {}
-            live.record(self.cfg, stage=name, stage_started=time.time(), stage_minutes=st.total,
-                        stage_log=str(st.log) if st.log else None, stages={**stages, name: "running"})
+            live.note(self.cfg, stage=name, stage_started=time.time(), stage_minutes=st.total,
+                      stage_log=str(st.log) if st.log else None, stages={**stages, name: "running"})
             end = "failed"
             try:
                 fn(st)
@@ -1169,7 +1185,7 @@ class Run:
                 raise
             finally:
                 stages = live.read_state(self.cfg).get("stages") or {}
-                live.record(self.cfg, stages={**stages, name: end})
+                live.note(self.cfg, stage=None, stages={**stages, name: end})
         return run
 
 
@@ -1194,25 +1210,29 @@ stages: """ + " ".join(STAGES)
 
 
 def parse(argv: list[str]) -> dict:
-    if not argv or argv[0] in ("-h", "--help", "help"):
+    if not argv or any(x in ("-h", "--help", "help") for x in argv):
         print(USAGE)
         raise SystemExit(0 if argv else 2)
     a = {"profile": argv[0], "stages": [], "sets": [], "dry": None, "force": False, "shutdown": False,
-         "cmd": "run", "argv": [x for x in argv if x != "start"]}
+         "cmd": "run", "argv": list(argv)}
     if a["profile"] not in PLAN:
         raise SystemExit(f"unknown profile {a['profile']!r}\n\n{USAGE}")
-    it = iter(argv[1:])
-    for x in it:
+    it = iter(enumerate(argv[1:], 1))
+    for i, x in it:
         if x == "--set":
-            a["sets"].append(next(it, ""))
+            a["sets"].append(next(it, (0, ""))[1])
         elif x == "--dry-run":
-            a["dry"] = Path(next(it, "."))
+            a["dry"] = Path(next(it, (0, "."))[1])
         elif x == "--force":
             a["force"] = True
         elif x == "--shutdown":
             a["shutdown"] = True
-        elif x in ("status", "start", "watch", "stop") and not a["stages"]:
+        elif x in ("status", "start", "watch", "stop"):
+            if a["cmd"] != "run":
+                raise SystemExit(f"one of status, start, watch, stop at a time\n\n{USAGE}")
             a["cmd"] = x
+            if x == "start":  # the detached run gets the same arguments without it
+                a["argv"] = argv[:i] + argv[i + 1:]
         elif x.startswith("-"):
             raise SystemExit(f"unknown option {x}\n\n{USAGE}")
         else:
@@ -1281,10 +1301,10 @@ def main(argv: list[str] | None = None) -> int:
     if other and other != os.getpid():
         print(f"a {cfg.profile} run is already going (pid {other}): bh_run.py {cfg.profile} watch, or stop it first")
         return 2
-    live.record(cfg, state="running", pid=os.getpid(), argv=a["argv"], log=os.environ.get("BH_RUN_LOG"),
-                started=time.time(), stage=None, exit=None, stopping=False, warnings=[],
-                stages={k: "done" if s.done() else "waiting" for k, s in zip(run.stage_keys, plan)})
-    ex.on_warn = lambda m: live.record(cfg, warnings=ex.notes[-20:])
+    live.note(cfg, state="running", pid=os.getpid(), boot=live._boot_id(), argv=a["argv"],
+              log=os.environ.get("BH_RUN_LOG"), started=time.time(), stage=None, exit=None, stopping=False,
+              warnings=[], stages={k: "done" if s.done() else "waiting" for k, s in zip(run.stage_keys, plan)})
+    ex.on_warn = lambda m: live.note(cfg, warnings=ex.notes[-20:])
 
     def stop(signum, frame):  # ssh dropped or killed: the run ends the way Ctrl-C ends it (upload, server stop)
         raise KeyboardInterrupt(signal.Signals(signum).name)
@@ -1292,6 +1312,9 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {}
     if threading.current_thread() is threading.main_thread():
         handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP)}
+        # a run started with `&` from a non-interactive shell (ssh 'cmd &') inherits SIGINT
+        # ignored, and Python then installs no Ctrl-C handler: `stop` would do nothing
+        handlers[signal.SIGINT] = signal.signal(signal.SIGINT, signal.default_int_handler)
     run.live = True
     os.environ["PATH"] = f"{Path.home() / '.bun' / 'bin'}:{os.environ['PATH']}"
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")  # centipede.py's: no FlashInfer JIT on the VMs
@@ -1302,7 +1325,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         code = run_plan(plan, run.summary, logs, ["run"], after_step=run.upload)
     finally:
-        live.record(cfg, state={0: "finished", 130: "stopped"}.get(code, "failed"), exit=code, stage=None)
+        live.note(cfg, state={0: "finished", 130: "stopped"}.get(code, "failed"), exit=code, stage=None)
         try:
             run.servers.stop()
         except Exception as e:  # noqa: BLE001
