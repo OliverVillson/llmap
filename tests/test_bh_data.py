@@ -190,7 +190,7 @@ def test_harvest_skips_loose_and_unclean_calls(run, tmp_path, tks):
     rows, st = harvest.harvest(SPIKE, [run], calls_logs=[log])
     assert st.dropped["unclean"] == 2 and len(rows) == 8
     for flag, val, why in (("forced", "length", "forced"), ("drop", "unlabelled", "parser"), ("loose", True, "loose")):
-        d = _edit(run, tmp_path / f"flag-{flag}", lambda t: t["calls"][-1].update({flag: val}))
+        d = _edit(run, tmp_path / f"flag-{flag}", lambda t, flag=flag, val=val: t["calls"][-1].update({flag: val}))
         assert harvest.harvest(SPIKE, [d])[1].dropped[why] == 10, flag
 
 
@@ -361,3 +361,76 @@ def test_smoke_dry_run(tmp_path):
     assert rep["by_kind"].get("repair/fix", 0) > 0 and rep["by_kind"].get("rft/write", 0) > 0
     n, total = map(int, rep["write_rows_rerendered_identical"].split("/"))
     assert n == total > 0
+
+
+# ---------- export with a kit limit, and the shared sampling default ----------
+
+FAKE_BHDATA = '''
+import json, shutil, sys
+from pathlib import Path
+args = sys.argv[1:]
+assert args[0] == "export"
+out = Path(args[args.index("--out") + 1])
+spike = Path(__import__("os").environ["SPIKE"])
+for split, n in (("train-bench", 25), ("heldout-bench", 22)):
+    for i in range(n):
+        dst = out / split / f"kit-{i:02d}"
+        dst.mkdir(parents=True)
+        for part in ("plan.json", "project", "solutions", "hidden"):
+            (shutil.copytree if (spike / part).is_dir() else shutil.copyfile)(spike / part, dst / part)
+(out / "extra_rows.jsonl").write_text("")
+'''
+
+
+def test_export_limits_kits(tmp_path, monkeypatch):
+    pkg = tmp_path / "bh-src" / "bhdata"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "llmap.py").write_text(FAKE_BHDATA)
+    monkeypatch.setenv("BHDATA", str(pkg))
+    monkeypatch.setenv("SPIKE", str(SPIKE))
+    work = tmp_path / "w"
+    assert data.main(["export", "--work", str(work), "--limit-kits", "20"]) == 0
+    st = json.loads((work / "data" / "stats" / "export.json").read_text())
+    assert st["limited"] == {"train": [20, 5], "heldout": [20, 2]}
+    assert len(list((work / "data" / "export" / "train-bench").iterdir())) == 20
+    assert len(list((work / "data" / "export-unused" / "train-bench").iterdir())) == 5
+    st = data.export_kits(None, tmp_path / "out", limit_kits=3)
+    assert (st["train_projects"], st["heldout_projects"], st["kits"]) == (3, 3, 6)
+
+
+def test_answer_uses_the_shared_sampling_default(tmp_path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from bh import sampling
+    bodies = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            bodies.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+            out = json.dumps({"choices": [{"message": {"content": "x"}, "finish_reason": "length"}],
+                              "usage": {"completion_tokens": 5}}).encode()
+            self.send_response(200)
+            self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        q = tmp_path / "q.jsonl"
+        harvest.write_jsonl(q, [{"id": "a", "messages": [{"role": "user", "content": "hi"}]}])
+        out = data.answer_requests(q, tmp_path / "a.jsonl", url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                                   model="t", samples=1)
+    finally:
+        srv.shutdown()
+    b = bodies[0]
+    assert {k: b[k] for k in sampling.DEFAULTS} == sampling.DEFAULTS == {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0}
+    assert b["chat_template_kwargs"] == {"enable_thinking": False}
+    assert harvest.read_jsonl(out)[0]["answers"][0]["cut"] is True
+    with pytest.raises(ValueError, match="finite"):
+        data.answer_requests(q, tmp_path / "b.jsonl", url="http://x", model="t", top_k=0)
