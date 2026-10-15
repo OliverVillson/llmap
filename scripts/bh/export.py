@@ -32,9 +32,16 @@ def q(x) -> str:
     return shlex.quote(str(x))
 
 
+def part(out: Path) -> Path:
+    """Where a command writes out first: a run stopped half way leaves no file at out, so a
+    resume never takes a half-written GGUF for a finished one."""
+    out = Path(out)
+    return out.with_name(f"{out.stem}.part{out.suffix}")
+
+
 def convert_cmd(llama_cpp: str, hf: Path, out: Path) -> Cmd:
-    return Cmd(f"python {q(Path(llama_cpp) / 'convert_hf_to_gguf.py')} {q(hf)} --outtype bf16 --outfile {q(out)}",
-               "gguf-convert", {"hf": str(hf), "out": str(out)})
+    return Cmd(f"python {q(Path(llama_cpp) / 'convert_hf_to_gguf.py')} {q(hf)} --outtype bf16 --outfile {q(part(out))} "
+               f"&& mv {q(part(out))} {q(out)}", "gguf-convert", {"hf": str(hf), "out": str(out)})
 
 
 def vocab_cmds(llama_cpp: str, hf: Path, out: Path, traces: Path, codebench: str) -> list[Cmd]:
@@ -63,13 +70,13 @@ def calib_cmd(hf: Path, rows: list[Path], out: Path, max_rows: int) -> Cmd:
 
 
 def imatrix_cmd(bin_dir: Path, bf16: Path, calib: Path, out: Path, chunks: int) -> Cmd:
-    return Cmd(f"{q(bin_dir / 'llama-imatrix')} -m {q(bf16)} -f {q(calib)} -o {q(out)} -c 4096 --chunks {chunks} -ngl 999",
-               "imatrix", {"out": str(out)}, gpu=True)
+    return Cmd(f"{q(bin_dir / 'llama-imatrix')} -m {q(bf16)} -f {q(calib)} -o {q(part(out))} -c 4096 --chunks {chunks} "
+               f"-ngl 999 && mv {q(part(out))} {q(out)}", "imatrix", {"out": str(out)}, gpu=True)
 
 
 def quant_cmd(bin_dir: Path, bf16: Path, imatrix: Path, out: Path, qtype: str) -> Cmd:
-    return Cmd(f"{q(bin_dir / 'llama-quantize')} --imatrix {q(imatrix)} {q(bf16)} {q(out)} {qtype}",
-               "quantize", {"out": str(out), "type": qtype})
+    return Cmd(f"{q(bin_dir / 'llama-quantize')} --imatrix {q(imatrix)} {q(bf16)} {q(part(out))} {qtype} "
+               f"&& mv {q(part(out))} {q(out)}", "quantize", {"out": str(out), "type": qtype})
 
 
 # ---------- the venv side ----------

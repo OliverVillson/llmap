@@ -8,8 +8,8 @@ path already did:
   - the system message is the engine's (stages/harness.py SYSTEM, held equal to
     prompts.ts by tests/test_harness.py), and there are exactly system, user, assistant;
   - meta.kind is write, fix or write-from-fix (BH0.1 trains the worker only);
-  - nothing cut at the token cap, nothing forced after a thinking cap, no thinking in a
-    thinking-off answer;
+  - nothing cut at the token cap, nothing forced after a thinking cap, no file whose path
+    the parser had to guess (loose), no thinking in a thinking-off answer;
   - the answer parses back into at least one file with the engine's parser
     (stages/harness.py parse_files, files.ts's twin);
   - no MuggeBench canary anywhere.
@@ -58,6 +58,8 @@ def drop_reason(row: dict, thinking: bool = False) -> str | None:
         return "cut"
     if row.get("forced") or mt.get("forced"):
         return "forced"
+    if row.get("loose") or mt.get("loose"):
+        return "loose"
     answer = msgs[2].get("content") or ""
     if not thinking and ("<think>" in answer or "</think>" in answer or msgs[2].get("reasoning_content")):
         return "thinking"
@@ -87,12 +89,13 @@ def filter_rows(rows: list[dict], thinking: bool = False) -> tuple[list[dict], d
 def drop_warning(stats: dict, limit: float) -> str | None:
     """The run-1/exp02 guard on harvest's counts (data.py's stats/teacher.json): more than
     `limit` of the answers dropped for length or because the parser could not read them
-    (670 of 900 teacher fix answers once)."""
+    (670 of 900 teacher fix answers once), loose paths (run 1's prog.c) included."""
     calls = stats.get("answers") or 0
-    cut, parse = int(stats.get("cut_or_forced") or 0), int(stats.get("parser_drops") or 0)
-    if calls and (cut + parse) / calls > limit:
-        return (f"{cut + parse} of {calls} answers ({100 * (cut + parse) / calls:.0f}%) dropped for length or parsing "
-                f"(cut or forced {cut}, parser {parse}); over {100 * limit:.0f}%: "
+    cut, parse, loose = (int(stats.get(k) or 0) for k in ("cut_or_forced", "parser_drops", "loose"))
+    bad = cut + parse + loose
+    if calls and bad / calls > limit:
+        return (f"{bad} of {calls} answers ({100 * bad / calls:.0f}%) dropped for length or parsing "
+                f"(cut or forced {cut}, parser {parse}, loose {loose}); over {100 * limit:.0f}%: "
                 "check the token cap and that the parser and the training format agree")
     return None
 

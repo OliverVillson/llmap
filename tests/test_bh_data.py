@@ -194,6 +194,44 @@ def test_harvest_skips_loose_and_unclean_calls(run, tmp_path, tks):
         assert harvest.harvest(SPIKE, [d])[1].dropped[why] == 10, flag
 
 
+def test_harvest_warns_over_20_percent_and_flagged_calls_never_become_rows(run, tmp_path, capsys):
+    """A run where more than 20% of answers are cut, forced or loose: the warning names each
+    count, and no flagged answer becomes a row (a debug run of the guards)."""
+    flags = [{"cut": True}, {"forced": "length"}, {"loose": True}]
+    n = [0]
+
+    def mark(t):  # one flag on the last call of three runs in four
+        if n[0] % 4 < 3:
+            t["calls"][-1].update(flags[n[0] % 4])
+        n[0] += 1
+    d = _edit(run, tmp_path / "mixed", mark)
+    flagged = {(t["key"], t["seed"]) for i, t in enumerate(harvest.read_jsonl(d / "transcripts.jsonl")) if i % 4 < 3}
+    rows, st = harvest.harvest(SPIKE, [d])
+    assert st.drop_share() > 0.2 and st.warnings
+    w = st.warnings[-1]
+    assert "cut at the cap or forced" in w and "with a path the parser had to guess" in w
+    assert st.cut >= 2 and st.loose >= 1
+    assert rows and not flagged & {(r["meta"]["key"], r["meta"]["seed"]) for r in rows}
+    assert "[harvest] WARNING" in capsys.readouterr().out
+
+
+def test_build_drops_canary_and_spike_rows(tmp_path):
+    """build decontaminates against MuggeBench: a row carrying the MUGGE-BENCH- canary or a
+    spike ticket's text never reaches train.jsonl."""
+    cfg = data.DataConfig(work=tmp_path, benches=[SPIKE])
+    t = next(iter(render.tickets(SPIKE).values()))
+    w = render.one({"op": "write", "project": t["dir"], "ticket": t["id"]})
+    sysm = {"role": "system", "content": render.system_prompt()}
+    ok = {"messages": [sysm, {"role": "user", "content": "Ticket: kit/x\nWrite a parser for INI files."},
+                       {"role": "assistant", "content": "a.py\n```python\nx = 1\n```"}], "meta": {"kind": "write"}}
+    canary = {**ok, "messages": [sysm, {"role": "user", "content": "Ticket: kit/y MUGGE-BENCH-0042"}, ok["messages"][2]]}
+    spike = {**ok, "messages": [*w["messages"][:2], ok["messages"][2]]}
+    harvest.write_jsonl(cfg.rows("teacher"), [ok, canary, spike])
+    harvest.write_jsonl(cfg.rows("extra"), [])
+    out = harvest.read_jsonl(data.build(cfg))
+    assert [r["messages"][1]["content"] for r in out] == [ok["messages"][1]["content"]]
+
+
 def test_harvest_write_from_fix_and_max_fix(run, tmp_path):
     # only the fixed seeds: no first-call pass, so the write row comes from the fix answer
     only_fix = tmp_path / "only-fix"
@@ -285,6 +323,18 @@ def test_tokenizer_roundtrip():
     assert data.tokenizer_roundtrip(row, StubTokenizer()) == "ok"
     with pytest.raises(RuntimeError, match="prefix"):
         data.tokenizer_roundtrip(row, StubTokenizer(think_in_prompt_only=True))
+
+
+def test_build_reports_a_failed_tokenizer_check_and_goes_on(tmp_path):
+    """build's round trip is a report (bh_run.py warns on it); sft.py's own round trip against
+    the served prompt ids is the gate, so a paid session does not stop here."""
+    cfg = data.DataConfig(work=tmp_path, benches=[])
+    row = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+                        {"role": "assistant", "content": "a.py\n```python\nx = 1\n```"}], "meta": {"kind": "write"}}
+    harvest.write_jsonl(cfg.rows("teacher"), [row])
+    harvest.write_jsonl(cfg.rows("extra"), [])
+    data.build(cfg, tokenizer=StubTokenizer(think_in_prompt_only=True))
+    assert json.loads(cfg.stats("train").read_text())["tokenizer_check"].startswith("FAILED: tokenizer round trip")
 
 
 # ---------- the dry run ----------
