@@ -20,12 +20,15 @@
 # summing every buffer llama-server allocates on every device (weights, KV cache, compute and
 # output buffers). With nvidia-smi, the GPU memory that load took is printed beside it.
 #
-# Settings default to the Centipede run's MuggeBench settings (scripts/centipede.py EVAL),
-# so laptop numbers can be compared with VM numbers. Change them only for every model you
-# compare: THINKING=1, TOKENS=8192 (per call, then the answer is forced), TEMP=1.0, TOP_K=0,
-# SEEDS=3, KV=q8_0 (8-bit KV cache, which fits more slots in 8 GB), CUT_RETRY=nothink (a
-# thinking call that runs out of tokens is asked again at once with thinking off, and the
-# ticket's later calls go without thinking, as Centipede's harness does).
+# Sampling is BlackHole's one set (SAMPLING=blackhole, the default): thinking on at
+# temperature 0.6, top_p 0.95, top_k 20; thinking off at 0.7, 0.8, 20; min_p 0, no penalties.
+# SAMPLING=centipede is the Centipede run's MuggeBench set (scripts/centipede.py EVAL:
+# temperature 1.0, top_p 0.95, no top_k), to compare with VM numbers; its results are kept
+# apart, under NAME-centipede. TEMP, TOP_P, TOP_K and NOTHINK_TEMP, NOTHINK_TOP_P, NOTHINK_TOP_K
+# override one value. Other settings: THINKING=1, TOKENS=8192 (per call), SEEDS=3, KV=q8_0
+# (8-bit KV cache, which fits more slots in 8 GB), CUT_RETRY=nothink (a thinking call that runs
+# out of tokens is asked again at once with thinking off, and the ticket's later calls go
+# without thinking, as Centipede's harness does). Change them only for every model you compare.
 # CTX16=1 scores in a 16k context per call instead (TOKENS=4096, LOBBOT_EVAL_CTX=16384), the
 # context the footprint is measured at; its results are kept apart, under NAME-ctx16k.
 #
@@ -34,10 +37,11 @@
 set -euo pipefail
 
 GGUF=${GGUF:?set GGUF to the model file}
-NAME=${NAME:-$(basename "$GGUF" .gguf)$([ "${CTX16:-0}" = 1 ] && echo -ctx16k)}
+SAMPLING=${SAMPLING:-blackhole}
+NAME=${NAME:-$(basename "$GGUF" .gguf)$([ "${CTX16:-0}" = 1 ] && echo -ctx16k)$([ "$SAMPLING" = blackhole ] || echo "-$SAMPLING")}
 WORK=${WORK:-$HOME/muggebench}
 LLMAP=${LLMAP:-$WORK/llmap}
-LLMAP_REF=${LLMAP_REF:-0e24d72a174c7fc08def79f20924bbb77102f676}  # llmap branch claude/project-thread-3t4k6m: MuggeBench plus Centipede's thinking-cap retry
+LLMAP_REF=${LLMAP_REF:-29576fb1203738f621211b0b9c7bce91f3d822a2}  # llmap branch claude/project-thread-3t4k6m: MuggeBench plus Centipede's thinking-cap retry
 LLAMA_CPP=${LLAMA_CPP:-$WORK/llama.cpp}
 LLAMA_CPP_SHA=${LLAMA_CPP_SHA:-af50f2f248b475d9760f8e67503d01c0f194f5f4}  # the Centipede run's
 BUN_VERSION=${BUN_VERSION:-1.3.14}
@@ -53,8 +57,13 @@ if [ "$CTX16" = 1 ]; then
   export LOBBOT_EVAL_CTX=16384
 fi
 TOKENS=${TOKENS:-8192}
-TEMP=${TEMP:-1.0}
-TOP_K=${TOP_K:-0}
+case $SAMPLING in
+  blackhole) TEMP=${TEMP:-0.6} TOP_P=${TOP_P:-0.95} TOP_K=${TOP_K:-20}
+             NOTHINK_TEMP=${NOTHINK_TEMP:-0.7} NOTHINK_TOP_P=${NOTHINK_TOP_P:-0.8} NOTHINK_TOP_K=${NOTHINK_TOP_K:-20} ;;
+  centipede) TEMP=${TEMP:-1.0} TOP_P=${TOP_P:-0.95} TOP_K=${TOP_K:-0}  # 0: no top_k (the server gets 100, see stages/eval.py)
+             NOTHINK_TEMP=${NOTHINK_TEMP:-1.0} NOTHINK_TOP_P=${NOTHINK_TOP_P:-0.95} NOTHINK_TOP_K=${NOTHINK_TOP_K:-0} ;;
+  *) echo "SAMPLING must be blackhole or centipede"; exit 1 ;;
+esac
 KV=${KV:-q8_0}
 PARSER=${PARSER:-qwen3}
 CUT_RETRY=${CUT_RETRY:-nothink}  # nothink: a thinking call that runs out is asked again without thinking, as Centipede does; force: the old forced answer
@@ -130,10 +139,17 @@ PY
 echo "$PROJECTS projects in $BENCH, toolchain images: $IMAGES"
 
 say "Sandbox"
+SANDBOX_ASKED=${SANDBOX:-}
 if [ -z "${SANDBOX:-}" ]; then
   if command -v docker >/dev/null && docker info >/dev/null 2>&1; then SANDBOX=docker
   elif command -v podman >/dev/null && podman info >/dev/null 2>&1; then SANDBOX=podman
   else SANDBOX=local; fi
+fi
+if [ "$SANDBOX" = local ] && [ "$PROJECTS" -gt 1 ] && [ "$SANDBOX_ASKED" != local ]; then
+  echo "The dev set needs Docker or Podman, and neither is running. In the local sandbox its ml and dotnet tickets"
+  echo "cannot run and fix prompts show this machine's paths, not /work as in training, so the score is not the one"
+  echo "that counts. Start Docker (Docker Desktop with WSL integration on Windows), or set SANDBOX=local to score anyway."
+  exit 1
 fi
 if [ "$SANDBOX" = local ]; then
   echo "No Docker or Podman: tickets run on this machine, with its own toolchains."
@@ -169,8 +185,11 @@ cat > "$JOB/config.json" <<EOF
   "code_eval_suites": [],
   "code_eval_thinking": $THINK,
   "code_eval_thinking_temperature": $TEMP,
-  "code_eval_temperature": $TEMP,
+  "code_eval_temperature": $NOTHINK_TEMP,
   "thinking_top_k": $TOP_K,
+  "eval_top_p": $TOP_P,
+  "eval_nothink_top_p": $NOTHINK_TOP_P,
+  "eval_nothink_top_k": $NOTHINK_TOP_K,
   "eval_min_p": 0.0,
   "code_eval_max_tokens": $TOKENS,
   "eval_reasoning_parser": "$PARSER",
@@ -338,6 +357,8 @@ verdict = "MEETS" if lo >= target and ok_size else "MISSES" if hi < target or no
 print(f"\n{verdict} the target (Mugge score >= {target:g}% with one agent in <= {budget:g} GB at {fp['ctx']} context): "
       f"score {'clears' if lo >= target else 'below' if hi < target else 'straddles'} {target:g}% at 95%, "
       f"footprint {'within' if ok_size else 'over'} budget")
+if json.loads((job / "config.json").read_text()).get("mugge_bench_sandbox") == "local" and projects > 1:
+    print("Scored in the local sandbox: not a deciding score (ml and dotnet tickets cannot run, fix prompts show host paths).")
 if projects <= 1:
     print("Only the public spike was scored: this is a smoke test, not the Mugge score. Set BENCH_TAR to the dev set.")
 PY
