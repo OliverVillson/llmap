@@ -24,12 +24,12 @@ import { inferenceFromEnv } from '../src/config.ts';
 import type { EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { runTicket } from '../src/engine/harness.ts';
-import { reviewFromEnv } from '../src/engine/review.ts';
 import { OpenAICompatible, type Inference } from '../src/engine/inference.ts';
 import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/sandbox.ts';
 import type { WorkerOutput } from '../src/tickets/schema.ts';
 import { applyHidden, findProjects, prepare, solution, type BenchProject, type BenchTicket } from './load.ts';
 import { formatSummary, summarize, type Row } from './report.ts';
+import { reviewFromEnv } from '../src/engine/review.ts';
 
 export interface BenchOptions {
   projects: BenchProject[];
