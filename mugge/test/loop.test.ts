@@ -8,7 +8,7 @@ import { gitOk, initRepo } from '../src/engine/git.ts';
 import { runTicket } from '../src/engine/harness.ts';
 import { OpenAICompatible } from '../src/engine/inference.ts';
 import { REVIEW_SYSTEM, reviewMessages } from '../src/engine/prompts.ts';
-import { diffOwned, normalizeReview, REVIEW_MAX_TOKENS, reviewFeedback, reviewFromEnv, snapshot } from '../src/engine/review.ts';
+import { diffOwned, normalizeReview, REVIEW_MAX_TOKENS, reviewCapFromEnv, reviewFeedback, reviewFromEnv, snapshot } from '../src/engine/review.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
 import { runPlan } from '../src/engine/scheduler.ts';
 import { BackendPool, resolveMachine } from '../src/engine/backends.ts';
@@ -454,6 +454,32 @@ describe('runTicket', () => {
     } finally {
       fake.stop();
     }
+  });
+
+  test('the review may write as much as MUGGE_MAX_CALL_TOKENS allows, never more than the ticket has left', async () => {
+    const old = process.env.MUGGE_MAX_CALL_TOKENS;
+    const fake = startFakeModel({ solutions: { a: ok('a') } });
+    const inference = () => new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake', maxCallTokens: 8192 });
+    try {
+      process.env.MUGGE_MAX_CALL_TOKENS = '8192';
+      await runTicket(ticket, folder('cap-env'), { plan, inference: inference(), sandbox: new LocalSandbox(), emit: () => {}, review: true });
+      expect(fake.calls().at(-1)).toMatchObject({ kind: 'review', maxTokens: 8192 });
+      // a ticket with less left than the cap: the review gets what is left
+      const small = validatePlan({ tickets: [{ ...ticket, budget: { attempts: 4, max_tokens: 5000 } }] });
+      const r = await runTicket(small.tickets[0]!, folder('cap-left'), { plan: small, inference: inference(), sandbox: new LocalSandbox(), emit: () => {}, review: true });
+      expect(fake.calls().at(-1)).toMatchObject({ kind: 'review', maxTokens: 5000 - (r.completionTokens - r.review!.completionTokens) });
+      // the caller's own cap wins over the environment
+      await runTicket(ticket, folder('cap-ctx'), { plan, inference: inference(), sandbox: new LocalSandbox(), emit: () => {}, review: true, reviewMaxTokens: 5000 });
+      expect(fake.calls().at(-1)).toMatchObject({ kind: 'review', maxTokens: 5000 });
+    } finally {
+      if (old === undefined) delete process.env.MUGGE_MAX_CALL_TOKENS;
+      else process.env.MUGGE_MAX_CALL_TOKENS = old;
+      fake.stop();
+    }
+    expect(reviewCapFromEnv({})).toBe(REVIEW_MAX_TOKENS);
+    expect(reviewCapFromEnv({ MUGGE_MAX_CALL_TOKENS: '16384' })).toBe(16384);
+    expect(reviewCapFromEnv({ MUGGE_MAX_CALL_TOKENS: '512' })).toBe(512);
+    expect(() => reviewCapFromEnv({ MUGGE_MAX_CALL_TOKENS: 'lots' })).toThrow(/positive integer/);
   });
 });
 

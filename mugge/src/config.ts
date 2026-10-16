@@ -37,7 +37,7 @@
  *                         (unset: the server's default). The bench's --thinking flag is the same switch.
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
- *                         spend in one call)
+ *                         spend in one call). The lead review writes up to this too (unset: 2,048)
  *   MUGGE_DEBUG_CALLS     1: one line per model call on stderr: model, prompt, completion and
  *                         reasoning tokens, time, and whether the answer was cut at max_tokens
  *   MUGGE_REVIEW          on | off (default on): one lead review of each ticket whose checks pass

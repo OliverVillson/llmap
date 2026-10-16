@@ -23,7 +23,7 @@ import type { EventSink } from './events.ts';
 import { parseFiles } from './files.ts';
 import type { Inference } from './inference.ts';
 import { buildPack, fixMessages, writeMessages } from './prompts.ts';
-import { diffOwned, review as leadReview, reviewFeedback, reviewFromEnv, snapshot, wantsFix, type ReviewOutcome } from './review.ts';
+import { diffOwned, review as leadReview, reviewCapFromEnv, reviewFeedback, reviewFromEnv, snapshot, wantsFix, type ReviewOutcome } from './review.ts';
 import { tail, type Sandbox } from './sandbox.ts';
 import { callState, type AgentState } from './state.ts';
 
@@ -38,6 +38,8 @@ export interface HarnessContext {
   signal?: AbortSignal;
   /** Lead review after the checks pass; unset: MUGGE_REVIEW (on unless it is off). */
   review?: boolean;
+  /** Most tokens the review may write (the ticket's tokens left still bound it); unset: MUGGE_MAX_CALL_TOKENS, else 2,048. */
+  reviewMaxTokens?: number;
   /** Where the review call goes (the scheduler gives a lead slot when the crew has one); unset: `inference`. */
   reviewInference?: Inference;
   /**
@@ -93,6 +95,7 @@ export function applyOutput(worktree: string, ticket: Ticket, out: WorkerOutput)
 export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessContext): Promise<TicketResult> {
   const r: TicketResult = { ok: false, attempts: 0, firstTry: false, error: null, promptTokens: 0, completionTokens: 0, inferenceMs: 0, checkMs: 0, model: ticket.model, review: null, reviewUnresolved: false, answerAttempt: null };
   const reviewOn = ctx.review ?? reviewFromEnv();
+  const reviewCap = ctx.reviewMaxTokens ?? (reviewOn ? reviewCapFromEnv() : 0);
   const thinking = ctx.thinking ?? thinkingOn(ctx.inference);
   const pack = buildPack(worktree, ctx.plan, ticket, ctx.memory);
   const rounds = [ticket.model, ...(ticket.escalate_to ? [ticket.escalate_to] : [])];
@@ -131,7 +134,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   };
 
   const reviewOnce = async (attempt: number, checks: Array<{ command: string; output: string }>, spent: number) => {
-    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent);
+    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent, reviewCap);
     r.promptTokens += rv.promptTokens;
     r.completionTokens += rv.completionTokens;
     r.inferenceMs += rv.ms;

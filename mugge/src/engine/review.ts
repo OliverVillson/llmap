@@ -41,7 +41,7 @@ export interface ReviewOutcome {
   ms: number;
 }
 
-/** Most tokens the review may write; the answer is a short JSON object. MUGGE_MAX_CALL_TOKENS still caps it. */
+/** Most tokens the review may write when MUGGE_MAX_CALL_TOKENS is unset; the answer is a short JSON object. */
 export const REVIEW_MAX_TOKENS = 2048;
 /** Most characters of diff the review sees, so one huge file cannot crowd out the rest. */
 const MAX_DIFF_CHARS = 40_000;
@@ -53,6 +53,19 @@ export function reviewFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.MUGGE_REVIEW?.trim().toLowerCase();
   if (v && v !== 'on' && v !== 'off') throw new Error('MUGGE_REVIEW must be on or off');
   return v !== 'off';
+}
+
+/**
+ * Most tokens the review may write: MUGGE_MAX_CALL_TOKENS when it is set, so a lead thinking
+ * before its answer is not cut at 2,048 (Oliver, 2026-10-16); else REVIEW_MAX_TOKENS. The
+ * ticket's tokens left still bound it.
+ */
+export function reviewCapFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const v = env.MUGGE_MAX_CALL_TOKENS?.trim();
+  if (!v) return REVIEW_MAX_TOKENS;
+  const n = Number(v);
+  if (!(Number.isInteger(n) && n > 0)) throw new Error('MUGGE_MAX_CALL_TOKENS must be a positive integer');
+  return n;
 }
 
 /** The owned files' contents; null for a file that does not exist. */
@@ -122,12 +135,13 @@ export interface ReviewInput {
   checks: Array<{ command: string; output: string }>;
 }
 
-export async function review(inference: Inference, model: string, input: ReviewInput, maxTokens: number): Promise<ReviewOutcome> {
+/** `maxTokens`: the ticket's tokens left; `cap`: reviewCapFromEnv's answer unless the caller sets one. */
+export async function review(inference: Inference, model: string, input: ReviewInput, maxTokens: number, cap: number = REVIEW_MAX_TOKENS): Promise<ReviewOutcome> {
   const checks = input.checks.map((c) => ({ command: c.command, output: c.output.length > MAX_CHECK_CHARS ? '…' + c.output.slice(-MAX_CHECK_CHARS) : c.output }));
   const messages = reviewMessages(input.ticket, input.diff, checks);
   let c: Completion<unknown>;
   try {
-    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, REVIEW_MAX_TOKENS));
+    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, cap));
   } catch (e) {
     // an answer that came back but is not JSON (most often cut at the cap) still cost its tokens
     const got = (e as { completion?: Completion<string> }).completion;
