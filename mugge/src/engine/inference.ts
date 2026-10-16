@@ -17,7 +17,54 @@ export interface Completion<T> {
   raw: string;
   promptTokens: number;
   completionTokens: number;
+  /** Tokens the model spent thinking, when the server reports them (vLLM, llama-server). */
+  reasoningTokens?: number;
+  /** The answer stopped at max_tokens, so it is probably incomplete. */
+  cut?: boolean;
   ms: number;
+}
+
+/**
+ * Sampling fields sent on every call. Every engine call goes out with a finite top_k: a top_k
+ * of 0 (or none, which vLLM and SGLang read as the whole vocabulary) makes llama.cpp sort the
+ * full vocabulary on the CPU for every token of every slot, and it was one of the three bugs
+ * that scored Centipede run 1's agent 0%. Fields left undefined are not sent, so the server's
+ * own default applies (llama-server's min_p is 0.05; MiniCPM5-2B needs 0, see backends.ts).
+ */
+export interface Sampling {
+  temperature?: number;
+  top_k?: number;
+  top_p?: number;
+  min_p?: number;
+}
+
+/**
+ * The engine's sampling defaults, the one place they live. top_k 40 is llama-server's own
+ * default, so on llama-server nothing changes; on vLLM and SGLang it replaces "all tokens".
+ */
+export const DEFAULT_SAMPLING: Readonly<Required<Pick<Sampling, 'temperature' | 'top_k'>>> = { temperature: 0.2, top_k: 40 };
+
+/** Default for InferenceConfig.timeoutMs: long enough for a 16K prefill on a busy laptop GPU. */
+export const DEFAULT_TIMEOUT_MS = 1_800_000;
+
+/** Throws unless top_k is a positive integer: finite, so llama.cpp never sorts the whole vocabulary. */
+export function checkTopK(topK: unknown, where = 'top_k'): number {
+  if (typeof topK !== 'number' || !Number.isInteger(topK) || topK <= 0) {
+    throw new Error(`${where} must be a positive integer (got ${JSON.stringify(topK)}): 0 or none means the whole vocabulary`);
+  }
+  return topK;
+}
+
+/** The sampling fields of a request: defaults, then `cfg.sampling`, then `cfg.temperature`. */
+export function samplingFields(cfg: Pick<InferenceConfig, 'sampling' | 'temperature'>): Record<string, number> {
+  const s: Sampling = { ...DEFAULT_SAMPLING, ...dropUndefined(cfg.sampling ?? {}), ...(cfg.temperature !== undefined ? { temperature: cfg.temperature } : {}) };
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(s)) if (v !== undefined) out[k] = v;
+  return out;
+}
+
+function dropUndefined<T extends object>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
 export interface InferenceConfig {
@@ -32,17 +79,28 @@ export interface InferenceConfig {
    * and most hosts accept; `guided_json` is vLLM's older extra field; `none` relies on the prompt.
    */
   guided?: 'response_format' | 'guided_json' | 'none';
+  /** Overrides `sampling.temperature` (kept for callers that set only this). */
   temperature?: number;
-  /** Extra request fields sent as they are, e.g. seed, top_p, top_k, chat_template_kwargs. */
+  /** temperature, top_k, top_p, min_p; unset fields take DEFAULT_SAMPLING or the server's default. */
+  sampling?: Sampling;
+  /** Extra request fields sent as they are, e.g. seed, chat_template_kwargs; a top_k here must still be finite. */
   extra?: Record<string, unknown>;
+  /**
+   * Most milliseconds one call may take once it is sent (default DEFAULT_TIMEOUT_MS). Time spent
+   * waiting for a slot (backends.ts) does not count. Bun's own 300 s fetch cut is always off.
+   */
   timeoutMs?: number;
+  /** Most tokens one call may write, however much the caller offers (MUGGE_MAX_CALL_TOKENS). */
+  maxCallTokens?: number;
+  /** One line per call on stderr (MUGGE_DEBUG_CALLS=1). */
+  debug?: boolean;
 }
 
 export interface Inference {
-  /** An answer constrained to `schema`, parsed. */
-  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>>;
+  /** An answer constrained to `schema`, parsed. `signal` aborts the call, even once it is sent. */
+  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>>;
   /** A free-text answer. */
-  text(model: string, messages: ChatMessage[], maxTokens: number): Promise<Completion<string>>;
+  text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal): Promise<Completion<string>>;
 }
 
 export class OpenAICompatible implements Inference {
@@ -52,20 +110,27 @@ export class OpenAICompatible implements Inference {
     return this.cfg.models?.[model] ?? this.cfg.models?.[model.split('@')[0]] ?? this.cfg.defaultModel;
   }
 
-  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number): Promise<Completion<T>> {
-    const c = await this.text(model, messages, maxTokens, schema);
-    return { ...c, value: parseJsonAnswer<T>(c.raw) };
+  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>> {
+    const c = await this.text(model, messages, maxTokens, signal, schema);
+    try {
+      return { ...c, value: parseJsonAnswer<T>(c.raw) };
+    } catch (e) {
+      // the caller can still count what the answer cost and see whether it was cut
+      throw Object.assign(e as Error, { completion: c });
+    }
   }
 
-  async text(model: string, messages: ChatMessage[], maxTokens: number, schema?: object): Promise<Completion<string>> {
+  async text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object): Promise<Completion<string>> {
     const started = performance.now();
+    const cap = this.cfg.maxCallTokens;
     const body: Record<string, unknown> = {
       model: this.served(model),
       messages,
-      max_tokens: maxTokens,
-      temperature: this.cfg.temperature ?? 0.2,
+      max_tokens: cap && cap < maxTokens ? cap : maxTokens,
+      ...samplingFields(this.cfg),
       ...this.cfg.extra,
     };
+    checkTopK(body.top_k);
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
     else if (schema && guided === 'guided_json') body.guided_json = schema;
@@ -73,21 +138,34 @@ export class OpenAICompatible implements Inference {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 600_000),
-      // Bun (1.3) also cuts every fetch at 300 s unless told not to; timeoutMs is the limit
+      // the run's stop (POST /stop) ends a call in flight too, so it does not hold its slot for up to timeoutMs
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS), signal]) : AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
       timeout: false,
     } as RequestInit);
     if (!res.ok) throw new Error(`inference ${res.status}: ${(await res.text()).slice(0, 500)}`);
     const data: any = await res.json();
-    const raw: string = data?.choices?.[0]?.message?.content ?? '';
-    return {
+    const choice = data?.choices?.[0];
+    const raw: string = choice?.message?.content ?? '';
+    const reasoning = data?.usage?.completion_tokens_details?.reasoning_tokens;
+    const out: Completion<string> = {
       value: raw,
       raw,
       promptTokens: data?.usage?.prompt_tokens ?? 0,
       completionTokens: data?.usage?.completion_tokens ?? 0,
+      reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
+      cut: choice?.finish_reason === 'length' || undefined,
       ms: Math.round(performance.now() - started),
     };
+    if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));
+    return out;
   }
+}
+
+/** The MUGGE_DEBUG_CALLS line: what one call cost and whether it finished. */
+export function describeCall(model: string, maxTokens: number, c: Completion<string>): string {
+  const reasoning = c.reasoningTokens === undefined ? '' : ` reasoning ${c.reasoningTokens}`;
+  return `call ${model}: prompt ${c.promptTokens} completion ${c.completionTokens}${reasoning} of ${maxTokens} max, ${c.ms} ms, ${c.cut ? 'CUT at max_tokens' : 'finished'}, ${c.raw.length} chars`;
 }
 
 /** Parses a JSON answer, tolerating a ```json fence or text around one object (for `guided: none`). */
