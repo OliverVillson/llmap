@@ -1410,8 +1410,15 @@ def bench_answer(body: dict, calls: dict) -> dict:
     with _bench_lock:
         calls["calls"] += 1
         calls["forced"] += forced
-    return {"choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": finish}],
-            "usage": {"prompt_tokens": got["usage"].get("prompt_tokens") or 0, "completion_tokens": tokens}}
+    # "forced" (why, or absent) is how the engine's per-call log tells a forced answer from a
+    # real one: forced answers must never become training rows (mugge/src/engine/telemetry.ts)
+    choice = {"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": finish}
+    if forced:
+        choice["forced"] = why
+    usage = {"prompt_tokens": got["usage"].get("prompt_tokens") or 0, "completion_tokens": tokens}
+    if got["usage"].get("completion_tokens_details"):
+        usage["completion_tokens_details"] = got["usage"]["completion_tokens_details"]
+    return {"choices": [choice], "usage": usage}
 
 
 @contextmanager

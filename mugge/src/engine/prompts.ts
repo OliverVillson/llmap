@@ -108,3 +108,51 @@ export function fixMessages(worktree: string, pack: ContextPack, failed: { comma
     },
   ];
 }
+
+/**
+ * The lead review (review.ts): a new call type, on unless MUGGE_REVIEW=off. One fresh message:
+ * the ticket, the diff of its owned files since the ticket started, and the output of the
+ * acceptance commands that passed. The answer is constrained to REVIEW_JSON_SCHEMA.
+ */
+export const REVIEW_SYSTEM = [
+  'You are the lead reviewing one finished ticket of a larger project. Its acceptance commands already pass.',
+  'Read the ticket, the diff of the files it owns and the check output. Look for what the checks miss: parts of the ticket not done, stubs left in, interfaces changed or misused, wrong edge cases.',
+  'Reply with one JSON object: {"verdict": "approve" or "problems", "problems": [one short line each], "fix": "what the coder should change, or empty"}.',
+  'Approve unless a problem makes the ticket wrong or incomplete; style alone is not a problem.',
+].join('\n');
+
+export const REVIEW_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['verdict', 'problems', 'fix'],
+  properties: {
+    verdict: { enum: ['approve', 'problems'] },
+    problems: { type: 'array', items: { type: 'string' } },
+    fix: { type: 'string' },
+  },
+} as const;
+
+export function reviewMessages(ticket: Ticket, diff: string, checks: Array<{ command: string; output: string }>): ChatMessage[] {
+  return [
+    { role: 'system', content: REVIEW_SYSTEM },
+    {
+      role: 'user',
+      content: [
+        `Ticket: ${ticket.id}`,
+        `Title: ${ticket.title}`,
+        `Role: ${ticket.role}`,
+        '',
+        ticket.context,
+        '',
+        `Files it owns: ${ticket.owns.join(', ')}`,
+        `Done when these commands pass: ${ticket.acceptance.join(' ; ')}`,
+        '',
+        '## Diff',
+        diff || '(no changes)',
+        '',
+        '## Checks (all passed)',
+        ...checks.map((c) => `$ ${c.command}\n${c.output}`),
+      ].join('\n'),
+    },
+  ];
+}

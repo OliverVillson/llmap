@@ -4,6 +4,7 @@
  *
  *   GET  /health           ok
  *   GET  /status           the current RunView
+ *   GET  /telemetry        the crew status (telemetry.ts CrewStatus, schema centipede.status/1)
  *   GET  /events           server-sent events, one EngineEvent per message (replays the run so far)
  *   POST /run              { plan, base?, concurrency? } starts a run on the project repo
  *   POST /stop             aborts the current run
@@ -12,8 +13,10 @@ import { join } from 'node:path';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from '../engine/events.ts';
 import { headCommit } from '../engine/git.ts';
 import type { Inference } from '../engine/inference.ts';
+import type { BackendPool } from '../engine/backends.ts';
 import type { Sandbox } from '../engine/sandbox.ts';
 import { runPlan } from '../engine/scheduler.ts';
+import { crewFromEnv, runId, Telemetry } from '../engine/telemetry.ts';
 import { validatePlan } from '../tickets/schema.ts';
 
 export interface EngineServerOptions {
@@ -21,19 +24,25 @@ export interface EngineServerOptions {
   /** The project's code checkout on the VM. */
   repo: string;
   inference: Inference;
+  /** The crew's machines (MUGGE_BACKENDS); when given, calls go to them and `inference` is not used. */
+  pool?: BackendPool;
   sandbox: Sandbox;
   concurrency: number;
   worktreeRoot?: string;
+  /** Each run's calls.jsonl and status.json go in <runsDir>/<run id>/ (kept in memory only without it). */
+  runsDir?: string;
 }
 
 export function startEngineServer(o: EngineServerOptions) {
   let view: RunView = emptyView();
   let events: EngineEvent[] = [];
   let abort: AbortController | null = null;
+  let telemetry = new Telemetry({ crew: crewFromEnv(process.env, o.concurrency), warn: null });
   const listeners = new Set<(e: EngineEvent) => void>();
   const emit = (e: EngineEvent) => {
     events.push(e);
     applyEvent(view, e);
+    telemetry.emit(e);
     for (const l of listeners) l(e);
   };
 
@@ -45,6 +54,7 @@ export function startEngineServer(o: EngineServerOptions) {
       const { pathname } = new URL(req.url);
       if (pathname === '/health') return new Response('ok');
       if (pathname === '/status') return Response.json({ running: !!abort, view });
+      if (pathname === '/telemetry') return Response.json(telemetry.status());
       if (pathname === '/events') {
         let send: ((e: EngineEvent) => void) | null = null;
         const stream = new ReadableStream({
@@ -71,12 +81,16 @@ export function startEngineServer(o: EngineServerOptions) {
         }
         view = emptyView();
         events = [];
+        const id = runId();
+        telemetry = new Telemetry({ run: id, dir: o.runsDir && join(o.runsDir, id), crew: crewFromEnv(process.env, body.concurrency ?? o.concurrency) });
+        telemetry.setPlan(plan);
         abort = new AbortController();
         const run = runPlan({
           repo: o.repo,
           base: body.base ?? headCommit(o.repo),
           plan,
           inference: o.inference,
+          pool: o.pool,
           sandbox: o.sandbox,
           concurrency: body.concurrency ?? o.concurrency,
           worktreeRoot: o.worktreeRoot ?? join(o.repo, '..', '.mugge-worktrees'),
@@ -85,7 +99,14 @@ export function startEngineServer(o: EngineServerOptions) {
         });
         run
           .catch((e) => emit({ type: 'log', at: Date.now(), level: 'error', message: String(e?.message ?? e) }))
-          .finally(() => (abort = null));
+          .finally(() => {
+            abort = null;
+            try {
+              telemetry.close();
+            } catch (e) {
+              console.error(`telemetry: ${(e as Error).message ?? e}`);
+            }
+          });
         return Response.json({ started: true, tickets: plan.tickets.length });
       }
       if (pathname === '/stop' && req.method === 'POST') {

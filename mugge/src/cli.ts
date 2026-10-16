@@ -7,12 +7,14 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startEngineServer, followEvents } from './api/server.ts';
-import { concurrencyFromEnv, inferenceFromEnv } from './config.ts';
+import { checkedPoolFromEnv, concurrencyFromEnv, inferenceFromEnv, machinesFromEnv } from './config.ts';
+import { describeMachine, describeProbe, llamaServerArgs, PROBE_TIMEOUT_MS, probeMachines, usableMachines } from './engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent, type RunView } from './engine/events.ts';
 import { headCommit, initRepo } from './engine/git.ts';
 import { OpenAICompatible } from './engine/inference.ts';
 import { sandboxFromEnv } from './engine/sandbox.ts';
 import { runPlan } from './engine/scheduler.ts';
+import { crewFromEnv, formatCallSummary, runId, statusLine, Telemetry, type CrewStatus } from './engine/telemetry.ts';
 import { architectureMarkdown, design, scaffold, tickets } from './plan/architect.ts';
 import { createProject, listProjects, loadProject, saveProject, slugify, stateDir, type VmConfig } from './project/project.ts';
 import { shipToFolder, shipToRemote } from './project/ship.ts';
@@ -28,16 +30,20 @@ const HELP = `mugge ${VERSION}: parallel coding with small specialist models
   mugge vm <project> --host H --user U [--driver ssh|command --start CMD --stop CMD --port N --identity KEY]
   mugge open <project>           boot the VM, restore state, follow the engine live
   mugge plan <project>           architect + scaffold + tickets (needs a model endpoint)
-  mugge run <plan.json> --repo <dir>   run a plan here (MUGGE_SANDBOX=local for no containers)
+  mugge run <plan.json> --repo <dir>   run a plan here (MUGGE_SANDBOX=local for no containers);
+                                 per-call log and crew status in --out (default <repo>/../.mugge-runs/<run>)
+  mugge status <run dir> [--watch]     the crew status a run is writing (status.json)
+  mugge smoke [--fake] [--url U --model M]   the 15 spike tickets through the loop: MEETS / MISSES
   mugge ship --repo <dir> (--to <folder> | --github <remote> --branch <b>) -m "message"
   mugge close <project>          save state, stop the VM, billing stops
   mugge list                     projects and their state
   mugge spike [--fake]           the engine spike on the polyglot test project
   mugge bench run|check|report … MuggeBench (see bench/run.ts, check.ts, report.ts)
   mugge engine serve --port N --project <dir>    (on the VM) the engine API
+  mugge backends                 the crew's machines, their slots and matching llama-server flags
   mugge dog                      the dog
 
-Model endpoint: MUGGE_INFERENCE_URL, MUGGE_MODEL, MUGGE_MODELS (see src/config.ts).`;
+Model endpoint: MUGGE_INFERENCE_URL, MUGGE_MODEL, MUGGE_MODELS, or MUGGE_BACKENDS for several machines (see src/config.ts).`;
 
 function die(msg: string): never {
   console.error(`mugge: ${msg}`);
@@ -73,6 +79,24 @@ function viewFeed() {
 function plainEvent(e: EngineEvent) {
   const v = applyEvent(emptyView(), e).log.at(-1);
   if (v) console.log(v);
+}
+
+function thinkingOf(extra: Record<string, unknown> | undefined): 'on' | 'off' | 'server' {
+  const v = (extra?.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking;
+  return v === undefined ? 'server' : v ? 'on' : 'off';
+}
+
+/** A crew status as a few plain lines: the status bar, teams, working agents, warnings. */
+function describeStatus(s: CrewStatus): string {
+  const lines = [statusLine(s)];
+  for (const t of s.teams) lines.push(`team ${t.id}${t.domain ? ` (${t.domain})` : ''} on ${t.machine}: ${t.working} working, ${Math.round(t.tokS)} tok/s${t.tickets.length ? `, ${t.tickets.join(' ')}` : ''}`);
+  for (const m of s.machines) lines.push(`machine ${m.id}: slots ${m.slotsUsed}/${m.slots}, ${Math.round(m.tokS)} tok/s`);
+  for (const a of s.agents.filter((x) => x.ticket && !['idle', 'finished', 'failed'].includes(x.state)))
+    lines.push(`  ${a.id.padEnd(4)} ${a.state.padEnd(8)} ${a.ticket} ${a.attempt}/${a.maxAttempts} ${Math.round(a.tokS)} tok/s ${a.owns.join(' ')}`);
+  const c = s.calls;
+  lines.push(`calls ${c.calls}: ${c.dropped} dropped, ${c.cut} cut, ${c.forced} forced, ${c.errors} errors, ${c.clean} clean`);
+  lines.push(...s.warnings);
+  return lines.join('\n');
 }
 
 async function main(argv: string[]) {
@@ -179,7 +203,8 @@ async function main(argv: string[]) {
     case 'plan': {
       const p = loadProject(rest[0] ?? die('which project?'));
       if (!p.request) die(`${p.name} has no request`);
-      const inf = new OpenAICompatible(inferenceFromEnv());
+      // the same start check as run: an optional manager machine that is down is left out
+      const inf = (await checkedPoolFromEnv(process.env, concurrencyFromEnv(), undefined, ['manager']).catch((e) => die(String((e as Error).message ?? e)))).forAgent({ role: 'manager' });
       const d = await design(inf, p.request);
       if (d.questions.length) {
         console.log('The architect asks:\n' + d.questions.map((q) => `  - ${q}`).join('\n'));
@@ -198,23 +223,38 @@ async function main(argv: string[]) {
       return;
     }
     case 'run': {
-      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { repo: { type: 'string' }, concurrency: { type: 'string' }, plain: { type: 'boolean' } } });
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { repo: { type: 'string' }, concurrency: { type: 'string' }, plain: { type: 'boolean' }, out: { type: 'string' } } });
       const plan = validatePlan(await Bun.file(positionals[0] ?? die('which plan.json?')).json());
       const repo = resolve(values.repo ?? die('--repo <dir> is required'));
       if (!existsSync(join(repo, '.git'))) initRepo(repo);
       const feed = viewFeed();
+      const cfg = inferenceFromEnv();
+      const concurrency = values.concurrency ? Number(values.concurrency) : concurrencyFromEnv();
+      const pool = await checkedPoolFromEnv(process.env, concurrency).catch((e) => die(String((e as Error).message ?? e)));
+      const id = runId();
+      const telemetry = new Telemetry({
+        run: id, dir: resolve(values.out ?? join(repo, '..', '.mugge-runs', id)), crew: crewFromEnv(process.env, concurrency),
+        settings: { thinking: thinkingOf(cfg.extra), maxCallTokens: cfg.maxCallTokens ?? null, model: cfg.defaultModel },
+      });
+      telemetry.setPlan(plan);
+      pool.subscribe((s) => telemetry.serving(s));
+      const show = values.plain || !process.stdout.isTTY ? plainEvent : feed.emit;
       const run = runPlan({
-        repo, base: headCommit(repo), plan,
-        inference: new OpenAICompatible(inferenceFromEnv()),
+        repo, base: headCommit(repo), plan, pool,
         sandbox: sandboxFromEnv(),
-        concurrency: values.concurrency ? Number(values.concurrency) : concurrencyFromEnv(),
+        concurrency,
         worktreeRoot: join(repo, '..', '.mugge-worktrees'),
-        emit: values.plain || !process.stdout.isTTY ? plainEvent : feed.emit,
+        emit: (e) => {
+          telemetry.emit(e);
+          show(e);
+        },
       });
       if (!values.plain && process.stdout.isTTY) void follow(repo.split('/').pop()!, feed.subscribe);
       const report = await run;
       const s = report.summary;
-      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
+      const status = telemetry.close();
+      console.log(`\n${s.done}/${s.tickets} done, ${s.failed} failed, ${s.skipped} skipped${s.blocked ? `, ${s.blocked} blocked (two tickets need the same file)` : ''}; integration ${s.integrated ? 'green on mugge/integration' : 'not green'}`);
+      console.log(`\n${formatCallSummary(status.calls)}\n(per call: ${telemetry.callsPath}; crew status: ${telemetry.statusPath})`);
       process.exit(s.done === s.tickets && s.integrated ? 0 : 1);
     }
     case 'ship': {
@@ -232,6 +272,23 @@ async function main(argv: string[]) {
         console.log(`pushed ${c.slice(0, 10)} to ${values.github} ${values.branch ?? 'mugge'}`);
       } else die('--to <folder> or --github <remote>');
       return;
+    }
+    case 'status': {
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { watch: { type: 'boolean' }, json: { type: 'boolean' } } });
+      const where = resolve(positionals[0] ?? die('which run? mugge status <run dir or status.json>'));
+      const file = where.endsWith('.json') ? where : join(where, 'status.json');
+      do {
+        if (!existsSync(file)) die(`no status at ${file}`);
+        const st: CrewStatus = await Bun.file(file).json();
+        if (values.watch && process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
+        console.log(values.json ? JSON.stringify(st, null, 2) : describeStatus(st));
+        if (values.watch) await Bun.sleep(2000);
+      } while (values.watch);
+      return;
+    }
+    case 'smoke': {
+      const p = Bun.spawnSync(['bun', join(import.meta.dir, '..', 'bench', 'smoke.ts'), ...rest], { stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
+      process.exit(p.exitCode ?? 2);
     }
     case 'spike': {
       const { runSpike, formatSummary } = await import('../spike/run-spike.ts');
@@ -256,11 +313,31 @@ async function main(argv: string[]) {
       const s = startEngineServer({
         port: Number(values.port ?? 7341), repo,
         inference: new OpenAICompatible(inferenceFromEnv()),
+        // a crew of machines (laptops on wifi, cloud GPUs) when MUGGE_BACKENDS lists them
+        pool: process.env.MUGGE_BACKENDS?.trim() ? await checkedPoolFromEnv().catch((e) => die(String((e as Error).message ?? e))) : undefined,
         sandbox: sandboxFromEnv(),
         concurrency: values.concurrency ? Number(values.concurrency) : concurrencyFromEnv(),
         worktreeRoot: join(dir, 'worktrees'),
+        runsDir: join(dir, 'runs'),
       });
       console.log(`engine on ${s.url}, repo ${repo}`);
+      return;
+    }
+    case 'backends': {
+      const machines = machinesFromEnv();
+      const probes = await probeMachines(machines, process.env, PROBE_TIMEOUT_MS, inferenceFromEnv().apiKey);
+      for (const [i, m] of machines.entries()) {
+        console.log(describeMachine(m));
+        console.log(`  ${describeProbe(probes[i]!)}`);
+        console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
+        for (const w of m.warnings) console.log(`  warning: ${w}`);
+      }
+      // the verdict mugge run would reach, and a non-zero exit when it would not start
+      try {
+        usableMachines(machines, probes);
+      } catch (e) {
+        die(String((e as Error).message ?? e));
+      }
       return;
     }
     default:
