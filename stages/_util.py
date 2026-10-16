@@ -155,6 +155,9 @@ class Config:
     # Centipede does (the engine's MUGGE_CUT_RETRY=nothink then keeps the ticket's later
     # calls off too); "force" closes the thinking and forces the answer on top of it.
     mugge_bench_cut_retry: str = "nothink"  # nothink | force
+    # Ticket keys (<project>/<ticket>) left out of the score, e.g. the ones whose reference
+    # answers fail in this sandbox
+    mugge_bench_exclude: list[str] = field(default_factory=list)
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
     # so a top-k test needs no rebuild.

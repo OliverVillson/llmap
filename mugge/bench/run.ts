@@ -192,7 +192,7 @@ if (import.meta.main) {
       temperature: { type: 'string' }, 'top-p': { type: 'string' }, 'top-k': { type: 'string' },
       thinking: { type: 'string' }, gpus: { type: 'string' }, name: { type: 'string' }, filter: { type: 'string' },
       split: { type: 'string' }, transcripts: { type: 'boolean' }, fake: { type: 'boolean' }, timeout: { type: 'string' },
-      'max-tokens': { type: 'string' }, tickets: { type: 'string' },
+      'max-tokens': { type: 'string' }, tickets: { type: 'string' }, exclude: { type: 'string' },
     },
   });
   if (!values.bench || !values.out) {
@@ -204,6 +204,11 @@ if (import.meta.main) {
   if (values.filter) {
     const f = values.filter;
     projects = projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => t.key.includes(f)) })).filter((p) => p.tickets.length);
+  }
+  // --exclude a/b,c/d: tickets left out of the score (e.g. ones whose reference answer fails in this sandbox)
+  if (values.exclude) {
+    const out = new Set(values.exclude.split(',').map((k) => k.trim()).filter(Boolean));
+    projects = projects.map((p) => ({ ...p, tickets: p.tickets.filter((t) => !out.has(t.key)) })).filter((p) => p.tickets.length);
   }
   if (values.tickets) projects = firstTickets(projects, Number(values.tickets));
   // refused before any call: a top_k of 0 would otherwise score every ticket 0% on call errors

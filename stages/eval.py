@@ -1364,6 +1364,8 @@ def mugge_bench_command(job: Job, name: str, out: Path, url: str = "") -> list[s
         cmd += ["--split", cfg.mugge_bench_split]
     if cfg.mugge_bench_tickets:
         cmd += ["--tickets", str(cfg.mugge_bench_tickets)]
+    if cfg.mugge_bench_exclude:
+        cmd += ["--exclude", ",".join(cfg.mugge_bench_exclude)]
     return cmd + ["--transcripts"]  # for scripts/mugge_rollouts.py; a flag with no value, so last
 
 

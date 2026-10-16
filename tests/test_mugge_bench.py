@@ -36,6 +36,8 @@ def test_command_targets_the_served_candidate_with_the_eval_sampling(tmp_path):
     assert "--transcripts" in cmd  # scripts/mugge_rollouts.py reads them
     quick = ev.mugge_bench_command(job(tmp_path / "q", mugge_bench_tickets=20), "x", tmp_path)
     assert quick[quick.index("--tickets") + 1] == "20"
+    ex = ev.mugge_bench_command(job(tmp_path / "e", mugge_bench_exclude=["a/x", "b/y"]), "x", tmp_path)
+    assert ex[ex.index("--exclude") + 1] == "a/x,b/y" and "--exclude" not in quick
     # and a forced answer after a call still thinking at its cap
     assert ev.limits(j.config)[1] >= ev.call_max_tokens(j.config) + ev.ANSWER_TOKENS + ev.BENCH_PROMPT_TOKENS
     assert ev.mugge_bench_command(j, "b", tmp_path, "http://127.0.0.1:9/v1")[ev.mugge_bench_command(j, "b", tmp_path).index("--url") + 1] == "http://127.0.0.1:9/v1"
@@ -242,6 +244,12 @@ def test_bench_cli_on_the_fixture_with_the_fake_model(tmp_path):
     cmp = subprocess.run(["bun", "bench/report.ts", str(out), "--ref", str(out)], cwd=ROOT / "mugge",
                          capture_output=True, text=True, timeout=120)
     assert cmp.returncode == 0 and "of reference: MET" in cmp.stdout
+    # --exclude leaves tickets out of the score
+    ex = tmp_path / "ex"
+    r = subprocess.run(["bun", "bench/run.ts", "--bench", str(FIXTURE), "--out", str(ex), "--fake", "--seeds", "1", "--exclude", "calc/mul"],
+                       cwd=ROOT / "mugge", capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((ex / "report.json").read_text())["tickets"] == 1
 
 
 def test_rows_holding_a_bench_canary_never_reach_training():
