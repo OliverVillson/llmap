@@ -160,39 +160,50 @@ else
   done
   echo "$SANDBOX images ready: $(for i in $IMAGES; do printf 'mugge-%s ' "$i"; done)"
 fi
-# Reference answers known to fail in the sandbox images: the dev set's four Playwright tickets
-# (the web image installs Chromium where the sandbox's HOME=/tmp does not look) and a dotnet
-# ticket whose hidden test restores packages. They are left out, so every score is on the same
-# scorable tickets; any other failure stops the run.
+# Tickets left out of every score, so every BlackHole number is on the same tickets: the dev
+# set's four Playwright tickets (the web image installs Chromium where the sandbox's HOME=/tmp
+# does not look) and booking-net/dn-repo (its hidden test fails even with the reference
+# answer, most often under load). They are left out whether or not they fail on a given run.
 UNSCORABLE=${UNSCORABLE-rota-ui/fe-grid-keys,rota-ui/fe-layout,rota-ui/fe-form,rota-ui/fe-grid,booking-net/dn-repo}
 EXCLUDED_FILE=$BENCH/.excluded-$SANDBOX
 if [ ! -f "$BENCH/.preflight-$SANDBOX" ]; then
-  say "Preflight: every ticket once with its reference answer (no model), to check the sandbox"
-  rm -rf "$WORK/preflight"
+  say "Preflight: every scorable ticket once with its reference answer (no model), to check the sandbox"
+  rm -rf "$WORK/preflight" "$WORK"/preflight-again-*
   (cd "$LLMAP/mugge" && bun bench/run.ts --bench "$BENCH" --out "$WORK/preflight" --fake --seeds 1 \
-    --concurrency 4 --sandbox "$SANDBOX" > "$WORK/preflight.log" 2>&1) || true
-  python3 - "$WORK/preflight/results.jsonl" "$UNSCORABLE" "$EXCLUDED_FILE" "$WORK/preflight.log" <<'PY'
+    --concurrency 4 --sandbox "$SANDBOX" ${UNSCORABLE:+--exclude "$UNSCORABLE"} > "$WORK/preflight.log" 2>&1) || true
+  [ -s "$WORK/preflight/results.jsonl" ] || { echo "The preflight did not run. Full log: $WORK/preflight.log"; exit 1; }
+  failed=$(python3 -c 'import json,sys; print(" ".join(r["key"] for r in map(json.loads, open(sys.argv[1])) if not r["solved"]))' "$WORK/preflight/results.jsonl")
+  still=""
+  for key in $failed; do  # once more, alone: four sandboxes at once can starve a small VM
+    echo "  $key failed; trying it again on its own"
+    out=$WORK/preflight-again-${key//\//_}
+    (cd "$LLMAP/mugge" && bun bench/run.ts --bench "$BENCH" --out "$out" --fake --seeds 1 --concurrency 1 \
+      --sandbox "$SANDBOX" --filter "$key" > "$out.log" 2>&1) || true
+    python3 -c 'import json,sys; sys.exit(0 if any(r["key"] == sys.argv[2] and r["solved"] for r in map(json.loads, open(sys.argv[1]))) else 1)' \
+      "$out/results.jsonl" "$key" 2>/dev/null || still="$still $key"
+  done
+  if [ -n "$still" ]; then
+    echo "Reference answers fail for these tickets, twice, so the sandbox cannot run them:"
+    for key in $still; do
+      out=$WORK/preflight-again-${key//\//_}
+      echo "  $key: $(python3 -c 'import json,sys; r=[r for r in map(json.loads, open(sys.argv[1])) if r["key"] == sys.argv[2]]; print(((r[0].get("error") or "").strip().splitlines() or [""])[-1][:200] if r else "no result")' "$out/results.jsonl" "$key" 2>/dev/null || echo "see $out.log")"
+    done
+    echo "Full logs: $WORK/preflight.log and $WORK/preflight-again-*.log. On a Mac, give Podman or Docker 6 GB and 8 CPUs (see the README)."
+    exit 1
+  fi
+  # the known unscorable tickets this bench has (the spike has none)
+  python3 - "$BENCH" "$UNSCORABLE" "$EXCLUDED_FILE" <<'PY'
 import json, sys
 from pathlib import Path
-res, known, out, log = Path(sys.argv[1]), {k for k in sys.argv[2].split(",") if k}, Path(sys.argv[3]), sys.argv[4]
-if not res.exists():
-    sys.exit(f"The preflight did not run. Full log: {log}")
-rows = [json.loads(l) for l in res.read_text().splitlines() if l.strip()]
-failed = sorted(r["key"] for r in rows if not r["solved"])
-other = [k for k in failed if k not in known]
-if other:
-    print(f"Reference answers solved {len(rows) - len(failed)} of {len(rows)}. The sandbox cannot run these tickets, which are not known to be unscorable:")
-    for r in rows:
-        if r["key"] in other:
-            print(f"  {r['key']}: {((r.get('error') or '').strip().splitlines() or [''])[-1][:200]}")
-    sys.exit(f"Full log: {log}")
-out.write_text(",".join(failed))
-print(f"reference answers: {len(rows) - len(failed)} of {len(rows)} solved"
-      + (f"; left out of every score, as known unscorable: {', '.join(failed)}" if failed else ""))
+bench, known, out = Path(sys.argv[1]), [k for k in sys.argv[2].split(",") if k], Path(sys.argv[3])
+keys = {f"{p.parent.name}/{t['id']}" for p in bench.rglob("plan.json") if "node_modules" not in p.parts for t in json.loads(p.read_text())["tickets"]}
+out.write_text(",".join(k for k in known if k in keys))
 PY
   touch "$BENCH/.preflight-$SANDBOX"
+  echo "reference answers: every scorable ticket solved$( [ -n "$failed" ] && echo " (after a second try on its own for:$(printf ' %s' $failed))")"
 fi
 EXCLUDE=$(cat "$EXCLUDED_FILE" 2>/dev/null || true)
+[ -n "$EXCLUDE" ] && echo "left out of every score: ${EXCLUDE//,/, }"
 
 JOB=$WORK/jobs/$NAME
 mkdir -p "$JOB"
@@ -359,7 +370,7 @@ size = sum(p.stat().st_size for p in shards) / 1e9
 lo, hi = r["scoreCI"]
 excluded = json.loads((job / "config.json").read_text()).get("mugge_bench_exclude", [])
 print(f"{name}: Mugge score {r['score']}% (95% {lo}-{hi}) on {r['tickets']} scorable tickets x {r['seeds']} seeds, {projects} projects"
-      + (f" ({len(excluded)} left out, their reference answers fail in the sandbox: {', '.join(excluded)})" if excluded else ""))
+      + (f" ({len(excluded)} known unscorable left out: {', '.join(excluded)})" if excluded else ""))
 parts = ", ".join(f"{k} {v:.2f}" for k, v in fp["by_kind_gb"].items())
 print(f"  footprint {fp['total_gb']:.2f} GB for one agent at {fp['ctx']} context after a {fp.get('prompt_tokens', '?')}-token prompt: "
       f"GGUF file {size:.2f} GB + working memory {fp.get('working_gb', fp['total_gb'] - size):.2f} GB "

@@ -32,6 +32,12 @@ Other settings:
   - The real score comes from the private dev set, `muggebench-dev.tar.gz`. That file has been on Oliver's Mac (copied to the VM from `~/Downloads`) and in the evroc bucket at `bench/muggebench-dev.tar.gz`. The `llmap-bench` repo it comes from is not reachable from these threads.
   - Copy the tarball to the laptop's home folder, or set `BENCH_TAR`, and the script unpacks it next to the spike.
 
+## Docker or Podman memory
+
+The dev set's dotnet tickets fail at random when the container VM is small, with no error after the build: four sandboxes at once, each allowed 2 GB, starve a 2 GB VM. Give it 6 GB and 8 CPUs:
+- Podman on a Mac: `podman machine stop; podman machine set --memory 6144 --cpus 8; podman machine start`.
+- Docker Desktop: Settings, Resources, at least 6 GB of memory. On Windows with WSL2 that comes from WSL's own limit, so also set `memory=6GB` in `.wslconfig` (see below). On the 8 GB laptop that leaves little for Windows, so close other apps during a run.
+
 ## The 4060 laptop (WSL2)
 
 One-time setup, in a WSL2 Ubuntu shell:
@@ -55,8 +61,8 @@ GGUF=~/models/BH-0.1-1.7B-Q4_K_M.gguf bash muggebench.sh                # the fu
 2. Checks out llmap at the bench commit into `~/muggebench/llmap`.
 3. Builds the sandbox images the bench needs.
 4. Runs a preflight: every ticket once with its reference answer, which proves the sandbox works on this machine.
-   - Five dev-set tickets are known to fail even with their reference answers: the four Playwright web tickets in `rota-ui` and `booking-net/dn-repo`. In the web image, Chromium is installed where the sandbox's `HOME=/tmp` does not look; the dotnet ticket's hidden test seems to restore packages with no network. These five are left out of every score, so every BlackHole number is on the same 57 scorable tickets. The result says how many tickets were scored and which were left out.
-   - Any other failing ticket stops the run (`UNSCORABLE` holds the known list).
+   - Five dev-set tickets are left out of every score, whether or not they fail on a given run, so every BlackHole number is on the same 57 tickets: the four Playwright web tickets in `rota-ui` (the web image installs Chromium where the sandbox's `HOME=/tmp` does not look) and `booking-net/dn-repo`, whose hidden test fails even with its reference answer, most often under load. `UNSCORABLE` holds the list, and the result names them.
+   - A ticket outside that list that fails is tried once more on its own. Only a second failure stops the run.
 5. Scores the model. Re-running skips steps that are done, and a model already scored is reported from its saved results. To score it again, delete `~/muggebench/jobs/<name>`.
 
 Before scoring, it measures the footprint the way the training plan defines it:
