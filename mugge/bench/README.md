@@ -66,7 +66,7 @@ bun bench/smoke.ts --fake --fake-mess        # no model: the fake server, with f
    `MUGGE_MAX_CALL_TOKENS`). `--min-p 0` for MiniCPM5-2B.
 3. It prints tickets passing, parser drops (by reason), forced and cut answers, call errors, wall
    time and **MEETS** (exit 0) when at least `--bar` (default 0.5) of the tickets pass, at most
-   20% of answers were lost to the parser, the cap or a forced answer, at most 20% wrote a file path the parser
+   20% of worker answers (write and fix; review answers are not rows) were lost to the parser, the cap or a forced answer, at most 20% wrote a file path the parser
    had to guess (`prog.c`, `**a.py**`: not the training format), and no call failed; **MISSES**
    (exit 1) otherwise, with the reasons.
 

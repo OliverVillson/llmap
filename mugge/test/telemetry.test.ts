@@ -48,7 +48,7 @@ describe('parser drops', () => {
     expect([c.calls, c.errors, c.dropped, c.cut, c.lost, c.clean]).toEqual([11, 1, 1, 1, 2, 8]);
     expect(lostWarning(c)).toBeNull(); // 2 of 10 answers is 20%: at the line, not over it
     t.emit(model('t11', { drop: 'empty', files: 0 }));
-    expect(lostWarning(t.calls())).toContain('3 of 11 answers (27%)');
+    expect(lostWarning(t.calls())).toContain('3 of 11 worker answers (27%)');
     expect(t.close().warnings[0]).toContain('empty 1, no_fence 1');
   });
 });
@@ -363,4 +363,13 @@ test('forced answers count as lost: a run of forced answers misses even when eve
   const c = t.calls();
   expect([c.forced, c.lost, c.clean, c.lostShare]).toEqual([10, 10, 0, 1]);
   expect(lostWarning(c)).toContain('forced');
+});
+
+test('review answers are not rows: they neither count as lost nor dilute the lost share', () => {
+  const t = new Telemetry({ warn: null });
+  t.emit({ type: 'model', at: 1000, ticket: 'a', attempt: 1, kind: 'write', promptTokens: 10, completionTokens: 5, ms: 10, note: '', files: 0, cut: true, drop: 'cut' });
+  t.emit({ type: 'model', at: 1000, ticket: 'b', attempt: 1, kind: 'write', promptTokens: 10, completionTokens: 5, ms: 10, note: '', files: 1 });
+  for (const ticket of ['a', 'b']) t.emit({ type: 'review', at: 1000, ticket, attempt: 1, verdict: 'approve', problems: [], fix: '', promptTokens: 10, completionTokens: 5, ms: 10 });
+  const c = t.calls();
+  expect([c.calls, c.review, c.answers, c.lost, c.lostShare]).toEqual([4, 2, 2, 1, 0.5]);
 });
