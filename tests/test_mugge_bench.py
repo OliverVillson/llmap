@@ -39,6 +39,8 @@ def test_command_targets_the_served_candidate_with_the_eval_sampling(tmp_path):
     # and a forced answer after a call still thinking at its cap
     assert ev.limits(j.config)[1] >= ev.call_max_tokens(j.config) + ev.ANSWER_TOKENS + ev.BENCH_PROMPT_TOKENS
     assert ev.mugge_bench_command(j, "b", tmp_path, "http://127.0.0.1:9/v1")[ev.mugge_bench_command(j, "b", tmp_path).index("--url") + 1] == "http://127.0.0.1:9/v1"
+    # Centipede's top_k 0 (none) is not passed: run.ts refuses it, and the proxy sets the sampling
+    assert "--top-k" not in ev.mugge_bench_command(job(tmp_path / "k", code_eval_thinking=True, thinking_top_k=0), "x", tmp_path)
     off = ev.mugge_bench_command(job(tmp_path / "b", code_eval_temperature=0.2), "x", tmp_path)
     assert "--top-k" not in off and off[off.index("--thinking") + 1] == "off" and off[off.index("--temperature") + 1] == "0.2"
 

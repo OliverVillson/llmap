@@ -1348,7 +1348,7 @@ def mugge_bench_command(job: Job, name: str, out: Path, url: str = "") -> list[s
            "--sandbox", cfg.mugge_bench_sandbox, "--thinking", "on" if thinking else "off",
            "--temperature", str(cfg.code_eval_thinking_temperature if thinking else cfg.code_eval_temperature),
            "--top-p", "0.95", "--max-tokens", str(call_max_tokens(cfg))]
-    if thinking:
+    if thinking and cfg.thinking_top_k > 0:  # run.ts refuses 0; the proxy sends llama-server LLAMA_TOP_K then (sampling_params)
         cmd += ["--top-k", str(cfg.thinking_top_k)]
     if cfg.mugge_bench_split:
         cmd += ["--split", cfg.mugge_bench_split]
