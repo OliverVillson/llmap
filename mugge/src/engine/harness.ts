@@ -47,6 +47,22 @@ export interface HarnessContext {
   reviewModel?: string;
   /** Whether calls think (only changes the state shown during a call); unset: the inference config's switch, else MUGGE_THINKING. */
   thinking?: boolean;
+  /**
+   * What the ticket's later calls do once a thinking call ran out of tokens (cut with no usable
+   * file, or forced): "nothink" sends them with thinking off, "same" changes nothing. Unset:
+   * MUGGE_CUT_RETRY, else "nothink".
+   */
+  cutRetry?: CutRetry;
+}
+
+export type CutRetry = 'nothink' | 'same';
+
+/** MUGGE_CUT_RETRY: nothink (default) or same. */
+export function cutRetryFromEnv(env: Record<string, string | undefined> = process.env): CutRetry {
+  const v = env.MUGGE_CUT_RETRY?.trim().toLowerCase();
+  if (!v) return 'nothink';
+  if (v !== 'nothink' && v !== 'same') throw new Error('MUGGE_CUT_RETRY must be nothink or same');
+  return v;
 }
 
 export interface TicketResult {
@@ -98,6 +114,9 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   const r: TicketResult = { ok: false, attempts: 0, firstTry: false, error: null, promptTokens: 0, completionTokens: 0, inferenceMs: 0, checkMs: 0, model: ticket.model, review: null, reviewUnresolved: false, answerAttempt: null };
   const reviewOn = ctx.review ?? reviewFromEnv();
   const thinking = ctx.thinking ?? thinkingOn(ctx.inference);
+  const cutRetry = ctx.cutRetry ?? cutRetryFromEnv();
+  // a thinking call of this ticket ran out of tokens: its later calls go out with thinking off
+  let noThink = false;
   const pack = buildPack(worktree, ctx.plan, ticket, ctx.memory);
   const rounds = [ticket.model, ...(ticket.escalate_to ? [ticket.escalate_to] : [])];
   const of = ticket.budget.attempts * rounds.length;
@@ -155,10 +174,10 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       const attempt = ++r.attempts;
       const kind = failed ? 'fix' : 'write';
       const messages = failed ? fixMessages(worktree, pack, failed) : writeMessages(worktree, pack);
-      state(callState(kind, thinking));
+      state(callState(kind, thinking && !noThink));
       let c: Completion<string>;
       try {
-        c = await ctx.inference.text(model, messages, ticket.budget.max_tokens - spent, ctx.signal);
+        c = await ctx.inference.text(model, messages, ticket.budget.max_tokens - spent, ctx.signal, noThink ? { thinking: false } : undefined);
       } catch (e) {
         const msg = String((e as Error).message ?? e);
         // The review's feedback is sent again: a fix that only answered the error would finish
@@ -176,7 +195,11 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
       r.inferenceMs += c.ms;
       const out: WorkerOutput = parseFiles(c.value, ticket.owns);
       const seen = classifyAnswer(c.value, ticket.owns, out, c.cut);
-      ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length, model, maxTokens: c.maxTokens, forced: c.forced, drop: seen.drop, missing: seen.missing.length || undefined, loose: seen.loose.length || undefined, reasoningChars: c.reasoningChars });
+      ctx.emit({ type: 'model', at: Date.now(), ticket: ticket.id, attempt, kind, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens, cut: c.cut, ms: c.ms, note: String(out?.note ?? '').slice(0, 200), files: Object.keys(out?.files ?? {}).length, model, maxTokens: c.maxTokens, forced: c.forced, drop: seen.drop, missing: seen.missing.length || undefined, loose: seen.loose.length || undefined, reasoningChars: c.reasoningChars, thinking: thinking && !noThink });
+      if (thinking && !noThink && cutRetry === 'nothink' && (seen.drop === 'cut' || c.forced)) {
+        noThink = true;
+        ctx.emit({ type: 'log', at: Date.now(), level: 'warn', message: `${ticket.id} #${attempt}: thinking ran out of tokens (${c.forced ? `forced: ${c.forced}` : `cut at ${c.maxTokens ?? '?'}`}); later calls of this ticket go without thinking` });
+      }
 
       const refused = applyOutput(worktree, ticket, out);
       if (refused.length) {

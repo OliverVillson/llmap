@@ -38,6 +38,9 @@
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
  *                         spend in one call)
+ *   MUGGE_CUT_RETRY       nothink | same (default nothink): once a thinking call of a ticket runs out
+ *                         of tokens (cut with no usable file, or forced), that ticket's later calls go
+ *                         out with thinking off; same keeps thinking on. Read by the harness itself.
  *   MUGGE_DEBUG_CALLS     1: one line per model call on stderr: model, prompt, completion and
  *                         reasoning tokens, time, and whether the answer was cut at max_tokens
  *   MUGGE_REVIEW          on | off (default off): one lead review of each ticket whose checks pass

@@ -116,6 +116,12 @@ export interface CallRecord {
   reasoningChars: number | null;
   /** max_tokens the call was sent with. */
   maxTokens: number | null;
+  /**
+   * Whether the call thought, as the harness sent it: false for a ticket's calls after one ran out
+   * of tokens thinking (MUGGE_CUT_RETRY). A row built from it renders with that thinking switch.
+   * null when the run does not set thinking (server default) or for review calls.
+   */
+  thinking: boolean | null;
   ms: number;
   /** Completion tokens over the call's own time. */
   tokS: number;
@@ -571,7 +577,7 @@ export class Telemetry {
         this.record({
           v: 1, run: this.run, at: e.at, ticket: e.ticket, attempt: e.attempt, kind: 'review',
           agent: a.id, team: a.team, machine: a.machine, model: null,
-          promptTokens: e.promptTokens, completionTokens: e.completionTokens, reasoningTokens: e.reasoningTokens ?? null, reasoningChars: null, maxTokens: null,
+          promptTokens: e.promptTokens, completionTokens: e.completionTokens, reasoningTokens: e.reasoningTokens ?? null, reasoningChars: null, maxTokens: null, thinking: null,
           ms: e.ms, tokS: e.ms > 0 ? round1((1000 * e.completionTokens) / e.ms) : 0, cut: !!e.cut, forced: null,
           files: 0, missing: 0, loose: 0, drop: null, error: e.verdict === 'error' ? e.error ?? 'review failed' : null, clean: !e.cut && e.verdict !== 'error',
         });
@@ -598,7 +604,7 @@ export class Telemetry {
           v: 1, run: this.run, at: e.at, ticket: e.ticket, attempt: e.attempt, kind: e.kind,
           agent: a.id, team: a.team, machine: a.machine, model: e.model ?? null,
           promptTokens: e.promptTokens, completionTokens: e.completionTokens,
-          reasoningTokens: e.reasoningTokens ?? null, reasoningChars: e.reasoningChars ?? null, maxTokens: e.maxTokens ?? null,
+          reasoningTokens: e.reasoningTokens ?? null, reasoningChars: e.reasoningChars ?? null, maxTokens: e.maxTokens ?? null, thinking: e.thinking ?? null,
           ms: e.ms, tokS: Math.round(tokS * 10) / 10, cut: !!e.cut, forced: e.forced ?? null,
           files: e.files ?? 0, missing: e.missing ?? 0, loose: e.loose ?? 0, drop: e.drop ?? null, error: null,
           clean: !e.cut && !e.forced && !e.drop && !e.loose,
@@ -618,7 +624,7 @@ export class Telemetry {
         this.record({
           v: 1, run: this.run, at: e.at, ticket: e.ticket, attempt: e.attempt, kind: e.kind,
           agent: a.id, team: a.team, machine: a.machine, model: e.model ?? null,
-          promptTokens: 0, completionTokens: 0, reasoningTokens: null, reasoningChars: null, maxTokens: null,
+          promptTokens: 0, completionTokens: 0, reasoningTokens: null, reasoningChars: null, maxTokens: null, thinking: null,
           ms: 0, tokS: 0, cut: false, forced: null, files: 0, missing: 0, loose: 0, drop: null, error: e.error, clean: false,
         });
         a.calls++;
