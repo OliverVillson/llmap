@@ -41,6 +41,8 @@ def test_command_targets_the_served_candidate_with_the_eval_sampling(tmp_path):
     assert ev.mugge_bench_command(j, "b", tmp_path, "http://127.0.0.1:9/v1")[ev.mugge_bench_command(j, "b", tmp_path).index("--url") + 1] == "http://127.0.0.1:9/v1"
     # Centipede's top_k 0 (none) is not passed: run.ts refuses it, and the proxy sets the sampling
     assert "--top-k" not in ev.mugge_bench_command(job(tmp_path / "k", code_eval_thinking=True, thinking_top_k=0), "x", tmp_path)
+    bh = ev.mugge_bench_command(job(tmp_path / "bh", code_eval_temperature=0.7, eval_nothink_top_p=0.8, eval_nothink_top_k=20), "x", tmp_path)
+    assert bh[bh.index("--top-p") + 1] == "0.8" and bh[bh.index("--top-k") + 1] == "20" and bh[bh.index("--temperature") + 1] == "0.7"
     off = ev.mugge_bench_command(job(tmp_path / "b", code_eval_temperature=0.2), "x", tmp_path)
     assert "--top-k" not in off and off[off.index("--thinking") + 1] == "off" and off[off.index("--temperature") + 1] == "0.2"
 
@@ -110,7 +112,8 @@ def test_a_call_still_thinking_at_its_cap_is_asked_again_without_thinking(monkey
     assert calls == {"calls": 1, "forced": 0, "nothink": 1}
     line = json.loads(log.read_text())
     assert line == {"prompt_sha": ev.prompt_sha("Ticket: t"), "seed": 3, "thinking": True, "finish": "length",
-                    "thinking_tokens": 100, "lost": "length", "retry": "nothink", "reasoning_tail": "round and round"}
+                    "thinking_tokens": 100, "reasoning_chars": 15, "lost": "length", "retry": "nothink",
+                    "reasoning_tail": "round and round"}
     # an answer that came needs no retry
     monkeypatch.setattr(ev, "chat", fake_chat({"content": "b.py\n```\ny\n```", "reasoning_content": "ok"}, "stop"))
     assert "forced" not in ev.bench_answer(THINKING, calls, "nothink", log)["choices"][0] and calls["nothink"] == 1
@@ -165,6 +168,17 @@ def test_bench_readings_become_rollouts_for_the_thinking_report(tmp_path):
     loaded = thinking_report.load(tmp_path / "bh.jsonl", "")
     assert set(loaded) == {"bh"} and len(loaded["bh"]) == 2
     assert thinking_report.looped(loaded["bh"][("p/t1#0", 0)]) and not thinking_report.looped(loaded["bh"][("p/t2#0", 0)])
+
+
+def test_sampling_follows_the_job_with_thinking_on_and_off(monkeypatch):
+    monkeypatch.setattr(ev, "VLLM", {})
+    # defaults: the old set (thinking-off calls send no top_k, so the server's applies)
+    assert ev.sampling_params(1, False) == {"seed": 1, "top_p": 0.95, "min_p": 0.0, "repeat_penalty": 1.0}
+    # BlackHole's: thinking 0.95 / 20, off 0.8 / 20
+    for k, v in {"THINK_TOP_K": 20, "THINK_TOP_P": 0.95, "NOTHINK_TOP_P": 0.8, "NOTHINK_TOP_K": 20}.items():
+        monkeypatch.setattr(ev, k, v)
+    assert ev.sampling_params(1, True)["top_p"] == 0.95 and ev.sampling_params(1, True)["top_k"] == 20
+    assert ev.sampling_params(1, False) == {"seed": 1, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "repeat_penalty": 1.0}
 
 
 def post(url, body):

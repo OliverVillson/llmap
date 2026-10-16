@@ -12,7 +12,9 @@ thinking tokens, how it ended and the end of its thinking). Each thinking call b
     {id: "<project>/<ticket>#<call>", sample: seed, tokens, finish, forced, retry,
      answer_cut, passed, reasoning_tail, attempt}
 in the eval rows' shape thinking_report reads: tokens is the thinking call's completion
-count (a retry or forced answer not in), finish how that call ended, forced why its
+count as the server reports it (usage, else llama-server's timings): llama-server gives no
+reasoning count apart, so it is the thinking plus any answer after it, as in the code eval's
+rows, and all thinking for a call that ran out (a retry or forced answer not in). finish is how that call ended, forced why its
 thinking ended with no answer ("length", "stop", "no_reasoning", or null), retry how it
 was answered then ("nothink": asked again with thinking off, as Centipede does; "force"),
 and passed whether this call's answer is the one the ticket ended on and the ticket was
@@ -85,6 +87,7 @@ def convert(run: Path) -> tuple[list[dict], dict]:
                 "finish": finish, "forced": lost, "retry": (p.get("retry") if p else None) if lost else None,
                 "answer_cut": finish == "length" and not lost,
                 "passed": bool(res.get("solved")) and c.get("attempt") == final,
+                **({"reasoning_chars": p["reasoning_chars"]} if p and "reasoning_chars" in p else {}),
                 **({"reasoning_tail": p["reasoning_tail"]} if p and p.get("reasoning_tail") else {}),
             })
     return rows, counts

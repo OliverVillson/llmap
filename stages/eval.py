@@ -132,6 +132,9 @@ THINK_TOP_K = 20  # top_k for thinking answers; serve() takes the job's thinking
 # GPU idles (4 tokens/s per slot for Granite 3B on a B200). vLLM samples on the GPU.
 LLAMA_TOP_K = 100
 MIN_P = 0.0  # serve() takes the job's eval_min_p
+# serve() takes these from the job too: eval_top_p, eval_nothink_top_p, eval_nothink_top_k,
+# and code_eval_temperature for a bench call asked again without thinking (bench_answer)
+THINK_TOP_P, NOTHINK_TOP_P, NOTHINK_TOP_K, NOTHINK_TEMPERATURE = 0.95, 0.95, 0, 0.2
 # The server serve() started ({"proc", "path", "name"}): alive() watches its process, and
 # the SIGTERM handler stops its process group.
 _SERVER: dict = {}
@@ -460,12 +463,14 @@ def serve(job: Job, path: str, name: str) -> subprocess.Popen:
     is refused: its /health would pass for this one's, and it would answer for it."""
     import httpx
 
-    global VLLM, THINK_TOP_K, MIN_P
+    global VLLM, THINK_TOP_K, MIN_P, THINK_TOP_P, NOTHINK_TOP_P, NOTHINK_TOP_K, NOTHINK_TEMPERATURE
     if port_taken():
         raise RuntimeError(f"port {PORT} is already in use, e.g. by a server an earlier eval left running; "
                            "stop it (or set LOBBOT_EVAL_PORT) and run again")
     cfg = job.config
     THINK_TOP_K, MIN_P = cfg.thinking_top_k, cfg.eval_min_p
+    THINK_TOP_P, NOTHINK_TOP_P, NOTHINK_TOP_K = cfg.eval_top_p, cfg.eval_nothink_top_p, cfg.eval_nothink_top_k
+    NOTHINK_TEMPERATURE = cfg.code_eval_temperature
     if is_checkpoint(path):
         cmd, env = vllm_command(path)
         cmd += vllm_args(cfg, path, name)
@@ -598,10 +603,13 @@ def sampling_params(seed: int | None, thinking: bool) -> dict:
     """Sampling fields for a request to the running server. min_p (Config.eval_min_p) and
     a repetition penalty of 1 always go explicitly, in the engine's own field names, so
     neither engine's default applies (llama-server's min_p is 0.05). A top_k of 0 (none)
-    goes to llama-server as LLAMA_TOP_K."""
+    goes to llama-server as LLAMA_TOP_K. With thinking off, top_k goes only when the job
+    sets one (eval_nothink_top_k), and top_p is eval_nothink_top_p."""
     penalty = {"repetition_penalty": 1.0} if VLLM else {"repeat_penalty": 1.0}
     top_k = THINK_TOP_K if VLLM or THINK_TOP_K > 0 else LLAMA_TOP_K
-    return {**({"seed": seed, "top_p": 0.95} if seed is not None else {}), **({"top_k": top_k} if thinking else {}),
+    top_p = THINK_TOP_P if thinking else NOTHINK_TOP_P
+    return {**({"seed": seed, "top_p": top_p} if seed is not None else {}),
+            **({"top_k": top_k} if thinking else {"top_k": NOTHINK_TOP_K} if NOTHINK_TOP_K > 0 else {}),
             "min_p": MIN_P, **penalty}
 
 
@@ -1347,9 +1355,11 @@ def mugge_bench_command(job: Job, name: str, out: Path, url: str = "") -> list[s
            "--seeds", str(cfg.mugge_bench_seeds), "--concurrency", str(cfg.mugge_bench_concurrency),
            "--sandbox", cfg.mugge_bench_sandbox, "--thinking", "on" if thinking else "off",
            "--temperature", str(cfg.code_eval_thinking_temperature if thinking else cfg.code_eval_temperature),
-           "--top-p", "0.95", "--max-tokens", str(call_max_tokens(cfg))]
-    if thinking and cfg.thinking_top_k > 0:  # run.ts refuses 0; the proxy sends llama-server LLAMA_TOP_K then (sampling_params)
-        cmd += ["--top-k", str(cfg.thinking_top_k)]
+           "--top-p", str(cfg.eval_top_p if thinking else cfg.eval_nothink_top_p), "--max-tokens", str(call_max_tokens(cfg))]
+    # run.ts refuses a top_k of 0; the proxy then sends llama-server LLAMA_TOP_K (sampling_params)
+    top_k = cfg.thinking_top_k if thinking else cfg.eval_nothink_top_k
+    if top_k > 0:
+        cmd += ["--top-k", str(top_k)]
     if cfg.mugge_bench_split:
         cmd += ["--split", cfg.mugge_bench_split]
     if cfg.mugge_bench_tickets:
@@ -1408,11 +1418,13 @@ def bench_answer(body: dict, calls: dict, retry: str = "force", log: Path | None
         got = chat(messages, int(body["max_tokens"]), temperature, sampling, thinking)
         finish = got["finish_reason"]
         reasoning, answer = split_reasoning(got["message"], cut=bool(VLLM) and thinking and finish == "length")
-        tokens = thought = got["usage"].get("completion_tokens") or 0
+        # llama-server reports no reasoning tokens apart, so this is the whole call: the thinking
+        # and any answer after it (as the code eval's rows count); its timings when usage is missing
+        tokens = thought = got["usage"].get("completion_tokens") or (got.get("timings") or {}).get("predicted_n") or 0
         lost = thinking and not answer
         why = ("no_reasoning" if not reasoning else "length" if finish == "length" else "stop") if lost else None
         if lost and retry == "nothink":
-            again = chat(messages, int(body["max_tokens"]), temperature, sampling_params(body.get("seed"), False), False)
+            again = chat(messages, int(body["max_tokens"]), NOTHINK_TEMPERATURE, sampling_params(body.get("seed"), False), False)
             answer = split_reasoning(again["message"])[1]
             finish = again["finish_reason"]
             tokens += again["usage"].get("completion_tokens") or 0
@@ -1429,7 +1441,7 @@ def bench_answer(body: dict, calls: dict, retry: str = "force", log: Path | None
             with open(log, "a") as f:
                 f.write(json.dumps({"prompt_sha": prompt_sha(last if isinstance(last, str) else json.dumps(last)),
                                     "seed": body.get("seed"), "thinking": thinking, "finish": got["finish_reason"],
-                                    "thinking_tokens": thought if thinking else 0, "lost": why,
+                                    "thinking_tokens": thought if thinking else 0, "reasoning_chars": len(reasoning), "lost": why,
                                     "retry": (retry if lost else None), "reasoning_tail": reasoning[-3000:]}) + "\n")
     # "forced" (why, or absent) is how the engine's per-call log tells a forced answer from a
     # real one: forced answers must never become training rows (mugge/src/engine/telemetry.ts).

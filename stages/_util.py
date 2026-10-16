@@ -176,6 +176,12 @@ class Config:
     # min_p sent with every eval request, explicitly and with a repetition penalty of 1,
     # so llama-server's own default (0.05) never applies and both engines sample alike.
     eval_min_p: float = 0.0
+    # top_p for thinking answers, and top_p, top_k for answers with thinking off (a top_k of
+    # 0 is not sent, so the server's own default applies). The thinking-off temperature is
+    # code_eval_temperature. BlackHole's set: thinking 0.6 / 0.95 / 20, off 0.7 / 0.8 / 20.
+    eval_top_p: float = 0.95
+    eval_nothink_top_p: float = 0.95
+    eval_nothink_top_k: int = 0
     lcb_since: str = "2026-01-01"  # LiveCodeBench problems published on or after this date only
     # ... and on or before this one ("" = no end), so a later release cannot grow the window.
     lcb_until: str = ""
