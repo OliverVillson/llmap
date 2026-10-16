@@ -33,6 +33,7 @@ def test_command_targets_the_served_candidate_with_the_eval_sampling(tmp_path):
     assert flags["--thinking"] == "on" and flags["--temperature"] == "1.0" and flags["--top-k"] == "64"
     # each call is capped as a code answer is, and the server's context fits a bench prompt over that
     assert flags["--max-tokens"] == str(ev.call_max_tokens(j.config)) and "--tickets" not in cmd
+    assert "--transcripts" in cmd  # scripts/mugge_rollouts.py reads them
     quick = ev.mugge_bench_command(job(tmp_path / "q", mugge_bench_tickets=20), "x", tmp_path)
     assert quick[quick.index("--tickets") + 1] == "20"
     # and a forced answer after a call still thinking at its cap
@@ -72,7 +73,7 @@ def test_a_call_still_thinking_at_its_cap_gets_a_forced_answer(monkeypatch):
     calls = {"calls": 0, "forced": 0}
     got = ev.bench_answer(THINKING, calls)
     assert got["choices"][0]["message"]["content"] == "a.py\n```\nx = 1\n```" and seen == [("so the loop must", "length", 1.0)]
-    assert got["usage"] == {"prompt_tokens": 40, "completion_tokens": 107} and calls == {"calls": 1, "forced": 1}
+    assert got["usage"] == {"prompt_tokens": 40, "completion_tokens": 107} and calls == {"calls": 1, "forced": 1, "nothink": 0}
     assert got["choices"][0]["forced"] == "length"  # the engine's per-call log keeps it out of training rows
     # an answer that came is passed on as it is, without its thinking
     monkeypatch.setattr(ev, "chat", fake_chat({"content": "<think>hm</think>b.py\n```\ny\n```", "reasoning_content": ""}, "stop"))
@@ -82,7 +83,86 @@ def test_a_call_still_thinking_at_its_cap_gets_a_forced_answer(monkeypatch):
     # thinking off: nothing is forced, even an empty answer
     monkeypatch.setattr(ev, "chat", fake_chat({"content": ""}, "length"))
     assert ev.bench_answer({**THINKING, "chat_template_kwargs": {"enable_thinking": False}}, calls)["choices"][0]["message"]["content"] == ""
-    assert len(seen) == 1 and calls == {"calls": 3, "forced": 1}
+    assert len(seen) == 1 and calls == {"calls": 3, "forced": 1, "nothink": 0}
+
+
+def test_a_call_still_thinking_at_its_cap_is_asked_again_without_thinking(monkeypatch, tmp_path):
+    sent = []
+
+    def chat(messages, max_tokens, temperature, sampling, thinking):
+        sent.append((messages, max_tokens, thinking, "top_k" in sampling))
+        if thinking:
+            return {"message": {"content": "", "reasoning_content": "round and round"}, "finish_reason": "length",
+                    "usage": {"prompt_tokens": 40, "completion_tokens": max_tokens}}
+        return {"message": {"content": "a.py\n```\nx = 1\n```"}, "finish_reason": "stop",
+                "usage": {"prompt_tokens": 40, "completion_tokens": 9}}
+
+    monkeypatch.setattr(ev, "chat", chat)
+    monkeypatch.setattr(ev, "force_answer", lambda *a: pytest.fail("nothink never forces"))
+    calls, log = {"calls": 0, "forced": 0}, tmp_path / "proxy.jsonl"
+    got = ev.bench_answer(THINKING, calls, "nothink", log)
+    # the same messages and cap, thinking off (no top_k); the engine is told so it keeps the ticket off
+    assert sent == [(THINKING["messages"], 100, True, True), (THINKING["messages"], 100, False, False)]
+    assert got["choices"][0]["message"]["content"] == "a.py\n```\nx = 1\n```" and got["choices"][0]["forced"] == "nothink:length"
+    assert got["choices"][0]["finish_reason"] == "stop" and got["usage"]["completion_tokens"] == 109
+    assert calls == {"calls": 1, "forced": 0, "nothink": 1}
+    line = json.loads(log.read_text())
+    assert line == {"prompt_sha": ev.prompt_sha("Ticket: t"), "seed": 3, "thinking": True, "finish": "length",
+                    "thinking_tokens": 100, "lost": "length", "retry": "nothink", "reasoning_tail": "round and round"}
+    # an answer that came needs no retry
+    monkeypatch.setattr(ev, "chat", fake_chat({"content": "b.py\n```\ny\n```", "reasoning_content": "ok"}, "stop"))
+    assert "forced" not in ev.bench_answer(THINKING, calls, "nothink", log)["choices"][0] and calls["nothink"] == 1
+
+
+def test_the_bench_runs_with_the_retry_the_job_asks_for(tmp_path, monkeypatch):
+    seen = {}
+
+    def bench(cmd, **kw):
+        seen["env"] = kw["env"]["MUGGE_CUT_RETRY"]
+        (Path(cmd[cmd.index("--out") + 1]) / "report.json").write_text(json.dumps({"score": 1, "tickets": 1, "seeds": 1}))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(ev.subprocess, "run", bench)
+    ev.mugge_bench(job(tmp_path), "a")
+    assert seen["env"] == "nothink" and (tmp_path / "job/work/mugge_bench/a/proxy-calls.jsonl").exists()
+    ev.mugge_bench(job(tmp_path / "f", mugge_bench_cut_retry="force"), "a")
+    assert seen["env"] == "same"
+    with pytest.raises(ValueError):
+        ev.mugge_bench(job(tmp_path / "x", mugge_bench_cut_retry="maybe"), "a")
+
+
+def test_bench_readings_become_rollouts_for_the_thinking_report(tmp_path):
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import mugge_rollouts
+    import thinking_report
+
+    run = tmp_path / "bh"
+    run.mkdir()
+    (run / "results.jsonl").write_text(json.dumps({"key": "p/t1", "seed": 0, "solved": True, "attempts": 2}) + "\n"
+                                       + json.dumps({"key": "p/t2", "seed": 0, "solved": False, "attempts": 1}) + "\n")
+    calls = [{"prompt": "write t1", "attempt": 1, "thinking": True}, {"prompt": "fix t1", "attempt": 2, "thinking": False}]
+    (run / "transcripts.jsonl").write_text(json.dumps({"key": "p/t1", "seed": 0, "calls": calls}) + "\n"
+                                           + json.dumps({"key": "p/t2", "seed": 0, "calls": [{"prompt": "write t2", "attempt": 1, "thinking": True}]}) + "\n")
+    loop = "and so the answer is " * 200
+    (run / "proxy-calls.jsonl").write_text("".join(json.dumps(p) + "\n" for p in [
+        {"prompt_sha": ev.prompt_sha("write t1"), "seed": 0, "thinking": True, "finish": "length", "thinking_tokens": 8192,
+         "lost": "length", "retry": "nothink", "reasoning_tail": loop},
+        {"prompt_sha": ev.prompt_sha("fix t1"), "seed": 0, "thinking": False, "finish": "stop", "thinking_tokens": 0,
+         "lost": None, "retry": None, "reasoning_tail": ""},
+        {"prompt_sha": ev.prompt_sha("write t2"), "seed": 0, "thinking": True, "finish": "stop", "thinking_tokens": 900,
+         "lost": None, "retry": None, "reasoning_tail": "Let me check the edge case, then write the file."},
+    ]))
+    rows, counts = mugge_rollouts.convert(run)
+    assert counts == {"thinking_calls": 2, "thinking_off_calls": 1, "unmatched": 0}
+    first, second = rows
+    # the cap-hit call lost its answer and was retried; the fix that solved it was a thinking-off call
+    assert first["id"] == "p/t1#0" and first["forced"] == "length" and first["retry"] == "nothink" and not first["passed"]
+    assert second["id"] == "p/t2#0" and second["tokens"] == 900 and not second["forced"] and not second["answer_cut"]
+    assert mugge_rollouts.main([str(run)]) == 0
+    loaded = thinking_report.load(tmp_path / "bh.jsonl", "")
+    assert set(loaded) == {"bh"} and len(loaded["bh"]) == 2
+    assert thinking_report.looped(loaded["bh"][("p/t1#0", 0)]) and not thinking_report.looped(loaded["bh"][("p/t2#0", 0)])
 
 
 def post(url, body):
@@ -111,7 +191,7 @@ def test_the_bench_endpoint_answers_over_http_and_reports_a_dead_server(monkeypa
         monkeypatch.setattr(ev, "chat", dead)
         status, got = post(url + "/chat/completions", THINKING)
         assert status == 502 and "refused" in got["error"]
-    assert calls == {"calls": 1, "forced": 1, "errors": 2, "dead": "refused"}
+    assert calls == {"calls": 1, "forced": 1, "nothink": 0, "errors": 2, "dead": "refused"}
 
 
 def test_a_server_that_dies_during_the_bench_gives_no_score(tmp_path, monkeypatch):

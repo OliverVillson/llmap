@@ -1354,7 +1354,7 @@ def mugge_bench_command(job: Job, name: str, out: Path, url: str = "") -> list[s
         cmd += ["--split", cfg.mugge_bench_split]
     if cfg.mugge_bench_tickets:
         cmd += ["--tickets", str(cfg.mugge_bench_tickets)]
-    return cmd
+    return cmd + ["--transcripts"]  # for scripts/mugge_rollouts.py; a flag with no value, so last
 
 
 def mugge_bench(job: Job, name: str) -> dict | None:
@@ -1364,12 +1364,17 @@ def mugge_bench(job: Job, name: str) -> dict | None:
     out = job.path("work", "mugge_bench", name)
     out.mkdir(parents=True, exist_ok=True)
     log = job.path("work", f"mugge-bench-{name}.log")
-    env = {**os.environ, "MUGGE_TIMEOUT_S": "3600"}  # a call may wait for a slot, then think, then answer
-    with open(log, "w") as f, bench_proxy() as (url, calls):
+    retry = job.config.mugge_bench_cut_retry
+    if retry not in ("nothink", "force"):
+        raise ValueError(f"mugge_bench_cut_retry must be nothink or force, not {retry!r}")
+    # a call may wait for a slot, then think, then answer; forced answers keep the old
+    # bench's behaviour of thinking on every call (MUGGE_CUT_RETRY=same)
+    env = {**os.environ, "MUGGE_TIMEOUT_S": "3600", "MUGGE_CUT_RETRY": "nothink" if retry == "nothink" else "same"}
+    with open(log, "w") as f, bench_proxy(retry, out / "proxy-calls.jsonl") as (url, calls):
         code = subprocess.run(mugge_bench_command(job, name, out, url), stdout=f, stderr=subprocess.STDOUT,
                               cwd=MUGGE_DIR, env=env).returncode
         f.write(f"\nmodel calls {calls['calls']}, answers forced after the thinking {calls['forced']}, "
-                f"failed calls {calls['errors']}\n")
+                f"thinking calls asked again without thinking {calls['nothink']}, failed calls {calls['errors']}\n")
     if calls["dead"]:  # every call after it failed: no score, and run_candidate serves it again
         raise ServerDead(f"{name}: the server died during MuggeBench ({calls['dead']})")
     report = out / "report.json"
@@ -1379,20 +1384,22 @@ def mugge_bench(job: Job, name: str) -> dict | None:
     r = json.loads(report.read_text())
     emit(STAGE, msg=f"{name}: Mugge score {r['score']}% ({r['tickets']} tickets x {r['seeds']} seeds), "
                     f"{r.get('solvedPerGpuHour')} solved per GPU-hour, {calls['forced']} of {calls['calls']} "
-                    f"answers forced after the thinking")
+                    f"answers forced after the thinking, {calls['nothink']} asked again without thinking")
     return r
 
 
 _bench_lock = threading.Lock()
 
 
-def bench_answer(body: dict, calls: dict) -> dict:
-    """One MuggeBench model call (an OpenAI chat request from the engine), answered as the
-    code eval answers (generate): a thinking that ends without an answer, out of the
-    call's cap or stopped inside it, is closed and the answer forced on top of it with up
-    to ANSWER_TOKENS more. The engine reads only the reply's content, so without this a
-    call still thinking at its cap writes no file. Sampling is the eval's own, which
-    mugge_bench_command also passes."""
+def bench_answer(body: dict, calls: dict, retry: str = "force", log: Path | None = None) -> dict:
+    """One MuggeBench model call (an OpenAI chat request from the engine). A thinking that
+    ends without an answer, out of the call's cap or stopped inside it, is answered again:
+    retry "nothink" sends the same messages at once with thinking off, as Centipede's
+    harness does, and "force" closes the thinking and forces the answer on top of it with
+    up to ANSWER_TOKENS more, as the code eval answers (generate). The engine reads only
+    the reply's content, so without either a call still thinking at its cap writes no
+    file. Sampling is the eval's own, which mugge_bench_command also passes. log, when
+    given, gets a line per call (scripts/mugge_rollouts.py reads it)."""
     messages = body["messages"]
     thinking = bool((body.get("chat_template_kwargs") or {}).get("enable_thinking"))
     temperature = float(body.get("temperature", 0.6))
@@ -1401,34 +1408,59 @@ def bench_answer(body: dict, calls: dict) -> dict:
         got = chat(messages, int(body["max_tokens"]), temperature, sampling, thinking)
         finish = got["finish_reason"]
         reasoning, answer = split_reasoning(got["message"], cut=bool(VLLM) and thinking and finish == "length")
-        tokens = got["usage"].get("completion_tokens") or 0
-        forced = thinking and not answer
-        if forced:
-            why = "no_reasoning" if not reasoning else "length" if finish == "length" else "stop"
+        tokens = thought = got["usage"].get("completion_tokens") or 0
+        lost = thinking and not answer
+        why = ("no_reasoning" if not reasoning else "length" if finish == "length" else "stop") if lost else None
+        if lost and retry == "nothink":
+            again = chat(messages, int(body["max_tokens"]), temperature, sampling_params(body.get("seed"), False), False)
+            answer = split_reasoning(again["message"])[1]
+            finish = again["finish_reason"]
+            tokens += again["usage"].get("completion_tokens") or 0
+        elif lost:
             answer, more = force_answer(messages, reasoning, why, temperature, sampling)
             tokens += more or 0
+    forced = lost and retry != "nothink"
     with _bench_lock:
         calls["calls"] += 1
         calls["forced"] += forced
+        calls["nothink"] = calls.get("nothink", 0) + (lost and not forced)
+        if log is not None:
+            last = messages[-1].get("content") if messages else ""
+            with open(log, "a") as f:
+                f.write(json.dumps({"prompt_sha": prompt_sha(last if isinstance(last, str) else json.dumps(last)),
+                                    "seed": body.get("seed"), "thinking": thinking, "finish": got["finish_reason"],
+                                    "thinking_tokens": thought if thinking else 0, "lost": why,
+                                    "retry": (retry if lost else None), "reasoning_tail": reasoning[-3000:]}) + "\n")
     # "forced" (why, or absent) is how the engine's per-call log tells a forced answer from a
-    # real one: forced answers must never become training rows (mugge/src/engine/telemetry.ts)
+    # real one: forced answers must never become training rows (mugge/src/engine/telemetry.ts).
+    # An answer asked again without thinking is marked too ("nothink:<why>"), so the engine
+    # turns thinking off for the ticket's later calls (MUGGE_CUT_RETRY=nothink).
     choice = {"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": finish}
-    if forced:
-        choice["forced"] = why
+    if lost:
+        choice["forced"] = why if forced else f"nothink:{why}"
     usage = {"prompt_tokens": got["usage"].get("prompt_tokens") or 0, "completion_tokens": tokens}
     if got["usage"].get("completion_tokens_details"):
         usage["completion_tokens_details"] = got["usage"]["completion_tokens_details"]
     return {"choices": [choice], "usage": usage}
 
 
+def prompt_sha(text: str) -> str:
+    """How a bench transcript's call (its last message) is matched to the proxy's line."""
+    import hashlib
+    return hashlib.sha1(text.encode()).hexdigest()[:16]
+
+
 @contextmanager
-def bench_proxy():
+def bench_proxy(retry: str = "force", log: Path | None = None):
     """A local OpenAI-style endpoint in front of the running server for MuggeBench: each
-    chat call goes through bench_answer. Yields (its /v1 URL, call counts: calls,
-    forced, errors, and dead, the ServerDead message once the server is gone)."""
+    chat call goes through bench_answer (with retry and log). Yields (its /v1 URL, call
+    counts: calls, forced, nothink (asked again without thinking), errors, and dead, the
+    ServerDead message once the server is gone)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    calls = {"calls": 0, "forced": 0, "errors": 0, "dead": ""}
+    calls = {"calls": 0, "forced": 0, "nothink": 0, "errors": 0, "dead": ""}
+    if log is not None:
+        Path(log).write_text("")
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -1436,7 +1468,7 @@ def bench_proxy():
                 if not self.path.rstrip("/").endswith("/chat/completions"):
                     raise LookupError(f"no endpoint {self.path}")
                 body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)))
-                status, reply = 200, bench_answer(body, calls)
+                status, reply = 200, bench_answer(body, calls, retry, log)
             except Exception as e:  # noqa: BLE001 - the engine counts it as a failed model call and goes on
                 with _bench_lock:
                     calls["errors"] += 1

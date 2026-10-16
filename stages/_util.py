@@ -150,6 +150,11 @@ class Config:
     mugge_bench_split: str = "test"  # "dev" while debugging the runner; "" = every project
     mugge_bench_sandbox: str = "podman"  # podman | docker | local
     mugge_bench_tickets: int = 0  # > 0: a quick run on that many tickets, taken in turn from each project
+    # A thinking call that ends with no answer (out of its cap, or stopped inside the
+    # thinking): "nothink" asks the same messages again at once with thinking off, as
+    # Centipede does (the engine's MUGGE_CUT_RETRY=nothink then keeps the ticket's later
+    # calls off too); "force" closes the thinking and forces the answer on top of it.
+    mugge_bench_cut_retry: str = "nothink"  # nothink | force
     # Route each token to this many experts instead of the model's own count (0 keeps
     # it). An override at serve time (llama-server --override-kv, vLLM --hf-overrides),
     # so a top-k test needs no rebuild.
