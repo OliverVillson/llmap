@@ -41,7 +41,7 @@ SAMPLING=${SAMPLING:-blackhole}
 NAME=${NAME:-$(basename "$GGUF" .gguf)$([ "${CTX16:-0}" = 1 ] && echo -ctx16k)$([ "$SAMPLING" = blackhole ] || echo "-$SAMPLING")}
 WORK=${WORK:-$HOME/muggebench}
 LLMAP=${LLMAP:-$WORK/llmap}
-LLMAP_REF=${LLMAP_REF:-29576fb1203738f621211b0b9c7bce91f3d822a2}  # llmap branch claude/project-thread-3t4k6m: MuggeBench plus Centipede's thinking-cap retry
+LLMAP_REF=${LLMAP_REF:-776570b890a4cc67e5823d3c98d8b73fa5f84dfc}  # llmap branch claude/project-thread-3t4k6m: MuggeBench plus Centipede's thinking-cap retry
 LLAMA_CPP=${LLAMA_CPP:-$WORK/llama.cpp}
 LLAMA_CPP_SHA=${LLAMA_CPP_SHA:-af50f2f248b475d9760f8e67503d01c0f194f5f4}  # the Centipede run's
 BUN_VERSION=${BUN_VERSION:-1.3.14}
@@ -160,19 +160,39 @@ else
   done
   echo "$SANDBOX images ready: $(for i in $IMAGES; do printf 'mugge-%s ' "$i"; done)"
 fi
+# Reference answers known to fail in the sandbox images: the dev set's four Playwright tickets
+# (the web image installs Chromium where the sandbox's HOME=/tmp does not look) and a dotnet
+# ticket whose hidden test restores packages. They are left out, so every score is on the same
+# scorable tickets; any other failure stops the run.
+UNSCORABLE=${UNSCORABLE-rota-ui/fe-grid-keys,rota-ui/fe-layout,rota-ui/fe-form,rota-ui/fe-grid,booking-net/dn-repo}
+EXCLUDED_FILE=$BENCH/.excluded-$SANDBOX
 if [ ! -f "$BENCH/.preflight-$SANDBOX" ]; then
   say "Preflight: every ticket once with its reference answer (no model), to check the sandbox"
+  rm -rf "$WORK/preflight"
   (cd "$LLMAP/mugge" && bun bench/run.ts --bench "$BENCH" --out "$WORK/preflight" --fake --seeds 1 \
     --concurrency 4 --sandbox "$SANDBOX" > "$WORK/preflight.log" 2>&1) || true
-  score=$(python3 -c "import json;print(json.load(open('$WORK/preflight/report.json'))['score'])" 2>/dev/null || echo 0)
-  if [ "${score%.*}" -lt 100 ]; then
-    echo "Reference answers scored $score%, not 100%: the sandbox cannot run some tickets. Unsolved:"
-    grep -v " solved " "$WORK/preflight.log" | grep -E "^ *[0-9]+/" | head -20
-    echo "Full log: $WORK/preflight.log"; exit 1
-  fi
+  python3 - "$WORK/preflight/results.jsonl" "$UNSCORABLE" "$EXCLUDED_FILE" "$WORK/preflight.log" <<'PY'
+import json, sys
+from pathlib import Path
+res, known, out, log = Path(sys.argv[1]), {k for k in sys.argv[2].split(",") if k}, Path(sys.argv[3]), sys.argv[4]
+if not res.exists():
+    sys.exit(f"The preflight did not run. Full log: {log}")
+rows = [json.loads(l) for l in res.read_text().splitlines() if l.strip()]
+failed = sorted(r["key"] for r in rows if not r["solved"])
+other = [k for k in failed if k not in known]
+if other:
+    print(f"Reference answers solved {len(rows) - len(failed)} of {len(rows)}. The sandbox cannot run these tickets, which are not known to be unscorable:")
+    for r in rows:
+        if r["key"] in other:
+            print(f"  {r['key']}: {((r.get('error') or '').strip().splitlines() or [''])[-1][:200]}")
+    sys.exit(f"Full log: {log}")
+out.write_text(",".join(failed))
+print(f"reference answers: {len(rows) - len(failed)} of {len(rows)} solved"
+      + (f"; left out of every score, as known unscorable: {', '.join(failed)}" if failed else ""))
+PY
   touch "$BENCH/.preflight-$SANDBOX"
-  echo "reference answers: 100%"
 fi
+EXCLUDE=$(cat "$EXCLUDED_FILE" 2>/dev/null || true)
 
 JOB=$WORK/jobs/$NAME
 mkdir -p "$JOB"
@@ -198,7 +218,8 @@ cat > "$JOB/config.json" <<EOF
   "mugge_bench_seeds": $SEEDS,
   "mugge_bench_split": "",
   "mugge_bench_sandbox": "$SANDBOX",
-  "mugge_bench_cut_retry": "$CUT_RETRY"${TICKETS:+,
+  "mugge_bench_cut_retry": "$CUT_RETRY",
+  "mugge_bench_exclude": $(python3 -c 'import json,sys; print(json.dumps([k for k in sys.argv[1].split(",") if k]))' "$EXCLUDE")${TICKETS:+,
   \"mugge_bench_tickets\": $TICKETS}
 }
 EOF
@@ -336,7 +357,9 @@ fp = json.loads((job / "footprint.json").read_text())
 shards = sorted(gguf.parent.glob(gguf.name.replace("-00001-of-", "-*-of-"))) if "-00001-of-" in gguf.name else [gguf]
 size = sum(p.stat().st_size for p in shards) / 1e9
 lo, hi = r["scoreCI"]
-print(f"{name}: Mugge score {r['score']}% (95% {lo}-{hi}) on {r['tickets']} tickets x {r['seeds']} seeds, {projects} projects")
+excluded = json.loads((job / "config.json").read_text()).get("mugge_bench_exclude", [])
+print(f"{name}: Mugge score {r['score']}% (95% {lo}-{hi}) on {r['tickets']} scorable tickets x {r['seeds']} seeds, {projects} projects"
+      + (f" ({len(excluded)} left out, their reference answers fail in the sandbox: {', '.join(excluded)})" if excluded else ""))
 parts = ", ".join(f"{k} {v:.2f}" for k, v in fp["by_kind_gb"].items())
 print(f"  footprint {fp['total_gb']:.2f} GB for one agent at {fp['ctx']} context after a {fp.get('prompt_tokens', '?')}-token prompt: "
       f"GGUF file {size:.2f} GB + working memory {fp.get('working_gb', fp['total_gb'] - size):.2f} GB "

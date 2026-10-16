@@ -54,7 +54,9 @@ GGUF=~/models/BH-0.1-1.7B-Q4_K_M.gguf bash muggebench.sh                # the fu
 1. Installs uv, Bun 1.3.14, and llama-server if they are missing.
 2. Checks out llmap at the bench commit into `~/muggebench/llmap`.
 3. Builds the sandbox images the bench needs.
-4. Runs a preflight: every ticket once with its reference answer. This must score 100%, which proves the sandbox works on this machine.
+4. Runs a preflight: every ticket once with its reference answer, which proves the sandbox works on this machine.
+   - Five dev-set tickets are known to fail even with their reference answers: the four Playwright web tickets in `rota-ui` and `booking-net/dn-repo`. In the web image, Chromium is installed where the sandbox's `HOME=/tmp` does not look; the dotnet ticket's hidden test seems to restore packages with no network. These five are left out of every score, so every BlackHole number is on the same 57 scorable tickets. The result says how many tickets were scored and which were left out.
+   - Any other failing ticket stops the run (`UNSCORABLE` holds the known list).
 5. Scores the model. Re-running skips steps that are done, and a model already scored is reported from its saved results. To score it again, delete `~/muggebench/jobs/<name>`.
 
 Before scoring, it measures the footprint the way the training plan defines it:
@@ -121,6 +123,7 @@ All are environment variables:
 | `TEMP`, `TOP_P`, `TOP_K` | from `SAMPLING` | thinking-on sampling, one value at a time |
 | `NOTHINK_TEMP`, `NOTHINK_TOP_P`, `NOTHINK_TOP_K` | from `SAMPLING` | thinking-off sampling |
 | `THINKING`, `TOKENS`, `KV` | 1, 8192, q8_0 | thinking, tokens per call, KV cache |
+| `UNSCORABLE` | the five known tickets | tickets left out when their reference answers fail |
 | `SANDBOX` | Docker, else Podman | where tickets run; `local` only for the spike |
 | `TARGET_SCORE`, `TARGET_GB` | 50, 2.0 | the target |
 | `CTX16` | 0 | 1 scores with a 16k context per call and 4k of thinking |
