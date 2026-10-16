@@ -230,8 +230,7 @@ cat > "$JOB/config.json" <<EOF
   "mugge_bench_split": "",
   "mugge_bench_sandbox": "$SANDBOX",
   "mugge_bench_cut_retry": "$CUT_RETRY",
-  "mugge_bench_exclude": $(python3 -c 'import json,sys; print(json.dumps([k for k in sys.argv[1].split(",") if k]))' "$EXCLUDE")${TICKETS:+,
-  \"mugge_bench_tickets\": $TICKETS}
+  "mugge_bench_exclude": $(python3 -c 'import json,sys; print(json.dumps([k for k in sys.argv[1].split(",") if k]))' "$EXCLUDE")
 }
 EOF
 if [ "$OS" = Darwin ]; then
@@ -248,9 +247,12 @@ from stages import eval as ev
 print(ev.llama_slots(Job(sys.argv[2]).config, sys.argv[3]))
 PY
 )}
-python3 - "$JOB/config.json" "$CONC" <<'PY'
+python3 - "$JOB/config.json" "$CONC" "$TICKETS" <<'PY'
 import json, sys
-p = sys.argv[1]; c = json.load(open(p)); c["mugge_bench_concurrency"] = int(sys.argv[2]); json.dump(c, open(p, "w"), indent=2)
+p = sys.argv[1]; c = json.load(open(p)); c["mugge_bench_concurrency"] = int(sys.argv[2])
+if sys.argv[3]:  # here, not in the heredoc: bash 3.2 (macOS /bin/bash) keeps \" inside ${VAR:+...} there
+    c["mugge_bench_tickets"] = int(sys.argv[3])
+json.dump(c, open(p, "w"), indent=2)
 PY
 
 if [ ! -s "$JOB/footprint.json" ]; then
@@ -338,7 +340,7 @@ if [ ! -f "$JOB/.done/eval" ]; then
   keepawake=()
   [ "$OS" = Darwin ] && keepawake=(caffeinate -i)
   set +e
-  (cd "$LLMAP" && "${keepawake[@]}" "$WORK/venv/bin/python" pipeline.py --job "$JOB" --only eval) > "$JOB/run.log" 2>&1 &
+  (cd "$LLMAP" && ${keepawake[@]+"${keepawake[@]}"} "$WORK/venv/bin/python" pipeline.py --job "$JOB" --only eval) > "$JOB/run.log" 2>&1 &
   run=$!
   while kill -0 $run 2>/dev/null; do
     line=$(grep -E "^ *[0-9]+/[0-9]+ " "$JOB"/work/mugge-bench-*.log 2>/dev/null | tail -1)
