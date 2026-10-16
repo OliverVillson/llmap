@@ -31,7 +31,15 @@ export interface Completion<T> {
   maxTokens?: number;
   /** Characters of thinking the server returned beside the answer (reasoning_content), when it splits them. */
   reasoningChars?: number;
+  /** chat_template_kwargs.enable_thinking the call was sent with, when it was sent. */
+  thinking?: boolean;
   ms: number;
+}
+
+/** What one call may change from the config. */
+export interface CallTweaks {
+  /** Sent as chat_template_kwargs.enable_thinking for this call only (the harness turns it off after a thinking call ran out of tokens). */
+  thinking?: boolean;
 }
 
 /**
@@ -110,7 +118,7 @@ export interface Inference {
   /** An answer constrained to `schema`, parsed. `signal` aborts the call, even once it is sent. */
   complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>>;
   /** A free-text answer. */
-  text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal): Promise<Completion<string>>;
+  text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, opts?: CallTweaks): Promise<Completion<string>>;
 }
 
 export class OpenAICompatible implements Inference {
@@ -121,7 +129,7 @@ export class OpenAICompatible implements Inference {
   }
 
   async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>> {
-    const c = await this.text(model, messages, maxTokens, signal, schema);
+    const c = await this.send(model, messages, maxTokens, signal, schema);
     try {
       return { ...c, value: parseJsonAnswer<T>(c.raw) };
     } catch (e) {
@@ -130,7 +138,11 @@ export class OpenAICompatible implements Inference {
     }
   }
 
-  async text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object): Promise<Completion<string>> {
+  text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, opts?: CallTweaks): Promise<Completion<string>> {
+    return this.send(model, messages, maxTokens, signal, undefined, opts);
+  }
+
+  private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks): Promise<Completion<string>> {
     const started = performance.now();
     const cap = this.cfg.maxCallTokens;
     const body: Record<string, unknown> = {
@@ -140,6 +152,7 @@ export class OpenAICompatible implements Inference {
       ...samplingFields(this.cfg),
       ...this.cfg.extra,
     };
+    if (typeof opts?.thinking === 'boolean') body.chat_template_kwargs = { ...(body.chat_template_kwargs as object | undefined), enable_thinking: opts.thinking };
     checkTopK(body.top_k);
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
@@ -160,6 +173,7 @@ export class OpenAICompatible implements Inference {
     const reasoning = data?.usage?.completion_tokens_details?.reasoning_tokens;
     const forced = choice?.forced ?? data?.forced;
     const thought = choice?.message?.reasoning_content ?? choice?.message?.reasoning;
+    const sentThinking = (body.chat_template_kwargs as { enable_thinking?: unknown } | undefined)?.enable_thinking;
     const out: Completion<string> = {
       value: raw,
       raw,
@@ -170,6 +184,7 @@ export class OpenAICompatible implements Inference {
       forced: typeof forced === 'string' && forced ? forced : forced === true ? 'yes' : undefined,
       maxTokens: body.max_tokens as number,
       reasoningChars: typeof thought === 'string' && thought ? thought.length : undefined,
+      thinking: typeof sentThinking === 'boolean' ? sentThinking : undefined,
       ms: Math.round(performance.now() - started),
     };
     if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));

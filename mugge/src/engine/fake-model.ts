@@ -25,6 +25,8 @@ export interface FakeOptions {
   prose?: string[];
   /** Ticket ids whose first answer comes back marked forced, as MuggeBench's proxy marks one. */
   forced?: string[];
+  /** Ticket ids whose calls with thinking on (chat_template_kwargs.enable_thinking) think to the cap and write nothing. */
+  overthink?: string[];
   latencyMs?: number;
   port?: number;
   /** Ticket id → the answers to its review calls, in order (the last one repeats). */
@@ -39,6 +41,8 @@ export interface FakeCall {
   kind: 'review' | 'fix' | 'write' | 'json';
   maxTokens: number;
   prompt: string;
+  /** chat_template_kwargs.enable_thinking as sent, when it was. */
+  thinking?: boolean;
 }
 
 export function loadSolutions(dir: string): Record<string, WorkerOutput> {
@@ -72,7 +76,8 @@ export function startFakeModel(o: FakeOptions) {
         const id = prompt.match(/^Ticket: (\S+)$/m)?.[1] ?? '';
         const isReview = body.messages?.[0]?.content === REVIEW_SYSTEM;
         const isFix = !isReview && /\n## Fix\n/.test(prompt);
-        calls.push({ ticket: id, kind: isReview ? 'review' : body.response_format || body.guided_json ? 'json' : isFix ? 'fix' : 'write', maxTokens: body.max_tokens, prompt });
+        const thinking = body.chat_template_kwargs?.enable_thinking;
+        calls.push({ ticket: id, kind: isReview ? 'review' : body.response_format || body.guided_json ? 'json' : isFix ? 'fix' : 'write', maxTokens: body.max_tokens, prompt, ...(typeof thinking === 'boolean' ? { thinking } : {}) });
         if (o.latencyMs) await Bun.sleep(o.latencyMs);
         if (isReview) {
           const k = reviewed.get(id) ?? 0;
@@ -99,6 +104,14 @@ export function startFakeModel(o: FakeOptions) {
         else answer = o.solutions[id] ?? { files: {}, note: `no canned answer for ${id || 'this prompt'}` };
         let content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
         let finish = 'stop', forced: string | undefined;
+        if (thinking === true && o.overthink?.includes(id)) {
+          const content = `<think>\n${'Let me reconsider the edge cases once more. '.repeat(Math.ceil((body.max_tokens ?? 64) / 8))}`;
+          return Response.json({
+            id: `fake-${requests}`, object: 'chat.completion', model: body.model,
+            choices: [{ index: 0, finish_reason: 'length', message: { role: 'assistant', content } }],
+            usage: { prompt_tokens: approxTokens(prompt), completion_tokens: body.max_tokens ?? 0, total_tokens: approxTokens(prompt) + (body.max_tokens ?? 0) },
+          });
+        }
         if (n === 1 && o.cut?.includes(id)) {
           content = content.slice(0, Math.max(1, Math.floor(content.length / 2)));
           finish = 'length';

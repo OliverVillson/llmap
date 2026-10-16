@@ -13,7 +13,7 @@
  * The pool also keeps per-agent, per-team and per-machine tok/s and slot occupancy as plain
  * data (`snapshot()`, `subscribe()`), for the run log and status stream to read.
  */
-import { DEFAULT_SAMPLING, OpenAICompatible, checkTopK, type ChatMessage, type Completion, type Inference, type InferenceConfig, type Sampling } from './inference.ts';
+import { DEFAULT_SAMPLING, OpenAICompatible, checkTopK, type ChatMessage, type Completion, type CallTweaks, type Inference, type InferenceConfig, type Sampling } from './inference.ts';
 
 /** Which kind of call a machine serves. Worker = a ticket's write and fix calls. */
 export const CALL_ROLES = ['worker', 'lead', 'manager'] as const;
@@ -482,7 +482,7 @@ export class BackendPool {
     };
     return {
       complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal)),
-      text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal) => call<string>((c) => c.text(model, messages, maxTokens, signal ?? o.signal)),
+      text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<string>((c) => c.text(model, messages, maxTokens, signal ?? o.signal, tweaks)),
     };
   }
 

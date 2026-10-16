@@ -78,12 +78,12 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   const cap = (n: number) => (o.maxTokens ? Math.min(n, o.maxTokens) : n);
   const inference: Inference = {
     complete: (m, msgs, schema, n) => base.complete(m, msgs, schema, cap(n)),
-    text: async (m, msgs, n) => {
-      const c = await base.text(m, msgs, cap(n));
+    text: async (m, msgs, n, signal, tweaks) => {
+      const c = await base.text(m, msgs, cap(n), signal, tweaks);
       if (o.transcripts) {
         // cut, forced and drop mark answers that must never become training rows
         const seen = classifyAnswer(c.raw, t.ticket.owns, parseFiles(c.raw, t.ticket.owns), c.cut);
-        transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw, cut: !!c.cut, forced: c.forced ?? null, drop: seen.drop ?? null, loose: seen.loose.length > 0, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null });
+        transcript.push({ prompt: msgs[msgs.length - 1]?.content, answer: c.raw, cut: !!c.cut, forced: c.forced ?? null, drop: seen.drop ?? null, loose: seen.loose.length > 0, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null, thinking: c.thinking ?? null });
       }
       return c;
     },

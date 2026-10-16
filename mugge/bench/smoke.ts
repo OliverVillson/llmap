@@ -27,7 +27,7 @@
  * console reads it), <out>/results.jsonl and report.json (MuggeBench's), and <out>/smoke.json.
  * Exit code: 0 MEETS, 1 MISSES, 2 could not score (reference answers fail, no server).
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -35,7 +35,7 @@ import { inferenceFromEnv } from '../src/config.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { checkTopK, OpenAICompatible } from '../src/engine/inference.ts';
 import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/sandbox.ts';
-import { crewFromEnv, emptyCallSummary, formatCallSummary, LOST_WARN_SHARE, runId, statusLine, Telemetry, type CallSummary } from '../src/engine/telemetry.ts';
+import { crewFromEnv, emptyCallSummary, formatCallSummary, LOST_WARN_SHARE, runId, statusLine, Telemetry, type CallRecord, type CallSummary } from '../src/engine/telemetry.ts';
 import type { WorkerOutput } from '../src/tickets/schema.ts';
 import { applyHidden, findProjects, prepare, solution, type BenchProject, type BenchTicket } from './load.ts';
 import type { Row } from './report.ts';
@@ -75,8 +75,55 @@ export interface SmokeResult {
   passed: number;
   tickets: number;
   calls: CallSummary;
+  /** How the per-call cap fared; null when no worker call answered. */
+  cap: CapReport | null;
   wallMs: number;
   out: string;
+}
+
+/** How worker answers sat against the per-call cap (max_tokens), from calls.jsonl. */
+export interface CapReport {
+  cap: number;
+  /** Worker calls that answered (no call error). */
+  answers: number;
+  /** Answers that ran out of tokens: cut with no usable file, or forced after the thinking. */
+  outOfTokens: number;
+  /** Calls a ticket sent with thinking off after one of its thinking calls ran out (MUGGE_CUT_RETRY). */
+  retriedWithoutThinking: number;
+  /** Completion tokens of the answers that finished inside the cap: median, 90th percentile, longest. */
+  finished: { p50: number; p90: number; max: number } | null;
+  /** One line on what to change, or null when the cap fits. */
+  advice: string | null;
+}
+
+/** Share of answers out of tokens above which the smoke suggests a bigger cap or shorter thinking. */
+export const CAP_WARN_SHARE = 0.05;
+
+export function capReport(records: CallRecord[], cap: number, thinking: 'on' | 'off'): CapReport | null {
+  const answers = records.filter((r) => r.kind !== 'review' && !r.error);
+  if (!answers.length) return null;
+  const outOf = answers.filter((r) => r.forced || r.drop === 'cut');
+  const done = answers.filter((r) => !r.cut).map((r) => r.completionTokens).sort((a, b) => a - b);
+  const at = (q: number) => done[Math.min(done.length - 1, Math.floor(q * done.length))]!;
+  const finished = done.length ? { p50: at(0.5), p90: at(0.9), max: done[done.length - 1]! } : null;
+  const roundUp = (n: number) => Math.ceil(n / 1024) * 1024;
+  let advice: string | null = null;
+  if (outOf.length / answers.length > CAP_WARN_SHARE) {
+    // answers that finish well inside the cap mean the lost ones ran away (a loop, endless
+    // thinking): a bigger cap only makes them slower
+    const near = !finished || finished.max > cap / 2;
+    const fix = near ? `try --max-tokens ${roundUp(cap * 2)}` : `the answers that finished took at most ${finished!.max}, so a bigger cap will not help`;
+    advice = thinking === 'on'
+      ? `${outOf.length} of ${answers.length} answers ran out of tokens thinking: ${fix}; --thinking off avoids it; for the model, train thinking that ends well inside ${cap} tokens (For BlackHole)`
+      : `${outOf.length} of ${answers.length} answers ran out of tokens: ${fix}`;
+  } else if (finished && finished.max < cap / 2 && cap > 2048) {
+    advice = `every answer finished under ${finished.max} tokens: --max-tokens ${Math.max(2048, roundUp(finished.max * 1.5))} would free slot memory with room to spare`;
+  }
+  return {
+    cap, answers: answers.length, outOfTokens: outOf.length,
+    retriedWithoutThinking: thinking === 'on' ? answers.filter((r) => r.thinking === false).length : 0,
+    finished, advice,
+  };
 }
 
 /**
@@ -135,7 +182,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const sandbox = o.sandbox ?? (o.fake ? new LocalSandbox() : sandboxFromEnv());
   const concurrency = o.concurrency ?? 12;
   const noScore = (reasons: string[], refs: SmokeResult['refs'] = null): SmokeResult => {
-    const r: SmokeResult = { verdict: 'NO SCORE', reasons, refs, passed: 0, tickets, calls: emptyCallSummary(), wallMs: Math.round(performance.now() - started), out: o.out };
+    const r: SmokeResult = { verdict: 'NO SCORE', reasons, refs, passed: 0, tickets, calls: emptyCallSummary(), cap: null, wallMs: Math.round(performance.now() - started), out: o.out };
     mkdirSync(o.out, { recursive: true });
     writeFileSync(join(o.out, 'smoke.json'), JSON.stringify(r, null, 2) + '\n');
     return r;
@@ -214,7 +261,10 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   if (answers && calls.loose / answers > LOST_WARN_SHARE) reasons.push(`${Math.round((100 * calls.loose) / answers)}% of answers named a file in a shape the parser had to guess, not the training format (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
   if (calls.errors) reasons.push(`${calls.errors} model calls failed (timeouts or server errors)`);
   if (rows.length < tickets * seeds) reasons.push(`only ${rows.length} of ${tickets * seeds} ticket runs finished`);
-  const result: SmokeResult = { verdict: reasons.length ? 'MISSES' : 'MEETS', reasons, refs, passed, tickets, calls, wallMs: Math.round(performance.now() - started), out: o.out };
+  const logged = join(o.out, 'calls.jsonl');
+  const records: CallRecord[] = existsSync(logged) ? readFileSync(logged, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const cap = capReport(records, maxTokens, thinking);
+  const result: SmokeResult = { verdict: reasons.length ? 'MISSES' : 'MEETS', reasons, refs, passed, tickets, calls, cap, wallMs: Math.round(performance.now() - started), out: o.out };
   writeFileSync(join(o.out, 'smoke.json'), JSON.stringify(result, null, 2) + '\n');
   return result;
 }
@@ -229,6 +279,10 @@ export function formatSmoke(r: SmokeResult): string {
     `forced / cut       ${c.forced} / ${c.cut}`,
     `guessed paths      ${c.loose}`,
     `call errors        ${c.errors}`,
+    ...(r.cap ? [
+      `per-call cap       ${r.cap.cap} tokens: ${r.cap.outOfTokens} of ${r.cap.answers} answers ran out${r.cap.finished ? `; finished answers p50 ${r.cap.finished.p50}, p90 ${r.cap.finished.p90}, longest ${r.cap.finished.max}` : ''}${r.cap.retriedWithoutThinking ? `; ${r.cap.retriedWithoutThinking} calls retried without thinking` : ''}`,
+      ...(r.cap.advice ? [`                   ${r.cap.advice}`] : []),
+    ] : []),
     `wall time          ${(r.wallMs / 1000).toFixed(1)} s`,
     '',
     `${r.verdict}${r.reasons.length ? `: ${r.reasons.join('; ')}` : ''}`,

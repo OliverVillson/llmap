@@ -69,6 +69,11 @@ bun bench/smoke.ts --fake --fake-mess        # no model: the fake server, with f
    20% of worker answers (write and fix; review answers are not rows) were lost to the parser, the cap or a forced answer, at most 20% wrote a file path the parser
    had to guess (`prog.c`, `**a.py**`: not the training format), and no call failed; **MISSES**
    (exit 1) otherwise, with the reasons.
+4. A `per-call cap` line says how many answers ran out of tokens and how long the finished ones
+   were (median, 90th percentile, longest), with a suggested `--max-tokens` when more than 5%
+   ran out or when every answer used under half the cap. With `--thinking on`, a ticket whose
+   thinking call ran out of tokens sends its later calls with thinking off (`MUGGE_CUT_RETRY`,
+   default `nothink`; `same` keeps thinking on); `calls.jsonl` marks each call's `thinking`.
 
 Writes `calls.jsonl`, `status.json`, `smoke.json` and the bench's `results.jsonl` / `report.json`
 in `--out` (default `runs/smoke-<time>`).
