@@ -257,7 +257,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const reasons: string[] = [];
   if (passed < Math.ceil(bar * tickets)) reasons.push(`${passed}/${tickets} pass, the bar is ${Math.ceil(bar * tickets)} (${Math.round(bar * 100)}%)`);
   if (calls.lostShare > LOST_WARN_SHARE) reasons.push(`${Math.round(calls.lostShare * 100)}% of answers lost to the parser, the cap or forced answers (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
-  const answers = calls.calls - calls.errors;
+  const answers = calls.answers;
   if (answers && calls.loose / answers > LOST_WARN_SHARE) reasons.push(`${Math.round((100 * calls.loose) / answers)}% of answers named a file in a shape the parser had to guess, not the training format (over ${Math.round(LOST_WARN_SHARE * 100)}%)`);
   if (calls.errors) reasons.push(`${calls.errors} model calls failed (timeouts or server errors)`);
   if (rows.length < tickets * seeds) reasons.push(`only ${rows.length} of ${tickets * seeds} ticket runs finished`);
@@ -275,7 +275,7 @@ export function formatSmoke(r: SmokeResult): string {
   const lines = [
     `reference answers  ${r.refs ? `${r.refs.passed}/${r.refs.tickets}` : 'not checked'}`,
     `tickets passing    ${r.passed}/${r.tickets}`,
-    `parser drops       ${c.dropped}${drops ? ` (${drops})` : ''} of ${c.calls} answers`,
+    `parser drops       ${c.dropped}${drops ? ` (${drops})` : ''} of ${c.answers} worker answers`,
     `forced / cut       ${c.forced} / ${c.cut}`,
     `guessed paths      ${c.loose}`,
     `call errors        ${c.errors}`,

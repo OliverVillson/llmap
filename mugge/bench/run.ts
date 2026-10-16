@@ -9,7 +9,9 @@
  *   options: --seeds 3, --concurrency 16, --sandbox local|podman|docker, --temperature 0.6,
  *            --top-p 0.95, --top-k 20, --thinking on|off, --gpus 1, --name <label>,
  *            --filter <text in project/ticket>, --split dev|test, --transcripts, --fake,
- *            --max-tokens <most tokens one model call may write>, --tickets <n: a quick run on n tickets>
+ *            --max-tokens <most tokens one model call may write>, --tickets <n: a quick run on n tickets>,
+ *            --review on|off (else MUGGE_REVIEW when it is set; else off: unlike the engine, the bench
+ *            scores the worker loop alone by default, so its numbers stay comparable with earlier runs)
  *
  * Writes <out>/results.jsonl (one row per ticket and seed), <out>/report.json and, with
  * --transcripts, <out>/transcripts.jsonl.
@@ -29,6 +31,7 @@ import { LocalSandbox, sandboxFromEnv, tail, type Sandbox } from '../src/engine/
 import type { WorkerOutput } from '../src/tickets/schema.ts';
 import { applyHidden, findProjects, prepare, solution, type BenchProject, type BenchTicket } from './load.ts';
 import { formatSummary, summarize, type Row } from './report.ts';
+import { reviewFromEnv } from '../src/engine/review.ts';
 
 export interface BenchOptions {
   projects: BenchProject[];
@@ -44,6 +47,8 @@ export interface BenchOptions {
   /** Most tokens one model call may write; the ticket's budget still caps the total. */
   maxTokens?: number;
   transcripts?: boolean;
+  /** Lead review after the checks pass; unset: MUGGE_REVIEW when it is set, else off (see the header). */
+  review?: boolean;
   /** Called after each row is written. */
   progress?: (row: Row, done: number, total: number) => void;
   /**
@@ -104,7 +109,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   tel?.emit({ type: 'start', at: Date.now(), ticket: id, attempt: 1, worktree });
   try {
     prepare(p, worktree, t.deps);
-    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs, thinking: thinkingOn(base) });
+    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs, thinking: thinkingOn(base), review: o.review ?? (process.env.MUGGE_REVIEW ? reviewFromEnv() : false) });
     let hiddenError: string | null = null;
     if (r.ok && t.tags.hidden.length) {
       applyHidden(p, t.ticket.id, worktree);
@@ -192,9 +197,13 @@ if (import.meta.main) {
       temperature: { type: 'string' }, 'top-p': { type: 'string' }, 'top-k': { type: 'string' },
       thinking: { type: 'string' }, gpus: { type: 'string' }, name: { type: 'string' }, filter: { type: 'string' },
       split: { type: 'string' }, transcripts: { type: 'boolean' }, fake: { type: 'boolean' }, timeout: { type: 'string' },
-      'max-tokens': { type: 'string' }, tickets: { type: 'string' },
+      'max-tokens': { type: 'string' }, tickets: { type: 'string' }, review: { type: 'string' },
     },
   });
+  if (values.review && values.review !== 'on' && values.review !== 'off') {
+    console.error('--review must be on or off');
+    process.exit(2);
+  }
   if (!values.bench || !values.out) {
     console.error('usage: bun bench/run.ts --bench <dir> --out <dir> [--url <v1 url> --model <name>] [options]');
     process.exit(2);
@@ -247,7 +256,7 @@ if (import.meta.main) {
     const rows = await runBench({
       projects, inference, sandbox, seeds,
       concurrency, out: values.out, name: values.name, telemetry,
-      gpus: Number(values.gpus ?? 1), transcripts: values.transcripts,
+      gpus: Number(values.gpus ?? 1), transcripts: values.transcripts, review: values.review ? values.review === 'on' : undefined,
       maxTokens: values['max-tokens'] ? Number(values['max-tokens']) : undefined,
       checkTimeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
       progress: (r, done, total) => console.log(`${String(done).padStart(5)}/${total} ${r.solved ? 'solved' : r.visible ? 'HIDDEN' : 'failed'} ${r.key} s${r.seed} (${r.attempts} attempt${r.attempts === 1 ? '' : 's'})`),

@@ -110,7 +110,7 @@ export function fixMessages(worktree: string, pack: ContextPack, failed: { comma
 }
 
 /**
- * The lead review (review.ts): a new call type, off unless MUGGE_REVIEW=on. One fresh message:
+ * The lead review (review.ts): a new call type, on unless MUGGE_REVIEW=off. One fresh message:
  * the ticket, the diff of its owned files since the ticket started, and the output of the
  * acceptance commands that passed. The answer is constrained to REVIEW_JSON_SCHEMA.
  */

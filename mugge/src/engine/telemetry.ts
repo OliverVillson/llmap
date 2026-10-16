@@ -153,8 +153,11 @@ export interface CallSummary {
   /** Answers with no usable file (any DropReason). */
   dropped: number;
   dropReasons: Record<DropReason, number>;
-  /** Answers dropped, cut or forced (none can become a row): what the 20% warning counts. */
+  /** Worker answers (write and fix calls that did not error): what lost and loose shares are out of. Review answers are not rows. */
+  answers: number;
+  /** Worker answers dropped, cut or forced (none can become a row): what the 20% warning counts. */
   lost: number;
+  /** lost / answers. */
   lostShare: number;
   write: number;
   fix: number;
@@ -168,7 +171,7 @@ export function emptyCallSummary(): CallSummary {
   return {
     calls: 0, errors: 0, clean: 0, cut: 0, forced: 0, loose: 0, dropped: 0,
     dropReasons: { cut: 0, empty: 0, no_fence: 0, unlabelled: 0, not_owned: 0 },
-    lost: 0, lostShare: 0, write: 0, fix: 0, review: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
+    answers: 0, lost: 0, lostShare: 0, write: 0, fix: 0, review: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
   };
 }
 
@@ -184,10 +187,13 @@ export function addCall(s: CallSummary, r: CallRecord): CallSummary {
     s.dropped++;
     s.dropReasons[r.drop]++;
   }
-  // a forced answer can never be a row either, and many of them mean the cap is wrong
-  if (r.drop || r.cut || r.forced) s.lost++;
-  const answers = s.calls - s.errors;
-  s.lostShare = answers ? s.lost / answers : 0;
+  // only worker answers can become rows: a review answer neither counts as lost nor dilutes the share
+  if (r.kind !== 'review' && !r.error) {
+    s.answers++;
+    // a forced answer can never be a row either, and many of them mean the cap is wrong
+    if (r.drop || r.cut || r.forced) s.lost++;
+  }
+  s.lostShare = s.answers ? s.lost / s.answers : 0;
   s.promptTokens += r.promptTokens;
   s.completionTokens += r.completionTokens;
   s.reasoningTokens += r.reasoningTokens ?? 0;
@@ -204,10 +210,10 @@ export function summarizeCallLog(path: string): CallSummary {
 
 /** The lost-answers warning, or null when the run is under the line. */
 export function lostWarning(s: CallSummary, share = LOST_WARN_SHARE): string | null {
-  if (!s.calls || s.lostShare <= share) return null;
+  if (!s.answers || s.lostShare <= share) return null;
   const reasons = DROP_REASONS.filter((r) => s.dropReasons[r]).map((r) => `${r} ${s.dropReasons[r]}`).join(', ');
   const cutKept = s.lost - s.dropped;
-  return `WARNING: ${s.lost} of ${s.calls - s.errors} answers (${pct(s.lostShare)}) were lost to the parser, the token cap or a forced answer` +
+  return `WARNING: ${s.lost} of ${s.answers} worker answers (${pct(s.lostShare)}) were lost to the parser, the token cap or a forced answer` +
     ` (dropped: ${reasons || 'none'}${cutKept ? `; cut or forced but parsed: ${cutKept}` : ''}). Check the format and MUGGE_MAX_CALL_TOKENS before trusting this run.`;
 }
 
@@ -215,7 +221,8 @@ export function lostWarning(s: CallSummary, share = LOST_WARN_SHARE): string | n
 export function formatCallSummary(s: CallSummary): string {
   const reasons = DROP_REASONS.filter((r) => s.dropReasons[r]).map((r) => `${r} ${s.dropReasons[r]}`).join(', ');
   const rows: Array<[string, string]> = [
-    ['model calls (write / fix)', `${s.calls} (${s.write} / ${s.fix})`],
+    ['model calls (write / fix / review)', `${s.calls} (${s.write} / ${s.fix} / ${s.review})`],
+    ['worker answers lost (no row)', `${s.lost}/${s.answers}`],
     ['parser drops', `${s.dropped}${reasons ? ` (${reasons})` : ''}`],
     ['cut at the cap', String(s.cut)],
     ['forced after thinking', String(s.forced)],

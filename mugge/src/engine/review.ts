@@ -5,8 +5,9 @@
  *
  * The review is part of done: a ticket finishes on an approve, or when a fix the review asked
  * for passes the checks. A `problems` verdict with something to fix spends the ticket's next fix
- * attempt, sent as an ordinary fix call whose failing command is `(lead review)`. Off by default
- * (MUGGE_REVIEW=on turns it on): BH0.1 is trained for worker calls only.
+ * attempt, sent as an ordinary fix call whose failing command is `(lead review)`. On by default
+ * (Oliver, 2026-10-16); MUGGE_REVIEW=off turns it off for runs that do not need it. BH0.1 is
+ * trained for worker calls only, so a BH0.1 crew reviews with an untrained call shape.
  *
  * The prompt lives in prompts.ts (REVIEW_SYSTEM, reviewMessages) next to the worker prompts so
  * the train harness builds review rows from the same code.
@@ -47,11 +48,11 @@ const MAX_DIFF_CHARS = 40_000;
 /** Most characters of each passing command's output. */
 const MAX_CHECK_CHARS = 600;
 
-/** MUGGE_REVIEW: on | off (unset: off). */
+/** MUGGE_REVIEW: on | off (unset: on). */
 export function reviewFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.MUGGE_REVIEW?.trim().toLowerCase();
   if (v && v !== 'on' && v !== 'off') throw new Error('MUGGE_REVIEW must be on or off');
-  return v === 'on';
+  return v !== 'off';
 }
 
 /** The owned files' contents; null for a file that does not exist. */
