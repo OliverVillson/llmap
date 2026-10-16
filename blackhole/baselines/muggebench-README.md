@@ -60,7 +60,8 @@ GGUF=~/models/BH-0.1-1.7B-Q4_K_M.gguf bash muggebench.sh                # the fu
 Before scoring, it measures the footprint the way the training plan defines it:
 - It serves the GGUF with one slot of 16,384 tokens (`FOOTPRINT_CTX`), the bench's KV cache type (`q8_0`) and flash attention.
 - It sends a prompt of about 12,000 tokens (`FOOTPRINT_PROMPT`), cut from llmap's own source code, so the memory is the memory of a real long ticket.
-- It adds up every buffer llama-server allocates on every device: weights, KV cache, recurrent state, compute and output buffers.
+- The footprint is the GGUF file's size plus llama-server's working memory: its KV cache, recurrent state, compute and output buffers. The weights count as the file, not as llama-server's model buffers, because on Metal those are two mapped views of the same file (`CPU_Mapped` and `MTL0_Mapped`), and summing both counted the weights twice. The raw sum of every buffer is still printed on a second line.
+- Newer llama-server builds (brew's 0.5.0) log buffer sizes only at verbosity 4, so the script sets `LLAMA_ARG_LOG_VERBOSITY=4` for these runs. The result also prints the llama-server build, because on a Mac the script uses whatever `llama-server` brew installed, not the pinned commit.
 - It does this twice: at llama.cpp's default micro-batch, and at `-ub 128` (`FOOTPRINT_UBATCH`). The compute buffer grows with the micro-batch, and Qwen3.5's 248K-token vocabulary can make it a few hundred MB at the default. The micro-batch changes prompt speed, not answers, so the smaller of the two totals is the footprint. Both are printed and saved in `footprint.json`.
 
 Where `nvidia-smi` is available, it also prints the peak GPU memory during each run. That figure includes the CUDA context, so it is shown for reference only.

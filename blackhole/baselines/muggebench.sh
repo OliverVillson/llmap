@@ -235,7 +235,8 @@ if [ ! -s "$JOB/footprint.json" ]; then
       nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 200 > "$peakf" 2>/dev/null &
       smi=$!
     fi
-    "$SERVER" -m "$GGUF" -ngl 999 --host 127.0.0.1 --port "$FPORT" -c "$FOOTPRINT_CTX" -np 1 --jinja \
+    # buffer sizes are logged only at verbosity 4 in newer builds (brew's 0.5.0)
+    LLAMA_ARG_LOG_VERBOSITY=4 "$SERVER" -m "$GGUF" -ngl 999 --host 127.0.0.1 --port "$FPORT" -c "$FOOTPRINT_CTX" -np 1 --jinja \
       ${ub:+-ub "$ub"} ${KV:+-ctk "$KV" -ctv "$KV" -fa on} > "$JOB/footprint-server-$tag.log" 2>&1 &
     fp=$!
     for _ in $(seq 300); do curl -sf "http://127.0.0.1:$FPORT/health" >/dev/null && break; kill -0 $fp 2>/dev/null || break; sleep 1; done
@@ -253,10 +254,15 @@ PY
     [ -n "${smi:-}" ] && { kill "$smi" 2>/dev/null; wait "$smi" 2>/dev/null || true; smi=""; }
     echo "${before:-}" > "$JOB/footprint-gpu-$tag.before"
   done
-  python3 - "$JOB" "$FOOTPRINT_CTX" "$KV" "$FOOTPRINT_PROMPT" $FOOTPRINT_UBATCH <<'PY'
+  BUILD=$("$SERVER" --version 2>&1 | grep -m1 -iE "version|build" || echo unknown)
+  python3 - "$JOB" "$FOOTPRINT_CTX" "$KV" "$FOOTPRINT_PROMPT" "$GGUF" "$BUILD" $FOOTPRINT_UBATCH <<'PY'
 import json, re, sys
 from pathlib import Path
-job, ctx, kv, want, ubs = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+job, ctx, kv, want, gguf, build, ubs = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), Path(sys.argv[5]), sys.argv[6], sys.argv[7:]
+# The weights count as the GGUF file: llama.cpp maps it, and its model buffers on several
+# devices (CPU_Mapped and MTL0_Mapped on Metal) can be views of the same pages.
+shards = sorted(gguf.parent.glob(gguf.name.replace("-00001-of-", "-*-of-"))) if "-00001-of-" in gguf.name else [gguf]
+file_gb = sum(p.stat().st_size for p in shards) / 1e9
 runs = {}
 for tag in ["default", *ubs]:
     log = job / f"footprint-server-{tag}.log"
@@ -272,14 +278,18 @@ for tag in ["default", *ubs]:
     before = (job / f"footprint-gpu-{tag}.before").read_text().strip()
     samples = [int(x) for x in (job / f"footprint-gpu-{tag}.log").read_text().split() if x.isdigit()]
     peak = (max(samples) - int(before)) * 2**20 / 1e9 if before and samples else None
-    runs[tag] = {"ubatch": tag, "prompt_tokens": int(prompt), "total_gb": round(sum(buffers.values()) * 2**20 / 1e9, 3),
+    work = sum(v for k, v in by.items() if k != "model")
+    runs[tag] = {"ubatch": tag, "prompt_tokens": int(prompt), "total_gb": round(file_gb + work, 3),
+                 "file_gb": round(file_gb, 3), "working_gb": round(work, 3),
+                 "buffer_sum_gb": round(sum(buffers.values()) * 2**20 / 1e9, 3),
                  "by_kind_gb": {k: round(v, 3) for k, v in by.items() if v}, "buffers_mib": buffers,
                  "gpu_peak_gb": round(peak, 3) if peak is not None else None}
-    print(f"  -ub {tag}: {runs[tag]['total_gb']:.2f} GB after {prompt} prompt tokens: "
+    print(f"  -ub {tag}: {runs[tag]['total_gb']:.2f} GB (file {file_gb:.2f} + working memory {work:.2f}) after {prompt} prompt tokens; buffers: "
           + ", ".join(f"{k} {v:.2f}" for k, v in by.items() if v)
           + (f"; peak GPU memory {peak:.2f} GB, CUDA context included" if peak is not None else ""))
 best = min(runs.values(), key=lambda r: r["total_gb"])
-json.dump({"ctx": ctx, "kv_type": kv, "prompt_tokens": want, **{k: best[k] for k in ("ubatch", "total_gb", "by_kind_gb", "gpu_peak_gb")},
+json.dump({"ctx": ctx, "kv_type": kv, "prompt_tokens": want, "llama_server": build,
+           **{k: best[k] for k in ("ubatch", "total_gb", "file_gb", "working_gb", "buffer_sum_gb", "by_kind_gb", "gpu_peak_gb")},
            "runs": runs}, open(job / "footprint.json", "w"), indent=2)
 print(f"  footprint: {best['total_gb']:.2f} GB (-ub {best['ubatch']}, the smaller; -ub changes speed, not answers)")
 PY
@@ -328,8 +338,12 @@ size = sum(p.stat().st_size for p in shards) / 1e9
 lo, hi = r["scoreCI"]
 print(f"{name}: Mugge score {r['score']}% (95% {lo}-{hi}) on {r['tickets']} tickets x {r['seeds']} seeds, {projects} projects")
 parts = ", ".join(f"{k} {v:.2f}" for k, v in fp["by_kind_gb"].items())
-print(f"  footprint {fp['total_gb']:.2f} GB for one agent at {fp['ctx']} context after a {fp.get('prompt_tokens', '?')}-token prompt, "
-      f"{fp['kv_type'] or 'f16'} KV, -ub {fp.get('ubatch', 'default')} ({parts}); GGUF file {size:.2f} GB")
+print(f"  footprint {fp['total_gb']:.2f} GB for one agent at {fp['ctx']} context after a {fp.get('prompt_tokens', '?')}-token prompt: "
+      f"GGUF file {size:.2f} GB + working memory {fp.get('working_gb', fp['total_gb'] - size):.2f} GB "
+      f"({fp['kv_type'] or 'f16'} KV, -ub {fp.get('ubatch', 'default')})")
+if "buffer_sum_gb" in fp:
+    print(f"  every buffer llama-server allocated, summed: {fp['buffer_sum_gb']:.2f} GB ({parts}); mapped views of the file can count twice")
+print(f"  llama-server: {fp.get('llama_server', 'unknown')}")
 for tag, run in fp.get("runs", {}).items():
     print(f"    -ub {tag}: {run['total_gb']:.2f} GB, compute buffer {run['by_kind_gb'].get('compute', 0):.2f} GB"
           + (f", peak GPU {run['gpu_peak_gb']:.2f} GB" if run.get("gpu_peak_gb") is not None else ""))
