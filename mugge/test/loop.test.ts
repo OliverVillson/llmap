@@ -59,7 +59,7 @@ describe('ticket states', () => {
     }
     expectLegal(events);
     const seq = statesOf(events);
-    expect(seq.get('b')!.filter((s) => s !== 'queued' && s !== 'waiting')).toEqual(['writing', 'checking', 'fixing', 'checking', 'finished']);
+    expect(seq.get('b')!.filter((s) => s !== 'queued' && s !== 'waiting')).toEqual(['writing', 'checking', 'fixing', 'checking', 'reviewing', 'finished']);
     expect(seq.get('c')![0]).toBe('waiting');
     expect(seq.get('x')!.at(-1)).toBe('failed');
     // five tickets, two agents: someone waited for an agent; one machine with two slots: no call queued
@@ -96,7 +96,7 @@ describe('ticket states', () => {
     expect(queuedOnes.length).toBeGreaterThan(0);
     for (const [, s] of queuedOnes) {
       const i = s.indexOf('queued');
-      expect(['writing', 'fixing']).toContain(s[i + 1]!);
+      expect(['writing', 'fixing', 'reviewing']).toContain(s[i + 1]!);
       expect(s[i + 1]).toBe(s[i - 1]!);
     }
     const q = events.find((e) => e.type === 'state' && e.state === 'queued');
@@ -239,21 +239,28 @@ describe('runTicket', () => {
     expectLegal(events);
   });
 
-  test('review is off unless switched on', async () => {
+  test('review is on unless switched off', async () => {
+    const old = process.env.MUGGE_REVIEW;
     const fake = startFakeModel({ solutions: { a: ok('a') } });
     try {
-      const old = process.env.MUGGE_REVIEW;
       delete process.env.MUGGE_REVIEW;
-      const r = await runTicket(ticket, folder('off'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: () => {} });
-      if (old !== undefined) process.env.MUGGE_REVIEW = old;
-      expect(r.ok).toBe(true);
-      expect(r.review).toBeNull();
-      expect(fake.calls().map((c) => c.kind)).toEqual(['write']);
+      const on = await runTicket(ticket, folder('default-on'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: () => {} });
+      expect(on.ok).toBe(true);
+      expect(on.review?.verdict).toBe('approve');
+      expect(fake.calls().map((c) => c.kind)).toEqual(['write', 'review']);
+      process.env.MUGGE_REVIEW = 'off';
+      const off = await runTicket(ticket, folder('off'), { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: () => {} });
+      expect(off.ok).toBe(true);
+      expect(off.review).toBeNull();
+      expect(fake.calls().map((c) => c.kind)).toEqual(['write', 'review', 'write']);
     } finally {
+      if (old === undefined) delete process.env.MUGGE_REVIEW;
+      else process.env.MUGGE_REVIEW = old;
       fake.stop();
     }
+    expect(reviewFromEnv({})).toBe(true);
     expect(reviewFromEnv({ MUGGE_REVIEW: 'on' })).toBe(true);
-    expect(reviewFromEnv({})).toBe(false);
+    expect(reviewFromEnv({ MUGGE_REVIEW: ' OFF ' })).toBe(false);
     expect(() => reviewFromEnv({ MUGGE_REVIEW: 'yes' })).toThrow(/on or off/);
   });
 

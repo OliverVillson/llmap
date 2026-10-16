@@ -6,7 +6,8 @@
  *   sandbox → on failure a fresh fix call gets the trimmed error → repeat until the budget runs
  *   out → escalate to a bigger model once, or end failed with the last error.
  *
- * With MUGGE_REVIEW=on the lead review is part of done (Oliver, 2026-10-15): a ticket whose
+ * The lead review is on by default (Oliver, 2026-10-16; MUGGE_REVIEW=off turns it off) and is
+ * part of done (Oliver, 2026-10-15): a ticket whose
  * checks pass gets one lead review (review.ts) and finishes only on an approve, or when a fix
  * the review asked for passes the checks. Problems spend the ticket's next fix attempt (and
  * escalate like a failing check); a ticket whose attempts run out first ends failed, as does
@@ -35,7 +36,7 @@ export interface HarnessContext {
   /** Per acceptance command. */
   checkTimeoutMs?: number;
   signal?: AbortSignal;
-  /** Lead review after the checks pass; unset: MUGGE_REVIEW. */
+  /** Lead review after the checks pass; unset: MUGGE_REVIEW (on unless it is off). */
   review?: boolean;
   /** Where the review call goes (the scheduler gives a lead slot when the crew has one); unset: `inference`. */
   reviewInference?: Inference;
