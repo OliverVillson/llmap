@@ -28,12 +28,16 @@ find them), then runs `setup` (venv on `/data`, vLLM, nvcc pinned to the CUDA ru
 
 ```bash
 curl -fsSLo /tmp/fresh.sh https://raw.githubusercontent.com/OliverVillson/llmap/claude/centipede-demo/mugge/deploy/fresh.sh
-bash /tmp/fresh.sh                       # stops and names the disk if /data has never been formatted
-cd ~/llmap/mugge
-CREW_WORKERS=64 deploy/qwen.sh start     # runs preflight first; detached; the crew size sticks
-deploy/qwen.sh wait                      # first start takes several minutes (load, compile, CUDA graphs)
-deploy/qwen.sh check                     # must end in PASS
+bash /tmp/fresh.sh && cd ~/llmap/mugge && CREW_WORKERS=64 deploy/qwen.sh start && deploy/qwen.sh wait && deploy/qwen.sh check
 ```
+
+One line, chained, so a step that stops (a blank disk, a failed preflight) stops the rest: `start`
+runs preflight first and starts the server detached (the crew size sticks); `wait` takes several
+minutes the first time (load, compile, CUDA graphs); `check` must end in `PASS`. If the ssh session
+drops at any point, `ssh evroc` and run the same two lines again: apt, the checkout, uv, bun, the
+venv and the weights download all carry on from where they were, and `start` leaves a running
+server alone. On a new VM, apt is usually busy with unattended-upgrades for the first minutes;
+`fresh.sh` says so and waits for it.
 
 It never erases a disk on its own. With no disk labelled `data` it lists the blank ones and stops
 with the exact line, e.g. `bash /tmp/fresh.sh --format /dev/vdc`. `--format` refuses any disk with
