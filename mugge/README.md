@@ -95,10 +95,14 @@ line per call on stderr, `--thinking off` for the fastest run.
 
 Speed levers, first to try first:
 
-- `MUGGE_REASONING_EFFORT=worker=medium,lead=xhigh,manager=xhigh` sets how hard each kind of call
+- `MUGGE_REASONING_EFFORT=worker=medium,lead=low,manager=xhigh` sets how hard each kind of call
   thinks (`off` for no thinking). Use one level for everything (`medium`), or give a machine in
   `MUGGE_BACKENDS` its own `"reasoning_effort"`. A lead with a level reviews with thinking on, and
-  a thinking review's cap is `MUGGE_MAX_CALL_TOKENS`, else 16,384.
+  a thinking review's cap is `MUGGE_MAX_CALL_TOKENS`, else 16,384. Keep the lead's level low: 8
+  lead slots review 64 workers' tickets, and every ticket waits for its review. In a mock of the
+  64 crew (80 agents, a review taking 2x a write at xhigh, 0.25x at low) the crew took 141 s with
+  `lead=xhigh` and up to 66 tickets queued for a lead, 44 s with `lead=low` (at most 16 queued);
+  `lead=off` (thinking off, the review's own default, cap 2,048) was no faster than low.
 - Run more agents than worker slots, e.g. `MUGGE_CONCURRENCY=80` on 64 slots. While some agents
   run checks, wait for a review or set up a worktree, others keep the slots decoding.
 - Give the lead about one slot for every eight worker slots. Reviews are short, but a ticket waits
