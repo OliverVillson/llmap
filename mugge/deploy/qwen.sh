@@ -109,7 +109,12 @@ serve_cmd() {
   if [ -n "${EXTRA_ARGS:-}" ]; then read -r -a extra <<< "$EXTRA_ARGS"; CMD+=("${extra[@]}"); fi
 }
 
-pid_alive() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+# the boot it was started in: after a reboot the saved pid may be some other process's
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || true; }
+pid_alive() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || return 1
+  [ ! -f "$STATE/serve.boot" ] || [ "$(cat "$STATE/serve.boot")" = "$(boot_id)" ]
+}
 
 case "${1:-}" in
   setup)
@@ -147,7 +152,7 @@ case "${1:-}" in
     echo "$CREW_WORKERS" > "$CREW_FILE"
     # its own session, no terminal: the server outlives the ssh login that started it
     setsid nohup "${CMD[@]}" >> "$LOG" 2>&1 < /dev/null &
-    echo $! > "$PIDFILE"
+    echo $! > "$PIDFILE"; boot_id > "$STATE/serve.boot"
     echo "started pid $! (profile $PROFILE, $MODEL), log $LOG; loading takes a few minutes: deploy/qwen.sh wait"
     ;;
   wait)
@@ -213,13 +218,13 @@ PY
     exec tail -n "${LINES:-100}" -F "$LOG"
     ;;
   stop)
-    pid_alive || { echo "not running"; rm -f "$PIDFILE"; exit 0; }
+    pid_alive || { echo "not running"; rm -f "$PIDFILE" "$STATE/serve.boot"; exit 0; }
     pid="$(cat "$PIDFILE")"
     # the whole process group: vLLM's engine core runs in child processes
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
     for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -0 "$pid" 2>/dev/null && { echo "still up after 60 s: killing"; kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid"; }
-    rm -f "$PIDFILE" "$RUNNING"
+    rm -f "$PIDFILE" "$RUNNING" "$STATE/serve.boot"
     echo stopped
     ;;
   *)

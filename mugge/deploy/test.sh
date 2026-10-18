@@ -55,6 +55,9 @@ grep -q 'crew: 64 workers + 8 leads + 1 orchestrator need at most 137 GB' "$STAT
 grep -q 'warning: if every call is long' "$STATE/wait64.txt"
 deploy/qwen.sh check > "$STATE/check64.txt"; grep -q 'ok    73 calls at once' "$STATE/check64.txt"
 ( unset CREW_WORKERS; set -a; . deploy/crew.env; set +a; [ "$MUGGE_CONCURRENCY" = 80 ] )
+# the same from sh (dash) and from another folder; CREW_WORKERS stays out of the environment
+env -u CREW_WORKERS sh -c 'set -a; . deploy/crew.env; set +a; [ "$MUGGE_CONCURRENCY" = 80 ] && [ -z "${CREW_WORKERS:-}" ]'
+( cd /; unset CREW_WORKERS; set -a; . "$OLDPWD/deploy/crew.env"; set +a; [ "$MUGGE_CONCURRENCY" = 80 ] )
 if MAX_NUM_SEQS=8 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "MAX_NUM_SEQS below the crew was allowed"; exit 1; fi
 # a public host is refused without a key
 if HOST=0.0.0.0 ALLOW_PUBLIC=1 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "public host without a key was allowed"; exit 1; fi

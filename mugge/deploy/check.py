@@ -354,7 +354,8 @@ def main():
     a = p.parse_args()
     if a.compare is not None:
         sys.exit(compare(a.compare))
-    base = a.url.rstrip("/").removesuffix("/v1")
+    base = a.url.rstrip("/")
+    base = base[:-3] if base.endswith("/v1") else base  # no str.removesuffix: Python 3.8 boxes
     key = os.environ.get("VLLM_API_KEY") or None
     if a.bench:
         levels = [int(x) for x in a.levels.split(",") if x.strip()]
