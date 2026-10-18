@@ -28,6 +28,12 @@ jobs:
           bun bench/run.ts --bench spike --out bench-run --fake --seeds 1
       - name: spike smoke (fake model, messy first answers)
         run: bun bench/smoke.ts --fake --fake-mess --out smoke-run
+      - name: demo (the task is fair; ten agents on a mock model to a green integration)
+        run: |
+          bun demo/check.ts
+          bun demo/run.ts --fake --fake-speed 50 --exit --port 0
+          bun demo/run.ts --fake --fake-speed 50 --exit --port 0 --plan orchestrator
+          bun demo/run.ts --fake --fake-speed 50 --exit --port 0 --concurrency 64 --prompt "one prompt, one ticket per agent"
       - name: deploy scripts (no-GPU stand-in for vLLM)
         run: deploy/test.sh
       - uses: actions/upload-artifact@v4
