@@ -55,6 +55,8 @@ export HF_HOME="${HF_HOME:-$DATA_DIR/hf}" XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DAT
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DATA_DIR/cache/triton}" UV_CACHE_DIR="${UV_CACHE_DIR:-$DATA_DIR/cache/uv}"
 # FlashInfer's compiled kernels: <base>/.cache/flashinfer
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$DATA_DIR}"
+# TileLang's kernel cache defaults to ~/.tilelang on the small root disk
+export TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-$DATA_DIR/cache/tilelang}"
 # a venv made before DATA_DIR existed stays where it is
 if [ -z "${VENV:-}" ] && [ -x "$HOME/venvs/qwen-vllm/bin/python" ]; then VENV="$HOME/venvs/qwen-vllm"; fi
 VENV="${VENV:-$DATA_DIR/venv}"
@@ -98,6 +100,18 @@ use_data_dir() {
   fi
   # remembered only once it has room, so a folder that failed the check is not picked again
   echo "$DATA_DIR" > "$DATA_FILE.new" && mv "$DATA_FILE.new" "$DATA_FILE"
+}
+
+# The venv runs: its Python, and the interpreter its scripts (vllm, hf, ninja) name. A venv carries
+# its own absolute path in those scripts, so one on a data disk mounted somewhere else is broken.
+venv_ok() {
+  "$VENV/bin/python" -c '' 2>/dev/null || return 1
+  local s i
+  for s in "$VENV/bin/vllm" "$VENV/bin/hf"; do
+    [ -f "$s" ] || continue
+    i="$(head -1 "$s")"; i="${i#\#!}"; i="${i%% *}"
+    [ -x "$i" ] || return 1
+  done
 }
 
 gpu_name() { command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true; }
@@ -168,6 +182,8 @@ serve_cmd() {
 boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || true; }
 pid_alive() {
   [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || return 1
+  # a server that died but was never reaped (no init to collect it, e.g. in a container) is not running
+  [ "$(ps -o stat= -p "$(cat "$PIDFILE")" 2>/dev/null | cut -c1)" != Z ] || return 1
   [ ! -f "$STATE/serve.boot" ] || [ "$(cat "$STATE/serve.boot")" = "$(boot_id)" ]
 }
 
@@ -239,7 +255,7 @@ preflight() {
   # the GPU: driver up, nothing else holding its memory, libcuda for Triton
   if [ -z "${NO_GPU:-}" ]; then
     if ! command -v nvidia-smi >/dev/null || ! nvidia-smi -L >/dev/null 2>&1; then
-      bad "GPU: nvidia-smi does not work (no driver loaded)" "sudo reboot, or a VM made from evroc's GPU image (sudo ubuntu-drivers install --gpgpu && sudo reboot)"
+      bad "GPU: nvidia-smi does not work ($(nvidia-smi -L 2>&1 | head -1 | cut -c1-120))" "sudo reboot (a driver update under the loaded module says 'version mismatch'), or a VM made from evroc's GPU image (sudo ubuntu-drivers install --gpgpu && sudo reboot)"
     else
       local used total apps drv
       read -r used total < <(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -1 | tr -d ',')
@@ -272,8 +288,8 @@ preflight() {
     bad "home disk: ${free} GB free (the server log and state go in $STATE)" "sudo apt-get clean; rm -rf ~/.cache/uv ~/.cache/huggingface ~/.cache/pip; df -h ~"
 
   # the venv and vLLM
-  if ! "$py" -c '' 2>/dev/null; then
-    bad "venv: $VENV has no working Python" "deploy/qwen.sh setup"
+  if ! venv_ok; then
+    bad "venv: $VENV has no working Python, or its scripts name another folder's" "deploy/qwen.sh setup   (makes it again)"
   else
     v="$("$py" -c 'import importlib.metadata as m; print(m.version("vllm"))' 2>/dev/null || true)"
     [ "$v" = "$VLLM_VERSION" ] && ok "vLLM $v in $VENV" || bad "vLLM in $VENV is '${v:-not installed}', expected $VLLM_VERSION" "deploy/qwen.sh setup"
@@ -385,6 +401,7 @@ start_hint() {
   [ -n "$h" ] || ! grep -qiE 'cuda.?graph|capture' "$log" || h="CUDA graph capture failed: EXTRA_ARGS='-cc.cudagraph_mode=PIECEWISE' deploy/qwen.sh start (slower), or GPU_UTIL=0.90"
   [ -n "$h" ] || ! grep -qiE 'No space left on device' "$log" || h="a disk is full: deploy/qwen.sh where; df -h ~ /data"
   [ -n "$h" ] || ! grep -qiE 'Address already in use' "$log" || h="port $PORT is taken: ss -ltnp | grep :$PORT"
+  [ -n "$h" ] || ! grep -qE 'Failed to infer device type|No CUDA GPUs are available|CUDA driver initialization failed' "$log" || h="vLLM sees no GPU: nvidia-smi; if that lists the B200, the driver and its kernel module are out of step after an update: sudo reboot"
   [ -n "$h" ] || ! grep -qiE 'HTTPError|ConnectionError|huggingface\.co|LocalEntryNotFound' "$log" || h="could not reach the Hub: if the weights are downloaded, HF_HUB_OFFLINE=1 deploy/qwen.sh start"
   if [ -n "$h" ]; then echo "likely fix: $h"; else echo "no known cause matched; send the lines above (README \"If start fails\")"; fi
 }
@@ -407,7 +424,7 @@ case "${1:-}" in
     use_data_dir 50
     command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
     # a venv kept on the data disk whose Python went with the old root disk: made again (from the uv cache)
-    if [ -e "$VENV" ] && ! "$VENV/bin/python" -c '' 2>/dev/null; then echo "the venv's Python is gone ($VENV): making it again"; rm -rf "$VENV"; fi
+    if [ -e "$VENV" ] && ! venv_ok; then echo "the venv's Python is gone, or its scripts point at another folder ($VENV): making it again"; rm -rf "$VENV"; fi
     [ -x "$VENV/bin/python" ] || uv venv -q --python-preference system -p 3.12 "$VENV"
     # --torch-backend=auto picks the PyTorch build that matches the installed driver's CUDA;
     # TORCH_BACKEND=cu130 (etc.) forces one, TORCH_BACKEND=pypi takes PyPI's default build
@@ -476,7 +493,7 @@ case "${1:-}" in
         echo "last lines:" >&2; tail -n 25 "$LOG" >&2 || true
         start_hint "$LOG" >&2; exit 1
       fi
-      [ $(( $(date +%s) - start )) -lt "$timeout_s" ] || { echo "not up after ${timeout_s}s; deploy/qwen.sh logs" >&2; exit 1; }
+      [ $(( $(date +%s) - start )) -lt "$timeout_s" ] || { echo "not up after ${timeout_s}s, but still running (the first start compiles kernels): deploy/qwen.sh wait again; deploy/qwen.sh logs shows what it is doing" >&2; exit 1; }
       sleep 5
     done
     echo "up after $(( $(date +%s) - start ))s"

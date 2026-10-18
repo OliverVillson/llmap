@@ -54,8 +54,17 @@ missing=()
 for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "installing ${missing[*]}"
-  $SUDO apt-get update -qq || die "apt-get update failed: sudo apt-get update"
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null ||
+  # a fresh VM runs unattended-upgrades in its first minutes and holds apt's locks; apt-get stops at
+  # once on a held lock, so wait for it (install has a lock timeout of its own, update does not)
+  for i in $(seq 1 90); do
+    out="$($SUDO apt-get update -qq 2>&1)" && break
+    case "$out" in *"Could not get lock"*|*"Unable to lock"*) ;; *) printf '%s\n' "$out" >&2; die "apt-get update failed: sudo apt-get update" ;; esac
+    [ "$i" != 1 ] || echo "another apt is running (unattended-upgrades on a new VM); waiting for it, up to 15 minutes"
+    [ "$i" != 90 ] || die "apt is still locked after 15 minutes: ps aux | grep -E 'apt|dpkg|unattended'"
+    sleep 10
+  done
+  $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+    apt-get install -y -qq -o DPkg::Lock::Timeout=900 "${missing[@]}" >/dev/null </dev/null ||
     die "apt-get install failed: sudo apt-get install -y ${missing[*]}"
 fi
 # the headers of the python3 that the venv is made from (python3-dev pulls the matching python3.X-dev)
@@ -65,8 +74,13 @@ for t in gcc g++ ninja git curl unzip; do command -v "$t" >/dev/null || die "$t 
 echo "ok: $(python3 --version), $(gcc --version | head -1), ninja $(ninja --version), $(git --version)"
 
 if [ -z "${NO_GPU:-}" ]; then
-  command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1 ||
-    die "no working NVIDIA driver (nvidia-smi). Create the VM from evroc's GPU image, or install one: sudo ubuntu-drivers install --gpgpu && sudo reboot"
+  if ! command -v nvidia-smi >/dev/null; then
+    die "no NVIDIA driver (nvidia-smi). Create the VM from evroc's GPU image, or install one: sudo ubuntu-drivers install --gpgpu && sudo reboot"
+  elif ! smi="$(nvidia-smi -L 2>&1)"; then
+    # unattended-upgrades on a new VM can update the driver's files under the loaded kernel module
+    case "$smi" in *mismatch*) die "the NVIDIA driver was updated under the running kernel module (nvidia-smi: $smi). sudo reboot, then run this again" ;; esac
+    die "nvidia-smi fails: $smi. Try: sudo reboot; else sudo ubuntu-drivers install --gpgpu && sudo reboot"
+  fi
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 fi
 
@@ -112,7 +126,8 @@ if [ -n "$dev" ]; then
   [ "$at" = "$DATA_MNT" ] || { echo "the data disk $dev is already mounted at $at; using it"; DATA_MNT="$at"; }
   fstype="$(blkid -o value -s TYPE "$dev" 2>/dev/null || $SUDO blkid -o value -s TYPE "$dev")"
   # back after a reboot; nofail so a missing disk never stops the VM from booting
-  if ! grep -qE "^[[:space:]]*LABEL=data[[:space:]]" /etc/fstab; then
+  # (a line of its own for that mount point, e.g. /dev/vdc /data made by hand, counts: two would clash)
+  if ! awk -v m="$DATA_MNT" '$1 !~ /^#/ && ($1 == "LABEL=data" || $2 == m) {f = 1} END {exit !f}' /etc/fstab; then
     echo "LABEL=data $DATA_MNT ${fstype:-auto} defaults,nofail 0 2" | $SUDO tee -a /etc/fstab >/dev/null
     echo "added to /etc/fstab: LABEL=data $DATA_MNT"
   fi
@@ -165,7 +180,10 @@ if [ -n "$DATA_MNT" ] && [ -d "$HOME/llmap" ] && [ ! -L "$HOME/llmap" ]; then
   old="$HOME/llmap.old-$(date +%Y%m%d-%H%M%S)"; mv "$HOME/llmap" "$old"; echo "moved the checkout on the root disk to $old"
 fi
 if [ -d "$CO/.git" ]; then
-  git -C "$CO" fetch -q origin "$BRANCH" || die "git fetch failed in $CO (network?): git -C $CO fetch origin $BRANCH"
+  # from REPO_URL into origin/$BRANCH by name: a checkout cloned single-branch, from another branch,
+  # or over ssh (no GitHub key on the VM) would otherwise leave origin/$BRANCH missing or stale
+  git -C "$CO" fetch -q "$REPO_URL" "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" ||
+    die "git fetch failed in $CO (network?): git -C $CO fetch $REPO_URL $BRANCH"
   if [ -n "$(git -C "$CO" status --porcelain --untracked-files=no)" ]; then
     tag="fresh-$(date +%Y%m%d-%H%M%S)"
     git -C "$CO" stash push -q -m "$tag" && echo "local edits in $CO saved: git -C $CO stash list ($tag)"
@@ -213,8 +231,10 @@ echo "ok: bun $(bun --version), $(uv --version)"
 # ---------------------------------------------------------------------------------------------
 step "5/5 vLLM, the weights, the demo"
 export DATA_DIR
-"$M/deploy/qwen.sh" setup
-[ -n "${SKIP_DOWNLOAD:-}" ] || "$M/deploy/qwen.sh" download
+"$M/deploy/qwen.sh" setup || die "setup stopped (see above). Run the same command again: what is installed is kept"
+# 31 GB: an ssh drop or a network error here loses nothing; the same command carries on
+[ -n "${SKIP_DOWNLOAD:-}" ] || "$M/deploy/qwen.sh" download ||
+  die "the weights download stopped (network, or the Hub). Run the same command again: it resumes where it stopped"
 ( cd "$M" && bun install --frozen-lockfile >/dev/null 2>&1 || bun install ) || die "bun install failed: cd $M && bun install"
 echo
 "$M/deploy/qwen.sh" preflight || die "preflight found problems (each FAIL line above has its fix); fix them and run: cd ~/llmap/mugge && deploy/qwen.sh preflight"
