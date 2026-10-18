@@ -105,9 +105,11 @@ on a B200 it is far above where speed flattens.
 
 Each entry uses the engine's `qwen3.8-27b` preset (16 KV layers × 4 × 256, plus the DeltaNet
 state) and `"server": "vllm"`. `crew.env` turns thinking on (`MUGGE_THINKING=on`) with an effort
-per role, `MUGGE_REASONING_EFFORT=worker=medium,lead=xhigh,manager=xhigh`: workers write most of
-the tokens and think less, the few review and plan calls think fully (`off` for a role sends its
-calls without thinking). A call is capped at 16,384 tokens. It sets no
+per role, `MUGGE_REASONING_EFFORT=worker=medium,lead=low,manager=xhigh`: workers write most of
+the tokens and think less, the few plan calls think fully, and reviews think briefly, because 8
+lead slots review every ticket of 64 workers and a ticket waits for its review (`off` for a role
+sends its calls without thinking; `lead=off` is the fallback if many tickets wait for a lead).
+Lead slots are still sized for a thinking review (24,576 tokens), so the memory sums below hold. A call is capped at 16,384 tokens. It sets no
 sampling: the engine sends Qwen's set per call from that call's thinking switch, and the server
 pins none.
 
@@ -140,7 +142,7 @@ The most each call can cost is its longest context plus the DeltaNet state (`dep
 | Call | Longest context | bf16 KV | fp8 KV |
 |---|---|---|---|
 | worker | 26,624 tokens (pack ~10K + `MUGGE_MAX_CALL_TOKENS` 16,384) | 1.90 GB | 1.03 GB |
-| lead | 24,576 tokens (review prompt and diff, thinking at xhigh up to 16,384) | 1.76 GB | 0.96 GB |
+| lead | 24,576 tokens (review prompt and diff, a thinking review up to 16,384) | 1.76 GB | 0.96 GB |
 | orchestrator | 24,576 tokens (a plan call with thinking) | 1.76 GB | 0.96 GB |
 | **64 + 8 + 1, all at their longest at once** | | **137 GB** | **74 GB** |
 

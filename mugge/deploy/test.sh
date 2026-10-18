@@ -41,7 +41,7 @@ diff <(python3 deploy/crew.py 10) deploy/crew-b200.json
   echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 3' )
 ( CREW_WORKERS=64; set -a; . deploy/crew.env; set +a
   [ "$MUGGE_CONCURRENCY" = 80 ]
-  [ "$MUGGE_REASONING_EFFORT" = worker=medium,lead=xhigh,manager=xhigh ]
+  [ "$MUGGE_REASONING_EFFORT" = worker=medium,lead=low,manager=xhigh ]
   echo "$MUGGE_BACKENDS" | grep -q '"b200-workers".*"slots": 64'
   echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 8' )
 CREW_WORKERS=64 deploy/qwen.sh cmd | grep -q -- '--max-num-seqs 73 .*--gpu-memory-utilization 0.94'
