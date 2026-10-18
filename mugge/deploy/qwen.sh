@@ -49,7 +49,7 @@ URL="http://127.0.0.1:$PORT"
 CREW_FILE="$STATE/serve.crew"
 if [ -z "${CREW_WORKERS:-}" ] && [ -f "$CREW_FILE" ]; then CREW_WORKERS="$(cat "$CREW_FILE")"; fi
 CREW_WORKERS="${CREW_WORKERS:-10}"
-read -r _ CREW_LEADS _ CREW_TOTAL < <(python3 "$HERE/crew.py" "$CREW_WORKERS" --sizes)
+read -r _ CREW_LEADS _ CREW_TOTAL CREW_AGENTS < <(python3 "$HERE/crew.py" "$CREW_WORKERS" --sizes)
 
 die() { echo "qwen.sh: $*" >&2; exit 1; }
 

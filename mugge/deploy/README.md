@@ -1,8 +1,9 @@
 # Qwen on one GPU for a Centipede crew
 
 One vLLM server with **Qwen/Qwen3.8-27B-FP8** (the official FP8 checkpoint, 31 GB) serves the
-whole crew on one GPU: the first run is 64 code agents, 4 lead reviewers and 1 orchestrator
-(`CREW_WORKERS=64`; without it the crew is 10 agents, 2 leads and 1 orchestrator). The evroc B200
+whole crew on one GPU: the first run is 64 worker slots, 8 lead reviewer slots and 1 orchestrator
+slot, with 80 code agents taking turns on the worker slots (`CREW_WORKERS=64`; without it the
+crew is 10 worker slots, 13 agents, 2 leads and 1 orchestrator). The evroc B200
 is the target; H100 and L40S notes are at the end.
 
 | File | What it is |
@@ -29,18 +30,19 @@ deploy/qwen.sh check                     # must end in PASS
 nproc; free -g                           # the agents' checks run on these CPUs (see "CPUs" below)
 ```
 
-`CREW_WORKERS=64` is given once, at `start`: the server then admits 69 calls at once (64 workers,
-4 leads, 1 orchestrator), and `wait`, `check`, `bench`, `status` and `deploy/crew.env` read the
+`CREW_WORKERS=64` is given once, at `start`: the server then admits 73 calls at once (64 workers,
+8 leads, 1 orchestrator), and `wait`, `check`, `bench`, `status` and `deploy/crew.env` read the
 size back, over ssh too. Starting again without it keeps 64; `CREW_WORKERS=10 deploy/qwen.sh start`
 changes it.
 
 `wait` prints vLLM's own pool and checks the crew against it, for example
-`crew: 64 workers + 4 leads + 1 orchestrator need at most 126 GB of KV cache and state; the pool holds 1xx GB`.
-Under 100% is what we want; above it, see "64 agents and memory" below.
+`crew: 64 workers + 8 leads + 1 orchestrator need at most 137 GB of KV cache and state; the pool holds 1xx GB`.
+On a 180 GB B200 that is a little over 100% and `wait` warns; that is expected, see "64 agents
+and memory" below.
 
 `check` ends in `PASS` when: the model answers; thinking comes back apart from the answer
 (so file blocks never contain it); a JSON-schema call parses (the planner's calls); and the whole
-crew's calls at once (69) all answer, ran together and none was preempted. It prints tokens per
+crew's calls at once (73) all answer, ran together and none was preempted. It prints tokens per
 second together and per call.
 
 ## Checking in over ssh from the Mac
@@ -68,7 +70,7 @@ Do not open port 8000 to the internet: vLLM's `--api-key` does not cover every e
 cd llmap/mugge
 curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install
 set -a; . deploy/crew.env; set +a       # from the mugge folder; picks up the 64 from start
-bun src/cli.ts backends                 # three entries (64, 4 and 1 slots), all "up"
+bun src/cli.ts backends                 # three entries (64, 8 and 1 slots), all "up"
 ```
 
 The machine list (`deploy/crew.py`, loaded by `crew.env`) names the one server three times, so
@@ -77,14 +79,16 @@ each kind of call has slots of its own and a burst of reviews never takes a work
 | Entry | Role | Slots | Who |
 |---|---|---|---|
 | b200-workers | worker | `CREW_WORKERS` (64 for the first run) | the code agents: each ticket's write and fix calls |
-| b200-leads | lead | one per 16 workers, at least 2 (4 for 64) | lead review of each ticket whose checks pass |
+| b200-leads | lead | one per 8 workers, at least 2 (8 for 64) | lead review of each ticket whose checks pass |
 | b200-orchestrator | manager | 1 | the architect, scaffold and ticket plan (`mugge plan`) |
 
 ### Crew size: one setting
 
 `CREW_WORKERS` sets the crew everywhere at once: the worker and lead slots, `MUGGE_CONCURRENCY`
-(tickets at once), and the server's `--max-num-seqs` (raised to cover every call the crew can
-have in flight). Give it to `start`; everything after reads it back from `~/qwen/serve.crew`:
+(tickets at once: 1.25 per worker slot, 80 for 64, so a slot freed while an agent runs its checks
+or waits for review goes straight to another agent), and the server's `--max-num-seqs` (raised to
+cover every call the crew can have in flight: workers + leads + 1; the extra agents' calls wait
+in the engine, not on the GPU). The ratios come from the engine's crew-scale measurements. Give it to `start`; everything after reads it back from `~/qwen/serve.crew`:
 
 ```bash
 CREW_WORKERS=24 deploy/qwen.sh start && deploy/qwen.sh wait    # wait says whether 24 fit in memory
@@ -100,8 +104,10 @@ how many workers fit by memory if every call reached 32K tokens at once; that is
 on a B200 it is far above where speed flattens.
 
 Each entry uses the engine's `qwen3.8-27b` preset (16 KV layers × 4 × 256, plus the DeltaNet
-state) and `"server": "vllm"`. `crew.env` turns thinking on (`MUGGE_THINKING=on`, sent on every
-call; the review call goes out with thinking off) and caps a call at 16,384 tokens. It sets no
+state) and `"server": "vllm"`. `crew.env` turns thinking on (`MUGGE_THINKING=on`) with an effort
+per role, `MUGGE_REASONING_EFFORT=worker=medium,lead=xhigh,manager=xhigh`: workers write most of
+the tokens and think less, the few review and plan calls think fully (`off` for a role sends its
+calls without thinking). A call is capped at 16,384 tokens. It sets no
 sampling: the engine sends Qwen's set per call from that call's thinking switch, and the server
 pins none.
 
@@ -123,7 +129,7 @@ pool (the server prints the real figure at start):
 
 | GPU | Memory × utilisation | Weights | Runtime | Left for KV | Profile | The default crew of 13 calls needs |
 |---|---|---|---|---|---|---|
-| B200 180 GB | 169 GB (0.94) | ~30 GB | ~10 GB | **~129 GB** | 64K max, bf16, 64+ seqs | 22 GB (64 agents: 126 GB, below) |
+| B200 180 GB | 169 GB (0.94) | ~30 GB | ~10 GB | **~129 GB** | 64K max, bf16, 64+ seqs | 24 GB (64 workers: 137 GB, below) |
 | H100 80 GB | 72 GB (0.90) | ~30 GB | ~6 GB | ~36 GB | 32K max, bf16, 16 seqs | 30 GB at 32K each |
 | L40S 48 GB | 44 GB (0.92) | ~30 GB | ~4 GB | ~10 GB | 16K max, fp8 KV, 13 seqs | 9 GB at 16K each |
 
@@ -134,16 +140,21 @@ The most each call can cost is its longest context plus the DeltaNet state (`dep
 | Call | Longest context | bf16 KV | fp8 KV |
 |---|---|---|---|
 | worker | 26,624 tokens (pack ~10K + `MUGGE_MAX_CALL_TOKENS` 16,384) | 1.90 GB | 1.03 GB |
-| lead | 8,192 tokens (review prompt, diff, 2,048-token answer) | 0.69 GB | 0.42 GB |
+| lead | 24,576 tokens (review prompt and diff, thinking at xhigh up to 16,384) | 1.76 GB | 0.96 GB |
 | orchestrator | 24,576 tokens (a plan call with thinking) | 1.76 GB | 0.96 GB |
-| **64 + 4 + 1, all at their longest at once** | | **126 GB** | **68 GB** |
+| **64 + 8 + 1, all at their longest at once** | | **137 GB** | **74 GB** |
 
 The B200 profile gives vLLM 94% of the GPU (`GPU_UTIL=0.94`); after ~30 GB of weights and the
 runtime that leaves an estimated ~129 GB for the pool (the B200's 180 GB; if `nvidia-smi` shows
-more, there is more). So 64 agents fit in bf16 even in the worst case, with little to spare.
-The worst case is rare: an agent holds KV only while its call runs, not while its checks run, and
-calls start at their pack size and grow. If the pool comes out smaller than the crew's need,
-`wait` warns. Then watch `deploy/qwen.sh status` during the run: preemptions there mean vLLM
+more, there is more). So the worst case, every slot at its longest at once, is about 8 GB over.
+The 80 agents add nothing to this: the engine never has more calls in flight than the 73 slots.
+
+We keep bf16 KV as the default anyway, because the worst case does not happen in practice: a
+worker at medium effort thinks far less than the 16,384 cap, an agent holds KV only while its
+call runs (not while its checks run), calls start at their pack size and grow, and the 8 lead
+slots are full only when 8 tickets pass their checks at the same moment. vLLM handles a short
+overflow by pausing a call and resuming it. So `wait` will warn for 64 on a 180 GB B200; that is
+expected. Then watch `deploy/qwen.sh status` during the run: preemptions there mean vLLM
 paused calls for memory (they resume, slower). If they keep climbing, restart with an fp8 KV
 cache, which halves the KV memory at a small quality cost:
 
@@ -220,8 +231,8 @@ with thinking off). The server is left stopped; start the winner. Then, in this 
 1. **MTP** (`MTP=3`). Speculative decoding with the model's own draft head: the answers are the
    same tokens, only faster, so there is no quality cost. Keep it if `compare` shows it ahead at
    your crew size (its gain shrinks as more calls share the GPU).
-2. **Fewer tokens per ticket.** Thinking is most of what a worker writes. `MUGGE_REASONING_EFFORT=medium`
-   in `crew.env` thinks less; `MUGGE_THINKING=off` drops it (compare the bench's thinking and
+2. **Fewer tokens per ticket.** Thinking is most of what a worker writes. `crew.env` already
+   runs workers at `medium`; `worker=low` or `worker=off` in `MUGGE_REASONING_EFFORT` goes further (compare the bench's thinking and
    short tables for the time an attempt takes). Both can cost passed tickets: run the engine
    smoke (`bun bench/smoke.ts --url http://127.0.0.1:8000/v1 --model qwen3.8-27b`) before and after.
 3. **Crew size.** Above: the most workers before together tok/s flattens.
