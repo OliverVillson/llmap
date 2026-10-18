@@ -35,6 +35,10 @@ export interface Row {
   emptyAnswers: number;
   /** Answers that wrote files outside `owns`. */
   refused: number;
+  /** Answers cut at max_tokens, forced after the thinking, or with no usable file (telemetry.ts). */
+  cutAnswers?: number;
+  forcedAnswers?: number;
+  droppedAnswers?: number;
   promptTokens: number;
   completionTokens: number;
   inferenceMs: number;

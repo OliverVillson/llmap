@@ -26,6 +26,8 @@ jobs:
           bun bench/check.ts spike --repeats 2
           bun bench/check.ts test/fixtures/bench-mini --repeats 2
           bun bench/run.ts --bench spike --out bench-run --fake --seeds 1
+      - name: spike smoke (fake model, messy first answers)
+        run: bun bench/smoke.ts --fake --fake-mess --out smoke-run
       - uses: actions/upload-artifact@v4
         with:
           name: spike-metrics

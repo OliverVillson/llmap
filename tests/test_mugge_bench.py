@@ -73,10 +73,12 @@ def test_a_call_still_thinking_at_its_cap_gets_a_forced_answer(monkeypatch):
     got = ev.bench_answer(THINKING, calls)
     assert got["choices"][0]["message"]["content"] == "a.py\n```\nx = 1\n```" and seen == [("so the loop must", "length", 1.0)]
     assert got["usage"] == {"prompt_tokens": 40, "completion_tokens": 107} and calls == {"calls": 1, "forced": 1}
+    assert got["choices"][0]["forced"] == "length"  # the engine's per-call log keeps it out of training rows
     # an answer that came is passed on as it is, without its thinking
     monkeypatch.setattr(ev, "chat", fake_chat({"content": "<think>hm</think>b.py\n```\ny\n```", "reasoning_content": ""}, "stop"))
     got = ev.bench_answer(THINKING, calls)
     assert got["choices"][0]["message"]["content"] == "b.py\n```\ny\n```" and len(seen) == 1 and calls["forced"] == 1
+    assert "forced" not in got["choices"][0]
     # thinking off: nothing is forced, even an empty answer
     monkeypatch.setattr(ev, "chat", fake_chat({"content": ""}, "length"))
     assert ev.bench_answer({**THINKING, "chat_template_kwargs": {"enable_thinking": False}}, calls)["choices"][0]["message"]["content"] == ""

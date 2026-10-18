@@ -85,8 +85,20 @@ describe('architect and planner', () => {
   test('tickets are validated', async () => {
     const good = { interfaces: ['lib/short.h'], tickets: [{ id: 'enc', title: 'Encode', image: 'c', owns: ['lib/enc.c'], acceptance: ['make test'] }] };
     expect((await tickets(canned(good), d, ['lib/short.h'])).tickets[0].budget.attempts).toBe(4);
-    const bad = { interfaces: [], tickets: [{ id: 'a', owns: ['x'] }, { id: 'b', owns: ['x'] }] };
-    expect(tickets(canned(bad), d, [])).rejects.toThrow(/both own/);
+    // a clash is settled by the planner (b runs after a), not thrown away with the plan
+    const clash = { interfaces: [], tickets: [{ id: 'a', owns: ['x'] }, { id: 'b', owns: ['x'] }] };
+    const settled = await tickets(canned(clash), d, []);
+    expect(settled.settled).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
+    expect(settled.tickets[1]!.depends_on).toEqual(['a']);
+    // a dependency on a ticket the plan does not have is dropped and said, not fatal
+    const ghost = await tickets(canned({ interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['nope'] }] }), d, []);
+    expect(ghost.tickets[0]!.depends_on).toEqual([]);
+    expect(ghost.warnings).toEqual(['a: dropped dependencies on nope']);
+    const cycle = { interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['b'] }, { id: 'b', owns: ['y'], depends_on: ['a'] }] };
+    // a cycle is opened at the edge that closes it and said, not fatal (debug round 2026-10-18)
+    const opened = await tickets(canned(cycle), d, []);
+    expect(opened.tickets.map((t) => t.depends_on)).toEqual([['b'], []]);
+    expect(opened.warnings).toEqual(['dependency cycle a -> b -> a: b no longer waits for a']);
   });
 });
 
