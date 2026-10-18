@@ -238,10 +238,16 @@ export class OpenAICompatible implements Inference {
     else if (schema && guided === 'guided_json') body.guided_json = schema;
     const res = await this.post(body, signal);
     if (!res.ok) {
-      // prompt + max_tokens over the server's context: ask again for what fits (twice, since vLLM
-      // 0.31 first refuses a max_tokens above the whole context without saying the prompt's size)
-      const fit = res.status === 400 && refits > 0 ? contextFit(res.text) : undefined;
-      if (fit !== undefined && fit < (body.max_tokens as number)) return this.send(model, messages, fit, signal, schema, opts, refits - 1);
+      // prompt + max_tokens over the server's context: ask again for what fits. vLLM 0.31 does not
+      // say the prompt's size: it refuses a max_tokens above the whole context before counting,
+      // and otherwise counts a prompt cut at what would fit plus one ("at least N"), so the prompt
+      // is counted with the server's own /tokenize (a guess from its length if that fails)
+      const refused = res.status === 400 && refits > 0 ? contextRefusal(res.text) : undefined;
+      if (refused) {
+        const prompt = refused.input !== undefined && !refused.atLeast ? refused.input : Math.max(refused.input ?? 0, await this.promptTokens(body, signal));
+        const fit = refused.limit - prompt - 16;
+        if (fit >= MIN_REFIT_TOKENS && fit < (body.max_tokens as number)) return this.send(model, messages, fit, signal, schema, opts, refits - 1);
+      }
       throw new Error(`inference ${res.status}: ${res.text.slice(0, 500)}`);
     }
     const data: any = res.data;
@@ -280,13 +286,35 @@ export class OpenAICompatible implements Inference {
   }
 
   /**
+   * The prompt's tokens as the server counts them (vLLM's POST /tokenize, beside /v1, with the
+   * same chat template switches), else a guess on the high side from its length.
+   */
+  private async promptTokens(body: Record<string, unknown>, signal?: AbortSignal): Promise<number> {
+    const guess = Math.ceil(JSON.stringify(body.messages).length / PROMPT_CHARS_PER_TOKEN);
+    try {
+      const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '').replace(/\/v1$/, '')}/tokenize`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
+        body: JSON.stringify({ model: body.model, messages: body.messages, add_generation_prompt: true, ...(body.chat_template_kwargs ? { chat_template_kwargs: body.chat_template_kwargs } : {}) }),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(30_000), signal]) : AbortSignal.timeout(30_000),
+      });
+      const count = res.ok ? ((await res.json()) as { count?: unknown }).count : undefined;
+      return typeof count === 'number' && count > 0 ? count : guess;
+    } catch {
+      return guess;
+    }
+  }
+
+  /**
    * One POST, sent again while the server is down or restarting (refused or dropped connection,
    * 502/503/504) for up to serverWaitMs, and a 500 up to MAX_500_RETRIES times, with growing
    * pauses. The run's stop and the call's own timeout are never retried.
    */
   private async post(body: Record<string, unknown>, signal?: AbortSignal): Promise<{ ok: true; data: any } | { ok: false; status: number; text: string }> {
     const url = `${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    const until = Date.now() + (this.cfg.serverWaitMs ?? DEFAULT_SERVER_WAIT_MS);
+    // the wait starts when the server first fails this call, not when it was sent: a call that ran
+    // (or sat in vLLM's queue) for 20 minutes before a restart dropped it still waits the restart out
+    let until: number | undefined;
     let tries = 0, fivehundreds = 0;
     for (;;) {
       let problem: string;
@@ -312,6 +340,7 @@ export class OpenAICompatible implements Inference {
         problem = String((e as Error)?.message ?? e);
       }
       const pause = SERVER_RETRY_MS[Math.min(tries++, SERVER_RETRY_MS.length - 1)]!;
+      until ??= Date.now() + (this.cfg.serverWaitMs ?? DEFAULT_SERVER_WAIT_MS);
       if (Date.now() + pause > until) throw new Error(`inference server ${this.cfg.baseUrl} not answering after ${tries} tries: ${problem}`);
       serverNote(this.cfg.baseUrl, problem);
       await sleepUnless(pause, signal);
@@ -350,20 +379,38 @@ export const MIN_REFIT_TOKENS = 1024;
 
 /**
  * The max_tokens that fits, from a server's context-length refusal (vLLM's wordings up to 0.31
- * and SGLang's): the context less the prompt, less a little room. vLLM 0.31 refuses a max_tokens
- * above the whole context before it counts the prompt (`max_tokens=N cannot be greater than
- * max_model_len=L`): that gives L - 1, and the next refusal then says the prompt's size.
+ * and SGLang's): the context less the prompt, less a little room. A refusal that does not count
+ * the prompt (`max_tokens=N cannot be greater than max_model_len=L`) gives L - 1; an "at least N"
+ * count is taken as it is. send() counts the prompt itself for both (contextRefusal).
  * Undefined when the error is something else or too little would fit.
  */
 export function contextFit(error: string): number | undefined {
-  const whole = /max(?:_completion)?_tokens=\d+ cannot be greater than max_model_len=(\d+)/.exec(error)?.[1];
-  if (whole) return Number(whole) - 1;
-  const limit = /maximum context length (?:is |of )?(\d+)/.exec(error)?.[1];
-  const m = /(\d+) in the messages|has (\d+) input tokens|(\d+) tokens from the input|contains (?:at least )?(\d+) input tokens/.exec(error);
-  const input = m?.[1] ?? m?.[2] ?? m?.[3] ?? m?.[4];
-  if (!limit || !input) return undefined;
-  const fit = Number(limit) - Number(input) - 16;
+  const r = contextRefusal(error);
+  if (!r) return undefined;
+  if (r.input === undefined) return r.limit - 1;
+  const fit = r.limit - r.input - 16;
   return fit >= MIN_REFIT_TOKENS ? fit : undefined;
+}
+
+/** Characters per token for the prompt guess when the server cannot count it: low, so the guess errs high. */
+export const PROMPT_CHARS_PER_TOKEN = 2.5;
+
+/**
+ * A context-length refusal read: the context, and the prompt's tokens when the error says them
+ * (`atLeast`: vLLM 0.31 counted a prompt it had cut, so the real one may be far longer). No input
+ * for the refusals that do not count the prompt (a max_tokens above the whole context, or 0.31's
+ * "contains N characters" when it was too long to tokenize). Undefined for any other error.
+ */
+export function contextRefusal(error: string): { limit: number; input?: number; atLeast: boolean } | undefined {
+  const whole = /max(?:_completion)?_tokens=\d+ cannot be greater than max_model_len=(\d+)/.exec(error)?.[1];
+  if (whole) return { limit: Number(whole), atLeast: true };
+  const limit = /maximum context length (?:is |of )?(\d+)/.exec(error)?.[1];
+  if (!limit) return undefined;
+  if (/your prompt contains \d+ characters/.test(error)) return { limit: Number(limit), atLeast: true };
+  const m = /(\d+) in the messages|has (\d+) input tokens|(\d+) tokens from the input|contains (at least )?(\d+) input tokens/.exec(error);
+  const input = m?.[1] ?? m?.[2] ?? m?.[3] ?? m?.[5];
+  if (!input) return undefined;
+  return { limit: Number(limit), input: Number(input), atLeast: !!m?.[4] };
 }
 
 /** The MUGGE_DEBUG_CALLS line: what one call cost and whether it finished. */

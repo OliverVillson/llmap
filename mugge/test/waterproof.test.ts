@@ -24,25 +24,47 @@ describe('vLLM 0.31 context refusals', () => {
     expect(contextFit(overContext(16_384, '65000'))).toBeUndefined();
   });
 
+  // as 0.31 counts: the prompt is tokenized cut at (context - max_tokens) + 1, so an over-long one
+  // is only ever "at least" that; POST /tokenize (beside /v1) counts it whole
   const asked: number[] = [];
+  let tokenizeUp = true;
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const body = (await req.json()) as { max_tokens: number };
+      if (new URL(req.url).pathname === '/tokenize') return tokenizeUp ? Response.json({ count: 5000, max_model_len: 65536 }) : new Response('not found', { status: 404 });
       asked.push(body.max_tokens);
       if (body.max_tokens > 65536) return vllmError(tooBig(body.max_tokens), 'max_tokens', body.max_tokens);
-      if (5000 + body.max_tokens > 65536) return vllmError(overContext(body.max_tokens, '5000'), 'input_tokens', 5000);
+      const room = 65536 - body.max_tokens;
+      if (5000 > room) return vllmError(overContext(body.max_tokens, `at least ${room + 1}`), 'input_tokens', room + 1);
       return ok();
     },
   });
   afterAll(() => server.stop(true));
 
-  test('a planning call above the whole context is fitted in two steps', async () => {
+  test('a planning call above the whole context is fitted at once, from the server\'s own count', async () => {
     const inf = new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm', maxCallTokens: 16_384 });
     const c = await inf.complete<{ ok: boolean }>('m', [{ role: 'user', content: 'plan' }], {}, 80_000, undefined, { planning: true });
     expect(c.value.ok).toBe(true);
-    expect(asked).toEqual([80_000, 65_535, 60_520]);
+    expect(asked).toEqual([80_000, 60_520]);
     expect(c.reasoning).toBe('thought');
+    asked.length = 0;
+    // over by a little: 0.31 says "at least 4097", which is not the prompt's size
+    await inf.complete('m', [{ role: 'user', content: 'plan' }], {}, 61_439, undefined, { planning: true });
+    expect(asked).toEqual([61_439, 60_520]);
+  });
+
+  test('without /tokenize the prompt is guessed high from its length', async () => {
+    tokenizeUp = false;
+    asked.length = 0;
+    const inf = new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm' });
+    // 5000 tokens of prompt are ~17,500 characters; guessed at 2.5 a token that is 7000+
+    const c = await inf.text('m', [{ role: 'user', content: 'x'.repeat(17_500) }], 63_000);
+    expect(c.value).toBe('{"ok": true}');
+    expect(asked[0]).toBe(63_000);
+    expect(asked.length).toBe(2);
+    expect(asked[1]!).toBeLessThan(65536 - 7000);
+    tokenizeUp = true;
   });
 });
 
@@ -98,6 +120,23 @@ describe('a server that goes away mid-run', () => {
   });
 });
 
+describe('a long call that a restart drops', () => {
+  test('still waits the restart out: the wait starts when the server fails it, not when it was sent', async () => {
+    setServerRetryMs([50]);
+    let n = 0;
+    // the first call is held 400 ms (a long thinking call), then the restart answers 502
+    const s = Bun.serve({ port: 0, async fetch() {
+      if (++n === 1) { await Bun.sleep(400); return new Response('upstream gone', { status: 502 }); }
+      return ok('back');
+    } });
+    const inf = new OpenAICompatible({ baseUrl: `http://127.0.0.1:${s.port}/v1`, defaultModel: 'm', serverWaitMs: 300 });
+    const c = await inf.text('m', [{ role: 'user', content: 'x' }], 100);
+    expect(c.value).toBe('back');
+    s.stop(true);
+    setServerRetryMs([2_000, 5_000, 10_000, 20_000]);
+  });
+});
+
 describe('a check whose child process never ends', () => {
   test('times out on time, and the child is gone', async () => {
     const tag = `mugge-hang-${process.pid}`;
@@ -110,6 +149,20 @@ describe('a check whose child process never ends', () => {
     await Bun.sleep(200);
     const left = Bun.spawnSync(['pgrep', '-f', tag]).stdout.toString().trim();
     expect(left).toBe('');
+  });
+
+  test('the run\'s stop kills it at once, and a stopped run starts no check', async () => {
+    const tag = `mugge-stop-${process.pid}`;
+    const stop = new AbortController();
+    const t0 = Date.now();
+    setTimeout(() => stop.abort(), 300);
+    const r = await new LocalSandbox().run(`python3 -c "import subprocess; subprocess.run(['bash', '-c', 'exec -a ${tag} sleep 600'])"`, { cwd: '/tmp', image: 'python', timeoutMs: 60_000, signal: stop.signal });
+    expect(r.code).not.toBe(0);
+    expect(Date.now() - t0).toBeLessThan(3000);
+    await Bun.sleep(200);
+    expect(Bun.spawnSync(['pgrep', '-f', tag]).stdout.toString().trim()).toBe('');
+    const again = await new LocalSandbox().run('touch should-not-exist', { cwd: '/tmp', image: 'python', signal: stop.signal });
+    expect(again.code).toBe(130);
   });
 });
 
@@ -135,6 +188,24 @@ describe('a planning call that thinks until max_tokens', () => {
     expect(d.components).toHaveLength(1);
     expect(sent.map((s) => s.effort)).toEqual(['xhigh', 'low']);
     expect(d.warnings?.[0]).toMatch(/the design ran out of tokens .*asked once more, thinking low/);
+  });
+});
+
+describe('a planning call that ends inside its thinking', () => {
+  let n = 0;
+  const design = { summary: 's', components: [{ name: 'core', language: 'Python', image: 'python', path: 'tk/', responsibility: 'r', interfaces: [] }], data_flow: 'd', decisions: [], questions: [] };
+  // finish_reason stop with content empty: the design came back in reasoning, or not at all
+  const server = Bun.serve({ port: 0, fetch: () => (++n === 1
+    ? Response.json({ choices: [{ message: { role: 'assistant', content: '', reasoning: 'the design is {...}' }, finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 900 } })
+    : ok(JSON.stringify(design))) });
+  afterAll(() => server.stop(true));
+
+  test('is asked once more with thinking low, not the end of the run', async () => {
+    const { design: plan } = await import('../src/plan/architect.ts');
+    const inf = new OpenAICompatible({ baseUrl: `http://127.0.0.1:${server.port}/v1`, defaultModel: 'm', extra: { chat_template_kwargs: { enable_thinking: true, reasoning_effort: 'xhigh' } } });
+    const d = await plan(inf, 'a toolbox');
+    expect(n).toBe(2);
+    expect(d.warnings?.[0]).toMatch(/the design came back with no answer .*asked once more, thinking low/);
   });
 });
 
