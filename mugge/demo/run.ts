@@ -508,7 +508,8 @@ try {
       files = Object.keys(sc.files);
       orchestrator.phase = 'planning';
       log(`orchestrator: planning tickets on a ${files.length}-file scaffold`);
-      plan = planned(await tickets(inf, d, files, 'planner', planFor));
+      // the scaffold itself, so each component's tickets may own the files its part wrote
+      plan = planned(await tickets(inf, d, sc, 'planner', planFor));
     }
     orchestrator.planNote = `${plan.tickets.length} tickets planned by the orchestrator from your prompt`;
     initRepo(repo, undefined, 'scaffold');
