@@ -270,7 +270,7 @@ default profile: each costs speed, and none is known to be needed.
 
 First start compiles: torch.compile (cached in `<data>/cache/vllm`), FlashInfer kernels
 (`<data>/.cache/flashinfer`), Triton (`<data>/cache/triton`). All are on the data disk, so a VM
-that keeps `/data` starts faster the second time. `wait` allows 30 minutes (`WAIT_S`).
+that keeps `/data` starts faster the second time. `wait` allows 60 minutes (`WAIT_S`) and reports a server that dies at once.
 
 ## NVFP4 instead of FP8 (B200 only)
 

@@ -483,7 +483,9 @@ case "${1:-}" in
     echo "started pid $! (profile $PROFILE, $MODEL), log $LOG; loading takes a few minutes: deploy/qwen.sh wait"
     ;;
   wait)
-    timeout_s="${WAIT_S:-1800}"
+    # the first start JIT-compiles FlashInfer's kernels with nvcc, which takes longer on few CPU cores;
+    # waiting longer costs nothing, a server that dies is reported at once
+    timeout_s="${WAIT_S:-3600}"
     start=$(date +%s)
     until curl -fsS -m 5 "$URL/health" >/dev/null 2>&1; do
       if ! pid_alive; then
