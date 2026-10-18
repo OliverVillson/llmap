@@ -8,38 +8,57 @@ ticket, and the run ends by merging every branch and running the whole project's
 
 ## First run: 64 agents from one prompt (B200)
 
-From the mugge folder:
+On the B200, from a fresh clone (the server steps are `deploy/README.md`'s; `setup` and
+`download` are needed once):
 
 ```bash
-git fetch origin && git checkout claude/centipede-demo   # until it is merged; it includes deploy/
+git clone https://github.com/OliverVillson/llmap && cd llmap/mugge
+git checkout claude/centipede-demo            # until it is merged; it includes deploy/ and the engine
+curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH"
 bun install
+deploy/qwen.sh setup                          # vLLM in ~/venvs/qwen-vllm
+deploy/qwen.sh download                       # the weights, ~31 GB
 CREW_WORKERS=64 deploy/qwen.sh start          # once; the server keeps the crew size
-deploy/qwen.sh wait && deploy/qwen.sh check   # check must end in PASS
-set -a; . deploy/crew.env; set +a             # reads 64 back: 64 workers, 4 leads, 1 orchestrator
-bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with 64 small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only."
+deploy/qwen.sh wait                           # warns about memory for 64 on a 180 GB B200: expected
+deploy/qwen.sh check                          # must end in PASS
+set -a; . deploy/crew.env; set +a             # reads 64 back: 64 worker slots, 8 leads, 1 orchestrator, 80 agents
+bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only."
 ```
 
-`deploy/README.md` covers the server itself. The demo needs `python3` (3.8 or newer), for
-`crew.env` and for Python projects' tests. It prints the view's address and the run folder, and
-keeps the view up after the run ends until Ctrl-C. To keep it running after you log out, start it
-with `nohup bun demo/run.ts --prompt "…" > demo.log 2>&1 &` (stop it with `kill`), or inside tmux.
+Then on the Mac: `ssh -N -L 7340:127.0.0.1:7340 b200` and open http://127.0.0.1:7340/.
+
+`crew.env` runs 80 code agents on the 64 worker slots (the extra 16 keep the slots busy while
+other agents run their checks), so the orchestrator plans for 80: **about 80 tickets for 64
+slots**. The demo needs `python3` (3.8 or newer), for `crew.env` and for Python projects' tests.
+It prints the view's address and the run folder, and keeps the view up after the run ends until
+Ctrl-C. To keep it running after you log out, start it with
+`nohup bun demo/run.ts --prompt "…" > demo.log 2>&1 &` (stop it with `kill`), or inside tmux.
 
 What to expect at 64:
 
-- **Planning comes first and takes a while.** The orchestrator makes three calls on its own
-  slot: design, scaffold and tickets. With 64 modules the scaffold is the long one (a stub and a
-  test per module), and the view shows how long the call in flight has run. A planning call is
-  capped at `MUGGE_MAX_CALL_TOKENS` (16,384), thinking included. If the scaffold or the plan is
-  cut there, the run stops with that error rather than starting a half plan; see "Not verified"
-  in the PR.
+- **Planning comes first.** The orchestrator designs the project on its own slot, then (above 16
+  agents) splits the work by design component: one call writes the shared and interface files,
+  then one call per component writes its stubs and tests and one call per component plans its
+  tickets, the components at the same time on worker slots that are idle until the plan is
+  ready. The view shows how long the planning calls have run. Planning calls are not capped by
+  `MUGGE_MAX_CALL_TOKENS`; they can run to the server's 65,536-token limit. If the plan comes out
+  well short of 80 tickets, or with few that can start at once, the log says so.
+- **Memory.** `wait` warns that the worst case (every slot at its longest at once) is a little
+  over the B200's pool; that is expected (`deploy/README.md`, "64 agents and memory"). Watch
+  `deploy/qwen.sh status`: if preemptions keep climbing, restart with an fp8 KV cache:
+  `deploy/qwen.sh stop && KV_DTYPE=fp8 deploy/qwen.sh start && deploy/qwen.sh wait`.
 - **Checks share the CPUs.** Each ticket's tests run on this machine, at most one per CPU at
   once (`--checks N` to change it). An agent whose check is waiting shows "checking".
-- **Leads are fewer than agents.** 4 leads review 64 agents' tickets, so finished tickets can
+- **Leads are fewer than agents.** 8 leads review 80 agents' tickets, so finished tickets can
   queue for a review ("queued for a slot").
 
-Rehearse the same run with no GPU: `bun demo/run.ts --fake --concurrency 64 --prompt "anything"`.
-The mock orchestrator plans one module per agent, 64 at once, plus a registry ticket that waits
-on all of them, and the mock workers answer each ticket.
+Rehearse the same run with no GPU: load `crew.env` the same way (with no server started, give the
+size yourself: `CREW_WORKERS=64; set -a; . deploy/crew.env; set +a`), then
+`bun demo/run.ts --fake --prompt "anything"`. The mock
+orchestrator answers the same planning calls with unit converters in 5 groups, about one
+module per agent and a table per group that waits on its converters (80 tickets, 75 ready at
+once), and the mock workers answer each ticket. It takes the crew's slot counts from
+`crew.env`.
 
 ## The built-in task (10 agents)
 
@@ -107,6 +126,6 @@ as it is written; the answer appears when the call returns.
 - `run.ts`: the one command. It drives the engine as it is (`runPlan`) and serves the view.
 - `orchestrator.ts`: the planning call and the check an orchestrator's plan must pass.
 - `view/index.html`: the live view.
-- `fake-prompt.ts`: the mock orchestrator for `--fake --prompt`, one module per agent.
+- `fake-prompt.ts`: the mock orchestrator for `--fake --prompt`, about one module per agent.
 - `project/`, `reference/`, `plan.json`: mdlite's scaffold, an answer for every ticket (used by
   `check.ts` and the mock model), and its prepared plan.

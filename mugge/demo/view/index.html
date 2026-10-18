@@ -269,13 +269,15 @@ function renderOrchestrator(d, st) {
   const o = d.orchestrator;
   const phaseWord = { starting: 'starting', designing: 'designing the project', scaffolding: 'writing the scaffold', planning: 'planning the tickets', dispatching: 'dispatching tickets and reviewing finished work', integrating: 'merging every finished ticket and running all the checks', finished: 'done', stopped: 'stopped', failed: 'stopped with an error' }[o.phase] ?? o.phase;
   // a planning call can run for minutes on a big crew: say how long the one in flight has run
-  const own = ['designing', 'scaffolding', 'planning'].includes(o.phase) ? (d.inflight ?? []).find((c) => c.ticket === 'orchestrator') : null;
+  // its parts (orchestrator-1, -2, …) plan one design component each, at the same time
+  const mine = ['designing', 'scaffolding', 'planning'].includes(o.phase) ? (d.inflight ?? []).filter((c) => c.ticket === 'orchestrator' || c.ticket.startsWith('orchestrator-')) : [];
+  const own = mine.length ? mine.reduce((a, b) => (a.sentAt < b.sentAt ? a : b)) : null;
   const reviewing = o.reviewing.length ? o.reviewing.slice(0, 6).map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') + (o.reviewing.length > 6 ? ` <span class="dimc">and ${o.reviewing.length - 6} more</span>` : '') : '<span class="dimc">nothing right now</span>';
   $('#orch-machine').textContent = [o.machine && `plans on ${o.machine}`, o.leadMachine && `reviews on ${o.leadMachine}`].filter(Boolean).join(' · ');
   $('#orch').innerHTML = `<div class="orch">
     <button class="dot" data-open="orchestrator" aria-label="Open the orchestrator's view"><span class="role">${['finished', 'stopped'].includes(o.phase) ? '◎' : '◉'}</span></button>
     <div class="body">
-      <div><b class="pale">orchestrator</b> <span class="dimc">·</span> ${esc(phaseWord)}${own ? ` <span class="dimc">· one call, running for</span> ${dur(d.now - own.sentAt)}` : ''}</div>
+      <div><b class="pale">orchestrator</b> <span class="dimc">·</span> ${esc(phaseWord)}${own ? ` <span class="dimc">· ${mine.length > 1 ? `${mine.length} calls at once, one per component, the longest` : 'one call,'} running for</span> ${dur(d.now - own.sentAt)}` : ''}</div>
       <div class="small"><span class="dimc">plan</span> ${esc(o.planNote || '…')}</div>
       <div class="small"><span class="dimc">◆ lead review</span> ${o.reviews.approve} approved · ${o.reviews.problems} sent back${o.reviews.error ? ` · ${o.reviews.error} failed` : ''} <span class="dimc">· reading</span> ${reviewing}</div>
       ${o.rejected?.length ? `<div class="small"><span class="dimc">its own plan was not used:</span> ${esc(o.rejected.slice(0, 2).join('; '))}${o.rejected.length > 2 ? ` (+${o.rejected.length - 2})` : ''}</div>` : ''}

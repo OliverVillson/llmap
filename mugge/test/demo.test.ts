@@ -61,14 +61,17 @@ describe('orchestrator plan check', () => {
 });
 
 describe('the mock orchestrator for --fake --prompt', () => {
-  test('plans one ticket per agent, all ready at once, plus a registry that waits on them', () => {
+  test('plans about one ticket per agent in groups of 16, most ready at once', () => {
     const fp = fakeProject(64);
-    expect(fp.plan.tickets.length).toBe(65);
-    expect(fp.plan.tickets.filter((t) => !t.depends_on.length).length).toBe(64);
-    expect(fp.plan.tickets.at(-1)!.depends_on.length).toBe(64);
-    for (const t of fp.plan.tickets) {
-      expect(Object.keys(fp.solutions[t.id]!.files)).toEqual(t.owns);
-      for (const p of [...t.owns, ...t.reads]) expect(fp.scaffold.files[p]).toBeDefined();
-    }
+    expect(fp.design.components.length).toBe(4);
+    expect(fp.plan.tickets.length).toBe(64);
+    expect(fp.plan.tickets.filter((t) => !t.depends_on.length).length).toBe(60);
+    for (const t of fp.plan.tickets) expect(Object.keys(fp.solutions[t.id]!.files)).toEqual(t.owns);
+  });
+
+  test('a small crew gets one group, planned in one call', () => {
+    const fp = fakeProject(10);
+    expect(fp.design.components.length).toBe(1);
+    expect(fp.plan.tickets.length).toBe(10);
   });
 });

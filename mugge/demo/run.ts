@@ -37,9 +37,9 @@ import { sandboxFromEnv, type Sandbox } from '../src/engine/sandbox.ts';
 import { availableParallelism } from 'node:os';
 import { runPlan, type RunReport } from '../src/engine/scheduler.ts';
 import { backendLabel, crewFromEnv, formatCallSummary, runId, Telemetry, type CrewLayout } from '../src/engine/telemetry.ts';
-import { architectureMarkdown, design, DESIGN_JSON_SCHEMA, scaffold, tickets, type Design } from '../src/plan/architect.ts';
+import { architectureMarkdown, design, scaffold, tickets, type PlannedTickets, type PlanOptions } from '../src/plan/architect.ts';
 import { fakeProject, type FakeProject } from './fake-prompt.ts';
-import { validatePlan, WORKER_OUTPUT_JSON_SCHEMA, type Plan } from '../src/tickets/schema.ts';
+import { validatePlan, type Plan } from '../src/tickets/schema.ts';
 import { DEMO_DIR, loadPlan, PLAN_PATH, PROJECT_DIR, referenceAnswers, REQUEST } from './lib.ts';
 import { orchestratorPlan } from './orchestrator.ts';
 
@@ -99,13 +99,24 @@ if (opt.fake) {
     flaky: [flakyId],
     // most of a call's pace is spent inside the server, so the pool shows the slot busy as with vLLM
     latencyMs: FAKE_HOLD_MS(),
-    reviews: { [sentBackId]: fakeOwn ? [{ verdict: 'problems', problems: ['convert() returns the value without rounding it to 6 decimals as the docstring says.'], fix: 'Round the result to 6 decimals.' }, { verdict: 'approve', problems: [], fix: '' }] : [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
+    reviews: { [sentBackId]: fakeOwn ? [{ verdict: 'problems', problems: ['convert() does not round to 6 decimals as the docstring says.'], fix: 'Round the result to 6 decimals.' }, { verdict: 'approve', problems: [], fix: '' }] : [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
   });
   stopFake = fake.stop;
-  // the same shape as deploy/crew-b200.json: one server, separate slots for workers, leads and the orchestrator
+  // the crew's shape: one server, separate slots for workers, leads and the orchestrator. With
+  // crew.env loaded the rehearsal takes its slot counts (64 workers, 8 leads at CREW_WORKERS=64),
+  // else one worker slot per agent and one lead per 8 workers, as deploy/crew.py sizes them.
+  const slotsFor = (role: string, otherwise: number) => {
+    try {
+      const list = JSON.parse(process.env.MUGGE_BACKENDS ?? '') as Array<{ roles?: string[]; slots?: number }>;
+      return list.filter((m) => m.roles?.includes(role)).reduce((n, m) => n + (m.slots ?? 0), 0) || otherwise;
+    } catch {
+      return otherwise;
+    }
+  };
+  const workers = slotsFor('worker', concurrency);
   process.env.MUGGE_BACKENDS = JSON.stringify([
-    { name: 'mock-workers', url: fake.url, roles: ['worker'], slots: concurrency },
-    { name: 'mock-leads', url: fake.url, roles: ['lead'], slots: Math.max(2, Math.ceil(concurrency / 16)) },
+    { name: 'mock-workers', url: fake.url, roles: ['worker'], slots: workers },
+    { name: 'mock-leads', url: fake.url, roles: ['lead'], slots: slotsFor('lead', Math.max(2, Math.ceil(workers / 8))) },
     { name: 'mock-orchestrator', url: fake.url, roles: ['manager'], slots: 1 },
   ]);
   process.env.MUGGE_MODEL ||= 'mock';
@@ -198,9 +209,10 @@ function recorded(inf: Inference, o: CallOptions): Inference {
       const c = await call();
       if (opt.fake) {
         // the mock has no orchestrator of its own: it answers the built-in task's plan call with the
-        // prepared plan, and --prompt's design, scaffold and ticket calls with the crew-sized project
+        // prepared plan, and --prompt's design, scaffold and ticket calls (and their parts) with the
+        // crew-sized project
         if (rec.kind === 'plan') {
-          const value = schema === DESIGN_JSON_SCHEMA ? fakeOwn?.design : schema === WORKER_OUTPUT_JSON_SCHEMA ? fakeOwn?.scaffold : (fakeOwn?.plan ?? JSON.parse(readFileSync(PLAN_PATH, 'utf8')));
+          const value = fakeOwn ? fakeOwn.answer(schema, messages) : JSON.parse(readFileSync(PLAN_PATH, 'utf8'));
           (c as Completion<unknown>).value = value;
           c.raw = JSON.stringify(value);
           c.completionTokens = Math.round(c.raw.length / 3.5);
@@ -376,7 +388,7 @@ const server = Bun.serve({
     if (p === '/api/status') return Response.json(status());
     if (p === '/api/calls') {
       const t = url.searchParams.get('ticket');
-      return Response.json(calls.filter((c) => !t || c.ticket === t || (t === 'orchestrator' && c.role !== 'worker')));
+      return Response.json(calls.filter((c) => !t || c.ticket === t || (t === 'orchestrator' && (c.role !== 'worker' || c.ticket.startsWith('orchestrator-')))));
     }
     if (p === '/api/events') return Response.json(events.slice(-Number(url.searchParams.get('last') ?? 300)));
     if (p === '/api/stream') {
@@ -439,15 +451,18 @@ console.log(`run folder: ${out}\n`);
 const orchestratorInf = () => pool.forAgent({ role: 'manager', agent: 'orchestrator', team: 'orchestrator' });
 
 /**
- * The crew size, for the orchestrator's design and plan: said in the request it designs from, and
- * kept as a design decision so the scaffold and ticket calls (which see ARCHITECTURE.md) get it too.
+ * The orchestrator plans for the crew: about one ticket per code agent. Above 16 agents the
+ * engine splits the scaffold and the tickets per design component and runs the parts at once,
+ * on worker slots (idle while the plan is made), each part shown as orchestrator-<n>.
  */
-const crewRequest = (request: string) =>
-  `${request}\n\nThe crew: ${concurrency} code agents work at the same time. Split the work so about ${concurrency} tickets can start at once: one module per ticket, each with its own files and its own test file, and as few dependencies between tickets as possible.`;
-const withCrew = (d: Design): Design => ({
-  ...d,
-  decisions: [...d.decisions, { decision: `About ${concurrency} tickets that can start at once, one module each with its own test file`, why: `the crew has ${concurrency} code agents working at the same time` }],
-});
+const planFor: PlanOptions = { crew: concurrency, parts: (i) => pool.forAgent({ role: 'worker', agent: `orchestrator-${i + 1}`, team: 'orchestrator' }) };
+
+/** The planned tickets, with what the planner warned about logged and left out of plan.json. */
+function planned(p: PlannedTickets): Plan {
+  const { warnings, ...plan } = p;
+  for (const w of warnings ?? []) log(`orchestrator: ${w}`, 'warn');
+  return plan;
+}
 
 try {
   if (opt.prompt) {
@@ -461,20 +476,21 @@ try {
       files = git(src, ['ls-files']).code === 0 ? git(src, ['ls-files']).out.split('\n').filter(Boolean) : readdirSync(repo, { recursive: true }).map(String);
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}" for ${src}`);
-      const d = withCrew(await design(inf, `${crewRequest(opt.prompt)}\n\nThe work happens in an existing repository with these files:\n${files.slice(0, 400).map((f) => `- ${f}`).join('\n')}`));
+      const d = await design(inf, `${opt.prompt}\n\nThe work happens in an existing repository with these files:\n${files.slice(0, 400).map((f) => `- ${f}`).join('\n')}`, [], 'architect', planFor);
       writeFileSync(join(out, 'ARCHITECTURE.md'), architectureMarkdown(d));
       orchestrator.phase = 'planning';
       log('orchestrator: planning tickets');
-      plan = await tickets(inf, d, files);
+      plan = planned(await tickets(inf, d, files, 'planner', planFor));
     } else {
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}"`);
-      const d = withCrew(await design(inf, crewRequest(opt.prompt)));
+      const d = await design(inf, opt.prompt, [], 'architect', planFor);
       writeFileSync(join(repo, 'ARCHITECTURE.md'), architectureMarkdown(d));
       if (d.questions.length) log(`orchestrator: it would have asked ${d.questions.join(' / ')} (answered by nobody in a demo)`, 'warn');
       orchestrator.phase = 'scaffolding';
       log('orchestrator: writing the scaffold');
-      const sc = await scaffold(inf, d);
+      const sc = await scaffold(inf, d, 'planner', planFor);
+      for (const w of sc.warnings) log(`orchestrator: ${w}`, 'warn');
       for (const [path, content] of Object.entries(sc.files)) {
         mkdirSync(join(repo, path, '..'), { recursive: true });
         writeFileSync(join(repo, path), content);
@@ -482,7 +498,7 @@ try {
       files = Object.keys(sc.files);
       orchestrator.phase = 'planning';
       log(`orchestrator: planning tickets on a ${files.length}-file scaffold`);
-      plan = await tickets(inf, d, files);
+      plan = planned(await tickets(inf, d, files, 'planner', planFor));
     }
     orchestrator.planNote = `${plan.tickets.length} tickets planned by the orchestrator from your prompt`;
     initRepo(repo, undefined, 'scaffold');
