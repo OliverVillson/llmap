@@ -73,7 +73,7 @@ test('cap report: says when the cap is too small, and when it is far bigger than
   const tight = capReport([rec(8192, { cut: true, drop: 'cut' }), rec(5000), rec(4000, { forced: 'length' })], 8192, 'on')!;
   expect(tight.outOfTokens).toBe(2);
   expect(tight.advice).toContain('--max-tokens 16384');
-  expect(tight.advice).toContain('For BlackHole');
+  expect(tight.advice).toContain('MUGGE_REASONING_EFFORT=medium');
   const runaway = capReport([rec(8192, { cut: true, drop: 'cut' }), rec(700), rec(900)], 8192, 'off')!;
   expect(runaway.advice).toContain('a bigger cap will not help');
   expect(capReport([rec(0, { error: 'boom' })], 8192, 'on')).toBeNull();

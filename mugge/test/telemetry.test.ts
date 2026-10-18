@@ -272,7 +272,8 @@ test('a real engine run: agents come from the engine state events, review calls 
   }
   const s = tel.close();
   expect(s.crew.state).toBe('finished');
-  expect(seen).toEqual(expect.arrayContaining(['writing', 'checking', 'reviewing', 'fixing', 'finished']));
+  // MUGGE_THINKING unset is on: write and fix calls show as thinking
+  expect(seen).toEqual(expect.arrayContaining(['thinking', 'checking', 'reviewing', 'finished']));
   // engine agents 0–3 are a1 b1 c1 d1; nobody is left working
   expect(new Set(s.agents.filter((a) => a.calls).map((a) => a.id))).toEqual(new Set(['a1', 'b1', 'c1', 'd1']));
   expect(s.crew.agents.working).toBe(0);

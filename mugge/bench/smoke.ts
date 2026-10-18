@@ -14,14 +14,16 @@
  *      `**a.py**`: not the training format), and no model call failed. MISSES otherwise, with
  *      the reasons.
  *
- *   bun bench/smoke.ts --url http://127.0.0.1:8080/v1 --model BH0.1-1.3 --sandbox local
+ *   bun bench/smoke.ts --url http://127.0.0.1:8000/v1 --model Qwen/Qwen3.8-27B-FP8 --sandbox local
  *   bun bench/smoke.ts --fake                  the fake model on the reference answers (CI)
+ *   bun bench/smoke.ts --fake --fake-qwen      … answering the way Qwen3.8 does (thinking, prose)
  *   bun bench/smoke.ts --fake --fake-mess      … plus a cut, a forced and a prose first answer
  *   options: --out <dir> (default runs/smoke-<time>), --concurrency 12, --sandbox local|podman|docker,
- *            --thinking off|on (default off: BlackHole workers are trained thinking-off),
- *            --max-tokens <per call> (default MUGGE_MAX_CALL_TOKENS, else 4096 off / 8192 on),
- *            --temperature 0.6, --top-k 20 (must be > 0), --top-p 0.95, --min-p <x> (0 for MiniCPM5),
- *            --bar 0.5, --seeds 1, --skip-refs
+ *            --thinking on|off (default MUGGE_THINKING, else on: Qwen3.8 thinks),
+ *            --max-tokens <per call> (default MUGGE_MAX_CALL_TOKENS, else 4096 off / 16384 on),
+ *            --temperature, --top-k (must be > 0), --top-p, --min-p (default: the engine's set for
+ *            the mode, inference.ts THINKING_SAMPLING / NOTHINK_SAMPLING), --bar 0.5, --seeds 1,
+ *            --skip-refs
  *
  * Writes <out>/calls.jsonl (one line per model call), <out>/status.json (crew status, as the
  * console reads it), <out>/results.jsonl and report.json (MuggeBench's), and <out>/smoke.json.
@@ -47,6 +49,8 @@ export interface SmokeOptions {
   fake?: boolean;
   /** Fake model only: a cut, a forced and a prose first answer on three tickets. */
   fakeMess?: boolean;
+  /** Fake model only: answers shaped like Qwen3.8's (fake-model.ts `qwen`). */
+  fakeQwen?: boolean;
   fakeLatencyMs?: number;
   url?: string;
   model?: string;
@@ -114,7 +118,7 @@ export function capReport(records: CallRecord[], cap: number, thinking: 'on' | '
     const near = !finished || finished.max > cap / 2;
     const fix = near ? `try --max-tokens ${roundUp(cap * 2)}` : `the answers that finished took at most ${finished!.max}, so a bigger cap will not help`;
     advice = thinking === 'on'
-      ? `${outOf.length} of ${answers.length} answers ran out of tokens thinking: ${fix}; --thinking off avoids it; for the model, train thinking that ends well inside ${cap} tokens (For BlackHole)`
+      ? `${outOf.length} of ${answers.length} answers ran out of tokens thinking: ${fix}; --thinking off avoids it; or MUGGE_REASONING_EFFORT=medium for shorter thinking`
       : `${outOf.length} of ${answers.length} answers ran out of tokens: ${fix}`;
   } else if (finished && finished.max < cap / 2 && cap > 2048) {
     advice = `every answer finished under ${finished.max} tokens: --max-tokens ${Math.max(2048, roundUp(finished.max * 1.5))} would free slot memory with room to spare`;
@@ -177,7 +181,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   const projects = findProjects(o.bench ?? SPIKE_DIR);
   const tickets = projects.reduce((n, p) => n + p.tickets.length, 0);
   const seeds = o.seeds ?? 1;
-  const thinking = o.thinking ?? 'off';
+  const thinking = o.thinking ?? 'on';
   const bar = o.bar ?? 0.5;
   const sandbox = o.sandbox ?? (o.fake ? new LocalSandbox() : sandboxFromEnv());
   const concurrency = o.concurrency ?? 12;
@@ -197,7 +201,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
     const why = String((e as Error).message ?? e);
     return noScore([/top_k/i.test(why) ? `${why}: top_k 0 was one of the three bugs that scored run 1's agent 0%` : why]);
   }
-  const maxTokens = o.maxTokens ?? cfg.maxCallTokens ?? (thinking === 'on' ? 8192 : 4096);
+  const maxTokens = o.maxTokens ?? cfg.maxCallTokens ?? (thinking === 'on' ? 16384 : 4096);
   const url = o.url ?? cfg.baseUrl;
   if (!o.fake) {
     const down = await reachable(url);
@@ -217,7 +221,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
 
   const solutions: Record<string, WorkerOutput> = {};
   if (o.fake) for (const p of projects) for (const t of p.tickets) solutions[t.ticket.id] = { files: solution(p, t.ticket.id), note: 'reference' };
-  const fake = o.fake ? startFakeModel({ solutions, latencyMs: o.fakeLatencyMs ?? 50, ...(o.fakeMess ? MESS : {}) }) : null;
+  const fake = o.fake ? startFakeModel({ solutions, latencyMs: o.fakeLatencyMs ?? 50, qwen: o.fakeQwen, ...(o.fakeMess ? MESS : {}) }) : null;
   const model = o.model ?? (fake ? 'fake' : cfg.defaultModel);
   const telemetry = new Telemetry({
     dir: o.out,
@@ -227,10 +231,10 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
   });
   const extra = (seed: number): Record<string, unknown> => ({
     seed,
-    top_k: o.topK ?? 20,
+    ...(o.topK !== undefined ? { top_k: o.topK } : {}),
     ...(o.topP !== undefined ? { top_p: o.topP } : {}),
     ...(o.minP !== undefined ? { min_p: o.minP } : {}),
-    chat_template_kwargs: { enable_thinking: thinking === 'on' },
+    chat_template_kwargs: { ...(cfg.extra?.chat_template_kwargs as object | undefined), enable_thinking: thinking === 'on' },
   });
   const ticker = o.quiet ? null : setInterval(() => say(statusLine(telemetry.status())), 30_000);
   (ticker as any)?.unref?.();
@@ -240,7 +244,7 @@ export async function runSmoke(o: SmokeOptions): Promise<SmokeResult> {
       projects, sandbox, seeds, concurrency, out: o.out, name: 'smoke', telemetry, maxTokens,
       inference: (seed) => new OpenAICompatible({
         ...cfg, baseUrl: fake?.url ?? url, defaultModel: model, models: undefined,
-        temperature: o.temperature ?? 0.6, maxCallTokens: maxTokens, extra: extra(seed),
+        temperature: o.temperature, maxCallTokens: maxTokens, extra: extra(seed),
       }),
       progress: (r, done, total) => say(`${String(done).padStart(3)}/${total} ${r.solved ? 'pass  ' : r.visible ? 'HIDDEN' : 'fail  '} ${r.key} (${r.attempts} attempt${r.attempts === 1 ? '' : 's'}${r.droppedAnswers ? `, ${r.droppedAnswers} dropped` : ''}${r.cutAnswers ? `, ${r.cutAnswers} cut` : ''}${r.forcedAnswers ? `, ${r.forcedAnswers} forced` : ''})`),
     });
@@ -293,21 +297,21 @@ export function formatSmoke(r: SmokeResult): string {
 if (import.meta.main) {
   const { values } = parseArgs({
     options: {
-      fake: { type: 'boolean' }, 'fake-mess': { type: 'boolean' }, url: { type: 'string' }, model: { type: 'string' },
+      fake: { type: 'boolean' }, 'fake-mess': { type: 'boolean' }, 'fake-qwen': { type: 'boolean' }, url: { type: 'string' }, model: { type: 'string' },
       out: { type: 'string' }, concurrency: { type: 'string' }, sandbox: { type: 'string' }, thinking: { type: 'string' },
       'max-tokens': { type: 'string' }, temperature: { type: 'string' }, 'top-k': { type: 'string' }, 'top-p': { type: 'string' },
       'min-p': { type: 'string' }, bar: { type: 'string' }, seeds: { type: 'string' }, 'skip-refs': { type: 'boolean' },
     },
   });
   const num = (v: string | undefined) => (v === undefined ? undefined : Number(v));
-  const thinking = values.thinking ?? (process.env.MUGGE_THINKING?.trim().toLowerCase() === 'on' ? 'on' : 'off');
+  const thinking = values.thinking ?? (process.env.MUGGE_THINKING?.trim().toLowerCase() === 'off' ? 'off' : 'on');
   if (thinking !== 'on' && thinking !== 'off') {
     console.error('--thinking must be on or off');
     process.exit(2);
   }
   const out = values.out ?? join('runs', `smoke-${runId()}`);
   const r = await runSmoke({
-    fake: values.fake, fakeMess: values['fake-mess'], url: values.url, model: values.model, out,
+    fake: values.fake, fakeMess: values['fake-mess'], fakeQwen: values['fake-qwen'], url: values.url, model: values.model, out,
     concurrency: num(values.concurrency), thinking,
     sandbox: values.sandbox ? sandboxFromEnv({ MUGGE_SANDBOX: values.sandbox }) : undefined,
     maxTokens: num(values['max-tokens']), temperature: num(values.temperature),

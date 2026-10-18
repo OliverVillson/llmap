@@ -25,6 +25,23 @@ export function renderFiles(files: Record<string, string>, note = ''): string {
   return parts.join('\n\n');
 }
 
+/**
+ * The answer without its thinking, when the thinking came back inside content: everything up to
+ * the last </think> goes (with or without its <think>, which Qwen's template puts in the prompt),
+ * and an unclosed <think> means the call was cut while thinking, so nothing after it is answer.
+ */
+export function stripThinking(raw: string): string {
+  const close = raw.lastIndexOf('</think>');
+  const rest = close >= 0 ? raw.slice(close + '</think>'.length) : raw;
+  const open = rest.indexOf('<think>');
+  return open >= 0 ? rest.slice(0, open) : rest;
+}
+
+/** Characters of thinking inside content (0 when the server split it out or there was none). */
+export function inlineThinkingChars(raw: string): number {
+  return raw.includes('</think>') || raw.includes('<think>') ? raw.length - stripThinking(raw).length : 0;
+}
+
 const TRIM = /^[*`: ]+|[*`: ]+$/g;
 
 /** A file path on its own line, minus markdown around it (`**a.py**`, `### \`a.py\`:`, `File: a.py`). */
@@ -61,11 +78,11 @@ function mentioned(text: string, owns: string[]): string {
  * name of an owned path moves to that path, a block also counts for an owned path that the line
  * before it or its own first line mentions ("Here is the fixed `src/a.py`:"), and a ticket that
  * owns one file takes a lone answer file of the same type under another name, else its last
- * unlabelled block. Other blocks are not files. Thinking
- * (`<think>…</think>`) is ignored.
+ * unlabelled block. Other blocks are not files. Thinking is ignored (stripThinking): with or
+ * without its <think>, and an unclosed <think> to the end.
  */
 export function parseFiles(raw: string, owns: string[] = []): WorkerOutput {
-  const lines = raw.replace(/<think>[\s\S]*?<\/think>/g, '').split('\n');
+  const lines = stripThinking(raw).split('\n');
   const files: Record<string, string> = {};
   const loose: { before: string; first: string; content: string }[] = [];
   let note = '', prev = '';

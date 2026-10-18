@@ -77,7 +77,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   const base = o.inference(seed);
   const cap = (n: number) => (o.maxTokens ? Math.min(n, o.maxTokens) : n);
   const inference: Inference = {
-    complete: (m, msgs, schema, n) => base.complete(m, msgs, schema, cap(n)),
+    complete: (m, msgs, schema, n, signal, tweaks) => base.complete(m, msgs, schema, cap(n), signal, tweaks),
     text: async (m, msgs, n, signal, tweaks) => {
       const c = await base.text(m, msgs, cap(n), signal, tweaks);
       if (o.transcripts) {

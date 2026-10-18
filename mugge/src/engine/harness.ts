@@ -23,7 +23,7 @@ import type { EventSink } from './events.ts';
 import { parseFiles } from './files.ts';
 import type { Completion, Inference } from './inference.ts';
 import { buildPack, fixMessages, writeMessages } from './prompts.ts';
-import { diffOwned, review as leadReview, reviewCapFromEnv, reviewFeedback, reviewFromEnv, snapshot, wantsFix, type ReviewOutcome } from './review.ts';
+import { diffOwned, review as leadReview, reviewCapFromEnv, reviewFeedback, reviewFromEnv, reviewThinkingFromEnv, snapshot, wantsFix, type ReviewOutcome } from './review.ts';
 import { tail, type Sandbox } from './sandbox.ts';
 import { callState, type AgentState } from './state.ts';
 import { classifyAnswer } from './telemetry.ts';
@@ -41,6 +41,8 @@ export interface HarnessContext {
   review?: boolean;
   /** Most tokens the review may write (the ticket's tokens left still bound it); unset: MUGGE_MAX_CALL_TOKENS, else 2,048. */
   reviewMaxTokens?: number;
+  /** Whether the review call thinks; unset: MUGGE_REVIEW_THINKING, else off. */
+  reviewThinking?: boolean;
   /** Where the review call goes (the scheduler gives a lead slot when the crew has one); unset: `inference`. */
   reviewInference?: Inference;
   /**
@@ -87,11 +89,14 @@ export interface TicketResult {
   answerAttempt: number | null;
 }
 
-/** Whether the inference config turns thinking on (MUGGE_THINKING / bench --thinking), else the environment. */
+/**
+ * Whether the inference config turns thinking on (MUGGE_THINKING / bench --thinking), else the
+ * environment: on unless MUGGE_THINKING=off, since Qwen3.8 thinks when nothing says otherwise.
+ */
 export function thinkingOn(inference: Inference): boolean {
   const kw = (inference as { cfg?: { extra?: { chat_template_kwargs?: { enable_thinking?: unknown } } } }).cfg?.extra?.chat_template_kwargs;
   if (typeof kw?.enable_thinking === 'boolean') return kw.enable_thinking;
-  return process.env.MUGGE_THINKING?.trim().toLowerCase() === 'on';
+  return process.env.MUGGE_THINKING?.trim().toLowerCase() !== 'off';
 }
 
 /**
@@ -118,6 +123,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   const reviewOn = ctx.review ?? reviewFromEnv();
   const reviewCap = ctx.reviewMaxTokens ?? (reviewOn ? reviewCapFromEnv() : 0);
   const thinking = ctx.thinking ?? thinkingOn(ctx.inference);
+  const reviewThinking = ctx.reviewThinking ?? (reviewOn ? reviewThinkingFromEnv() : false);
   const cutRetry = ctx.cutRetry ?? cutRetryFromEnv();
   // a thinking call of this ticket ran out of tokens: its later calls go out with thinking off
   let noThink = false;
@@ -158,7 +164,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   };
 
   const reviewOnce = async (attempt: number, checks: Array<{ command: string; output: string }>, spent: number) => {
-    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent, reviewCap);
+    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent, reviewCap, reviewThinking);
     r.promptTokens += rv.promptTokens;
     r.completionTokens += rv.completionTokens;
     r.inferenceMs += rv.ms;

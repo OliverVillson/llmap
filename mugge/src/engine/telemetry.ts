@@ -32,6 +32,7 @@ import { machinesFromEnv } from '../config.ts';
 import { settledReason, type Plan, type WorkerOutput } from '../tickets/schema.ts';
 import type { Machine, ServingSnapshot } from './backends.ts';
 import type { EngineEvent } from './events.ts';
+import { stripThinking } from './files.ts';
 import type { AgentState } from './state.ts';
 
 // ---------------------------------------------------------------------------------------------
@@ -76,12 +77,12 @@ export function classifyAnswer(raw: string, owns: string[], out: WorkerOutput | 
   let drop: DropReason | undefined;
   if (stray.length) drop = 'not_owned';
   else if (!written.length) {
-    const text = raw.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '').trim();
+    const text = stripThinking(raw).trim();
     if (cut) drop = 'cut';
     else if (!text) drop = 'empty';
     else if (!/^\s*`{3,}/m.test(text)) drop = 'no_fence';
     else drop = 'unlabelled';
-  } else if (cut && (raw.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '').match(/^[ \t]*`{3,}/gm)?.length ?? 0) % 2 === 1) {
+  } else if (cut && (stripThinking(raw).match(/^[ \t]*`{3,}/gm)?.length ?? 0) % 2 === 1) {
     // the cap fell inside a file: the parser kept half of it
     drop = 'cut';
   }

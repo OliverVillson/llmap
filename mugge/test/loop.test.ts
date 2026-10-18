@@ -7,8 +7,8 @@ import { startFakeModel } from '../src/engine/fake-model.ts';
 import { gitOk, initRepo } from '../src/engine/git.ts';
 import { runTicket } from '../src/engine/harness.ts';
 import { OpenAICompatible } from '../src/engine/inference.ts';
-import { REVIEW_SYSTEM, reviewMessages } from '../src/engine/prompts.ts';
-import { diffOwned, normalizeReview, REVIEW_MAX_TOKENS, reviewCapFromEnv, reviewFeedback, reviewFromEnv, snapshot } from '../src/engine/review.ts';
+import { REVIEW_JSON_SCHEMA, REVIEW_SYSTEM, reviewMessages } from '../src/engine/prompts.ts';
+import { diffOwned, normalizeReview, REVIEW_MAX_TOKENS, reviewAnswer, reviewCapFromEnv, reviewFeedback, reviewFromEnv, reviewThinkingFromEnv, snapshot } from '../src/engine/review.ts';
 import { LocalSandbox } from '../src/engine/sandbox.ts';
 import { runPlan } from '../src/engine/scheduler.ts';
 import { BackendPool, resolveMachine } from '../src/engine/backends.ts';
@@ -23,6 +23,17 @@ beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'mugge-loop-'));
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+// these tests follow the loop's states with thinking off (writing / fixing); unset is on, which
+// the last test checks
+const thinkingWas = process.env.MUGGE_THINKING;
+beforeAll(() => {
+  process.env.MUGGE_THINKING = 'off';
+});
+afterAll(() => {
+  if (thinkingWas === undefined) delete process.env.MUGGE_THINKING;
+  else process.env.MUGGE_THINKING = thinkingWas;
+});
 
 /** Each ticket's states in order, from the events. */
 function statesOf(events: EngineEvent[]): Map<string, AgentState[]> {
@@ -296,7 +307,7 @@ describe('runTicket', () => {
       expect(r).toMatchObject({ ok: true, attempts: 2, firstTry: false, reviewUnresolved: false });
       const calls = fake.calls();
       expect(calls.map((c) => c.kind)).toEqual(['write', 'review', 'fix']); // one review per ticket
-      expect(calls[2]!.prompt).toContain('## Fix\nThis command failed:\n$ (lead review)\nThe lead reviewed your passing files and found problems:\n- empty input is not handled\n\nSuggested fix: handle the empty case\n\nReturn your files fixed so it passes.');
+      expect(calls[2]!.prompt).toContain('## Fix\nThis command failed:\n$ (lead review)\nThe lead reviewed your passing files and sent them back:\n- empty input is not handled; handle the empty case\n\nReply with your files, fixed so it passes, in the same format.');
       expect(readFileSync(join(wt, 'a.txt'), 'utf8')).toBe('ok-a\nempty case\n');
     } finally {
       fake.stop();
@@ -363,7 +374,7 @@ describe('runTicket', () => {
       expect(r).toMatchObject({ ok: true, attempts: 3, reviewUnresolved: false });
       const calls = fake.calls();
       expect(calls.map((c) => c.kind)).toEqual(['write', 'review', 'fix']);
-      expect(calls[2]!.prompt).toContain('$ (lead review)\nThe lead reviewed your passing files and found problems:\n- empty input is not handled');
+      expect(calls[2]!.prompt).toContain('$ (lead review)\nThe lead reviewed your passing files and sent them back:\n- empty input is not handled');
     } finally {
       fake.stop();
     }
@@ -456,7 +467,7 @@ describe('runTicket', () => {
     } finally {
       fake.stop();
     }
-    expect(normalizeReview({ verdict: 'maybe' })).toMatch(/not approve or problems/);
+    expect(normalizeReview({ verdict: 'maybe' })).toMatch(/not approve or send_back/);
     expect(normalizeReview({ verdict: 'problems', problems: [' a ', 3, ''], fix: 7 })).toEqual({ verdict: 'problems', problems: ['a'], fix: '' });
   });
 
@@ -515,5 +526,43 @@ test('review prompt shape', () => {
   const m = reviewMessages(plan.tickets[0]!, '', [{ command: 'make test', output: 'ok' }]);
   expect(m[0]).toEqual({ role: 'system', content: REVIEW_SYSTEM });
   expect(m[1]!.content).toBe('Ticket: a\nTitle: Write a\nRole: implement\n\n\n\nFiles it owns: a.txt\nDone when these commands pass: grep -q ok-a a.txt\n\n## Diff\n(no changes)\n\n## Checks (all passed)\n$ make test\nok');
-  expect(reviewFeedback({ problems: ['x'], fix: '' })).toBe('The lead reviewed your passing files and found problems:\n- x');
+  expect(reviewFeedback({ problems: ['x'], fix: '' })).toBe('The lead reviewed your passing files and sent them back:\n- x');
+});
+
+test('review answer shape: approve or send_back plus one reason; the older shape still reads', () => {
+  expect(normalizeReview({ verdict: 'approve', reason: '' })).toEqual({ verdict: 'approve', problems: [], fix: '' });
+  expect(normalizeReview({ verdict: 'send_back', reason: ' format() drops the sign ' })).toEqual({ verdict: 'problems', problems: ['format() drops the sign'], fix: '' });
+  // a send-back with no reason still sends it back, with something to act on
+  expect(normalizeReview({ verdict: 'send_back', reason: '' })).toMatchObject({ verdict: 'problems', problems: [expect.stringContaining('without a reason')] });
+  expect(normalizeReview({ verdict: 'problems', problems: ['p'], fix: 'f' })).toEqual({ verdict: 'problems', problems: ['p'], fix: 'f' });
+  expect(reviewAnswer({ verdict: 'problems', problems: ['p'], fix: 'f' })).toEqual({ verdict: 'send_back', reason: 'p; f' });
+  expect(REVIEW_JSON_SCHEMA.required).toEqual(['verdict', 'reason']);
+});
+
+test('the review call goes out with thinking off unless MUGGE_REVIEW_THINKING=on; worker calls think by default', async () => {
+  const was = process.env.MUGGE_THINKING;
+  const plan = validatePlan({ tickets: [t('a')] });
+  try {
+    delete process.env.MUGGE_THINKING;
+    for (const [env, want] of [[undefined, false], ['on', true], ['off', false]] as const) {
+      if (env === undefined) delete process.env.MUGGE_REVIEW_THINKING;
+      else process.env.MUGGE_REVIEW_THINKING = env;
+      const fake = startFakeModel({ solutions: { a: ok('a') } });
+      const events: EngineEvent[] = [];
+      try {
+        const wt = join(dir, `rt-${env}`);
+        mkdirSync(wt, { recursive: true });
+        await runTicket(plan.tickets[0]!, wt, { plan, inference: new OpenAICompatible({ baseUrl: fake.url, defaultModel: 'fake' }), sandbox: new LocalSandbox(), emit: (e) => events.push(e), review: true });
+        expect(fake.calls().map((c) => [c.kind, c.thinking])).toEqual([['write', undefined], ['review', want]]);
+      } finally {
+        fake.stop();
+      }
+      // MUGGE_THINKING unset: the worker call shows as thinking (Qwen3.8 thinks unless told not to)
+      expect(statesOf(events).get('a')![0]).toBe('thinking');
+    }
+    expect(() => reviewThinkingFromEnv({ MUGGE_REVIEW_THINKING: 'maybe' })).toThrow(/on or off/);
+  } finally {
+    delete process.env.MUGGE_REVIEW_THINKING;
+    process.env.MUGGE_THINKING = was ?? 'off';
+  }
 });

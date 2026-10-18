@@ -6,6 +6,7 @@
  * Specialists are LoRA adapters served under their own model names by vLLM
  * (`--lora-modules coder-ts=/models/adapters/coder-ts`), so routing is only a name lookup.
  */
+import { inlineThinkingChars, stripThinking } from './files.ts';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -29,8 +30,10 @@ export interface Completion<T> {
   forced?: string;
   /** max_tokens the call was sent with, after MUGGE_MAX_CALL_TOKENS. */
   maxTokens?: number;
-  /** Characters of thinking the server returned beside the answer (reasoning_content), when it splits them. */
+  /** Characters of thinking: what the server returned beside the answer (reasoning_content), else what came inside content. */
   reasoningChars?: number;
+  /** The thinking text itself, from reasoning_content or from inside content, when there was any. */
+  reasoning?: string;
   /** chat_template_kwargs.enable_thinking the call was sent with, when it was sent. */
   thinking?: boolean;
   ms: number;
@@ -54,13 +57,24 @@ export interface Sampling {
   top_k?: number;
   top_p?: number;
   min_p?: number;
+  presence_penalty?: number;
 }
 
 /**
- * The engine's sampling defaults, the one place they live. top_k 40 is llama-server's own
- * default, so on llama-server nothing changes; on vLLM and SGLang it replaces "all tokens".
+ * The engine's sampling defaults, the one place they live: Qwen3.8's own recommendation for
+ * each mode (model card of Qwen/Qwen3.8-27B-FP8), picked per call by whether that call thinks.
+ * One change from the card: presence_penalty stays 0 with thinking off (the card says 1.5 for
+ * chat), because a worker rewrites whole files and code repeats its own tokens on purpose.
  */
-export const DEFAULT_SAMPLING: Readonly<Required<Pick<Sampling, 'temperature' | 'top_k'>>> = { temperature: 0.2, top_k: 40 };
+export const THINKING_SAMPLING: Readonly<Required<Sampling>> = { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 };
+export const NOTHINK_SAMPLING: Readonly<Required<Sampling>> = { temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 0 };
+/** The set a call gets when nothing says whether it thinks (Qwen3.8 thinks unless told not to). */
+export const DEFAULT_SAMPLING = THINKING_SAMPLING;
+
+/** The default set for a call: THINKING_SAMPLING unless the call goes out with thinking off. */
+export function defaultSampling(thinking: boolean | undefined): Readonly<Required<Sampling>> {
+  return thinking === false ? NOTHINK_SAMPLING : THINKING_SAMPLING;
+}
 
 /** Default for InferenceConfig.timeoutMs: long enough for a 16K prefill on a busy laptop GPU. */
 export const DEFAULT_TIMEOUT_MS = 1_800_000;
@@ -73,9 +87,9 @@ export function checkTopK(topK: unknown, where = 'top_k'): number {
   return topK;
 }
 
-/** The sampling fields of a request: defaults, then `cfg.sampling`, then `cfg.temperature`. */
-export function samplingFields(cfg: Pick<InferenceConfig, 'sampling' | 'temperature'>): Record<string, number> {
-  const s: Sampling = { ...DEFAULT_SAMPLING, ...dropUndefined(cfg.sampling ?? {}), ...(cfg.temperature !== undefined ? { temperature: cfg.temperature } : {}) };
+/** The sampling fields of a request: the mode's defaults, then `cfg.sampling`, then `cfg.temperature`. */
+export function samplingFields(cfg: Pick<InferenceConfig, 'sampling' | 'temperature'>, thinking?: boolean): Record<string, number> {
+  const s: Sampling = { ...defaultSampling(thinking), ...dropUndefined(cfg.sampling ?? {}), ...(cfg.temperature !== undefined ? { temperature: cfg.temperature } : {}) };
   const out: Record<string, number> = {};
   for (const [k, v] of Object.entries(s)) if (v !== undefined) out[k] = v;
   return out;
@@ -99,7 +113,7 @@ export interface InferenceConfig {
   guided?: 'response_format' | 'guided_json' | 'none';
   /** Overrides `sampling.temperature` (kept for callers that set only this). */
   temperature?: number;
-  /** temperature, top_k, top_p, min_p; unset fields take DEFAULT_SAMPLING or the server's default. */
+  /** temperature, top_k, top_p, min_p, presence_penalty; unset fields take the mode's defaults (THINKING_SAMPLING / NOTHINK_SAMPLING). */
   sampling?: Sampling;
   /** Extra request fields sent as they are, e.g. seed, chat_template_kwargs; a top_k here must still be finite. */
   extra?: Record<string, unknown>;
@@ -116,7 +130,7 @@ export interface InferenceConfig {
 
 export interface Inference {
   /** An answer constrained to `schema`, parsed. `signal` aborts the call, even once it is sent. */
-  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>>;
+  complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, opts?: CallTweaks): Promise<Completion<T>>;
   /** A free-text answer. */
   text(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, opts?: CallTweaks): Promise<Completion<string>>;
 }
@@ -128,8 +142,8 @@ export class OpenAICompatible implements Inference {
     return this.cfg.models?.[model] ?? this.cfg.models?.[model.split('@')[0]] ?? this.cfg.defaultModel;
   }
 
-  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal): Promise<Completion<T>> {
-    const c = await this.send(model, messages, maxTokens, signal, schema);
+  async complete<T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, opts?: CallTweaks): Promise<Completion<T>> {
+    const c = await this.send(model, messages, maxTokens, signal, schema, opts);
     try {
       return { ...c, value: parseJsonAnswer<T>(c.raw) };
     } catch (e) {
@@ -145,14 +159,17 @@ export class OpenAICompatible implements Inference {
   private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks): Promise<Completion<string>> {
     const started = performance.now();
     const cap = this.cfg.maxCallTokens;
+    const kwargs = { ...(this.cfg.extra?.chat_template_kwargs as Record<string, unknown> | undefined), ...(typeof opts?.thinking === 'boolean' ? { enable_thinking: opts.thinking } : {}) };
+    // the sampling set follows whether this call thinks: a cut retry with thinking off gets the non-thinking set
+    const thinks = typeof kwargs.enable_thinking === 'boolean' ? kwargs.enable_thinking : undefined;
     const body: Record<string, unknown> = {
       model: this.served(model),
       messages,
       max_tokens: cap && cap < maxTokens ? cap : maxTokens,
-      ...samplingFields(this.cfg),
+      ...samplingFields(this.cfg, thinks),
       ...this.cfg.extra,
     };
-    if (typeof opts?.thinking === 'boolean') body.chat_template_kwargs = { ...(body.chat_template_kwargs as object | undefined), enable_thinking: opts.thinking };
+    if (Object.keys(kwargs).length) body.chat_template_kwargs = kwargs;
     checkTopK(body.top_k);
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
@@ -170,20 +187,31 @@ export class OpenAICompatible implements Inference {
     const data: any = await res.json();
     const choice = data?.choices?.[0];
     const raw: string = choice?.message?.content ?? '';
+    // without vLLM's --reasoning-parser the thinking comes back inside content; Qwen's template
+    // opens <think> in the prompt, so content holds only its closing tag
+    const inlineThought = inlineThinkingChars(raw);
     const reasoning = data?.usage?.completion_tokens_details?.reasoning_tokens;
     const forced = choice?.forced ?? data?.forced;
     const thought = choice?.message?.reasoning_content ?? choice?.message?.reasoning;
     const sentThinking = (body.chat_template_kwargs as { enable_thinking?: unknown } | undefined)?.enable_thinking;
+    const thoughtChars = typeof thought === 'string' && thought ? thought.length : inlineThought || undefined;
+    const cut = choice?.finish_reason === 'length';
+    // thinking on, no parser on the server, cut before </think>: all of content is thinking
+    const cutThinking = sentThinking === true && cut && typeof thought !== 'string' && !raw.includes('</think>');
+    const close = raw.lastIndexOf('</think>');
+    const inlineText = cutThinking ? raw : close >= 0 ? raw.slice(0, close).replace(/^\s*<think>\n?/, '') : '';
+    const reasoningText = typeof thought === 'string' && thought ? thought : inlineText || undefined;
     const out: Completion<string> = {
-      value: raw,
+      value: cutThinking ? '' : stripThinking(raw),
       raw,
       promptTokens: data?.usage?.prompt_tokens ?? 0,
       completionTokens: data?.usage?.completion_tokens ?? 0,
       reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
-      cut: choice?.finish_reason === 'length' || undefined,
+      cut: cut || undefined,
       forced: typeof forced === 'string' && forced ? forced : forced === true ? 'yes' : undefined,
       maxTokens: body.max_tokens as number,
-      reasoningChars: typeof thought === 'string' && thought ? thought.length : undefined,
+      reasoningChars: cutThinking ? raw.length : thoughtChars,
+      reasoning: reasoningText,
       thinking: typeof sentThinking === 'boolean' ? sentThinking : undefined,
       ms: Math.round(performance.now() - started),
     };
@@ -200,7 +228,7 @@ export function describeCall(model: string, maxTokens: number, c: Completion<str
 
 /** Parses a JSON answer, tolerating a ```json fence or text around one object (for `guided: none`). */
 export function parseJsonAnswer<T>(raw: string): T {
-  const s = raw.trim();
+  const s = stripThinking(raw).trim();
   try {
     return JSON.parse(s);
   } catch {
@@ -211,3 +239,4 @@ export function parseJsonAnswer<T>(raw: string): T {
     throw new Error(`model answer is not JSON: ${s.slice(0, 200)}`);
   }
 }
+

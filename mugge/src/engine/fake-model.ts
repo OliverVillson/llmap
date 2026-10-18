@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import type { WorkerOutput } from '../tickets/schema.ts';
 import { renderFiles } from './files.ts';
 import { REVIEW_SYSTEM } from './prompts.ts';
-import type { LeadReview } from './review.ts';
+import { reviewAnswer, type LeadReview } from './review.ts';
 
 export interface FakeOptions {
   solutions: Record<string, WorkerOutput>;
@@ -27,6 +27,13 @@ export interface FakeOptions {
   forced?: string[];
   /** Ticket ids whose calls with thinking on (chat_template_kwargs.enable_thinking) think to the cap and write nothing. */
   overthink?: string[];
+  /**
+   * Answer the way Qwen3.8 does through vLLM: calls with thinking on (or not set) think first,
+   * half of them inside content up to a bare </think> (no --reasoning-parser; the template opened
+   * <think>), with a drafted file for a path no ticket owns, the other half in reasoning_content
+   * (with the parser); then one line of prose before the files.
+   */
+  qwen?: boolean;
   latencyMs?: number;
   port?: number;
   /** Ticket id → the answers to its review calls, in order (the last one repeats). */
@@ -84,7 +91,7 @@ export function startFakeModel(o: FakeOptions) {
           reviewed.set(id, k + 1);
           const list = o.reviews?.[id] ?? [];
           const rv: LeadReview = list[Math.min(k, list.length - 1)] ?? { verdict: 'approve', problems: [], fix: '' };
-          const content = JSON.stringify(rv);
+          const content = JSON.stringify(reviewAnswer(rv));
           return Response.json({
             id: `fake-${requests}`, object: 'chat.completion', model: body.model,
             choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }],
@@ -103,7 +110,13 @@ export function startFakeModel(o: FakeOptions) {
         else if (o.flaky?.includes(id) && n === 1) answer = { files: {}, note: 'first try, wrote nothing' };
         else answer = o.solutions[id] ?? { files: {}, note: `no canned answer for ${id || 'this prompt'}` };
         let content = body.response_format || body.guided_json ? JSON.stringify(answer) : renderFiles(answer.files, answer.note);
-        let finish = 'stop', forced: string | undefined;
+        let finish = 'stop', forced: string | undefined, reasoningContent: string | undefined;
+        if (o.qwen && thinking !== false && !(body.response_format || body.guided_json)) {
+          const thought = `The ticket asks for ${id}. Let me draft it first:\nscratch/draft.txt\n\`\`\`\nnot the answer\n\`\`\`\nThat works; now the real files.\n`;
+          content = `I'll write the files for ${id} now.\n\n${content}`;
+          if (requests % 2) content = `${thought}</think>\n\n${content}`;
+          else reasoningContent = thought;
+        }
         if (thinking === true && o.overthink?.includes(id)) {
           const content = `<think>\n${'Let me reconsider the edge cases once more. '.repeat(Math.ceil((body.max_tokens ?? 64) / 8))}`;
           return Response.json({
@@ -121,7 +134,7 @@ export function startFakeModel(o: FakeOptions) {
           id: `fake-${requests}`,
           object: 'chat.completion',
           model: body.model,
-          choices: [{ index: 0, finish_reason: finish, message: { role: 'assistant', content }, ...(forced ? { forced } : {}) }],
+          choices: [{ index: 0, finish_reason: finish, message: { role: 'assistant', content, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) }, ...(forced ? { forced } : {}) }],
           usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(content), total_tokens: approxTokens(prompt) + approxTokens(content) },
         });
       } finally {

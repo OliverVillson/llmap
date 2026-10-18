@@ -10,9 +10,10 @@
  *   MUGGE_TIMEOUT_S       most seconds one model call may take once sent (default 1800; waiting
  *                         for a slot does not count, and Bun's own 300 s fetch cut is off)
  *   MUGGE_CONCURRENCY     tickets at once, i.e. agents working (default 12)
- *   MUGGE_TEMPERATURE, MUGGE_TOP_K, MUGGE_TOP_P, MUGGE_MIN_P
- *                         sampling for every call (defaults: engine/inference.ts DEFAULT_SAMPLING;
- *                         top_k must be a positive integer, never 0)
+ *   MUGGE_TEMPERATURE, MUGGE_TOP_K, MUGGE_TOP_P, MUGGE_MIN_P, MUGGE_PRESENCE_PENALTY
+ *                         sampling for every call (defaults: Qwen3.8's set for the call's mode,
+ *                         engine/inference.ts THINKING_SAMPLING / NOTHINK_SAMPLING; top_k must be a
+ *                         positive integer, never 0)
  *   MUGGE_PRESET          model preset (engine/backends.ts MODEL_PRESETS, e.g. minicpm5-2b): its
  *                         sampling needs (min_p 0) and KV cost, for the single-URL machine
  *
@@ -33,8 +34,11 @@
  *   MUGGE_SLOTS, MUGGE_MEMORY_GB, MUGGE_CTX
  *                         the single-URL machine's slots, working-memory budget and context per call
  *   MUGGE_SANDBOX         local | podman | docker (see engine/sandbox.ts)
- *   MUGGE_THINKING        on | off: sent as chat_template_kwargs.enable_thinking on every call
- *                         (unset: the server's default). The bench's --thinking flag is the same switch.
+ *   MUGGE_THINKING        on | off | server (default on): sent as chat_template_kwargs.enable_thinking
+ *                         on every call; server sends nothing and leaves it to the chat template
+ *                         (Qwen3.8 thinks). The bench's --thinking flag is the same switch.
+ *   MUGGE_REASONING_EFFORT xhigh | medium | low: sent as chat_template_kwargs.reasoning_effort
+ *                         (unset: the template's default, xhigh on Qwen3.8)
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
  *                         spend in one call). The lead review writes up to this too (unset: 2,048)
@@ -71,6 +75,7 @@ export function samplingFromEnv(env: NodeJS.ProcessEnv = process.env): Sampling 
       top_k: topK,
       top_p: num(env, 'MUGGE_TOP_P', (n) => n > 0 && n <= 1, 'a number in (0, 1]'),
       min_p: num(env, 'MUGGE_MIN_P', (n) => n >= 0 && n < 1, 'a number in [0, 1)'),
+      presence_penalty: num(env, 'MUGGE_PRESENCE_PENALTY', (n) => n >= -2 && n <= 2, 'a number in [-2, 2]'),
     }),
   };
   return Object.keys(s).length ? s : undefined;
@@ -91,8 +96,14 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
   }
   const guided = (env.MUGGE_GUIDED as InferenceConfig['guided']) || 'response_format';
   if (!['response_format', 'guided_json', 'none'].includes(guided)) throw new Error('MUGGE_GUIDED must be response_format, guided_json or none');
-  const thinking = env.MUGGE_THINKING?.trim().toLowerCase();
-  if (thinking && !['on', 'off'].includes(thinking)) throw new Error('MUGGE_THINKING must be on or off');
+  const thinking = env.MUGGE_THINKING?.trim().toLowerCase() || 'on';
+  if (!['on', 'off', 'server'].includes(thinking)) throw new Error('MUGGE_THINKING must be on, off or server');
+  const effort = env.MUGGE_REASONING_EFFORT?.trim().toLowerCase() || undefined;
+  if (effort && !['xhigh', 'medium', 'low'].includes(effort)) throw new Error('MUGGE_REASONING_EFFORT must be xhigh, medium or low');
+  const kwargs: Record<string, unknown> = {
+    ...(thinking === 'server' ? {} : { enable_thinking: thinking === 'on' }),
+    ...(effort ? { reasoning_effort: effort } : {}),
+  };
   const maxCall = env.MUGGE_MAX_CALL_TOKENS ? Number(env.MUGGE_MAX_CALL_TOKENS) : undefined;
   if (maxCall !== undefined && !(Number.isInteger(maxCall) && maxCall > 0)) throw new Error('MUGGE_MAX_CALL_TOKENS must be a positive integer');
   return {
@@ -103,7 +114,7 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
     apiKey: env.MUGGE_API_KEY || undefined,
     timeoutMs: Number(env.MUGGE_TIMEOUT_S) > 0 ? Number(env.MUGGE_TIMEOUT_S) * 1000 : undefined,
     sampling: samplingFromEnv(env),
-    extra: thinking ? { chat_template_kwargs: { enable_thinking: thinking === 'on' } } : undefined,
+    extra: Object.keys(kwargs).length ? { chat_template_kwargs: kwargs } : undefined,
     maxCallTokens: maxCall,
     debug: env.MUGGE_DEBUG_CALLS === '1',
   };

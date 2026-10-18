@@ -329,7 +329,7 @@ async function main(argv: string[]) {
       for (const [i, m] of machines.entries()) {
         console.log(describeMachine(m));
         console.log(`  ${describeProbe(probes[i]!)}`);
-        console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
+        if (m.server === 'llama-server') console.log(`  llama-server ${llamaServerArgs(m).join(' ')}`);
         for (const w of m.warnings) console.log(`  warning: ${w}`);
       }
       // the verdict mugge run would reach, and a non-zero exit when it would not start

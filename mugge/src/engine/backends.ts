@@ -24,8 +24,8 @@ export const MAX_DERIVED_SLOTS = 40;
 /** Tokens one worker call needs with thinking off: a pack of up to ~10K plus a 1–2K answer. */
 export const DEFAULT_CTX_PER_CALL = 12_288;
 
-/** Bytes per element of llama.cpp's KV cache types (`-ctk` / `-ctv`). */
-export const CACHE_TYPE_BYTES = { f32: 4, f16: 2, bf16: 2, q8_0: 34 / 32, q5_1: 24 / 32, q5_0: 22 / 32, q4_1: 20 / 32, q4_0: 18 / 32, iq4_nl: 18 / 32 } as const;
+/** Bytes per element of llama.cpp's KV cache types (`-ctk` / `-ctv`), and vLLM's fp8 (`--kv-cache-dtype fp8`). */
+export const CACHE_TYPE_BYTES = { f32: 4, f16: 2, bf16: 2, fp8: 1, q8_0: 34 / 32, q5_1: 24 / 32, q5_0: 22 / 32, q4_1: 20 / 32, q4_0: 18 / 32, iq4_nl: 18 / 32 } as const;
 export type CacheType = keyof typeof CACHE_TYPE_BYTES;
 
 export interface ModelPreset {
@@ -35,11 +35,17 @@ export interface ModelPreset {
   headDim: number;
   /** Sampling this model needs whatever the engine default is. */
   sampling?: Sampling;
+  /** Fixed bytes per sequence beside the KV cache (a hybrid model's recurrent state); a machine's state_bytes_per_slot wins. */
+  stateBytesPerSlot?: number;
   note: string;
 }
 
-/** The BlackHole base candidates and the Centipede run 1 reference, from their configs. */
+/** The demo model (Qwen3.8-27B), the BlackHole base candidates and the Centipede run 1 reference, from their configs. */
 export const MODEL_PRESETS: Record<string, ModelPreset> = {
+  // 64 layers, 1 in 4 full attention (4 KV heads × 256); the other 48 are Gated DeltaNet with a
+  // 48 × 128 × 128 state each at fp32, plus conv state: 153,944,064 B a sequence, an estimate
+  // until a real vLLM run reports its numbers
+  'qwen3.8-27b': { kvLayers: 16, kvHeads: 4, headDim: 256, stateBytesPerSlot: 153_944_064, note: 'Qwen/Qwen3.8-27B-FP8, the demo model: hybrid, 16 of 64 layers keep a KV cache (64 KiB a token at bf16, 32 KiB at fp8); recurrent state per sequence estimated' },
   'qwen3.5-2b': { kvLayers: 6, kvHeads: 2, headDim: 256, note: 'hybrid: 6 of 24 layers keep a KV cache; the rest hold a fixed recurrent state per sequence (set state_bytes_per_slot from footprint.sh)' },
   'minicpm5-2b': { kvLayers: 42, kvHeads: 2, headDim: 128, sampling: { min_p: 0 }, note: 'plain attention; min_p 0 (llama.cpp default 0.05 makes it repeat)' },
   'granite-4.2-3b': { kvLayers: 40, kvHeads: 8, headDim: 64, note: 'every layer keeps a KV cache; Centipede run 1 base' },
@@ -78,6 +84,8 @@ export interface MachineInput {
   sampling?: Sampling;
   /** Most seconds one call may take on this machine once sent (a far cloud GPU may need more than the crew default). */
   timeout_s?: number;
+  /** What serves it: llama-server (default) gets a matching llama-server line in `mugge backends`; vllm and sglang do not. */
+  server?: 'llama-server' | 'vllm' | 'sglang';
   /** A machine the crew can do without (a laptop on wifi that may be asleep): unreachable at start, it is left out instead of failing the run. */
   optional?: boolean;
 }
@@ -104,6 +112,7 @@ export interface Machine {
   sampling: Sampling;
   timeoutMs?: number;
   optional: boolean;
+  server: 'llama-server' | 'vllm' | 'sglang';
   /** Things worth a look, e.g. explicit slots that overrun the memory budget. */
   warnings: string[];
 }
@@ -134,9 +143,10 @@ export function resolveMachine(raw: MachineInput, base: Sampling = {}): Machine 
   const memoryGb = positive(raw.memory_gb, `${where}: memory_gb`);
   const ctxPerCall = positive(raw.ctx, `${where}: ctx`, true) ?? DEFAULT_CTX_PER_CALL;
   const kv = positive(raw.kv_bytes_per_token, `${where}: kv_bytes_per_token`) ?? (preset ? kvBytesPerToken(preset, cacheType) : undefined);
-  const state = raw.state_bytes_per_slot === undefined ? 0 : positive(raw.state_bytes_per_slot, `${where}: state_bytes_per_slot`)!;
+  const state = raw.state_bytes_per_slot === undefined ? (preset?.stateBytesPerSlot ?? 0) : positive(raw.state_bytes_per_slot, `${where}: state_bytes_per_slot`)!;
   const timeoutS = positive(raw.timeout_s, `${where}: timeout_s`);
   if (raw.optional !== undefined && typeof raw.optional !== 'boolean') throw new Error(`${where}: optional must be true or false`);
+  if (raw.server !== undefined && !['llama-server', 'vllm', 'sglang'].includes(raw.server)) throw new Error(`${where}: server must be llama-server, vllm or sglang`);
   if (raw.api_key_env !== undefined && (typeof raw.api_key_env !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(raw.api_key_env))) throw new Error(`${where}: api_key_env must name an environment variable`);
   const sampling: Sampling = { ...preset?.sampling, ...base, ...raw.sampling };
   if (sampling.top_k !== undefined) checkTopK(sampling.top_k, `${where}: sampling.top_k`);
@@ -162,7 +172,7 @@ export function resolveMachine(raw: MachineInput, base: Sampling = {}): Machine 
   return {
     name: raw.name, url: raw.url, roles, slots: n, slotSource, ctxPerCall, cacheType,
     preset: raw.preset?.toLowerCase(), kvBytesPerToken: kv, stateBytesPerSlot: state, bytesPerSlot, memoryBytes, slotsFromMemory,
-    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, optional: raw.optional ?? false, warnings,
+    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, optional: raw.optional ?? false, server: raw.server ?? 'llama-server', warnings,
   };
 }
 
@@ -481,7 +491,7 @@ export class BackendPool {
       }
     };
     return {
-      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal)),
+      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal, tweaks)),
       text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<string>((c) => c.text(model, messages, maxTokens, signal ?? o.signal, tweaks)),
     };
   }

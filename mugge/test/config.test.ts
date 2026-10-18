@@ -3,8 +3,12 @@ import { inferenceFromEnv } from '../src/config.ts';
 import { OpenAICompatible, describeCall } from '../src/engine/inference.ts';
 
 describe('thinking switch, per-call cap and debug line', () => {
-  test('MUGGE_THINKING becomes chat_template_kwargs.enable_thinking; unset leaves the server default', () => {
-    expect(inferenceFromEnv({}).extra).toBeUndefined();
+  test('MUGGE_THINKING becomes chat_template_kwargs.enable_thinking; unset is on, server leaves it to the template', () => {
+    expect(inferenceFromEnv({}).extra).toEqual({ chat_template_kwargs: { enable_thinking: true } });
+    expect(inferenceFromEnv({ MUGGE_THINKING: 'server' }).extra).toBeUndefined();
+    expect(inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'Medium' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: true, reasoning_effort: 'medium' } });
+    expect(inferenceFromEnv({ MUGGE_THINKING: 'server', MUGGE_REASONING_EFFORT: 'low' }).extra).toEqual({ chat_template_kwargs: { reasoning_effort: 'low' } });
+    expect(() => inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'max' })).toThrow(/xhigh, medium or low/);
     expect(inferenceFromEnv({ MUGGE_THINKING: 'off' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: false } });
     expect(inferenceFromEnv({ MUGGE_THINKING: 'ON' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: true } });
     expect(() => inferenceFromEnv({ MUGGE_THINKING: 'maybe' })).toThrow();

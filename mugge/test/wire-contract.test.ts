@@ -3,7 +3,7 @@
  * must stay byte-identical to the base branch's (claude/project-thread-uidsop), because the
  * specialists are trained on byte-exact copies of them (llmap stages/harness.py). The base
  * branch's harness.ts, prompts.ts, files.ts and what they import are kept verbatim under
- * fixtures/wire-base/ (from `git show origin/claude/project-thread-uidsop:mugge/src/...`), and each
+ * fixtures/wire-pinned/ (from `git show origin/claude/project-thread-uidsop:mugge/src/...`), and each
  * test drives both sides with the same inputs and compares the bytes.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -20,11 +20,11 @@ import { reviewFeedback } from '../src/engine/review.ts';
 import type { RunOptions, RunResult, Sandbox } from '../src/engine/sandbox.ts';
 import { tail as headTail } from '../src/engine/sandbox.ts';
 import type { Plan, Ticket } from '../src/tickets/schema.ts';
-import * as baseFiles from './fixtures/wire-base/engine/files.ts';
-import { runTicket as baseRunTicket } from './fixtures/wire-base/engine/harness.ts';
-import { OpenAICompatible as BaseOpenAICompatible } from './fixtures/wire-base/engine/inference.ts';
-import * as base from './fixtures/wire-base/engine/prompts.ts';
-import { tail as baseTail } from './fixtures/wire-base/engine/sandbox.ts';
+import * as baseFiles from './fixtures/wire-pinned/engine/files.ts';
+import { runTicket as baseRunTicket } from './fixtures/wire-pinned/engine/harness.ts';
+import { OpenAICompatible as BaseOpenAICompatible } from './fixtures/wire-pinned/engine/inference.ts';
+import * as base from './fixtures/wire-pinned/engine/prompts.ts';
+import { tail as baseTail } from './fixtures/wire-pinned/engine/sandbox.ts';
 
 const OWNED_HEADER = '## Your files as they are now';
 
@@ -131,6 +131,35 @@ function failures(tail: (s: string, n?: number) => string, ticket: Ticket) {
     { command: '(write files)', output: `You wrote files you do not own: evil.ts. Write only: ${ticket.owns.join(', ')}.` },
   ];
 }
+
+/** sha256 of the pinned bytes: the system prompts, and the write and fix user messages of TICKETS[1]. */
+const PINNED = {
+  system: '1c0ac4acaa8c50c38744a2bfb811d780155e5fda0b3e58805a2d06a1a89ed026',
+  review: 'ba9e56319fddc977434f5c2206dc2dbfde8175c7b02addd76db2b60bdf71f70b',
+  write: 'f2a6bef682aea12b63d4166a341239d634b6209dffe31af766eb9ae77c110678',
+  fix: '7759890e203c525c21bced39c32bfb7e4773d3754fb64f3a70d76db46c237504',
+};
+
+const sha = (s: string) => new Bun.CryptoHasher('sha256').update(s).digest('hex');
+
+describe('pinned bytes', () => {
+  test('system prompts, write and fix messages hash to PINNED', () => {
+    const c = TICKETS[1]!;
+    const wt = seed('pin');
+    const pack = head.buildPack(wt, { interfaces: c.interfaces, tickets: [c.ticket] }, c.ticket, c.memory);
+    const got = {
+      system: sha(head.SYSTEM),
+      review: sha(head.REVIEW_SYSTEM),
+      write: sha(head.writeMessages(wt, pack)[1]!.content),
+      fix: sha(head.fixMessages(wt, pack, { command: 'bun test', output: '1 fail' })[1]!.content),
+    };
+    expect(got).toEqual(PINNED);
+  });
+
+  test('the system prompt shows the answer shape renderFiles writes', () => {
+    expect(head.SYSTEM).toContain(headFiles.renderFiles({ 'src/example.py': '<the whole file>' }));
+  });
+});
 
 describe('builders: head prompts.ts vs base prompts.ts', () => {
   test('the system prompt is the same bytes', () => {
@@ -348,7 +377,7 @@ describe('runTicket: the messages the harness actually sends, head vs base', () 
     const text = m.calls.filter((c) => c.kind === 'text');
     expect(text.length).toBe(4); // write, fix, fix, then the review's fix
     expectSameMessages(text[3]!.messages, expected[3]!, 'review fix');
-    expect(text[3]!.messages[1]!.content).toContain('\n\n## Fix\nThis command failed:\n$ (lead review)\nThe lead reviewed your passing files and found problems:\n- format() drops the sign');
+    expect(text[3]!.messages[1]!.content).toContain('\n\n## Fix\nThis command failed:\n$ (lead review)\nThe lead reviewed your passing files and sent them back:\n- format() drops the sign');
   });
 });
 
@@ -408,8 +437,8 @@ describe('request body: MUGGE_THINKING / MUGGE_MAX_CALL_TOKENS / sampling leave 
         expectSameMessages(sent.messages, want[i]!, `env ${JSON.stringify(env)} ${i ? 'fix' : 'write'}`);
         expect(firstDiff(slice(bodies[0]!), slice(baseBodies[i]!))).toBeNull();
         expect(sent.max_tokens).toBe(env.MUGGE_MAX_CALL_TOKENS ? Number(env.MUGGE_MAX_CALL_TOKENS) : 5000);
-        if (env.MUGGE_THINKING) expect(sent.chat_template_kwargs).toEqual({ enable_thinking: env.MUGGE_THINKING === 'on' });
-        else expect(sent.chat_template_kwargs).toBeUndefined();
+        // unset is on: Qwen3.8 thinks unless told not to, and the engine says so on every call
+        expect(sent.chat_template_kwargs).toEqual({ enable_thinking: env.MUGGE_THINKING !== 'off' });
       }
     }
   });
@@ -473,6 +502,6 @@ describe('prefix stability: a fix message starts with the write message', () => 
     const pack = head.buildPack(wt, { interfaces: c.interfaces, tickets: [c.ticket] }, c.ticket, c.memory);
     const W = head.writeMessages(wt, pack)[1]!.content;
     const F = head.fixMessages(wt, pack, { command: 'bun test', output: '1 fail' })[1]!.content;
-    expect(F).toBe(`${W}\n\n## Fix\nThis command failed:\n$ bun test\n1 fail\n\nReturn your files fixed so it passes.`);
+    expect(F).toBe(`${W}\n\n## Fix\nThis command failed:\n$ bun test\n1 fail\n\nReply with your files, fixed so it passes, in the same format.`);
   });
 });

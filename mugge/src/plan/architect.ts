@@ -8,7 +8,10 @@
  *
  * All three are single constrained-JSON calls, so every answer parses. They run on the bigger
  * model (`architect` / `planner` names in the inference config): few calls, high leverage.
+ * With thinking on (the default; Qwen3.8 thinks first) each call gets PLANNER_THINK_TOKENS on top
+ * of its answer budget, so the thinking does not eat the JSON.
  */
+import { thinkingOn } from '../engine/harness.ts';
 import type { Inference } from '../engine/inference.ts';
 import { IMAGES, PLAN_JSON_SCHEMA, validatePlan, WORKER_OUTPUT_JSON_SCHEMA, type Plan, type WorkerOutput } from '../tickets/schema.ts';
 
@@ -82,9 +85,14 @@ const TICKETS_SYSTEM = [
   'Prefer many small tickets with few dependencies, so most can run at once. Reply with {"interfaces": [...], "tickets": [...]}.',
 ].join('\n');
 
+/** Tokens a planning call may think before its answer, on top of the answer's own budget. */
+export const PLANNER_THINK_TOKENS = 32_768;
+
+const budget = (inf: Inference, answer: number) => answer + (thinkingOn(inf) ? PLANNER_THINK_TOKENS : 0);
+
 export async function design(inf: Inference, request: string, answers: string[] = [], model = 'architect'): Promise<Design> {
   const user = answers.length ? `${request}\n\nAnswers to your questions:\n${answers.join('\n')}` : request;
-  const c = await inf.complete<Design>(model, [{ role: 'system', content: ARCHITECT_SYSTEM }, { role: 'user', content: user }], DESIGN_JSON_SCHEMA, 8000);
+  const c = await inf.complete<Design>(model, [{ role: 'system', content: ARCHITECT_SYSTEM }, { role: 'user', content: user }], DESIGN_JSON_SCHEMA, budget(inf, 8000));
   return c.value;
 }
 
@@ -116,12 +124,12 @@ export function architectureMarkdown(d: Design): string {
 }
 
 export async function scaffold(inf: Inference, d: Design, model = 'planner'): Promise<WorkerOutput> {
-  const c = await inf.complete<WorkerOutput>(model, [{ role: 'system', content: SCAFFOLD_SYSTEM }, { role: 'user', content: architectureMarkdown(d) }], WORKER_OUTPUT_JSON_SCHEMA, 32000);
+  const c = await inf.complete<WorkerOutput>(model, [{ role: 'system', content: SCAFFOLD_SYSTEM }, { role: 'user', content: architectureMarkdown(d) }], WORKER_OUTPUT_JSON_SCHEMA, budget(inf, 32000));
   return c.value;
 }
 
 export async function tickets(inf: Inference, d: Design, files: string[], model = 'planner'): Promise<Plan> {
   const user = `${architectureMarkdown(d)}\n\n## Scaffold files\n${files.map((f) => `- ${f}`).join('\n')}`;
-  const c = await inf.complete<Plan>(model, [{ role: 'system', content: TICKETS_SYSTEM }, { role: 'user', content: user }], PLAN_JSON_SCHEMA, 16000);
+  const c = await inf.complete<Plan>(model, [{ role: 'system', content: TICKETS_SYSTEM }, { role: 'user', content: user }], PLAN_JSON_SCHEMA, budget(inf, 16000));
   return validatePlan(c.value);
 }

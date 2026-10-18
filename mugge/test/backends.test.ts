@@ -71,21 +71,26 @@ describe('KV budget', () => {
     const args = llamaServerArgs(m).join(' ');
     expect(args).toContain('-np 15 -c 245760 --kv-unified');
     expect(args).toContain('-ctk q8_0 -ctv q8_0');
-    expect(args).toContain('--top-k 40');
+    expect(args).toContain('--top-k 20');
     expect(args).toContain('--min-p 0');
   });
 });
 
 describe('sampling', () => {
   test('defaults in one place, preset needs on top, env on top of that; top_k always finite', () => {
-    expect(samplingFields({})).toEqual({ temperature: 0.2, top_k: 40 });
+    // Qwen3.8's sets: thinking unless the call says it does not
+    expect(samplingFields({})).toEqual({ temperature: 1, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 });
+    expect(samplingFields({}, true)).toEqual(samplingFields({}));
+    expect(samplingFields({}, false)).toEqual({ temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 0 });
+    expect(samplingFromEnv({ MUGGE_PRESENCE_PENALTY: '1.5' })).toEqual({ presence_penalty: 1.5 });
+    expect(() => samplingFromEnv({ MUGGE_PRESENCE_PENALTY: '3' })).toThrow();
     expect(samplingFromEnv({ MUGGE_PRESET: 'minicpm5-2b' })).toEqual({ min_p: 0 });
     expect(samplingFromEnv({ MUGGE_PRESET: 'minicpm5-2b', MUGGE_MIN_P: '0.02', MUGGE_TOP_K: '20' })).toEqual({ min_p: 0.02, top_k: 20 });
     expect(samplingFromEnv({})).toBeUndefined();
     expect(() => samplingFromEnv({ MUGGE_TOP_K: '0' })).toThrow(/whole vocabulary/);
     expect(() => samplingFromEnv({ MUGGE_TOP_K: '-1' })).toThrow();
     expect(() => samplingFromEnv({ MUGGE_PRESET: 'nope' })).toThrow();
-    expect(samplingFields({ sampling: { temperature: 0.7 }, temperature: 1 })).toEqual({ temperature: 1, top_k: 40 });
+    expect(samplingFields({ sampling: { temperature: 0.7 }, temperature: 0.3 }, false)).toEqual({ temperature: 0.3, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 0 });
   });
 
   test('every request carries a finite top_k, and a top_k of 0 is never sent', async () => {
@@ -93,10 +98,10 @@ describe('sampling', () => {
     const server = Bun.serve({ port: 0, fetch: async (req) => (bodies.push(await req.json()), Response.json({ choices: [{ message: { content: 'ok' } }], usage: {} })) });
     try {
       await new OpenAICompatible({ baseUrl: `${server.url}v1`, defaultModel: 'm' }).text('coder', [{ role: 'user', content: 'hi' }], 10);
-      expect(bodies[0]).toMatchObject({ top_k: 40, temperature: 0.2 });
-      expect(bodies[0].min_p).toBeUndefined();
-      await new OpenAICompatible({ baseUrl: `${server.url}v1`, defaultModel: 'm', sampling: { min_p: 0 } }).text('coder', [{ role: 'user', content: 'hi' }], 10);
-      expect(bodies[1].min_p).toBe(0);
+      expect(bodies[0]).toMatchObject({ top_k: 20, temperature: 1, top_p: 0.95, min_p: 0 });
+      // a call sent with thinking off (the cut retry) gets the non-thinking set
+      await new OpenAICompatible({ baseUrl: `${server.url}v1`, defaultModel: 'm', sampling: { min_p: 0.01 } }).text('coder', [{ role: 'user', content: 'hi' }], 10, undefined, { thinking: false });
+      expect(bodies[1]).toMatchObject({ top_k: 20, temperature: 0.7, top_p: 0.8, min_p: 0.01, chat_template_kwargs: { enable_thinking: false } });
       const bad = new OpenAICompatible({ baseUrl: `${server.url}v1`, defaultModel: 'm', extra: { top_k: 0 } });
       await expect(bad.text('coder', [{ role: 'user', content: 'hi' }], 10)).rejects.toThrow(/top_k/);
       expect(bodies.length).toBe(2);

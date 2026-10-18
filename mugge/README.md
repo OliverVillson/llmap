@@ -53,17 +53,47 @@ holds 15 tickets, 9 without dependencies. `spike/solutions/` are canned answers 
 model; `spike/check.sh` proves each ticket fails on the scaffold, passes with its solution, and
 needs nothing beyond its dependencies.
 
-On a real VM, against vLLM:
+On a real machine, against vLLM serving Qwen3.8-27B (the demo model, `Qwen/Qwen3.8-27B-FP8`; the
+server scripts and the crew file live in `deploy/`, from the serving branch, claude/qwen-serving):
 
 ```bash
-vm/setup.sh                                          # once, then snapshot the disk
-MODEL=Qwen/Qwen3.6-35B-A3B-FP8 vm/serve-vllm.sh &
-bun run spike/run-spike.ts --url http://127.0.0.1:8000/v1 --model mugge-small \
-  --concurrency 16 --sandbox podman --serial --out metrics.json
+vllm serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen3.8-27b --reasoning-parser qwen3 &   # or deploy/'s script
+bun run spike/run-spike.ts --url http://127.0.0.1:8000/v1 --model qwen3.8-27b \
+  --concurrency 10 --sandbox podman --serial --out metrics.json
 ```
 
 The pass bar from the spec: 12+ agents at once without preemption, 70%+ of tickets within 4
 attempts, a clean integration, 3x faster than one at a time.
+
+## Running on Qwen3.8-27B
+
+The engine's defaults are Qwen3.8's (2026-10-18): thinking on, sent on every call as
+`chat_template_kwargs.enable_thinking`; the model card's sampling per mode (thinking: temperature
+1.0, top_p 0.95, top_k 20, min_p 0; thinking off: 0.7, 0.8, 20, 0; presence_penalty 0 in both,
+because workers rewrite whole files); the lead review sent with thinking off and answered as
+`{"verdict": "approve" | "send_back", "reason": "..."}`. The server must run vLLM's
+`--reasoning-parser qwen3` so the review's JSON constraint applies after the thinking; the engine
+also copes with thinking left inside the answer (a bare `</think>`), but never relies on it.
+
+From a fresh clone on the GPU box, with the server up on port 8000:
+
+```bash
+cd llmap/mugge && bun install
+export MUGGE_MAX_CALL_TOKENS=16384            # per call: thinking plus the files
+# 1. one endpoint: the 15 spike tickets through the write → check → fix loop, MEETS or MISSES
+bun bench/smoke.ts --url http://127.0.0.1:8000/v1 --model qwen3.8-27b --sandbox local   # needs gcc, make, python3, node
+# 2. the crew: every machine in MUGGE_BACKENDS answers, then the spike plan with 10 agents
+export MUGGE_BACKENDS=@deploy/crew-b200.json MUGGE_CONCURRENCY=10
+bun src/cli.ts backends
+cp -r spike/project /tmp/spike-repo && bun src/cli.ts run spike/plan.json --repo /tmp/spike-repo --plain
+```
+
+The smoke writes `runs/smoke-<time>/calls.jsonl` (one line per call: tokens, cut, thinking),
+`status.json` and `smoke.json`; `bun src/cli.ts status <run dir> --watch` follows a crew run.
+Add `MUGGE_REVIEW=on` to the smoke to score with the lead review, `MUGGE_DEBUG_CALLS=1` for one
+line per call on stderr, `MUGGE_REASONING_EFFORT=medium` for shorter thinking, `--thinking off`
+for the fastest run. Without a GPU, `bun bench/smoke.ts --fake --fake-qwen` runs the same path
+against the fake model answering the way Qwen does.
 
 ## Commands
 

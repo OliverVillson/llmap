@@ -1,7 +1,14 @@
 /**
  * The lead review: after a ticket's checks pass, one fresh one-shot call shows the lead the
  * ticket, the diff of its owned files and the check output, and gets back
- * {"verdict": "approve" | "problems", "problems": [...], "fix": "..."} (constrained JSON).
+ * {"verdict": "approve" | "send_back", "reason": "..."} (constrained JSON; the designs' shape,
+ * picked for Qwen3.8 on 2026-10-18 over the earlier {verdict, problems, fix}, which let an answer
+ * approve and list problems at once). Inside the engine and in `review` events a send-back is
+ * verdict "problems" with the reason as its one problem, so the console and telemetry read it
+ * as before.
+ *
+ * The review call goes out with thinking off unless MUGGE_REVIEW_THINKING=on: the answer is a
+ * short JSON object, and a thinking lead would need far more than its 2,048-token cap.
  *
  * The review is part of done: a ticket finishes on an approve, or when a fix the review asked
  * for passes the checks. A `problems` verdict with something to fix spends the ticket's next fix
@@ -55,6 +62,13 @@ export function reviewFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return v !== 'off';
 }
 
+/** MUGGE_REVIEW_THINKING: on | off (unset: off). */
+export function reviewThinkingFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env.MUGGE_REVIEW_THINKING?.trim().toLowerCase();
+  if (v && v !== 'on' && v !== 'off') throw new Error('MUGGE_REVIEW_THINKING must be on or off');
+  return v === 'on';
+}
+
 /**
  * Most tokens the review may write: MUGGE_MAX_CALL_TOKENS when it is set, so a lead thinking
  * before its answer is not cut at 2,048 (Oliver, 2026-10-16); else REVIEW_MAX_TOKENS. The
@@ -104,13 +118,28 @@ export function diffOwned(worktree: string, before: Snapshot): string {
   }
 }
 
-/** The answer as a LeadReview, or a reason it is not one. */
+/**
+ * The answer as a LeadReview, or a reason it is not one. Takes the wire shape
+ * {verdict: approve | send_back, reason}; the older {verdict: approve | problems, problems, fix}
+ * still reads, for run logs and canned reviews written before the change.
+ */
 export function normalizeReview(v: any): LeadReview | string {
   if (!v || typeof v !== 'object') return 'review answer is not an object';
-  if (v.verdict !== 'approve' && v.verdict !== 'problems') return `review verdict ${JSON.stringify(v.verdict)} is not approve or problems`;
+  if (v.verdict === 'send_back' || (v.verdict === 'approve' && 'reason' in v)) {
+    const reason = typeof v.reason === 'string' ? v.reason.trim() : '';
+    if (v.verdict === 'approve') return { verdict: 'approve', problems: [], fix: '' };
+    return { verdict: 'problems', problems: [reason || 'The lead sent it back without a reason; check the ticket again.'], fix: '' };
+  }
+  if (v.verdict !== 'approve' && v.verdict !== 'problems') return `review verdict ${JSON.stringify(v.verdict)} is not approve or send_back`;
   const problems = Array.isArray(v.problems) ? v.problems.filter((p: unknown) => typeof p === 'string' && p.trim()).map((p: string) => p.trim()) : [];
   const fix = typeof v.fix === 'string' ? v.fix.trim() : '';
   return { verdict: v.verdict, problems, fix };
+}
+
+/** A LeadReview as the model writes it (REVIEW_JSON_SCHEMA), for the fake model and tests. */
+export function reviewAnswer(r: LeadReview): { verdict: 'approve' | 'send_back'; reason: string } {
+  if (r.verdict === 'approve') return { verdict: 'approve', reason: '' };
+  return { verdict: 'send_back', reason: [...r.problems, ...(r.fix ? [r.fix] : [])].join('; ') };
 }
 
 /** Whether a review asks for a fix attempt: problems, with something to fix. */
@@ -121,7 +150,7 @@ export function wantsFix(r: ReviewOutcome): boolean {
 /** The failing output the review's fix call carries (in place of a failing command's output). */
 export function reviewFeedback(r: Pick<LeadReview, 'problems' | 'fix'>): string {
   return [
-    'The lead reviewed your passing files and found problems:',
+    'The lead reviewed your passing files and sent them back:',
     ...r.problems.map((p) => `- ${p}`),
     ...(r.fix ? ['', `Suggested fix: ${r.fix}`] : []),
   ].join('\n');
@@ -135,13 +164,13 @@ export interface ReviewInput {
   checks: Array<{ command: string; output: string }>;
 }
 
-/** `maxTokens`: the ticket's tokens left; `cap`: reviewCapFromEnv's answer unless the caller sets one. */
-export async function review(inference: Inference, model: string, input: ReviewInput, maxTokens: number, cap: number = REVIEW_MAX_TOKENS): Promise<ReviewOutcome> {
+/** `maxTokens`: the ticket's tokens left; `cap`: reviewCapFromEnv's answer unless the caller sets one; `thinking`: sent as the call's thinking switch. */
+export async function review(inference: Inference, model: string, input: ReviewInput, maxTokens: number, cap: number = REVIEW_MAX_TOKENS, thinking = false): Promise<ReviewOutcome> {
   const checks = input.checks.map((c) => ({ command: c.command, output: c.output.length > MAX_CHECK_CHARS ? '…' + c.output.slice(-MAX_CHECK_CHARS) : c.output }));
   const messages = reviewMessages(input.ticket, input.diff, checks);
   let c: Completion<unknown>;
   try {
-    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, cap));
+    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, cap), undefined, { thinking });
   } catch (e) {
     // an answer that came back but is not JSON (most often cut at the cap) still cost its tokens
     const got = (e as { completion?: Completion<string> }).completion;
