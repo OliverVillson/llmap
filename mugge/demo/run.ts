@@ -33,7 +33,7 @@ import { startFakeModel } from '../src/engine/fake-model.ts';
 import { git, headCommit, initRepo, INTEGRATION_BRANCH } from '../src/engine/git.ts';
 import type { CallTweaks, ChatMessage, Completion, Inference } from '../src/engine/inference.ts';
 import { REVIEW_SYSTEM } from '../src/engine/prompts.ts';
-import { sandboxFromEnv, type Sandbox } from '../src/engine/sandbox.ts';
+import { LocalSandbox, sandboxFromEnv, type Sandbox } from '../src/engine/sandbox.ts';
 import { availableParallelism } from 'node:os';
 import { runPlan, type RunReport } from '../src/engine/scheduler.ts';
 import { backendLabel, crewFromEnv, formatCallSummary, runId, Telemetry, type CrewLayout } from '../src/engine/telemetry.ts';
@@ -370,6 +370,8 @@ const log = (message: string, level: 'info' | 'warn' | 'error' = 'info') => {
 // The live view: GET / (the page), /api/status, /api/stream (SSE), /api/calls?ticket= (the list), /api/call?id= (one call in full), POST /api/steer
 
 const VIEW = join(DEMO_DIR, 'view', 'index.html');
+/** Most the integrated project's whole test run may take at the end. */
+const RESULT_TESTS_TIMEOUT_MS = 600_000;
 /** Frames a view's stream may have unsent before even engine events are skipped for it. */
 const BEHIND = 200;
 
@@ -618,9 +620,13 @@ try {
     // a Python project with a tests/ folder (the built-in task, the mock's, or yours): its whole suite
     const pyTests = existsSync(join(resultDir, 'tests')) && readdirSync(join(resultDir, 'tests')).some((f) => /^test_.*\.py$/.test(f));
     if (pyTests) {
-      const t = Bun.spawnSync(['bash', '-c', 'python3 -m unittest discover -s tests -t . 2>&1 | tail -4'], { cwd: resultDir });
-      result.tests = t.stdout.toString().trim();
-      result.testsOk = /\nOK\b|^OK\b/m.test(result.tests);
+      // tests/ without an __init__.py (each ticket's `python3 -m unittest tests.test_x` runs fine
+      // without one) is "not importable" to discover -t . ; in its own process group with a
+      // timeout, so a test that never ends cannot hold the run's end (and its summary) forever
+      const discover = existsSync(join(resultDir, 'tests', '__init__.py')) ? 'python3 -m unittest discover -s tests -t .' : 'python3 -m unittest discover -s tests';
+      const t = await new LocalSandbox().run(discover, { cwd: resultDir, image: 'python', timeoutMs: RESULT_TESTS_TIMEOUT_MS });
+      result.tests = `${t.timedOut ? `(timed out after ${RESULT_TESTS_TIMEOUT_MS / 1000} s)\n` : ''}${t.out.split('\n').slice(-4).join('\n')}`.trim();
+      result.testsOk = !t.timedOut && t.code === 0 && /\nOK\b|^OK\b/m.test(result.tests);
       if (opt.prompt) log(`whole project: ${result.testsOk ? 'every test passes' : 'tests do not all pass'}`);
     }
     if (!opt.prompt) {
