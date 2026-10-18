@@ -138,6 +138,7 @@ mugge smoke [--fake] [--url U --model M]   the 15 spike tickets through the loop
 mugge ship --repo <dir> (--to <folder> | --github <remote> --branch <b>) -m "message"
 mugge close <project>          pull state, stop the VM
 mugge dog
+bun demo/run.ts [--fake]       the Centipede demo: an orchestrator and 10 code agents, live view (demo/README.md)
 ```
 
 ## Not done yet

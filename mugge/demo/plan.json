@@ -1,0 +1,461 @@
+{
+  "interfaces": [
+    "ARCHITECTURE.md",
+    "mdlite/types.py"
+  ],
+  "tickets": [
+    {
+      "id": "escape",
+      "title": "Escape HTML text and attributes",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/escape.py"
+      ],
+      "reads": [
+        "tests/test_escape.py"
+      ],
+      "context": "Write escape_html and escape_attr in mdlite/escape.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_escape.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_escape"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "slug",
+      "title": "Heading ids: slugify and unique ids",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/slug.py"
+      ],
+      "reads": [
+        "tests/test_slug.py"
+      ],
+      "context": "Write slugify and the Slugger class in mdlite/slug.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_slug.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_slug"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "inline-code",
+      "title": "Code spans: split a line into text and code",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/inline_code.py"
+      ],
+      "reads": [
+        "tests/test_inline_code.py"
+      ],
+      "context": "Write split_code in mdlite/inline_code.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_inline_code.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_inline_code"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "inline-links",
+      "title": "Links, images and autolinks",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/inline_links.py"
+      ],
+      "reads": [
+        "tests/test_inline_links.py"
+      ],
+      "context": "Write render_links in mdlite/inline_links.py. It must not import other mdlite modules: escaping and inner rendering come in as the inner and attr arguments. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_inline_links.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_inline_links"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "inline-emphasis",
+      "title": "Strong, emphasis and strikethrough",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/inline_emphasis.py"
+      ],
+      "reads": [
+        "tests/test_inline_emphasis.py"
+      ],
+      "context": "Write render_emphasis in mdlite/inline_emphasis.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_inline_emphasis.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_inline_emphasis"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-rule",
+      "title": "Horizontal rules",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_rule.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_rule.py"
+      ],
+      "context": "Write parse in mdlite/block_rule.py, following the block contract in ARCHITECTURE.md. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_rule.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_rule"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-para",
+      "title": "Paragraphs",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_para.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_para.py"
+      ],
+      "context": "Write starts_block and parse in mdlite/block_para.py, following the block contract in ARCHITECTURE.md. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_para.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_para"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-table",
+      "title": "Pipe tables, and the table styles",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_table.py",
+        "mdlite/theme.css"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_table.py"
+      ],
+      "context": "Write split_row and parse in mdlite/block_table.py, following the block contract in ARCHITECTURE.md. Also add two rules to mdlite/theme.css and keep every rule already there: `table` with `border-collapse: collapse` and a margin, and `th, td` with a light border and some padding (a `th` background is welcome). Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_table.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_table"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-code",
+      "title": "Fenced code blocks, and the code styles",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_code.py",
+        "mdlite/theme.css"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_code.py"
+      ],
+      "context": "Write parse in mdlite/block_code.py, following the block contract in ARCHITECTURE.md. Also add two rules to mdlite/theme.css and keep every rule already there (another ticket may have added some): `pre` with `overflow-x: auto`, padding and a light background, and `code` with a monospace `font-family`. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_code.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_code"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-quote",
+      "title": "Block quotes",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_quote.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_quote.py"
+      ],
+      "context": "Write parse in mdlite/block_quote.py, following the block contract in ARCHITECTURE.md. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_quote.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_quote"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-list",
+      "title": "Bullet, numbered and task lists",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/block_list.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "tests/test_block_list.py"
+      ],
+      "context": "Write parse in mdlite/block_list.py, following the block contract in ARCHITECTURE.md. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_list.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_list"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "frontmatter",
+      "title": "Front matter: the --- header",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/frontmatter.py"
+      ],
+      "reads": [
+        "tests/test_frontmatter.py"
+      ],
+      "context": "Write split_front_matter in mdlite/frontmatter.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_frontmatter.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_frontmatter"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "toc",
+      "title": "Table of contents",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [],
+      "owns": [
+        "mdlite/toc.py"
+      ],
+      "reads": [
+        "tests/test_toc.py"
+      ],
+      "context": "Write render_toc in mdlite/toc.py. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_toc.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_toc"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "block-heading",
+      "title": "Headings with unique ids",
+      "role": "implement",
+      "model": "coder",
+      "priority": 2,
+      "depends_on": [
+        "slug"
+      ],
+      "owns": [
+        "mdlite/block_heading.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "mdlite/slug.py",
+        "tests/test_block_heading.py"
+      ],
+      "context": "Write HeadingParser.parse in mdlite/block_heading.py, following the block contract in ARCHITECTURE.md; ids come from the Slugger it is given (mdlite/slug.py). Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_block_heading.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_block_heading"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "inline",
+      "title": "The inline pipeline",
+      "role": "implement",
+      "model": "coder",
+      "priority": 3,
+      "depends_on": [
+        "escape",
+        "inline-code",
+        "inline-links",
+        "inline-emphasis"
+      ],
+      "owns": [
+        "mdlite/inline.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "mdlite/escape.py",
+        "mdlite/inline_code.py",
+        "mdlite/inline_links.py",
+        "mdlite/inline_emphasis.py",
+        "tests/test_inline.py"
+      ],
+      "context": "Write render_inline in mdlite/inline.py by putting together split_code, render_links, render_emphasis, escape_html and escape_attr as ARCHITECTURE.md's inline pipeline says. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_inline.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_inline"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "render",
+      "title": "Render a whole document",
+      "role": "implement",
+      "model": "coder",
+      "priority": 3,
+      "depends_on": [
+        "block-code",
+        "block-heading",
+        "block-rule",
+        "block-table",
+        "block-quote",
+        "block-list",
+        "block-para",
+        "inline"
+      ],
+      "owns": [
+        "mdlite/render.py"
+      ],
+      "reads": [
+        "ARCHITECTURE.md",
+        "mdlite/block_*.py",
+        "mdlite/inline.py",
+        "mdlite/slug.py",
+        "tests/test_render.py"
+      ],
+      "context": "Write render and to_html in mdlite/render.py: walk the lines and call the block parsers in the order ARCHITECTURE.md gives, with render_inline for inline text. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_render.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_render"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    },
+    {
+      "id": "cli",
+      "title": "The command line: python3 -m mdlite",
+      "role": "implement",
+      "model": "coder",
+      "priority": 4,
+      "depends_on": [
+        "render",
+        "toc",
+        "frontmatter",
+        "escape"
+      ],
+      "owns": [
+        "mdlite/__main__.py"
+      ],
+      "reads": [
+        "mdlite/render.py",
+        "mdlite/toc.py",
+        "mdlite/frontmatter.py",
+        "mdlite/escape.py",
+        "mdlite/theme.css",
+        "tests/test_cli.py"
+      ],
+      "context": "Write main in mdlite/__main__.py with argparse: read the input, split off the front matter, render, add the table of contents and the standalone page as the docstring says. Implement it exactly as its docstring says (keep the docstring), in plain Python 3 with the standard library only. The tests in tests/test_cli.py are the definition of done.",
+      "acceptance": [
+        "python3 -m unittest -v tests.test_cli"
+      ],
+      "image": "python",
+      "budget": {
+        "attempts": 4,
+        "max_tokens": 96000
+      },
+      "escalate_to": null
+    }
+  ]
+}

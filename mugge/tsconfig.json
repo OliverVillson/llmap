@@ -10,5 +10,5 @@
     "types": ["bun-types"],
     "resolveJsonModule": true
   },
-  "include": ["src", "test", "spike/*.ts", "bench"]
+  "include": ["src", "test", "spike/*.ts", "bench", "demo/*.ts"]
 }

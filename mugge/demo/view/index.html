@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Centipede crew</title>
+<style>
+/* The Console prototype's look (centipede/design/components.md): one dark terminal, green only, state carried by glyph and brightness. */
+:root{
+  --accent:#00ff41; --mid:#00c933; --deep:#0e8f32; --edge:#0b6e26;
+  --light:#6dff8f; --pale:#8dffa6; --dim:#1f9e45;
+  --bg:#010a05; --bar:#06240f;
+  --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{background:var(--bg);margin:0}
+body{font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--light);padding:16px;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+button,textarea{font:inherit;color:inherit}
+button{background:none;border:0;padding:0;cursor:pointer}
+a{color:var(--accent)}
+::selection{background:var(--accent);color:var(--bg)}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+*{scrollbar-color:var(--edge) var(--bg)}
+.wrap{max-width:1240px;margin:0 auto}
+.win{border:1px solid var(--edge);border-radius:10px;overflow:hidden}
+.wbar{display:flex;align-items:center;gap:7px;padding:9px 14px;border-bottom:1px solid var(--edge);color:var(--dim);font-size:12px}
+.wbar i{width:11px;height:11px;border-radius:50%;background:var(--edge);display:inline-block}
+.wbar i:first-child{background:var(--deep)}
+.wbar .wt{margin-left:8px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.con{padding:12px 16px 14px;display:flex;flex-direction:column;gap:14px}
+.top{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;justify-content:space-between}
+.mini{display:flex;align-items:center;gap:8px;min-width:0}
+.mk{display:block;flex:none;width:21px;height:12px;fill:var(--pale)}
+.wm{color:var(--accent);font-weight:800;letter-spacing:.22em}
+.sep{color:var(--edge)}
+.cstate{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sub{color:var(--dim)}
+.phrase{font-weight:700;color:var(--accent)}
+.phrase.calm{color:var(--light)}
+.phrase.inv{background:var(--accent);color:var(--bg);padding:0 6px}
+.badge{color:var(--dim);font-size:11px;border:1px solid var(--edge);padding:0 6px;border-radius:2px;letter-spacing:.06em}
+.status{background:var(--bar);padding:3px 10px;display:flex;flex-wrap:wrap;align-items:center;color:var(--light);font-size:12.5px}
+.status .it{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.status .it+.it::before{content:"|";color:var(--edge);margin:0 10px}
+.lbl,.dimc{color:var(--dim)}
+.pale{color:var(--pale)}
+.acc{color:var(--accent)}
+.deep{color:var(--deep)}
+.h{color:var(--pale);font-size:13px;letter-spacing:.12em;text-transform:uppercase;font-weight:700;margin:0}
+.h .n{color:var(--dim);font-weight:400;letter-spacing:0;text-transform:none;margin-left:8px}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+@media (max-width:900px){.grid2{grid-template-columns:1fr}}
+.card{border:1px solid var(--edge);border-radius:4px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.card-title{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+/* tok/s readout */
+.tps{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.tps .num{font-size:40px;font-weight:800;line-height:1;color:var(--accent)}
+.tps .num.warm{color:var(--mid)}
+.tps .num.idle{color:var(--dim)}
+.tps .num.peak{background:var(--accent);color:var(--bg);padding:0 4px}
+.tps .unit{color:var(--dim);font-size:11px}
+.spark{width:180px;height:36px}
+.spark polyline{fill:none;stroke:var(--mid);stroke-width:1.4}
+.spark line{stroke:var(--edge);stroke-width:1}
+.word{color:var(--pale);font-weight:700}
+.word.drop{background:var(--accent);color:var(--bg);padding:0 4px}
+/* the orchestrator */
+.orch{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.orch .role{font-size:18px;line-height:1;color:var(--pale)}
+.orch .body{flex:1;min-width:240px;display:flex;flex-direction:column;gap:3px}
+/* agent dots */
+.dots{display:flex;gap:4px;flex-wrap:wrap}
+.dot{min-width:30px;height:30px;padding:0 4px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--edge);border-radius:3px;color:var(--dim);font-weight:700;border-bottom-width:2px}
+.dot:hover,.dot:focus-visible{border-bottom-color:var(--accent);background:var(--bar);outline:0}
+.dot.sel{border-color:var(--accent)}
+/* agent cells */
+.agents{display:grid;grid-template-columns:repeat(auto-fill,minmax(225px,1fr));gap:8px}
+.cell{border:1px solid var(--edge);border-left:3px solid var(--edge);border-radius:3px;padding:6px 8px;text-align:left;display:flex;flex-direction:column;gap:2px;min-width:0}
+.cell:hover{background:var(--bar)}
+.cell.on{border-left-color:var(--mid)}
+.cell .r1{display:flex;justify-content:space-between;gap:8px;white-space:nowrap}
+.cell .r1>span:first-child{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.cell .id{color:var(--pale);font-weight:700}
+.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.small{font-size:12px}
+.xs{font-size:11px}
+/* glyph brightness by state */
+.g-idle,.g-queued{color:var(--dim)}
+.g-writing{color:var(--accent);animation:pulse 1.6s ease-in-out infinite}
+.g-thinking,.g-reviewing{color:var(--pale)}
+.g-checking,.g-fixing{color:var(--mid)}
+.g-waiting{color:var(--deep)}
+.g-finished{color:var(--deep)}
+.g-blocked,.g-failed,.g-skipped{background:var(--accent);color:var(--bg);padding:0 2px}
+@keyframes pulse{50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.g-writing{animation:none}}
+/* ticket board */
+.board{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+@media (max-width:1000px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:560px){.board{grid-template-columns:1fr}}
+.col{display:flex;flex-direction:column;gap:6px;min-width:0}
+.col .ch{color:var(--dim);font-size:11px;letter-spacing:.12em;text-transform:uppercase;border-bottom:1px solid var(--edge);padding-bottom:3px}
+.col .ch b{color:var(--pale);font-weight:700;letter-spacing:0}
+.tk{border:1px solid var(--edge);border-radius:3px;padding:4px 7px;text-align:left;display:flex;flex-direction:column;gap:1px;min-width:0}
+.tk:hover{background:var(--bar)}
+.tk .r1{display:flex;justify-content:space-between;gap:6px}
+.tk .tid{color:var(--light)}
+.tk.done .tid{color:var(--deep)}
+.settled{border:1px dashed var(--edge);border-radius:3px;padding:6px 8px}
+/* log */
+.log{max-height:240px;overflow:auto;font-size:12px;display:flex;flex-direction:column}
+.log div{white-space:pre-wrap;word-break:break-word}
+.log .warn{color:var(--pale)}
+.log .error{background:var(--accent);color:var(--bg)}
+/* finished card */
+.done-card{border:1px solid var(--accent);border-radius:4px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+/* buttons */
+.btn{display:inline-flex;align-items:center;color:var(--light);padding:1px 2px;white-space:nowrap;text-decoration:none}
+.btn .br{color:var(--edge)}
+.btn .key{color:var(--dim)}
+.btn:hover{background:var(--bar);color:var(--pale)}
+.btn:hover .br{color:var(--accent)}
+.btn.primary,.btn.primary .br{color:var(--accent)}
+.btn:active{background:var(--accent);color:var(--bg)}
+.btn[disabled]{color:var(--edge);cursor:default}
+.btn[disabled]:hover{background:none}
+/* agent view dialog */
+dialog{background:var(--bg);color:var(--light);border:1px solid var(--accent);border-radius:6px;padding:0;width:min(920px,calc(100vw - 32px));max-height:calc(100vh - 32px)}
+dialog::backdrop{background:#010a05e6}
+.dlg{display:flex;flex-direction:column;max-height:calc(100vh - 34px)}
+.dhead{padding:10px 14px;border-bottom:1px solid var(--edge);display:flex;justify-content:space-between;gap:10px;align-items:baseline;flex-wrap:wrap}
+.dtabs{display:flex;gap:2px;padding:6px 14px 0;border-bottom:1px solid var(--edge);flex-wrap:wrap}
+.dtab{padding:2px 10px;color:var(--light);border:1px solid transparent}
+.dtab:hover{background:var(--bar);color:var(--pale)}
+.dtab[aria-selected="true"]{background:var(--accent);color:var(--bg);font-weight:700}
+.dbody{padding:12px 14px;overflow:auto;display:flex;flex-direction:column;gap:10px}
+.kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 12px}
+.kv dt{color:var(--dim)}
+.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bar);padding:8px 10px;border-left:2px solid var(--edge);font-size:12px;max-height:420px;overflow:auto}
+.hrow{display:grid;grid-template-columns:3.5em 4.5em minmax(0,1fr) auto;gap:10px;width:100%;text-align:left;padding:3px 4px;border-bottom:1px solid var(--edge)}
+.hrow:hover{background:var(--bar)}
+.hrow[aria-expanded="true"]{background:var(--bar);border-left:2px solid var(--accent)}
+.msgh{color:var(--dim);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin-top:6px}
+textarea{width:100%;min-height:80px;background:var(--bg);border:1px solid var(--edge);color:var(--pale);padding:6px 8px;caret-color:var(--accent)}
+textarea:focus{outline:1px solid var(--accent)}
+.radio{display:flex;gap:16px;flex-wrap:wrap}
+.radio label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+input[type=radio]{accent-color:var(--accent)}
+.hint{color:var(--dim);font-size:11.5px}
+.offline{background:var(--accent);color:var(--bg);padding:0 6px;font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="win">
+    <div class="wbar"><i></i><i></i><i></i><span class="wt" id="wt">centipede · live crew</span></div>
+    <div class="con">
+      <div class="top" id="top"></div>
+      <div class="status" id="statusbar"></div>
+      <div id="finish"></div>
+      <div class="grid2">
+        <section class="card" aria-labelledby="h-orch"><div class="card-title"><h2 class="h" id="h-orch">Orchestrator</h2><span class="dimc small" id="orch-machine"></span></div><div id="orch"></div></section>
+        <section class="card" aria-labelledby="h-tps"><div class="card-title"><h2 class="h" id="h-tps">Throughput</h2><span class="dimc small" id="tps-sub"></span></div><div id="tps"></div></section>
+      </div>
+      <section class="card" aria-labelledby="h-crew">
+        <div class="card-title"><h2 class="h" id="h-crew">Code agents<span class="n" id="crew-n"></span></h2><span class="hint">Press an agent to see what it is doing now and every prompt it was sent.</span></div>
+        <div class="dots" id="dots" role="toolbar" aria-label="Agents"></div>
+        <div class="agents" id="agents"></div>
+      </section>
+      <section class="card" aria-labelledby="h-board">
+        <div class="card-title"><h2 class="h" id="h-board">Tickets<span class="n" id="board-n"></span></h2><span class="dimc small" id="plan-note"></span></div>
+        <div id="settled"></div>
+        <div class="board" id="board"></div>
+      </section>
+      <section class="card" aria-labelledby="h-log"><h2 class="h" id="h-log">Log</h2><div class="log" id="log" aria-live="polite"></div></section>
+      <div class="hint">Legend: ○ idle · ◌ queued for a slot · ● writing · ●… thinking · ●✓ checking · ●n/4 fixing · ●◇ in review · ●→ waiting · ✓ finished · [✗] failed · [!] blocked · ◉ orchestrator · ◆ lead review</div>
+    </div>
+  </div>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title"><div class="dlg" id="dlg-inner"></div></dialog>
+
+<script>
+const MINIMARK = `<svg class="mk" viewBox="0 0 21 12" aria-hidden="true" focusable="false">${[[1,2],[2,1],[2,2],[3,0],[3,1],[3,2]].map(([c,r])=>`<circle cx="${(c*5.5+2.25).toFixed(2)}" cy="${(r*4+2).toFixed(2)}" r="1.6"/>`).join('')}</svg>`;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const fmt = (n) => Math.round(n ?? 0).toLocaleString('en-US');
+const dur = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`; };
+const B = (label, key, attrs = '', cls = '') => `<button class="btn ${cls}" ${attrs}><span class="br">[</span>&nbsp;${esc(label)}${key ? `&nbsp;<span class="key">· ${esc(key)}</span>` : ''}&nbsp;<span class="br">]</span></button>`;
+
+let S = null;            // the last /api/status
+let logLines = [];       // rendered log lines
+let online = false;
+const view = { open: null, tab: 'now', hist: null, calls: [], steerWhen: 'next', steerMsg: '' };
+
+/** The console's glyph for an agent or ticket state. */
+function glyph(state, attempt, of, waitingOn) {
+  switch (state) {
+    case 'idle': return '○';
+    case 'queued': return '◌';
+    case 'writing': return '●';
+    case 'thinking': return '●…';
+    case 'checking': return '●✓';
+    case 'fixing': return `●${attempt}/${of}`;
+    case 'reviewing': return '●◇';
+    case 'waiting': return waitingOn && waitingOn.length ? `●→${waitingOn[0]}` : '●→';
+    case 'finished': case 'done': return '✓';
+    case 'failed': return '[✗]';
+    case 'blocked': return '[!]';
+    case 'skipped': return '[–]';
+    default: return '·';
+  }
+}
+const STATE_WORD = { idle: 'idle', queued: 'queued for a slot', writing: 'writing', thinking: 'thinking', checking: 'checking', fixing: 'fixing', reviewing: 'in review', waiting: 'waiting', finished: 'finished', failed: 'failed', blocked: 'blocked', skipped: 'skipped' };
+
+function digestOf(t) { return S?.demo.tickets?.[t] ?? null; }
+function inflightOf(t) { return (S?.demo.inflight ?? []).find((c) => c.ticket === t) ?? null; }
+
+// ------------------------------------------------------------------------------------------
+// Rendering
+
+function render() {
+  if (!S) return;
+  const st = S.status, d = S.demo;
+  const working = st.crew.agents.working;
+  const phase = d.orchestrator.phase;
+  const crewWord = phase === 'finished' ? 'finished' : phase === 'failed' ? 'stopped with an error' : phase === 'stopped' ? 'stopped' : ['designing', 'scaffolding', 'planning', 'starting'].includes(phase) ? 'planning' : phase === 'integrating' ? 'integrating' : working ? 'working' : 'ready';
+  $('#wt').textContent = `centipede · ${d.task} · run ${d.run}`;
+  $('#top').innerHTML = `<div class="mini">${MINIMARK}<span class="wm">CENTIPEDE</span><span class="sep">·</span><span class="trunc">${esc(d.task)}</span></div>
+    <div class="cstate"><span class="sub">crew</span><span class="phrase${['finished', 'ready'].includes(crewWord) ? ' calm' : crewWord.startsWith('stopped') ? ' inv' : ''}">${esc(crewWord)}</span>${d.fake ? '<span class="badge">mock model · rehearsal</span>' : ''}${online ? '' : '<span class="offline">view offline: retrying</span>'}</div>`;
+
+  const elapsed = st.startedAt ? (d.result || phase === 'finished' ? (d.result?.summary?.wallMs ?? st.elapsedMs) : d.now - st.startedAt) : 0;
+  const t = st.crew.tickets;
+  $('#statusbar').innerHTML = [
+    `<span class="it"><b class="acc">${fmt(st.tokS.total)}</b> <span class="lbl">tok/s</span></span>`,
+    `<span class="it"><span class="lbl">agents</span> ${working}/${st.crew.agents.total} working${st.crew.agents.queued ? `, ${st.crew.agents.queued} queued` : ''}</span>`,
+    `<span class="it"><span class="lbl">tickets</span> ${t.done}/${t.total} done${t.failed ? `, ${t.failed} failed` : ''}${t.skipped ? `, ${t.skipped} skipped` : ''}</span>`,
+    `<span class="it"><span class="lbl">calls</span> ${st.calls.calls} <span class="lbl">(${st.calls.write} write, ${st.calls.fix} fix, ${st.calls.review} review)</span></span>`,
+    `<span class="it"><span class="lbl">time</span> ${dur(elapsed)}</span>`,
+    `<span class="it"><span class="lbl">model</span> ${esc(st.settings.model ?? '?')} <span class="lbl">thinking ${esc(st.settings.thinking)}</span></span>`,
+  ].join('');
+
+  renderFinish(d);
+  renderOrchestrator(d, st);
+  renderTps(st);
+  renderAgents(st);
+  renderBoard(st, d);
+  if (view.open) renderDialog(false);
+}
+
+function renderFinish(d) {
+  const r = d.result;
+  if (!r) { $('#finish').innerHTML = ''; return; }
+  const s = r.summary;
+  const speed = s.wallMs ? (s.serialMs / s.wallMs).toFixed(1) : '?';
+  $('#finish').innerHTML = `<div class="done-card" role="status">
+    <div class="card-title"><b class="acc">${s.done}/${s.tickets} tickets done${s.failed ? `, ${s.failed} failed` : ''}${s.skipped ? `, ${s.skipped} skipped` : ''} · integration ${r.integrated ? 'green' : r.integrated === null ? 'not run' : 'not green'}</b><span class="dimc">${dur(s.wallMs)} wall · ${dur(s.serialMs)} of ticket time · ${speed}x · ${s.peakParallel} at once at the peak</span></div>
+    ${r.tests ? `<div class="small">${r.testsOk ? '<span class="acc">✓</span> the whole project\'s tests pass' : '<span class="g-failed">[✗]</span> the whole project\'s tests do not all pass'} <span class="dimc">${esc(r.tests.split('\n').filter(Boolean).slice(-2).join(' · '))}</span></div>` : ''}
+    ${r.readme ? `<div>The crew's own tool rendered the project's README: <a class="btn primary" href="/result/README.html" target="_blank" rel="noopener"><span class="br">[</span>&nbsp;Open README.html&nbsp;<span class="br">]</span></a></div>` : ''}
+    ${r.merged?.length ? `<div class="dimc xs">merged onto mugge/integration: ${esc(r.merged.join(', '))}${r.failedChecks?.length ? ` · failing after the merge: ${esc(r.failedChecks.join(', '))}` : ''}</div>` : ''}
+  </div>`;
+}
+
+function renderOrchestrator(d, st) {
+  const o = d.orchestrator;
+  const phaseWord = { starting: 'starting', designing: 'designing the project', scaffolding: 'writing the scaffold', planning: 'planning the tickets', dispatching: 'dispatching tickets and reviewing finished work', integrating: 'merging every finished ticket and running all the checks', finished: 'done', stopped: 'stopped', failed: 'stopped with an error' }[o.phase] ?? o.phase;
+  const reviewing = o.reviewing.length ? o.reviewing.map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') : '<span class="dimc">nothing right now</span>';
+  $('#orch-machine').textContent = [o.machine && `plans on ${o.machine}`, o.leadMachine && `reviews on ${o.leadMachine}`].filter(Boolean).join(' · ');
+  $('#orch').innerHTML = `<div class="orch">
+    <button class="dot" data-open="orchestrator" aria-label="Open the orchestrator's view"><span class="role">${['finished', 'stopped'].includes(o.phase) ? '◎' : '◉'}</span></button>
+    <div class="body">
+      <div><b class="pale">orchestrator</b> <span class="dimc">·</span> ${esc(phaseWord)}</div>
+      <div class="small"><span class="dimc">plan</span> ${esc(o.planNote || '…')}</div>
+      <div class="small"><span class="dimc">◆ lead review</span> ${o.reviews.approve} approved · ${o.reviews.problems} sent back${o.reviews.error ? ` · ${o.reviews.error} failed` : ''} <span class="dimc">· reading</span> ${reviewing}</div>
+      ${o.rejected?.length ? `<div class="small"><span class="dimc">its own plan was not used:</span> ${esc(o.rejected.slice(0, 2).join('; '))}${o.rejected.length > 2 ? ` (+${o.rejected.length - 2})` : ''}</div>` : ''}
+    </div></div>`;
+}
+
+let peakFlash = 0, lastPeak = 0;
+function renderTps(st) {
+  const k = st.tokS;
+  const spark = k.spark.length ? k.spark : [0];
+  const max = Math.max(1, ...spark);
+  const pts = spark.map((v, i) => `${(i / Math.max(1, spark.length - 1) * 180).toFixed(1)},${(34 - v / max * 32).toFixed(1)}`).join(' ');
+  if (k.peak > lastPeak + 0.5 && k.state === 'peak') { peakFlash = Date.now(); }
+  lastPeak = Math.max(lastPeak, k.peak);
+  const flash = Date.now() - peakFlash < 2000 && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const cls = k.state === 'idle' ? 'idle' : k.state === 'warming' ? 'warm' : flash ? 'peak' : '';
+  $('#tps-sub').textContent = st.settings.backend;
+  const machines = st.machines.map((m) => `<div class="small trunc"><span class="dimc">${esc(m.id)}</span> ${m.slotsUsed}/${m.slots} slots · ${fmt(m.tokS)} <span class="dimc">tok/s</span></div>`).join('');
+  $('#tps').innerHTML = `<div class="tps"><span class="num ${cls}">${k.state === 'idle' ? '—' : fmt(k.total)}</span><span class="unit">tok/s</span>
+    <svg class="spark" viewBox="0 0 180 36" aria-hidden="true"><line x1="0" y1="35" x2="180" y2="35"/><polyline points="${pts}"/></svg>
+    <span class="word ${k.state === 'drop' ? 'drop' : ''}">${k.state === 'warming' ? 'warming up' : k.state === 'drop' ? '▼ drop' : k.state}</span></div>
+    <div class="small"><span class="dimc">peak</span> ${fmt(k.peak)} · <span class="dimc">session</span> ${fmt(k.session)} · <span class="dimc">10 min</span> ${fmt(k.tenMinutes)}</div>${machines}`;
+}
+
+function agentNow(a) {
+  if (!a.ticket) return a.state === 'finished' ? 'done for this run' : 'no ticket';
+  return a.lastNote || STATE_WORD[a.state] || a.state;
+}
+
+function renderAgents(st) {
+  const ws = st.agents.filter((a) => a.role === 'worker');
+  $('#crew-n').textContent = `${ws.filter((a) => a.ticket && !['finished', 'failed', 'idle'].includes(a.state)).length} of ${ws.length} working`;
+  $('#dots').innerHTML = ws.map((a) => `<button class="dot ${view.open === a.id ? 'sel' : ''}" data-open="${esc(a.id)}" aria-label="${esc(a.id)}: ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` on ${esc(a.ticket)}` : ''}" title="${esc(a.id)} · ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` · ${esc(a.ticket)}` : ''}"><span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span></button>`).join('');
+  $('#agents').innerHTML = ws.map((a) => {
+    const on = a.ticket && !['finished', 'failed', 'idle'].includes(a.state);
+    return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}">
+      <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span> <span class="small">${esc(a.ticket ?? '')}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
+      <span class="small trunc ${on ? '' : 'dimc'}">${esc(STATE_WORD[a.state] ?? a.state)}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
+      <span class="xs dimc trunc">${esc(a.owns.join(' ') || '—')}</span></button>`;
+  }).join('');
+}
+
+function ticketColumn(t, dg) {
+  const s = dg?.state ?? t.state;
+  if (['finished', 'done'].includes(s) || t.state === 'done') return 'done';
+  if (['failed', 'skipped', 'blocked'].includes(s) || ['failed', 'skipped'].includes(t.state)) return 'failed';
+  if (s === 'reviewing') return 'review';
+  if (['queued', 'writing', 'thinking', 'checking', 'fixing'].includes(s) || t.state === 'running' || t.state === 'queued') return 'working';
+  return 'waiting';
+}
+
+function renderBoard(st, d) {
+  const cols = { waiting: [], working: [], review: [], done: [], failed: [] };
+  const titles = Object.fromEntries((d.plan?.tickets ?? []).map((t) => [t.id, t.title]));
+  for (const t of st.tickets) cols[ticketColumn(t, digestOf(t.id))].push(t);
+  const head = { waiting: 'Waiting', working: 'Working', review: 'In review', done: 'Done', failed: 'Failed' };
+  $('#board-n').textContent = `${st.tickets.length} tickets`;
+  $('#plan-note').textContent = d.plan ? (d.plan.source === 'orchestrator' ? 'plan written by the orchestrator' : 'prepared plan, settled by the orchestrator') : '';
+  $('#board').innerHTML = Object.entries(cols).map(([k, list]) => `<div class="col"><div class="ch">${head[k]} <b>${list.length}</b></div>${list.map((t) => {
+    const dg = digestOf(t.id);
+    const s = dg?.state ?? t.state;
+    const why = k === 'waiting' ? (t.settled ? `after ${t.dependsOn.join(', ')} (settled clash)` : t.state === 'ready' || t.error === 'waiting for a free agent' ? 'ready, waiting for a free agent' : t.dependsOn.length ? `waits on ${t.dependsOn.filter((x) => !['done'].includes(st.tickets.find((y) => y.id === x)?.state)).join(', ') || 'nothing now'}` : 'ready') : k === 'failed' ? (dg?.error ?? t.error ?? s) : k === 'done' ? (dg?.reviews?.some((r) => r.verdict === 'problems') ? 'fixed what the lead sent back' : dg?.reviews?.length ? '' : 'checks pass') : k === 'review' ? 'the lead is reading the diff' : `${STATE_WORD[s] ?? s} · attempt ${t.attempt}/${t.maxAttempts}`;
+    const agent = t.agent ? `<span class="dimc xs">${esc(t.agent)}</span>` : '';
+    return `<button class="tk ${k === 'done' ? 'done' : ''}" data-ticket="${esc(t.id)}" title="${esc(titles[t.id] ?? '')}"><span class="r1"><span class="tid trunc"><span class="g-${esc(s === 'done' ? 'finished' : s)}">${esc(glyph(s === 'done' ? 'finished' : s, t.attempt, t.maxAttempts))}</span> ${esc(t.id)}</span>${agent}</span>${why ? `<span class="xs dimc trunc">${esc(why)}</span>` : ''}</button>`;
+  }).join('')}</div>`).join('');
+  const settled = d.plan?.settled ?? [];
+  $('#settled').innerHTML = settled.length ? `<div class="settled small"><b class="pale">Settled by the orchestrator</b> ${settled.map((c) => `<span class="pale">${esc(c.ticket)}</span> runs after <span class="pale">${esc(c.with.join(', '))}</span>: both write <span class="pale">${esc(c.files.join(', '))}</span>`).join('; ')}. The later ticket starts from the earlier one's finished file.</div>` : '';
+}
+
+// ------------------------------------------------------------------------------------------
+// The log, from the engine's events
+
+function eventLine(e) {
+  const at = new Date(e.at).toTimeString().slice(0, 8);
+  switch (e.type) {
+    case 'model': return [`${e.ticket} #${e.attempt} ${e.kind}: ${fmt(e.completionTokens)} tokens${e.reasoningTokens ? ` (${fmt(e.reasoningTokens)} thinking)` : ''}${e.drop ? `, no usable file (${e.drop})` : `, ${e.files ?? 0} file${e.files === 1 ? '' : 's'}`}${e.note ? ` · ${e.note}` : ''}`, at];
+    case 'check': return [`${e.ticket} #${e.attempt} ${e.ok ? 'passes' : 'FAILS'} ${e.command}`, at, e.ok ? '' : 'warn'];
+    case 'review': return [`◆ lead ${e.verdict === 'approve' ? 'approves' : e.verdict === 'problems' ? 'sends back' : 'review failed for'} ${e.ticket}${e.problems[0] ? `: ${e.problems[0]}` : e.error ? `: ${e.error.split('\n')[0]}` : ''}`, at, e.verdict === 'approve' ? '' : 'warn'];
+    case 'finish': return [`${e.ticket} ${e.state === 'done' ? 'done' : e.state}${e.error ? `: ${e.error.split('\n')[0]}` : ''}`, at, e.state === 'done' ? '' : 'warn'];
+    case 'call_error': return [`${e.ticket} #${e.attempt} call failed: ${e.error.split('\n')[0]}`, at, 'warn'];
+    case 'refused': return [`${e.ticket} #${e.attempt} wrote files it does not own: ${e.paths.join(', ')}`, at, 'warn'];
+    case 'integrate': return [`integrate ${e.ok ? 'green' : 'FAILED'} on ${e.branch}${e.failed?.length ? `: ${e.failed.join(', ')}` : ''}`, at, e.ok ? '' : 'warn'];
+    case 'log': return [e.message, at, e.level === 'info' ? '' : e.level];
+    case 'end': return [`run over: ${e.summary.done}/${e.summary.tickets} done`, at];
+    default: return null;
+  }
+}
+function addEvent(e) {
+  const l = eventLine(e);
+  if (!l) return;
+  logLines.push(l);
+  if (logLines.length > 400) logLines = logLines.slice(-400);
+  const box = $('#log');
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  box.innerHTML = logLines.slice(-160).map(([text, at, cls]) => `<div class="${cls ?? ''}"><span class="dimc">${at}</span> ${esc(text)}</div>`).join('');
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// ------------------------------------------------------------------------------------------
+// The agent view: Now, Prompt history, Steer
+
+function subject() {
+  if (!view.open || !S) return null;
+  if (view.open === 'orchestrator') return { kind: 'orchestrator' };
+  if (view.open.startsWith('ticket:')) {
+    const id = view.open.slice(7);
+    const t = S.status.tickets.find((x) => x.id === id);
+    const a = t?.agent ? S.status.agents.find((x) => x.id === t.agent && x.ticket === id) : null;
+    return { kind: 'ticket', ticket: id, agent: a, row: t };
+  }
+  const a = S.status.agents.find((x) => x.id === view.open);
+  return a ? { kind: 'agent', agent: a, ticket: a.ticket, row: a.ticket ? S.status.tickets.find((x) => x.id === a.ticket) : null } : null;
+}
+
+async function loadCalls() {
+  const s = subject();
+  const key = s?.kind === 'orchestrator' ? 'orchestrator' : s?.ticket;
+  if (!key) { view.calls = []; return; }
+  try {
+    const r = await fetch(`/api/calls?ticket=${encodeURIComponent(key)}`);
+    view.calls = await r.json();
+  } catch { /* keep the last */ }
+}
+
+function openView(id) {
+  view.open = id;
+  view.tab = 'now';
+  view.hist = null;
+  view.steerMsg = '';
+  view.calls = [];
+  const dlg = $('#dlg');
+  renderDialog(true);
+  if (!dlg.open) dlg.showModal();
+  loadCalls().then(() => renderDialog(false));
+}
+
+function nowText(s) {
+  const d = S.demo;
+  if (s.kind === 'orchestrator') {
+    const o = d.orchestrator;
+    const inflight = d.inflight.filter((c) => c.role !== 'worker');
+    return `<dl class="kv"><dt>doing</dt><dd>${esc(o.phase)}</dd><dt>plan</dt><dd>${esc(o.planNote)}</dd>
+      <dt>reviews</dt><dd>${o.reviews.approve} approved, ${o.reviews.problems} sent back, ${o.reviews.error} failed</dd>
+      <dt>reading now</dt><dd>${esc(o.reviewing.join(', ') || 'nothing')}</dd>
+      <dt>calls in flight</dt><dd>${inflight.length ? inflight.map((c) => `${esc(c.kind)} ${esc(c.ticket)} for ${dur(d.now - c.sentAt)}`).join('; ') : 'none'}</dd>
+      <dt>settled</dt><dd>${esc((d.plan?.settled ?? []).map((c) => `${c.ticket} after ${c.with.join(', ')} (${c.files.join(', ')})`).join('; ') || 'no clashes')}</dd></dl>
+      ${o.rejected?.length ? `<div class="msgh">why its own plan was not used</div><pre>${esc(o.rejected.join('\n'))}</pre>` : ''}`;
+  }
+  const t = s.ticket, a = s.agent, row = s.row;
+  if (!t) return `<div class="dimc">${esc(a?.id)} has no ticket ${a?.state === 'finished' ? 'left: its work is done' : 'yet: it gets one when a ticket is ready'}.</div>`;
+  const dg = digestOf(t) ?? {};
+  const plan = d.plan?.tickets.find((x) => x.id === t);
+  const call = inflightOf(t);
+  const state = dg.state ?? row?.state;
+  let doing;
+  if (call) doing = `${call.role === 'worker' ? (call.kind === 'fix' ? 'writing a fix' : 'writing its files') : 'the lead is reviewing its diff'}${S.status.settings.thinking === 'on' && call.role === 'worker' ? ' (thinking first)' : ''}: call sent ${dur(d.now - call.sentAt)} ago, up to ${fmt(call.maxTokens)} tokens. Calls do not stream, so the answer shows when it is complete.`;
+  else if (state === 'checking') doing = `running its checks: ${esc(plan?.acceptance.join(' ; ') ?? '')}`;
+  else if (state === 'waiting') doing = row?.settled ? `waiting for ${esc(row.dependsOn.join(', '))} to finish (the orchestrator settled a file clash)` : row?.error === 'waiting for a free agent' ? 'ready; waiting for a free agent' : `waiting for ${esc((row?.dependsOn ?? []).join(', '))}`;
+  else if (state === 'queued') doing = 'its call waits for a free slot on the model server';
+  else if (state === 'finished') doing = `finished: checks pass${dg.reviews?.some((r) => r.verdict === 'problems') ? ', after a fix for what the lead sent back' : dg.reviews?.length ? ' and the lead approved' : ''}${dg.commit ? ` (commit ${esc(dg.commit.slice(0, 10))})` : ''}`;
+  else if (['failed', 'skipped', 'blocked'].includes(state)) doing = `${esc(state)}: ${esc(dg.error ?? row?.error ?? '')}`;
+  else doing = esc(STATE_WORD[state] ?? state ?? '');
+  const review = dg.reviews?.at(-1);
+  return `<dl class="kv"><dt>now</dt><dd>${doing}</dd>
+    <dt>ticket</dt><dd><b class="pale">${esc(t)}</b> ${esc(plan?.title ?? '')}</dd>
+    <dt>attempt</dt><dd>${row?.attempt ?? 0} of ${row?.maxAttempts ?? 4}</dd>
+    <dt>owns</dt><dd>${esc((plan?.owns ?? row?.owns ?? []).join(', '))}</dd>
+    <dt>done when</dt><dd>${esc(plan?.acceptance.join(' ; ') ?? '')}</dd>
+    ${a ? `<dt>agent</dt><dd>${esc(a.id)} on ${esc(a.machine)} · ${fmt(a.tokS)} tok/s · ${a.calls} calls</dd>` : ''}
+    ${plan?.depends_on?.length ? `<dt>after</dt><dd>${esc(plan.depends_on.join(', '))}</dd>` : ''}</dl>
+    ${dg.lastAnswer ? `<div class="msgh">last answer · attempt ${dg.lastAnswer.attempt} ${esc(dg.lastAnswer.kind)}</div><div class="small">${fmt(dg.lastAnswer.completionTokens)} tokens${dg.lastAnswer.reasoningTokens ? ` (${fmt(dg.lastAnswer.reasoningTokens)} thinking)` : ''}${dg.lastAnswer.cut ? ' · cut at the cap' : ''}${dg.lastAnswer.drop ? ` · no usable file (${esc(dg.lastAnswer.drop)})` : ` · ${dg.lastAnswer.files} file(s)`}${dg.lastAnswer.note ? ` · ${esc(dg.lastAnswer.note)}` : ''}</div>` : ''}
+    ${dg.lastCheck ? `<div class="msgh">last check · attempt ${dg.lastCheck.attempt} · ${dg.lastCheck.ok ? 'passed' : 'failed'}</div><pre>$ ${esc(dg.lastCheck.command)}\n${esc(dg.lastCheck.tail)}</pre>` : ''}
+    ${review ? `<div class="msgh">lead review · attempt ${review.attempt}</div><div class="small">${review.verdict === 'approve' ? '◆ approved' : review.verdict === 'problems' ? '◆ sent back' : '◆ review failed'}${review.problems.length ? `: ${esc(review.problems.join(' · '))}` : ''}${review.fix ? `<br><span class="dimc">fix:</span> ${esc(review.fix)}` : ''}</div>` : ''}`;
+}
+
+function historyText(s) {
+  const list = view.calls;
+  if (!list.length) return `<div class="dimc">No prompt sent yet. ${s.kind === 'orchestrator' ? 'Its calls show here as it plans and reviews.' : 'The first goes out when the ticket gets an agent and a slot.'}</div>`;
+  const rows = list.map((c) => {
+    const res = c.endAt === null ? `in flight for ${dur(S.demo.now - c.sentAt)}` : c.error ? `error: ${c.error.split('\n')[0]}` : c.kind === 'review' ? reviewVerdict(c.answer) : c.kind === 'plan' ? 'plan' : resultFor(c);
+    const open = view.hist === c.id;
+    return `<button class="hrow" data-hist="${c.id}" aria-expanded="${open}"><span class="dimc">#${c.attempt || '–'}</span><span>${esc(c.kind)}</span><span class="trunc">${s.kind === 'orchestrator' ? `${esc(c.ticket)} · ` : ''}${esc(res)}</span><span class="dimc">${fmt(c.promptTokens)} in · ${fmt(c.completionTokens)} out${c.reasoningTokens ? ` (${fmt(c.reasoningTokens)} thinking)` : ''}${c.ms ? ` · ${dur(c.ms)}` : ''}</span></button>${open ? callBody(c) : ''}`;
+  });
+  return `<div>${rows.join('')}</div><div class="hint">Each attempt is one fresh prompt: nothing carries over but what is shown here. Press a row to read the prompt as sent and the answer.</div>`;
+}
+function reviewVerdict(answer) {
+  try { const v = JSON.parse(answer); return v.verdict === 'approve' ? 'approved' : `sent back: ${v.reason ?? (v.problems ?? [])[0] ?? v.fix ?? ''}`; } catch { return 'answer did not parse'; }
+}
+function resultFor(c) {
+  const dg = digestOf(c.ticket);
+  if (dg?.lastCheck && dg.lastCheck.attempt === c.attempt) return dg.lastCheck.ok ? `checks pass` : `check failed: ${dg.lastCheck.command}`;
+  return c.cut ? 'cut at the cap' : 'answered';
+}
+function callBody(c) {
+  const msgs = (c.messages ?? []).map((m) => `<div class="msgh">${esc(m.role)}</div><pre>${esc(m.content)}</pre>`).join('');
+  const think = c.reasoning ? `<details><summary class="msgh" style="cursor:pointer">thinking · ${fmt(c.reasoning.length)} chars${c.reasoningTokens ? ` · ${fmt(c.reasoningTokens)} tokens` : ''}</summary><pre>${esc(c.reasoning)}</pre></details>` : '';
+  const ans = c.answer !== null && c.answer !== undefined ? `${think}<div class="msgh">answer</div><pre>${esc(c.answer || '(empty)')}</pre>` : c.endAt === null ? '<div class="msgh">answer</div><div class="dimc">not back yet</div>' : '';
+  return `<div style="padding:4px 0 10px 12px">${msgs}${ans}${c.error ? `<div class="msgh">error</div><pre>${esc(c.error)}</pre>` : ''}</div>`;
+}
+
+function steerText(s) {
+  if (s.kind === 'orchestrator') return '<div class="dimc">Steering talks to one code agent. Open an agent to leave it a note.</div>';
+  const t = s.ticket;
+  if (!t) return '<div class="dimc">This agent has no ticket to steer.</div>';
+  const dg = digestOf(t) ?? {};
+  const closed = ['finished', 'failed', 'skipped', 'blocked'].includes(dg.state);
+  const row = s.row;
+  const notes = (S.demo.steers ?? []).filter((x) => x.ticket === t);
+  return `<div class="card-title"><b class="pale">Steer ${esc(t)}</b><span class="dimc">${closed ? `the ticket is ${esc(dg.state)}: nothing left to steer` : `goes with attempt ${Math.min((row?.attempt ?? 0) + 1, row?.maxAttempts ?? 4)} of ${row?.maxAttempts ?? 4}`}</span></div>
+    <textarea id="steer-note" placeholder="A short note for this agent's next prompt" ${closed ? 'disabled' : ''}></textarea>
+    <div class="radio" role="radiogroup" aria-label="When">
+      <label><input type="radio" name="when" value="next" ${view.steerWhen === 'next' ? 'checked' : ''} ${closed ? 'disabled' : ''}> with its next attempt</label>
+      <label><input type="radio" name="when" value="now" ${view.steerWhen === 'now' ? 'checked' : ''} ${closed ? 'disabled' : ''}> stop this attempt and start again now</label>
+    </div>
+    <div>${B('Send note', 'ctrl ⏎', `data-act="steer" ${closed ? 'disabled' : ''}`, 'primary')}</div>
+    <div class="hint">Not wired yet: the engine has no steer path, so a note is kept in the run's steer.jsonl and shown here, but no prompt carries it and no attempt is stopped.</div>
+    ${view.steerMsg ? `<div class="pale small" role="status">${esc(view.steerMsg)}</div>` : ''}
+    ${notes.length ? `<div class="msgh">notes kept</div>${notes.map((n) => `<div class="small"><span class="dimc">${new Date(n.at).toTimeString().slice(0, 8)} · ${n.when === 'now' ? 'stop and restart' : 'next attempt'} · not delivered</span> ${esc(n.note)}</div>`).join('')}` : ''}`;
+}
+
+function renderDialog(force) {
+  const s = subject();
+  const inner = $('#dlg-inner');
+  if (!s) { inner.innerHTML = `<div class="dbody">Nothing to show.</div>`; return; }
+  // keep typing and the open prompt untouched: only redraw what changes underneath
+  const typing = document.activeElement?.id === 'steer-note';
+  const draft = $('#steer-note')?.value ?? '';
+  const scroll = $('#dlg .dbody')?.scrollTop ?? 0;
+  if (!force && view.tab === 'steer' && typing) return;
+  if (!force && view.tab === 'history' && view.hist !== null) return; // a prompt open for reading stays still
+  const title = s.kind === 'orchestrator' ? '<span class="role pale">◉</span> orchestrator' : s.kind === 'ticket' ? `ticket ${esc(s.ticket)}` : `<span class="g-${s.agent.state}">${esc(glyph(s.agent.state, s.agent.attempt, s.agent.maxAttempts))}</span> agent ${esc(s.agent.id)}`;
+  const sub = s.kind === 'orchestrator' ? esc(S.demo.orchestrator.phase) : s.agent ? `${esc(STATE_WORD[s.agent.state] ?? s.agent.state)}${s.ticket ? ` · ${esc(s.ticket)} · attempt ${s.agent.attempt}/${s.agent.maxAttempts}` : ''}` : esc(digestOf(s.ticket)?.state ?? '');
+  const tabs = [['now', 'Now'], ['history', 'Prompt history'], ['steer', 'Steer']];
+  const body = view.tab === 'now' ? nowText(s) : view.tab === 'history' ? historyText(s) : steerText(s);
+  inner.innerHTML = `<div class="dhead"><div id="dlg-title"><b class="pale">${title}</b> <span class="dimc">· ${sub}</span></div>${B('Close', 'esc', 'data-act="close"')}</div>
+    <div class="dtabs" role="tablist">${tabs.map(([k, l]) => `<button class="dtab" role="tab" aria-selected="${view.tab === k}" data-tab="${k}">${l}${k === 'history' && view.calls.length ? ` <span class="${view.tab === k ? '' : 'dimc'}">${view.calls.length}</span>` : ''}</button>`).join('')}</div>
+    <div class="dbody">${body}</div>`;
+  const ta = $('#steer-note');
+  if (ta) ta.value = draft;
+  const b = $('#dlg .dbody');
+  if (b) b.scrollTop = scroll;
+}
+
+async function sendSteer() {
+  const s = subject();
+  const note = $('#steer-note')?.value.trim();
+  if (!s?.ticket || !note) { view.steerMsg = 'Write a note first.'; renderDialog(true); return; }
+  try {
+    const r = await fetch('/api/steer', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ticket: s.ticket, note, when: view.steerWhen }) });
+    const j = await r.json();
+    view.steerMsg = j.error ? j.error : `Kept, not delivered. ${j.why}`;
+    $('#steer-note').value = '';
+  } catch {
+    view.steerMsg = 'The run is not reachable; the note was not kept.';
+  }
+  renderDialog(true);
+}
+
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-open],[data-ticket],[data-tab],[data-hist],[data-act]');
+  if (!el) return;
+  if (el.dataset.open) return openView(el.dataset.open);
+  if (el.dataset.ticket) return openView(`ticket:${el.dataset.ticket}`);
+  if (el.dataset.tab) { view.tab = el.dataset.tab; view.hist = null; if (view.tab === 'history') loadCalls().then(() => renderDialog(true)); return renderDialog(true); }
+  if (el.dataset.hist) { const id = Number(el.dataset.hist); view.hist = view.hist === id ? null : id; return renderDialog(true); }
+  if (el.dataset.act === 'close') return $('#dlg').close();
+  if (el.dataset.act === 'steer') return sendSteer();
+});
+document.addEventListener('change', (ev) => { if (ev.target.name === 'when') view.steerWhen = ev.target.value; });
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey) && document.activeElement?.id === 'steer-note') { ev.preventDefault(); sendSteer(); }
+  // arrow keys move between agent dots
+  if ((ev.key === 'ArrowRight' || ev.key === 'ArrowLeft') && document.activeElement?.classList.contains('dot')) {
+    const dots = [...document.querySelectorAll('#dots .dot')];
+    const i = dots.indexOf(document.activeElement);
+    if (i >= 0) { ev.preventDefault(); dots[(i + (ev.key === 'ArrowRight' ? 1 : dots.length - 1)) % dots.length].focus(); }
+  }
+});
+$('#dlg').addEventListener('close', () => { view.open = null; render(); });
+
+// ------------------------------------------------------------------------------------------
+// Live data: the run's stream, with a reconnect
+
+let lastCallsLoad = 0;
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.addEventListener('status', (m) => {
+    online = true;
+    S = JSON.parse(m.data);
+    render();
+    if (view.open && view.tab === 'history' && view.hist === null && Date.now() - lastCallsLoad > 1500) { lastCallsLoad = Date.now(); loadCalls().then(() => renderDialog(false)); }
+  });
+  es.addEventListener('engine', (m) => addEvent(JSON.parse(m.data)));
+  es.onerror = () => { online = false; render(); };
+}
+fetch('/api/events?last=300').then((r) => r.json()).then((list) => list.forEach(addEvent)).catch(() => {}).finally(connect);
+</script>
+</body>
+</html>
