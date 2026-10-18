@@ -161,7 +161,8 @@ class H(BaseHTTPRequestHandler):
             SLOTS.release()
         msg = {"role": "assistant", "content": content}
         if reasoning:
-            msg["reasoning_content"] = reasoning
+            # vLLM 0.31 answers with `reasoning`; `reasoning_content` is only accepted on input now
+            msg["reasoning"] = reasoning
         self.send(200, {
             "id": "chatcmpl-mock", "object": "chat.completion", "model": body["model"],
             "choices": [{"index": 0, "message": msg, "finish_reason": "length" if body.get("ignore_eos") else "stop"}],
