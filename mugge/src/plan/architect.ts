@@ -37,6 +37,8 @@ export interface Design {
   decisions: Array<{ decision: string; why: string }>;
   /** Up to three questions for the user; empty when the request is clear enough. */
   questions: string[];
+  /** What the planner settled while designing (a call asked again); not part of the model's answer. */
+  warnings?: string[];
 }
 
 export const DESIGN_JSON_SCHEMA = {
@@ -120,6 +122,8 @@ export const SPLIT_AT = 16;
 /** Answer tokens per ticket of a plan (a ticket is about 200 tokens of JSON) and per scaffolded module (a stub and its test). */
 export const TOKENS_PER_TICKET = 400;
 export const TOKENS_PER_MODULE = 1200;
+/** Every planned ticket's budget: room for 4 attempts at a 16K call cap plus the review. */
+export const PLANNED_BUDGET = { attempts: 4, max_tokens: 96_000 } as const;
 /** A plan with fewer tickets than this share of the crew is asked for again, once. */
 export const MIN_CREW_SHARE = 0.75;
 /** A plan (or a part's) where fewer than this share of its tickets can start at once is asked for again, once. */
@@ -167,12 +171,20 @@ export async function design(inf: Inference, request: string, answers: string[] 
   const user = asked + crewLine(o.crew, `Size the design for them: about ${o.crew} implementation files of similar size, one per agent, spread over components that each own a folder.${many}`);
   const messages = [{ role: 'system' as const, content: ARCHITECT_SYSTEM }, { role: 'user' as const, content: user }];
   const max = budget(inf, Math.max(8000, (o.crew ?? 0) * 150));
-  const c = await inf.complete<Design>(model, messages, DESIGN_JSON_SCHEMA, max, undefined, PLANNING);
+  const warnings: string[] = [];
+  const withWarnings = (d: Design): Design => (warnings.length ? { ...d, warnings } : d);
+  const first = await planCall<Design>(inf, model, messages, DESIGN_JSON_SCHEMA, max, 'the design', warnings);
+  if (!Array.isArray(first?.components) || !first.components.length) throw new Error('the design came back with no components');
   // a big crew on one component would scaffold and plan in one call each, which cannot fit: ask once more
-  if (!split || c.value.components.length >= 2) return c.value;
-  const again = [...messages, { role: 'assistant' as const, content: JSON.stringify(c.value) }, { role: 'user' as const, content: `That design has ${c.value.components.length} component${c.value.components.length === 1 ? '' : 's'}, too few for ${o.crew} agents. Split it into at least ${componentsFor(o.crew!)} components, each owning its own folder with about ${FILES_PER_COMPONENT} files at most, and reply with the whole design again.` }];
-  const c2 = await inf.complete<Design>(model, again, DESIGN_JSON_SCHEMA, max, undefined, PLANNING);
-  return c2.value.components.length > c.value.components.length ? c2.value : c.value;
+  if (!split || first.components.length >= 2) return withWarnings(first);
+  const again = [...messages, { role: 'assistant' as const, content: JSON.stringify(first) }, { role: 'user' as const, content: `That design has ${first.components.length} component${first.components.length === 1 ? '' : 's'}, too few for ${o.crew} agents. Split it into at least ${componentsFor(o.crew!)} components, each owning its own folder with about ${FILES_PER_COMPONENT} files at most, and reply with the whole design again.` }];
+  let second: Design | undefined;
+  try {
+    second = await planCall<Design>(inf, model, again, DESIGN_JSON_SCHEMA, max, 'the design (asked again)', warnings);
+  } catch (e) {
+    warnings.push(`the design asked again failed (${why(e)}); the first answer is kept`);
+  }
+  return withWarnings(Array.isArray(second?.components) && second.components.length > first.components.length ? second : first);
 }
 
 export function architectureMarkdown(d: Design): string {
@@ -260,26 +272,31 @@ export function salvageJson(raw: string): unknown {
 /** Pause before a planning call that failed with a server error is sent once more. */
 export let PLAN_RETRY_MS = 5_000;
 export const setPlanRetryMs = (ms: number) => { PLAN_RETRY_MS = ms; };
-/** Errors worth one more try: the server's 5xx, a dropped or refused connection, a timeout. */
-const TRANSIENT = /inference 5\d\d|fetch failed|ECONNRESET|ECONNREFUSED|socket|connection|timed? ?out|aborted due to timeout/i;
+/** Errors worth one more try: the server's 5xx, a dropped or refused connection (Bun: "Unable to connect"), a timeout. */
+const TRANSIENT = /inference 5\d\d|fetch failed|ECONNRESET|ECONNREFUSED|Unable to connect|socket|connection|timed? ?out|aborted due to timeout/i;
 
 /**
  * One planning call. An answer cut at max_tokens keeps its complete part (salvageJson) and says
  * so in `warnings`; a server error is tried once more; anything else that fails throws as before.
  */
-async function planCall<T>(client: Inference, model: string, messages: ChatMessage[], schema: object, max: number, what: string, warnings: string[], retryMs = PLAN_RETRY_MS): Promise<T> {
+async function planCall<T>(client: Inference, model: string, messages: ChatMessage[], schema: object, max: number, what: string, warnings: string[], retryMs = PLAN_RETRY_MS, tweaks: CallTweaks = PLANNING): Promise<T> {
   try {
-    return (await client.complete<T>(model, messages, schema, max, undefined, PLANNING)).value;
+    return (await client.complete<T>(model, messages, schema, max, undefined, tweaks)).value;
   } catch (e) {
     // a server error or a dropped connection with nothing back: once more after a pause, so one
     // 500 does not stop a run before its first ticket
     if (!(e as { completion?: unknown }).completion && retryMs >= 0 && TRANSIENT.test(String((e as Error)?.message ?? e))) {
       warnings.push(`${what} failed (${why(e)}); asked once more`);
       await Bun.sleep(retryMs);
-      return planCall<T>(client, model, messages, schema, max, what, warnings, -1);
+      return planCall<T>(client, model, messages, schema, max, what, warnings, -1, tweaks);
     }
     const c = (e as { completion?: Completion<string> }).completion;
     const v = c?.raw ? salvageJson(c.raw) : undefined;
+    // thought until max_tokens with no complete answer to keep: once more, thinking less
+    if ((v === undefined || typeof v !== 'object') && c?.cut && c.thinking !== false && !tweaks.reasoningEffort && thinkingOn(client)) {
+      warnings.push(`${what} ran out of tokens (cut at ${c.completionTokens}${c.reasoningChars ? `, ${c.reasoningChars} characters of thinking` : ''}) with no answer to keep; asked once more, thinking low`);
+      return planCall<T>(client, model, messages, schema, max, what, warnings, retryMs, { ...PLANNING, thinking: true, reasoningEffort: 'low' });
+    }
     if (v === undefined || typeof v !== 'object') throw e;
     warnings.push(`${what} was ${c!.cut ? `cut at ${c!.completionTokens} tokens` : 'not valid JSON'}; its complete part is kept`);
     return v as T;
@@ -563,6 +580,11 @@ export async function tickets(inf: Inference, d: Design, files: string[] | Scaff
     const left = new Set(merged.map((t) => t.id));
     raw = { interfaces: [...new Set(parts.flatMap((p) => p?.interfaces ?? []))], tickets: tidy(merged.map((t) => ({ ...t, depends_on: t.depends_on.filter((x) => left.has(x)) })), warnings) };
   }
+  // the budget is the engine's, not the model's: a guessed max_tokens of a few thousand would cut
+  // every thinking call of the ticket and fail it on its first answer
+  const guessed = raw.tickets.filter((t) => t.budget && (t.budget.attempts !== PLANNED_BUDGET.attempts || t.budget.max_tokens !== PLANNED_BUDGET.max_tokens));
+  if (guessed.length) warnings.push(`${guessed.length} tickets came with a budget of their own (smallest ${Math.min(...guessed.map((t) => Number(t.budget.max_tokens) || 0))} tokens); every ticket gets ${PLANNED_BUDGET.attempts} attempts and ${PLANNED_BUDGET.max_tokens} tokens`);
+  raw = { ...raw, tickets: raw.tickets.map((t) => ({ ...t, budget: { ...PLANNED_BUDGET } })) };
   const plan = validatePlan(raw);
   for (const [p, ids] of crowdedFiles(plan.tickets).slice(0, 3)) if (ids.length > 2) warnings.push(`${p} is owned by ${ids.length} tickets, so they run one after another`);
   if (crew) warnings.push(...planShape(plan, crew).warnings);
