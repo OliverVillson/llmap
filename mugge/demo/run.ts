@@ -196,7 +196,8 @@ const broadcast = (type: string, data: unknown) => {
 const callKind = (messages: ChatMessage[]): CallLog['kind'] =>
   messages[0]?.content === REVIEW_SYSTEM ? 'review' : /\n## Fix\nThis command failed:/.test(messages.at(-1)?.content ?? '') ? 'fix' : 'write';
 
-const brief = (c: CallLog) => ({ ...c, messages: undefined, answer: undefined, reasoning: undefined, answerChars: c.answer?.length ?? 0 });
+/** A call without its messages, thinking and answer (a review's short verdict stays): what lists and the stream carry. */
+const brief = (c: CallLog) => ({ ...c, messages: undefined, answer: c.kind === 'review' && (c.answer?.length ?? 0) <= 4000 ? c.answer : undefined, reasoning: undefined, answerChars: c.answer?.length ?? 0 });
 
 /** Records every call an agent's inference makes; in a rehearsal also gives the mock a model's pace. */
 function recorded(inf: Inference, o: CallOptions): Inference {
@@ -325,8 +326,10 @@ const emit = (e: EngineEvent) => {
         if (e.attempt) d.attempt = e.attempt;
         // a slot wait after this attempt's checks passed is the review's call waiting for a lead
         d.queuedFor = e.state !== 'queued' ? null : d.lastCheck?.ok && d.lastCheck.attempt === d.attempt && !d.reviews.some((r) => r.attempt === d.attempt) ? 'lead' : 'write';
-        if (e.state === 'reviewing' && !orchestrator.reviewing.includes(e.ticket)) orchestrator.reviewing.push(e.ticket);
-        else if (e.state !== 'queued') orchestrator.reviewing = orchestrator.reviewing.filter((x) => x !== e.ticket);
+        // a review goes reviewing, queued (for a lead slot), reviewing again: it stays on the list until it ends
+        if (e.state === 'reviewing') {
+          if (!orchestrator.reviewing.includes(e.ticket)) orchestrator.reviewing.push(e.ticket);
+        } else if (e.state !== 'queued') orchestrator.reviewing = orchestrator.reviewing.filter((x) => x !== e.ticket);
         break;
       case 'check':
         d.lastCheck = { attempt: e.attempt, command: e.command, ok: e.ok, tail: e.tail, at: e.at };
@@ -364,7 +367,7 @@ const log = (message: string, level: 'info' | 'warn' | 'error' = 'info') => {
 };
 
 // ---------------------------------------------------------------------------------------------
-// The live view: GET / (the page), /api/status, /api/stream (SSE), /api/calls?ticket=, POST /api/steer
+// The live view: GET / (the page), /api/status, /api/stream (SSE), /api/calls?ticket= (the list), /api/call?id= (one call in full), POST /api/steer
 
 const VIEW = join(DEMO_DIR, 'view', 'index.html');
 
@@ -405,7 +408,12 @@ const server = Bun.serve({
     if (p === '/api/status') return Response.json(status());
     if (p === '/api/calls') {
       const t = url.searchParams.get('ticket');
-      return Response.json(calls.filter((c) => !t || c.ticket === t || (t === 'orchestrator' && (c.role !== 'worker' || c.ticket.startsWith('orchestrator-')))));
+      // the list only: a real call carries tens of KB of messages and thinking, fetched one at a time from /api/call
+      return Response.json(calls.filter((c) => !t || c.ticket === t || (t === 'orchestrator' && (c.role !== 'worker' || c.ticket.startsWith('orchestrator-')))).map(brief));
+    }
+    if (p === '/api/call') {
+      const c = calls[Number(url.searchParams.get('id')) - 1];
+      return c ? Response.json(c) : new Response('not found', { status: 404 });
     }
     if (p === '/api/events') return Response.json(events.slice(-Number(url.searchParams.get('last') ?? 300)));
     if (p === '/api/stream') {

@@ -195,7 +195,7 @@ const B = (label, key, attrs = '', cls = '') => `<button class="btn ${cls}" ${at
 let S = null;            // the last /api/status
 let logLines = [];       // rendered log lines
 let online = false;
-const view = { open: null, tab: 'now', hist: null, calls: [], steerWhen: 'next', steerMsg: '' };
+const view = { open: null, tab: 'now', hist: null, calls: [], full: {}, steerWhen: 'next', steerMsg: '' };
 
 /** The console's glyph for an agent or ticket state. */
 function glyph(state, attempt, of, waitingOn) {
@@ -274,7 +274,9 @@ function renderOrchestrator(d, st) {
   // its parts (orchestrator-1, -2, …) plan one design component each, at the same time
   const mine = ['designing', 'scaffolding', 'planning'].includes(o.phase) ? (d.inflight ?? []).filter((c) => c.ticket === 'orchestrator' || c.ticket.startsWith('orchestrator-')) : [];
   const own = mine.length ? mine.reduce((a, b) => (a.sentAt < b.sentAt ? a : b)) : null;
-  const reviewing = o.reviewing.length ? o.reviewing.slice(0, 6).map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') + (o.reviewing.length > 6 ? ` <span class="dimc">and ${o.reviewing.length - 6} more</span>` : '') : '<span class="dimc">nothing right now</span>';
+  // a review waiting for a lead slot stays on o.reviewing while its ticket is queued: name only the ones being read
+  const reading = o.reviewing.filter((x) => digestOf(x)?.state === 'reviewing'), waitingReview = o.reviewing.length - reading.length;
+  const reviewing = (reading.length ? reading.slice(0, 6).map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') + (reading.length > 6 ? ` <span class="dimc">and ${reading.length - 6} more</span>` : '') : '<span class="dimc">nothing right now</span>') + (waitingReview ? ` <span class="dimc">· ${waitingReview} waiting for a lead</span>` : '');
   $('#orch-machine').textContent = [o.machine && `plans on ${o.machine}`, o.leadMachine && `reviews on ${o.leadMachine}`].filter(Boolean).join(' · ');
   $('#orch').innerHTML = `<div class="orch">
     <button class="dot" data-open="orchestrator" aria-label="Open the orchestrator's view"><span class="role">${['finished', 'stopped'].includes(o.phase) ? '◎' : '◉'}</span></button>
@@ -322,10 +324,11 @@ function renderAgents(st) {
   box.classList.toggle('dense', shown.length > 20);
   box.innerHTML = shown.map((a) => {
     const on = a.ticket && !['finished', 'failed', 'idle'].includes(a.state);
-    return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}">
-      <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span> <span class="small">${esc(a.ticket ?? '')}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
-      <span class="small trunc ${on ? '' : 'dimc'}">${esc(stateWord(a.state, a.ticket))}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
-      <span class="xs dimc trunc">${esc(a.owns.join(' ') || '—')}</span></button>`;
+    // the ticket gets a line of its own: in a dense grid (180px cells) it no longer shares one with the id and the rate
+    return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}" title="${esc(a.owns.join(' '))}">
+      <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
+      <span class="small trunc pale">${esc(a.ticket ?? '—')}</span>
+      <span class="xs trunc ${on ? '' : 'dimc'}">${esc(stateWord(a.state, a.ticket))}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span></button>`;
   }).join('') + (rest ? `<div class="cell"><span class="r1"><span><span class="g-idle">○</span> ${rest} idle</span></span><span class="small dimc trunc">waiting for a ready ticket</span><span class="xs dimc trunc">press a dot above to open one</span></div>` : '');
   box.scrollTop = top;
 }
@@ -405,14 +408,25 @@ function subject() {
   return a ? { kind: 'agent', agent: a, ticket: a.ticket, row: a.ticket ? S.status.tickets.find((x) => x.id === a.ticket) : null } : null;
 }
 
-async function loadCalls() {
+// the list of calls only (no messages): one request at a time, however slow the tunnel
+let callsLoading = null;
+function loadCalls() {
   const s = subject();
   const key = s?.kind === 'orchestrator' ? 'orchestrator' : s?.ticket;
-  if (!key) { view.calls = []; return; }
+  if (!key) { view.calls = []; return Promise.resolve(); }
+  if (callsLoading) return callsLoading;
+  callsLoading = fetch(`/api/calls?ticket=${encodeURIComponent(key)}`).then((r) => r.json()).then((list) => { if (view.open && subject() && (subject().kind === 'orchestrator' ? 'orchestrator' : subject().ticket) === key) view.calls = list; })
+    .catch(() => { /* keep the last */ }).finally(() => { callsLoading = null; });
+  return callsLoading;
+}
+/** One call in full (messages, thinking, answer), fetched when its row is opened; kept once it is back. */
+async function loadCall(id) {
+  const have = view.full[id];
+  if (have && have.endAt !== null) return;
   try {
-    const r = await fetch(`/api/calls?ticket=${encodeURIComponent(key)}`);
-    view.calls = await r.json();
-  } catch { /* keep the last */ }
+    const r = await fetch(`/api/call?id=${id}`);
+    if (r.ok) view.full[id] = await r.json();
+  } catch { /* shown as not loaded */ }
 }
 
 function openView(id) {
@@ -421,6 +435,7 @@ function openView(id) {
   view.hist = null;
   view.steerMsg = '';
   view.calls = [];
+  view.full = {};
   const dlg = $('#dlg');
   renderDialog(true);
   if (!dlg.open) dlg.showModal();
@@ -431,10 +446,11 @@ function nowText(s) {
   const d = S.demo;
   if (s.kind === 'orchestrator') {
     const o = d.orchestrator;
-    const inflight = d.inflight.filter((c) => c.role !== 'worker');
+    const inflight = d.inflight.filter((c) => c.role !== 'worker' || c.ticket.startsWith('orchestrator'));
     return `<dl class="kv"><dt>doing</dt><dd>${esc(o.phase)}</dd><dt>plan</dt><dd>${esc(o.planNote)}</dd>
       <dt>reviews</dt><dd>${o.reviews.approve} approved, ${o.reviews.problems} sent back, ${o.reviews.error} failed</dd>
-      <dt>reading now</dt><dd>${esc(o.reviewing.join(', ') || 'nothing')}</dd>
+      <dt>reading now</dt><dd>${esc(o.reviewing.filter((x) => digestOf(x)?.state === 'reviewing').join(', ') || 'nothing')}</dd>
+      <dt>waiting for a lead</dt><dd>${esc(o.reviewing.filter((x) => digestOf(x)?.state !== 'reviewing').join(', ') || 'none')}</dd>
       <dt>calls in flight</dt><dd>${inflight.length ? inflight.map((c) => `${esc(c.kind)} ${esc(c.ticket)} for ${dur(d.now - c.sentAt)}`).join('; ') : 'none'}</dd>
       <dt>settled</dt><dd>${esc((d.plan?.settled ?? []).map((c) => `${c.ticket} after ${c.with.join(', ')} (${c.files.join(', ')})`).join('; ') || 'no clashes')}</dd></dl>
       ${o.rejected?.length ? `<div class="msgh">why its own plan was not used</div><pre>${esc(o.rejected.join('\n'))}</pre>` : ''}`;
@@ -446,7 +462,8 @@ function nowText(s) {
   const call = inflightOf(t);
   const state = dg.state ?? row?.state;
   let doing;
-  if (call) doing = `${call.role === 'worker' ? (call.kind === 'fix' ? 'writing a fix' : 'writing its files') : 'the lead is reviewing its diff'}${S.status.settings.thinking === 'on' && call.role === 'worker' ? ' (thinking first)' : ''}: call sent ${dur(d.now - call.sentAt)} ago, up to ${fmt(call.maxTokens)} tokens. Calls do not stream, so the answer shows when it is complete.`;
+  if (call && state === 'queued') doing = `${call.role === 'worker' ? 'its call waits for a free slot on the model server' : 'its checks pass; the review waits for a free lead slot on the model server'} (waiting ${dur(d.now - call.sentAt)})`;
+  else if (call) doing = `${call.role === 'worker' ? (call.kind === 'fix' ? 'writing a fix' : 'writing its files') : 'the lead is reviewing its diff'}${S.status.settings.thinking === 'on' && call.role === 'worker' ? ' (thinking first)' : ''}: call sent ${dur(d.now - call.sentAt)} ago, up to ${fmt(call.maxTokens)} tokens. Calls do not stream, so the answer shows when it is complete.`;
   else if (state === 'checking') doing = `running its checks: ${esc(plan?.acceptance.join(' ; ') ?? '')}`;
   else if (state === 'waiting') doing = row?.settled ? `waiting for ${esc(row.dependsOn.join(', '))} to finish (the orchestrator settled a file clash)` : row?.error === 'waiting for a free agent' ? 'ready; waiting for a free agent' : `waiting for ${esc((row?.dependsOn ?? []).join(', '))}`;
   else if (state === 'queued') doing = dg.queuedFor === 'lead' ? 'its checks pass; the review waits for a free lead slot on the model server' : 'its call waits for a free slot on the model server';
@@ -472,7 +489,7 @@ function historyText(s) {
   const rows = list.map((c) => {
     const res = c.endAt === null ? `in flight for ${dur(S.demo.now - c.sentAt)}` : c.error ? `error: ${c.error.split('\n')[0]}` : c.kind === 'review' ? reviewVerdict(c.answer) : c.kind === 'plan' ? 'plan' : resultFor(c);
     const open = view.hist === c.id;
-    return `<button class="hrow" data-hist="${c.id}" aria-expanded="${open}"><span class="dimc">#${c.attempt || '–'}</span><span>${esc(c.kind)}</span><span class="trunc">${s.kind === 'orchestrator' ? `${esc(c.ticket)} · ` : ''}${esc(res)}</span><span class="dimc">${fmt(c.promptTokens)} in · ${fmt(c.completionTokens)} out${c.reasoningTokens ? ` (${fmt(c.reasoningTokens)} thinking)` : ''}${c.ms ? ` · ${dur(c.ms)}` : ''}</span></button>${open ? callBody(c) : ''}`;
+    return `<button class="hrow" data-hist="${c.id}" aria-expanded="${open}"><span class="dimc">#${c.attempt || '–'}</span><span>${esc(c.kind)}</span><span class="trunc">${s.kind === 'orchestrator' ? `${esc(c.ticket)} · ` : ''}${esc(res)}</span><span class="dimc">${fmt(c.promptTokens)} in · ${fmt(c.completionTokens)} out${c.reasoningTokens ? ` (${fmt(c.reasoningTokens)} thinking)` : ''}${c.ms ? ` · ${dur(c.ms)}` : ''}</span></button>${open ? callBody(view.full[c.id] ?? c) : ''}`;
   });
   return `<div>${rows.join('')}</div><div class="hint">Each attempt is one fresh prompt: nothing carries over but what is shown here. Press a row to read the prompt as sent and the answer.</div>`;
 }
@@ -485,6 +502,7 @@ function resultFor(c) {
   return c.cut ? 'cut at the cap' : 'answered';
 }
 function callBody(c) {
+  if (!c.messages) return '<div class="dimc" style="padding:4px 0 10px 12px">loading the prompt…</div>';
   const msgs = (c.messages ?? []).map((m) => `<div class="msgh">${esc(m.role)}</div><pre>${esc(m.content)}</pre>`).join('');
   const think = c.reasoning ? `<details><summary class="msgh" style="cursor:pointer">thinking · ${fmt(c.reasoning.length)} chars${c.reasoningTokens ? ` · ${fmt(c.reasoningTokens)} tokens` : ''}</summary><pre>${esc(c.reasoning)}</pre></details>` : '';
   const ans = c.answer !== null && c.answer !== undefined ? `${think}<div class="msgh">answer</div><pre>${esc(c.answer || '(empty)')}</pre>` : c.endAt === null ? '<div class="msgh">answer</div><div class="dimc">not back yet</div>' : '';
@@ -555,7 +573,7 @@ document.addEventListener('click', (ev) => {
   if (el.dataset.open) return openView(el.dataset.open);
   if (el.dataset.ticket) return openView(`ticket:${el.dataset.ticket}`);
   if (el.dataset.tab) { view.tab = el.dataset.tab; view.hist = null; if (view.tab === 'history') loadCalls().then(() => renderDialog(true)); return renderDialog(true); }
-  if (el.dataset.hist) { const id = Number(el.dataset.hist); view.hist = view.hist === id ? null : id; return renderDialog(true); }
+  if (el.dataset.hist) { const id = Number(el.dataset.hist); view.hist = view.hist === id ? null : id; if (view.hist !== null) loadCall(id).then(() => { if (view.hist === id) renderDialog(true); }); return renderDialog(true); }
   if (el.dataset.act === 'close') return $('#dlg').close();
   if (el.dataset.act === 'steer') return sendSteer();
 });
