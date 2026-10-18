@@ -13,14 +13,17 @@
  * The pool also keeps per-agent, per-team and per-machine tok/s and slot occupancy as plain
  * data (`snapshot()`, `subscribe()`), for the run log and status stream to read.
  */
-import { DEFAULT_SAMPLING, OpenAICompatible, checkTopK, type ChatMessage, type Completion, type CallTweaks, type Inference, type InferenceConfig, type Sampling } from './inference.ts';
+import { DEFAULT_SAMPLING, OpenAICompatible, checkEffort, checkTopK, effortsFromEnv, effortTweaks, type Effort, type ChatMessage, type Completion, type CallTweaks, type Inference, type InferenceConfig, type Sampling } from './inference.ts';
 
 /** Which kind of call a machine serves. Worker = a ticket's write and fix calls. */
 export const CALL_ROLES = ['worker', 'lead', 'manager'] as const;
 export type CallRole = (typeof CALL_ROLES)[number];
 
 export const DEFAULT_SLOTS = 12;
-export const MAX_DERIVED_SLOTS = 40;
+/** Slots a memory budget may give one machine: a B200 serving Qwen3.8-27B holds about 100 calls at 16K. */
+export const MAX_DERIVED_SLOTS = 256;
+/** Least ms between two serving snapshots sent to subscribers (the first after a quiet spell goes at once). */
+export const NOTIFY_MS = 100;
 /** Tokens one worker call needs with thinking off: a pack of up to ~10K plus a 1–2K answer. */
 export const DEFAULT_CTX_PER_CALL = 12_288;
 
@@ -84,6 +87,8 @@ export interface MachineInput {
   sampling?: Sampling;
   /** Most seconds one call may take on this machine once sent (a far cloud GPU may need more than the crew default). */
   timeout_s?: number;
+  /** How hard calls on this machine think: xhigh | medium | low | off; wins over MUGGE_REASONING_EFFORT for them. */
+  reasoning_effort?: string;
   /** What serves it: llama-server (default) gets a matching llama-server line in `mugge backends`; vllm and sglang do not. */
   server?: 'llama-server' | 'vllm' | 'sglang';
   /** A machine the crew can do without (a laptop on wifi that may be asleep): unreachable at start, it is left out instead of failing the run. */
@@ -113,6 +118,7 @@ export interface Machine {
   timeoutMs?: number;
   optional: boolean;
   server: 'llama-server' | 'vllm' | 'sglang';
+  reasoningEffort?: Effort;
   /** Things worth a look, e.g. explicit slots that overrun the memory budget. */
   warnings: string[];
 }
@@ -172,7 +178,8 @@ export function resolveMachine(raw: MachineInput, base: Sampling = {}): Machine 
   return {
     name: raw.name, url: raw.url, roles, slots: n, slotSource, ctxPerCall, cacheType,
     preset: raw.preset?.toLowerCase(), kvBytesPerToken: kv, stateBytesPerSlot: state, bytesPerSlot, memoryBytes, slotsFromMemory,
-    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, optional: raw.optional ?? false, server: raw.server ?? 'llama-server', warnings,
+    model: raw.model, apiKeyEnv: raw.api_key_env, sampling, timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined, optional: raw.optional ?? false, server: raw.server ?? 'llama-server',
+    reasoningEffort: raw.reasoning_effort === undefined ? undefined : checkEffort(raw.reasoning_effort, `${where}: reasoning_effort`), warnings,
   };
 }
 
@@ -402,6 +409,8 @@ export class BackendPool {
   private teamTokens = new Map<string, number>();
   private listeners = new Set<(s: ServingSnapshot) => void>();
   private readonly started = Date.now();
+  /** MUGGE_REASONING_EFFORT's per-role levels; a machine's own reasoning_effort wins for its calls. */
+  roleEffort: Partial<Record<CallRole, Effort>> = {};
 
   constructor(machines: Array<{ machine: Machine; client: Inference }>) {
     if (!machines.length) throw new Error('a pool needs at least one machine');
@@ -413,7 +422,7 @@ export class BackendPool {
   static fromMachines(machines: Machine[], base: InferenceConfig, env: NodeJS.ProcessEnv = process.env): BackendPool {
     // a key variable that is not set would send no key at all and come back as a bare 401
     for (const m of machines) if (m.apiKeyEnv && !env[m.apiKeyEnv]?.trim()) throw new Error(`backend ${m.name}: ${m.apiKeyEnv} is not set`);
-    return new BackendPool(machines.map((m) => ({
+    const pool = new BackendPool(machines.map((m) => ({
       machine: m,
       client: new OpenAICompatible({
         ...base,
@@ -424,6 +433,25 @@ export class BackendPool {
         timeoutMs: m.timeoutMs ?? base.timeoutMs,
       }),
     })));
+    pool.roleEffort = effortsFromEnv(env).roles;
+    return pool;
+  }
+
+  /** The effort a call of `role` goes out with on machine `m`: the machine's, else the role's; undefined leaves the config alone. */
+  effortFor(role: CallRole, m?: Machine): Effort | undefined {
+    return m?.reasoningEffort ?? this.roleEffort[role];
+  }
+
+  /**
+   * Whether calls of `role` think, for the state agents show: off when every machine serving it
+   * (or the role's level) says off, else the client's switch (MUGGE_THINKING, on by default).
+   */
+  thinksFor(role: CallRole, clientThinks: (c: Inference) => boolean): boolean {
+    const serving = this.machines.filter((m) => m.machine.roles.includes(role));
+    if (!serving.length) return false;
+    if (serving.every((m) => this.effortFor(role, m.machine) === 'off')) return false;
+    if (serving.some((m) => { const e = this.effortFor(role, m.machine); return e !== undefined && e !== 'off'; })) return true;
+    return clientThinks(serving[0]!.client);
   }
 
   /** The single-URL crew: one machine serving every role with `slots` slots (`url` is only shown). */
@@ -448,7 +476,13 @@ export class BackendPool {
     const agent = o.agent ?? role;
     const team = o.team ?? (role === 'worker' ? 'crew' : role);
     let last: string | undefined;
-    const call = async <T>(run: (c: Inference) => Promise<Completion<T>>): Promise<Completion<T>> => {
+    // the role's effort (or its machine's) under each call's own tweaks: a cut retry's thinking off wins
+    const tweaked = (m: Slotted, t?: CallTweaks): CallTweaks | undefined => {
+      const e = effortTweaks(this.effortFor(role, m.machine));
+      if (!Object.keys(e).length) return t;
+      return t?.thinkingIsDefault ? { ...t, ...e } : { ...e, ...t };
+    };
+    const call = async <T>(run: (c: Inference, m: Slotted) => Promise<Completion<T>>): Promise<Completion<T>> => {
       const rec = this.agent(agent, team, role);
       const waitStart = Date.now();
       let m = this.tryTake(role, last);
@@ -472,7 +506,7 @@ export class BackendPool {
       try {
         o.onSlot?.({ state: 'got', machine: m.machine.name, waitedMs: Date.now() - waitStart });
         this.changed();
-        const c = await run(m.client);
+        const c = await run(m.client, m);
         this.record(m.machine.name, rec, c);
         // the next call prefers this machine (prompt cache), but only once it has answered
         last = m.machine.name;
@@ -491,8 +525,8 @@ export class BackendPool {
       }
     };
     return {
-      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<T>((c) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal, tweaks)),
-      text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<string>((c) => c.text(model, messages, maxTokens, signal ?? o.signal, tweaks)),
+      complete: <T>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<T>((c, m) => c.complete<T>(model, messages, schema, maxTokens, signal ?? o.signal, tweaked(m, tweaks))),
+      text: (model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) => call<string>((c, m) => c.text(model, messages, maxTokens, signal ?? o.signal, tweaked(m, tweaks))),
     };
   }
 
@@ -507,8 +541,19 @@ export class BackendPool {
     const sum = (rs: CallRecord[], k: 'promptTokens' | 'completionTokens') => rs.reduce((n, r) => n + r[k], 0);
     const rate = (rs: CallRecord[], k: 'promptTokens' | 'completionTokens' = 'completionTokens') => round1(sum(rs, k) / windowS);
     const waitingFor = (m: Slotted) => this.waiters.filter((w) => m.machine.roles.includes(w.role)).length;
+    // one pass over the window's records, grouped: a snapshot goes out on every slot change, and
+    // filtering the records once per agent cost O(agents × records) each time at crew scale
+    const by = (key: 'machine' | 'agent' | 'team') => {
+      const g = new Map<string, CallRecord[]>();
+      for (const r of this.records) {
+        const k = r[key] as string;
+        (g.get(k) ?? g.set(k, []).get(k)!).push(r);
+      }
+      return (k: string) => g.get(k) ?? [];
+    };
+    const ofMachine = by('machine'), ofAgent = by('agent'), ofTeam = by('team');
     const machines: MachineStats[] = this.machines.map((m) => {
-      const rs = this.records.filter((r) => r.machine === m.machine.name);
+      const rs = ofMachine(m.machine.name);
       const t = this.totals.get(m.machine.name)!;
       return {
         name: m.machine.name, url: m.machine.url, roles: m.machine.roles, slots: m.machine.slots, busy: m.busy, occupancy: round1(m.busy / m.machine.slots * 100) / 100,
@@ -520,14 +565,14 @@ export class BackendPool {
       agent: a.agent, team: a.team, role: a.role, state: a.state, machine: a.machine,
       ...(a.state === 'queued' ? { queuedMs: now - a.since } : {}),
       calls: a.calls, promptTokens: a.promptTokens, completionTokens: a.completionTokens,
-      tokPerSec: rate(this.records.filter((r) => r.agent === a.agent)), lastCallTokPerSec: a.lastCallTokPerSec,
+      tokPerSec: rate(ofAgent(a.agent)), lastCallTokPerSec: a.lastCallTokPerSec,
     }));
     const teamNames = [...new Set([...agents.map((a) => a.team), ...this.teamTokens.keys()])].sort();
     const teams: TeamStats[] = teamNames.map((team) => {
       const as = agents.filter((a) => a.team === team);
       return {
         team, agents: as.length, calling: as.filter((a) => a.state === 'calling').length, queued: as.filter((a) => a.state === 'queued').length,
-        completionTokens: this.teamTokens.get(team) ?? 0, tokPerSec: rate(this.records.filter((r) => r.team === team)),
+        completionTokens: this.teamTokens.get(team) ?? 0, tokPerSec: rate(ofTeam(team)),
       };
     });
     return {
@@ -621,9 +666,27 @@ export class BackendPool {
     if (i) this.records.splice(0, i);
   }
 
-  /** Tells the listeners; one that throws (a status file that cannot be written) never reaches a call or a slot. */
+  /**
+   * Tells the listeners; one that throws (a status file that cannot be written) never reaches a
+   * call or a slot. The first change after a quiet spell goes out at once; changes within
+   * NOTIFY_MS of it go out as one trailing snapshot, so a crew of 128 agents taking and freeing
+   * slots builds a few snapshots a second, not hundreds.
+   */
+  private lastNotify = 0;
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
   private changed() {
-    if (!this.listeners.size) return;
+    if (!this.listeners.size || this.notifyTimer) return;
+    const wait = this.lastNotify + NOTIFY_MS - Date.now();
+    if (wait <= 0) return this.notify();
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      this.notify();
+    }, wait);
+    (this.notifyTimer as { unref?: () => void }).unref?.();
+  }
+
+  private notify() {
+    this.lastNotify = Date.now();
     const s = this.snapshot();
     for (const fn of this.listeners) {
       try {

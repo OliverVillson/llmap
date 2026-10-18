@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { machinesFromEnv, poolFromEnv, samplingFromEnv } from '../src/config.ts';
-import { BackendPool, describeProbe, MODEL_PRESETS, kvBytesPerToken, llamaServerArgs, probeMachines, resolveMachine, resolveMachines, usableMachines } from '../src/engine/backends.ts';
+import { BackendPool, describeProbe, MODEL_PRESETS, kvBytesPerToken, llamaServerArgs, MAX_DERIVED_SLOTS, probeMachines, resolveMachine, resolveMachines, usableMachines } from '../src/engine/backends.ts';
 import { applyEvent, emptyView, type EngineEvent } from '../src/engine/events.ts';
 import { startFakeModel } from '../src/engine/fake-model.ts';
 import { initRepo } from '../src/engine/git.ts';
@@ -39,14 +39,20 @@ describe('KV budget', () => {
     expect(gb('granite-4.2-3b')).toBeCloseTo(0.66, 1);
   });
 
-  test('slots come from memory, capped at 40; explicit slots win and warn when they overrun', () => {
+  test('slots come from memory, capped at MAX_DERIVED_SLOTS; explicit slots win and warn when they overrun', () => {
     const mini8k = resolveMachine({ name: 'laptop', url: 'http://x/v1', preset: 'minicpm5-2b', memory_gb: 5.3, ctx: 8192 });
     expect(mini8k.slotSource).toBe('memory');
     expect(mini8k.slots).toBe(28);
     expect(resolveMachine({ name: 'laptop', url: 'http://x/v1', preset: 'minicpm5-2b', memory_gb: 5.3, ctx: 16384 }).slots).toBe(14);
     const qwen = resolveMachine({ name: 'laptop', url: 'http://x/v1', preset: 'qwen3.5-2b', memory_gb: 5.3, ctx: 8192 });
     expect(qwen.slotsFromMemory).toBeGreaterThan(40);
-    expect(qwen.slots).toBe(40);
+    expect(qwen.slots).toBe(qwen.slotsFromMemory!);
+    const huge = resolveMachine({ name: 'big', url: 'http://x/v1', preset: 'qwen3.5-2b', memory_gb: 500, ctx: 8192 });
+    expect(huge.slots).toBe(MAX_DERIVED_SLOTS);
+    // a B200's 120 GB pool with Qwen3.8-27B at 16K and an fp8 cache: about a hundred calls
+    const b200 = resolveMachine({ name: 'b200', url: 'http://x/v1', preset: 'qwen3.8-27b', cache_type: 'fp8', memory_gb: 120, ctx: 16384 });
+    expect(b200.slots).toBeGreaterThan(90);
+    expect(b200.slots).toBeLessThan(MAX_DERIVED_SLOTS);
     const over = resolveMachine({ name: 'laptop', url: 'http://x/v1', preset: 'minicpm5-2b', memory_gb: 1, ctx: 16384, slots: 12 });
     expect(over.slots).toBe(12);
     expect(over.warnings[0]).toContain('fits 2');

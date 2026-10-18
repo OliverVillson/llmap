@@ -37,8 +37,11 @@
  *   MUGGE_THINKING        on | off | server (default on): sent as chat_template_kwargs.enable_thinking
  *                         on every call; server sends nothing and leaves it to the chat template
  *                         (Qwen3.8 thinks). The bench's --thinking flag is the same switch.
- *   MUGGE_REASONING_EFFORT xhigh | medium | low: sent as chat_template_kwargs.reasoning_effort
- *                         (unset: the template's default, xhigh on Qwen3.8)
+ *   MUGGE_REASONING_EFFORT how hard calls think: one level for all (medium), per kind of call
+ *                         (worker=medium,lead=xhigh,manager=xhigh), or both (low,manager=xhigh).
+ *                         Levels xhigh | medium | low go out as chat_template_kwargs.reasoning_effort;
+ *                         off sends that kind of call with thinking off. Unset: the template's
+ *                         default, xhigh on Qwen3.8. A machine's reasoning_effort wins for its calls.
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
  *                         spend in one call). The lead review writes up to this too (unset: 2,048)
@@ -52,7 +55,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { BackendPool, describeProbe, MODEL_PRESETS, PROBE_TIMEOUT_MS, probeMachines, resolveMachine, resolveMachines, usableMachines, type CallRole, type Machine, type MachineInput } from './engine/backends.ts';
-import { checkTopK, type InferenceConfig, type Sampling } from './engine/inference.ts';
+import { checkTopK, effortsFromEnv, type InferenceConfig, type Sampling } from './engine/inference.ts';
 
 function num(env: NodeJS.ProcessEnv, key: string, check: (n: number) => boolean, what: string): number | undefined {
   const v = env[key]?.trim();
@@ -98,11 +101,11 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
   if (!['response_format', 'guided_json', 'none'].includes(guided)) throw new Error('MUGGE_GUIDED must be response_format, guided_json or none');
   const thinking = env.MUGGE_THINKING?.trim().toLowerCase() || 'on';
   if (!['on', 'off', 'server'].includes(thinking)) throw new Error('MUGGE_THINKING must be on, off or server');
-  const effort = env.MUGGE_REASONING_EFFORT?.trim().toLowerCase() || undefined;
-  if (effort && !['xhigh', 'medium', 'low'].includes(effort)) throw new Error('MUGGE_REASONING_EFFORT must be xhigh, medium or low');
+  // the level for every call; per-role levels are the pool's (backends.ts)
+  const effort = effortsFromEnv(env).all;
   const kwargs: Record<string, unknown> = {
-    ...(thinking === 'server' ? {} : { enable_thinking: thinking === 'on' }),
-    ...(effort ? { reasoning_effort: effort } : {}),
+    ...(thinking === 'server' && effort !== 'off' ? {} : { enable_thinking: effort === 'off' ? false : thinking === 'on' }),
+    ...(effort && effort !== 'off' ? { reasoning_effort: effort } : {}),
   };
   const maxCall = env.MUGGE_MAX_CALL_TOKENS ? Number(env.MUGGE_MAX_CALL_TOKENS) : undefined;
   if (maxCall !== undefined && !(Number.isInteger(maxCall) && maxCall > 0)) throw new Error('MUGGE_MAX_CALL_TOKENS must be a positive integer');

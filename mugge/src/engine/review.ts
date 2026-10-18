@@ -23,8 +23,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Ticket } from '../tickets/schema.ts';
-import { git } from './git.ts';
-import type { Completion, Inference } from './inference.ts';
+import { gitAsync } from './git.ts';
+import { effortsFromEnv, type Completion, type Inference } from './inference.ts';
 import { REVIEW_JSON_SCHEMA, reviewMessages } from './prompts.ts';
 
 export interface LeadReview {
@@ -62,21 +62,29 @@ export function reviewFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return v !== 'off';
 }
 
-/** MUGGE_REVIEW_THINKING: on | off (unset: off). */
+/**
+ * MUGGE_REVIEW_THINKING: on | off. Unset: on when MUGGE_REASONING_EFFORT gives the lead a level
+ * (lead=xhigh), else off. A lead machine's own reasoning_effort also wins over the default.
+ */
 export function reviewThinkingFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.MUGGE_REVIEW_THINKING?.trim().toLowerCase();
   if (v && v !== 'on' && v !== 'off') throw new Error('MUGGE_REVIEW_THINKING must be on or off');
-  return v === 'on';
+  if (v) return v === 'on';
+  const lead = effortsFromEnv(env).roles.lead;
+  return lead !== undefined && lead !== 'off';
 }
+
+/** Most tokens a thinking review may write when MUGGE_MAX_CALL_TOKENS is unset. */
+export const REVIEW_THINKING_MAX_TOKENS = 16_384;
 
 /**
  * Most tokens the review may write: MUGGE_MAX_CALL_TOKENS when it is set, so a lead thinking
  * before its answer is not cut at 2,048 (Oliver, 2026-10-16); else REVIEW_MAX_TOKENS. The
  * ticket's tokens left still bound it.
  */
-export function reviewCapFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+export function reviewCapFromEnv(env: NodeJS.ProcessEnv = process.env, thinking = false): number {
   const v = env.MUGGE_MAX_CALL_TOKENS?.trim();
-  if (!v) return REVIEW_MAX_TOKENS;
+  if (!v) return thinking ? REVIEW_THINKING_MAX_TOKENS : REVIEW_MAX_TOKENS;
   const n = Number(v);
   if (!(Number.isInteger(n) && n > 0)) throw new Error('MUGGE_MAX_CALL_TOKENS must be a positive integer');
   return n;
@@ -95,7 +103,7 @@ export function snapshot(worktree: string, paths: string[]): Snapshot {
  * A unified diff (git's format, `a/` and `b/` paths) of the owned files from `before` to their
  * state in the worktree. Works in any folder, git repo or not (the bench's are not).
  */
-export function diffOwned(worktree: string, before: Snapshot): string {
+export async function diffOwned(worktree: string, before: Snapshot): Promise<string> {
   const after = snapshot(worktree, Object.keys(before));
   const changed = Object.keys(before).filter((p) => before[p] !== after[p]);
   if (!changed.length) return '';
@@ -109,7 +117,7 @@ export function diffOwned(worktree: string, before: Snapshot): string {
         writeFileSync(join(tmp, side, p), snap[p]!);
       }
     }
-    const r = git(tmp, ['diff', '--no-index', '--no-color', '--no-prefix', '--', 'a', 'b']);
+    const r = await gitAsync(tmp, ['diff', '--no-index', '--no-color', '--no-prefix', '--', 'a', 'b']);
     // git diff --no-index exits 1 when the trees differ
     if (r.code > 1) throw new Error(r.out);
     return r.out.length > MAX_DIFF_CHARS ? r.out.slice(0, MAX_DIFF_CHARS) + '\n…(truncated)' : r.out;
@@ -170,7 +178,8 @@ export async function review(inference: Inference, model: string, input: ReviewI
   const messages = reviewMessages(input.ticket, input.diff, checks);
   let c: Completion<unknown>;
   try {
-    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, cap), undefined, { thinking });
+    // thinking off is the review's default only: a lead's effort (MUGGE_REASONING_EFFORT lead=…, or its machine's) wins
+    c = await inference.complete<unknown>(model, messages, REVIEW_JSON_SCHEMA, Math.min(maxTokens, cap), undefined, { thinking, thinkingIsDefault: true });
   } catch (e) {
     // an answer that came back but is not JSON (most often cut at the cap) still cost its tokens
     const got = (e as { completion?: Completion<string> }).completion;

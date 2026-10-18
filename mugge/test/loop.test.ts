@@ -508,15 +508,15 @@ describe('runTicket', () => {
   });
 });
 
-test('diffOwned diffs the owned files from their start, in any folder', () => {
+test('diffOwned diffs the owned files from their start, in any folder', async () => {
   const wt = join(dir, 'diff');
   mkdirSync(join(wt, 'src'), { recursive: true });
   writeFileSync(join(wt, 'src/m.ts'), 'x\ny\n');
   const before = snapshot(wt, ['src/m.ts', 'new.py', 'gone.txt']);
-  expect(diffOwned(wt, before)).toBe('');
+  expect(await diffOwned(wt, before)).toBe('');
   writeFileSync(join(wt, 'src/m.ts'), 'x\nz\n');
   writeFileSync(join(wt, 'new.py'), 'print(1)\n');
-  const d = diffOwned(wt, before);
+  const d = await diffOwned(wt, before);
   expect(d).toContain('--- a/src/m.ts\n+++ b/src/m.ts\n@@ -1,2 +1,2 @@\n x\n-y\n+z');
   expect(d).toContain('--- /dev/null\n+++ b/new.py');
 });

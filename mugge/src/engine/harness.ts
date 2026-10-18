@@ -121,9 +121,9 @@ export function applyOutput(worktree: string, ticket: Ticket, out: WorkerOutput)
 export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessContext): Promise<TicketResult> {
   const r: TicketResult = { ok: false, attempts: 0, firstTry: false, error: null, promptTokens: 0, completionTokens: 0, inferenceMs: 0, checkMs: 0, model: ticket.model, review: null, reviewUnresolved: false, answerAttempt: null };
   const reviewOn = ctx.review ?? reviewFromEnv();
-  const reviewCap = ctx.reviewMaxTokens ?? (reviewOn ? reviewCapFromEnv() : 0);
   const thinking = ctx.thinking ?? thinkingOn(ctx.inference);
   const reviewThinking = ctx.reviewThinking ?? (reviewOn ? reviewThinkingFromEnv() : false);
+  const reviewCap = ctx.reviewMaxTokens ?? (reviewOn ? reviewCapFromEnv(process.env, reviewThinking) : 0);
   const cutRetry = ctx.cutRetry ?? cutRetryFromEnv();
   // a thinking call of this ticket ran out of tokens: its later calls go out with thinking off
   let noThink = false;
@@ -164,7 +164,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   };
 
   const reviewOnce = async (attempt: number, checks: Array<{ command: string; output: string }>, spent: number) => {
-    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent, reviewCap, reviewThinking);
+    const rv = await leadReview(ctx.reviewInference ?? ctx.inference, ctx.reviewModel ?? 'lead', { ticket, diff: await diffOwned(worktree, before), checks }, ticket.budget.max_tokens - spent, reviewCap, reviewThinking);
     r.promptTokens += rv.promptTokens;
     r.completionTokens += rv.completionTokens;
     r.inferenceMs += rv.ms;

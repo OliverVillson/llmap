@@ -680,6 +680,8 @@ export class Telemetry {
 
   /** The backend pool's latest numbers (BackendPool.subscribe): real slot use per machine. */
   serving(s: ServingSnapshot): void {
+    // the pool's trailing snapshot can land after close(); the final status stays as written
+    if (this.ended) return;
     this.pool = s;
     for (const m of s.machines)
       if (!this.crew.machines.some((x) => x.id === m.name)) this.crew.machines.push({ id: m.name, slots: m.slots, backend: backendLabel(m.url), url: m.url, memoryBytes: m.memoryBytes, perAgentBytes: m.bytesPerSlot });

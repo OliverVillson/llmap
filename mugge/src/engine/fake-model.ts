@@ -35,6 +35,10 @@ export interface FakeOptions {
    */
   qwen?: boolean;
   latencyMs?: number;
+  /** Think time of review calls (default latencyMs): a real review writes a short JSON answer. */
+  reviewLatencyMs?: number;
+  /** Completion tokens every answer reports (default: about a quarter of its characters). */
+  completionTokens?: number;
   port?: number;
   /** Ticket id → the answers to its review calls, in order (the last one repeats). */
   reviews?: Record<string, LeadReview[]>;
@@ -67,6 +71,9 @@ export function startFakeModel(o: FakeOptions) {
   const seen = new Map<string, number>(), reviewed = new Map<string, number>(), fixed = new Map<string, number>();
   const calls: FakeCall[] = [];
   let inFlight = 0, peakInFlight = 0, requests = 0;
+  // ms each kind of call spent inside the fake, summed: worker (write, fix, json) and review
+  const busyMs: Record<string, number> = {};
+  const used = (s: string) => o.completionTokens ?? approxTokens(s);
   const server = Bun.serve({
     port: o.port ?? 0,
     hostname: '127.0.0.1',
@@ -77,6 +84,8 @@ export function startFakeModel(o: FakeOptions) {
       requests++;
       inFlight++;
       peakInFlight = Math.max(peakInFlight, inFlight);
+      const began = performance.now();
+      let kindOf = 'worker';
       try {
         const body: any = await req.json();
         const prompt: string = body.messages?.map((m: any) => m.content).join('\n') ?? '';
@@ -85,7 +94,9 @@ export function startFakeModel(o: FakeOptions) {
         const isFix = !isReview && /\n## Fix\n/.test(prompt);
         const thinking = body.chat_template_kwargs?.enable_thinking;
         calls.push({ ticket: id, kind: isReview ? 'review' : body.response_format || body.guided_json ? 'json' : isFix ? 'fix' : 'write', maxTokens: body.max_tokens, prompt, ...(typeof thinking === 'boolean' ? { thinking } : {}) });
-        if (o.latencyMs) await Bun.sleep(o.latencyMs);
+        if (isReview) kindOf = 'review';
+        const wait = isReview ? (o.reviewLatencyMs ?? o.latencyMs) : o.latencyMs;
+        if (wait) await Bun.sleep(wait);
         if (isReview) {
           const k = reviewed.get(id) ?? 0;
           reviewed.set(id, k + 1);
@@ -95,7 +106,7 @@ export function startFakeModel(o: FakeOptions) {
           return Response.json({
             id: `fake-${requests}`, object: 'chat.completion', model: body.model,
             choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }],
-            usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(content), total_tokens: approxTokens(prompt) + approxTokens(content) },
+            usage: { prompt_tokens: approxTokens(prompt), completion_tokens: used(content), total_tokens: approxTokens(prompt) + used(content) },
           });
         }
         const n = (seen.get(id) ?? 0) + 1;
@@ -135,16 +146,17 @@ export function startFakeModel(o: FakeOptions) {
           object: 'chat.completion',
           model: body.model,
           choices: [{ index: 0, finish_reason: finish, message: { role: 'assistant', content, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) }, ...(forced ? { forced } : {}) }],
-          usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(content), total_tokens: approxTokens(prompt) + approxTokens(content) },
+          usage: { prompt_tokens: approxTokens(prompt), completion_tokens: used(content), total_tokens: approxTokens(prompt) + used(content) },
         });
       } finally {
         inFlight--;
+        busyMs[kindOf] = (busyMs[kindOf] ?? 0) + performance.now() - began;
       }
     },
   });
   return {
     url: `http://127.0.0.1:${server.port}/v1`,
-    stats: () => ({ requests, peakInFlight }),
+    stats: () => ({ requests, peakInFlight, busyMs: { ...busyMs } }),
     calls: () => calls,
     stop: () => server.stop(true),
   };

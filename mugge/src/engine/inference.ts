@@ -43,6 +43,46 @@ export interface Completion<T> {
 export interface CallTweaks {
   /** Sent as chat_template_kwargs.enable_thinking for this call only (the harness turns it off after a thinking call ran out of tokens). */
   thinking?: boolean;
+  /** Sent as chat_template_kwargs.reasoning_effort for this call only (a role's effort, backends.ts). */
+  reasoningEffort?: ReasoningEffort;
+  /** `thinking` is only the caller's default (the lead review's off): a role's or machine's effort wins over it. */
+  thinkingIsDefault?: boolean;
+}
+
+/** Qwen3.8's reasoning_effort levels. */
+export const REASONING_EFFORTS = ['xhigh', 'medium', 'low'] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+/** How hard one kind of call thinks: a reasoning_effort level, or off (no thinking at all). */
+export type Effort = ReasoningEffort | 'off';
+export type CallRoleName = 'worker' | 'lead' | 'manager';
+
+/** The call settings an effort means. */
+export function effortTweaks(e: Effort | undefined): CallTweaks {
+  if (!e) return {};
+  return e === 'off' ? { thinking: false } : { thinking: true, reasoningEffort: e };
+}
+
+export function checkEffort(v: unknown, where: string): Effort {
+  if (typeof v === 'string' && ([...REASONING_EFFORTS, 'off'] as string[]).includes(v.trim().toLowerCase())) return v.trim().toLowerCase() as Effort;
+  throw new Error(`${where} must be xhigh, medium, low or off (got ${JSON.stringify(v)})`);
+}
+
+/**
+ * MUGGE_REASONING_EFFORT: one level for every call (`medium`), or levels per kind of call
+ * (`worker=medium,lead=xhigh,manager=xhigh`), or both (`low,manager=xhigh`). Levels are xhigh,
+ * medium, low, or off (that kind of call does not think).
+ */
+export function effortsFromEnv(env: Record<string, string | undefined> = process.env): { all?: Effort; roles: Partial<Record<CallRoleName, Effort>> } {
+  const raw = env.MUGGE_REASONING_EFFORT?.trim();
+  const out: { all?: Effort; roles: Partial<Record<CallRoleName, Effort>> } = { roles: {} };
+  if (!raw) return out;
+  for (const part of raw.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const [k, v] = part.includes('=') ? part.split('=', 2).map((x) => x.trim().toLowerCase()) : [undefined, part];
+    if (k === undefined) out.all = checkEffort(v, 'MUGGE_REASONING_EFFORT');
+    else if (k === 'worker' || k === 'lead' || k === 'manager') out.roles[k] = checkEffort(v, `MUGGE_REASONING_EFFORT ${k}`);
+    else throw new Error(`MUGGE_REASONING_EFFORT: ${k} is not worker, lead or manager`);
+  }
+  return out;
 }
 
 /**
@@ -159,7 +199,11 @@ export class OpenAICompatible implements Inference {
   private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks): Promise<Completion<string>> {
     const started = performance.now();
     const cap = this.cfg.maxCallTokens;
-    const kwargs = { ...(this.cfg.extra?.chat_template_kwargs as Record<string, unknown> | undefined), ...(typeof opts?.thinking === 'boolean' ? { enable_thinking: opts.thinking } : {}) };
+    const kwargs = {
+      ...(this.cfg.extra?.chat_template_kwargs as Record<string, unknown> | undefined),
+      ...(typeof opts?.thinking === 'boolean' ? { enable_thinking: opts.thinking } : {}),
+      ...(opts?.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
+    };
     // the sampling set follows whether this call thinks: a cut retry with thinking off gets the non-thinking set
     const thinks = typeof kwargs.enable_thinking === 'boolean' ? kwargs.enable_thinking : undefined;
     const body: Record<string, unknown> = {

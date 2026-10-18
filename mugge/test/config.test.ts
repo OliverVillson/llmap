@@ -8,7 +8,7 @@ describe('thinking switch, per-call cap and debug line', () => {
     expect(inferenceFromEnv({ MUGGE_THINKING: 'server' }).extra).toBeUndefined();
     expect(inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'Medium' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: true, reasoning_effort: 'medium' } });
     expect(inferenceFromEnv({ MUGGE_THINKING: 'server', MUGGE_REASONING_EFFORT: 'low' }).extra).toEqual({ chat_template_kwargs: { reasoning_effort: 'low' } });
-    expect(() => inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'max' })).toThrow(/xhigh, medium or low/);
+    expect(() => inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'max' })).toThrow(/xhigh, medium, low or off/);
     expect(inferenceFromEnv({ MUGGE_THINKING: 'off' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: false } });
     expect(inferenceFromEnv({ MUGGE_THINKING: 'ON' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: true } });
     expect(() => inferenceFromEnv({ MUGGE_THINKING: 'maybe' })).toThrow();

@@ -69,8 +69,8 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   });
   // The lead review goes to a machine serving leads when the crew has one; same model either way.
   const reviewRole = pool.slotsFor('lead') > 0 ? 'lead' : 'worker';
-  // whether worker calls think, for the state they show: the machines' clients carry the switch
-  const thinking = thinkingOn(pool.machines.find((m) => m.machine.roles.includes('worker'))?.client ?? pool.machines[0].client);
+  // whether worker calls think, for the state they show: the role's effort, else the machines' clients' switch
+  const thinking = pool.thinksFor('worker', thinkingOn);
   const author = o.author ?? DEFAULT_AUTHOR;
   const wt = new Worktrees(o.repo, o.worktreeRoot, author);
   const started = Date.now();
@@ -79,7 +79,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
   const agents: Array<string | null> = Array.from({ length: o.concurrency }, () => null);
   const shown = new Map<string, string>(); // ticket → its last state before it runs, so each change is emitted once
   const waitState = (t: Ticket, state: 'waiting' | 'blocked' | 'failed', extra: { reason?: string; waitingOn?: string[] } = {}) => {
-    const key = JSON.stringify([state, extra]);
+    const key = `${state}\u0000${extra.reason ?? ''}\u0000${extra.waitingOn?.join(',') ?? ''}`;
     if (shown.get(t.id) === key) return;
     shown.set(t.id, key);
     emit({ type: 'state', at: Date.now(), ticket: t.id, state, attempt: 0, of: t.budget.attempts * (t.escalate_to ? 2 : 1), ...extra });
@@ -139,7 +139,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
         let path: string;
         try {
           // every dependency that finished (a settled owner that failed has nothing to bring)
-          path = wt.create(t.id, branch, o.base, t.depends_on.filter((d) => states.get(d) === 'done').map(branchFor));
+          path = await wt.createAsync(t.id, branch, o.base, t.depends_on.filter((d) => states.get(d) === 'done').map(branchFor));
         } catch (e) {
           // the finally below still frees the agent number, or the next ticket would get agent -1
           finish(t.id, 'failed', { error: String((e as Error).message) });
@@ -149,7 +149,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
         const r = await runTicket(t, path, { plan: o.plan, inference: agentFor(t, 'worker', onSlot), reviewInference: agentFor(t, reviewRole, onSlot), sandbox: o.sandbox, emit: forAgent, memory: o.memory, checkTimeoutMs: o.checkTimeoutMs, signal: o.signal, thinking });
         results.set(t.id, r);
         if (r.ok) {
-          const commit = wt.commit(path, t.owns, t.title) ?? undefined;
+          const commit = (await wt.commitAsync(path, t.owns, t.title)) ?? undefined;
           finish(t.id, 'done', { commit });
         } else {
           finish(t.id, 'failed', { error: r.error ?? 'failed' });
@@ -159,7 +159,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       } finally {
         serialMs += Date.now() - t0;
         agents[agent] = null;
-        wt.remove(t.id);
+        await wt.removeAsync(t.id).catch(() => {});
         pool.retire(t.id);
       }
     })();
@@ -182,6 +182,9 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
       }
     }
     if (!o.signal?.aborted) {
+      // files held by running tickets, kept up to date as this pass starts tickets (one scan per
+      // pass, not one per waiting ticket: 1,000 tickets made that a million checks per ticket end)
+      const busy = ownedByRunning();
       for (const t of tickets) {
         if (states.get(t.id) !== 'waiting') continue;
         const deps = pending(t);
@@ -190,7 +193,6 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
           waitState(t, 'waiting', { waitingOn: deps, ...(s && s.with.some((d) => deps.includes(d)) ? { reason: settledReason(s) } : {}) });
           continue;
         }
-        const busy = ownedByRunning();
         if (t.owns.some((p) => busy.has(p))) {
           const holders = tickets.filter((x) => states.get(x.id) === 'running' && x.owns.some((p) => t.owns.includes(p))).map((x) => x.id);
           waitState(t, 'waiting', { reason: 'a running ticket holds one of its files', waitingOn: holders });
@@ -201,6 +203,7 @@ export async function runPlan(o: RunOptions): Promise<RunReport> {
           continue;
         }
         start(t);
+        for (const p of t.owns) busy.add(p);
       }
     }
     if (running.size === 0) break;

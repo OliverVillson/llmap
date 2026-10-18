@@ -91,8 +91,22 @@ cp -r spike/project /tmp/spike-repo && bun src/cli.ts run spike/plan.json --repo
 The smoke writes `runs/smoke-<time>/calls.jsonl` (one line per call: tokens, cut, thinking),
 `status.json` and `smoke.json`; `bun src/cli.ts status <run dir> --watch` follows a crew run.
 Add `MUGGE_REVIEW=on` to the smoke to score with the lead review, `MUGGE_DEBUG_CALLS=1` for one
-line per call on stderr, `MUGGE_REASONING_EFFORT=medium` for shorter thinking, `--thinking off`
-for the fastest run. Without a GPU, `bun bench/smoke.ts --fake --fake-qwen` runs the same path
+line per call on stderr, `--thinking off` for the fastest run.
+
+Speed levers, first to try first:
+
+- `MUGGE_REASONING_EFFORT=worker=medium,lead=xhigh,manager=xhigh` sets how hard each kind of call
+  thinks (`off` for no thinking). Use one level for everything (`medium`), or give a machine in
+  `MUGGE_BACKENDS` its own `"reasoning_effort"`. A lead with a level reviews with thinking on, and
+  a thinking review's cap is `MUGGE_MAX_CALL_TOKENS`, else 16,384.
+- Run more agents than worker slots, e.g. `MUGGE_CONCURRENCY=80` on 64 slots. While some agents
+  run checks, wait for a review or set up a worktree, others keep the slots decoding.
+- Give the lead about one slot for every eight worker slots. Reviews are short, but a ticket waits
+  for its review while it holds its agent.
+
+`bun bench/scale.ts --agents 80 --slots 64 --tickets 768 --latency 5000` measures the engine at
+crew size against the fake model: how busy the slots stay, event-loop stalls, CPU per call and
+log sizes. Without a GPU, `bun bench/smoke.ts --fake --fake-qwen` runs the same path
 against the fake model answering the way Qwen does.
 
 ## Commands

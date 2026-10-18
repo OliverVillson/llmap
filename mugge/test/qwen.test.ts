@@ -8,10 +8,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runSmoke } from '../bench/smoke.ts';
-import { inferenceFromEnv } from '../src/config.ts';
-import { resolveMachine } from '../src/engine/backends.ts';
+import { inferenceFromEnv, machinesFromEnv } from '../src/config.ts';
+import { BackendPool, resolveMachine } from '../src/engine/backends.ts';
 import { parseFiles, stripThinking } from '../src/engine/files.ts';
-import { OpenAICompatible, parseJsonAnswer } from '../src/engine/inference.ts';
+import { effortsFromEnv, OpenAICompatible, parseJsonAnswer } from '../src/engine/inference.ts';
+import { reviewCapFromEnv, reviewThinkingFromEnv } from '../src/engine/review.ts';
 import { classifyAnswer } from '../src/engine/telemetry.ts';
 
 describe('thinking inside content', () => {
@@ -83,3 +84,53 @@ test('the smoke meets the bar on the fake model answering the way Qwen3.8 does',
     rmSync(out, { recursive: true, force: true });
   }
 }, 120_000);
+
+describe('thinking effort per role', () => {
+  test('MUGGE_REASONING_EFFORT: one level, levels per role, or both', () => {
+    expect(effortsFromEnv({})).toEqual({ roles: {} });
+    expect(effortsFromEnv({ MUGGE_REASONING_EFFORT: 'Medium' })).toEqual({ all: 'medium', roles: {} });
+    expect(effortsFromEnv({ MUGGE_REASONING_EFFORT: 'worker=off, lead=xhigh,manager=xhigh' })).toEqual({ roles: { worker: 'off', lead: 'xhigh', manager: 'xhigh' } });
+    expect(effortsFromEnv({ MUGGE_REASONING_EFFORT: 'low,manager=xhigh' })).toEqual({ all: 'low', roles: { manager: 'xhigh' } });
+    expect(() => effortsFromEnv({ MUGGE_REASONING_EFFORT: 'coder=low' })).toThrow(/worker, lead or manager/);
+    expect(() => effortsFromEnv({ MUGGE_REASONING_EFFORT: 'worker=max' })).toThrow(/xhigh, medium, low or off/);
+    // off for everything turns thinking off, whatever MUGGE_THINKING says
+    expect(inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'off' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: false } });
+    expect(inferenceFromEnv({ MUGGE_REASONING_EFFORT: 'worker=medium' }).extra).toEqual({ chat_template_kwargs: { enable_thinking: true } });
+  });
+
+  test('each role\'s calls carry its level; a machine\'s own level wins; the cut retry still turns thinking off', async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ port: 0, fetch: async (req) => (bodies.push(await req.json()), Response.json({ choices: [{ message: { content: '{"verdict":"approve","reason":""}' }, finish_reason: 'stop' }], usage: {} })) });
+    const url = `${server.url}v1`;
+    const env = { MUGGE_REASONING_EFFORT: 'worker=medium,lead=xhigh,manager=low', MUGGE_BACKENDS: JSON.stringify([
+      { name: 'w', url, roles: ['worker'], slots: 4 },
+      { name: 'l', url, roles: ['lead'], slots: 1 },
+      { name: 'm', url, roles: ['manager'], slots: 1, reasoning_effort: 'off' },
+    ]) };
+    try {
+      const pool = BackendPool.fromMachines(machinesFromEnv(env), inferenceFromEnv({ ...env, MUGGE_INFERENCE_URL: url }), env);
+      const msgs = [{ role: 'user' as const, content: 'hi' }];
+      await pool.forAgent({ role: 'worker' }).text('coder', msgs, 10);
+      await pool.forAgent({ role: 'worker' }).text('coder', msgs, 10, undefined, { thinking: false });
+      // the review's thinking off is only a default: the lead's level wins
+      await pool.forAgent({ role: 'lead' }).complete('lead', msgs, {}, 10, undefined, { thinking: false, thinkingIsDefault: true });
+      await pool.forAgent({ role: 'manager' }).complete('architect', msgs, {}, 10);
+      const kw = bodies.map((b) => b.chat_template_kwargs);
+      expect(kw[0]).toEqual({ enable_thinking: true, reasoning_effort: 'medium' });
+      expect(kw[1]).toMatchObject({ enable_thinking: false });
+      expect(kw[2]).toEqual({ enable_thinking: true, reasoning_effort: 'xhigh' });
+      expect(kw[3]).toEqual({ enable_thinking: false });
+      // and the sampling follows: the cut retry and the manager go out with the non-thinking set
+      expect(bodies.map((b) => b.temperature)).toEqual([1, 0.7, 1, 0.7]);
+      expect(pool.thinksFor('worker', () => false)).toBe(true);
+      expect(pool.thinksFor('manager', () => true)).toBe(false);
+    } finally {
+      server.stop(true);
+    }
+    expect(reviewThinkingFromEnv({ MUGGE_REASONING_EFFORT: 'lead=xhigh' })).toBe(true);
+    expect(reviewThinkingFromEnv({ MUGGE_REASONING_EFFORT: 'lead=xhigh', MUGGE_REVIEW_THINKING: 'off' })).toBe(false);
+    expect(reviewThinkingFromEnv({ MUGGE_REASONING_EFFORT: 'lead=off' })).toBe(false);
+    expect(reviewCapFromEnv({}, true)).toBe(16_384);
+    expect(reviewCapFromEnv({}, false)).toBe(2048);
+  });
+});
