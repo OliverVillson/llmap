@@ -74,6 +74,8 @@ if (existsSync(repo)) die(`${repo} exists already; pick another --out`);
 // The model: the mock (a rehearsal with the reference answers) or the crew's machines
 
 let fakeSpeed = 1;
+/** How long the mock server holds each call, so the call has its slot for most of its pace. */
+const FAKE_HOLD_MS = () => Math.round(10_000 / fakeSpeed);
 let stopFake: (() => void) | null = null;
 if (opt.fake) {
   if (opt.prompt) die('--fake only knows the built-in task: it answers with demo/reference');
@@ -83,6 +85,8 @@ if (opt.fake) {
     solutions: referenceAnswers(loadPlan()),
     // a first answer with no file (the fix loop runs) and one send-back by the lead
     flaky: ['block-list'],
+    // most of a call's pace is spent inside the server, so the pool shows the slot busy as with vLLM
+    latencyMs: FAKE_HOLD_MS(),
     reviews: { 'block-quote': [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
   });
   stopFake = fake.stop;
@@ -184,8 +188,10 @@ function recorded(inf: Inference, o: CallOptions): Inference {
         // a model's pace: about 60 tok/s per call, some thinking first
         const think = role === 'worker' ? 300 + Math.round(Math.random() * 900) : 120;
         const ms = Math.round(((c.completionTokens + think) / 60) * 1000 * (0.7 + Math.random() * 0.6) / fakeSpeed);
-        await Bun.sleep(ms);
-        c.ms += ms;
+        // the server already held the call for FAKE_HOLD_MS (inside c.ms); wait out the rest of its pace
+        const rest = Math.max(0, ms - FAKE_HOLD_MS());
+        await Bun.sleep(rest);
+        c.ms += rest;
         c.reasoningTokens = think;
         c.completionTokens += think;
         if (role === 'worker') c.reasoning = `(mock model: no real thinking; a real run shows the model's own here, about ${think} tokens of it)`;
@@ -223,8 +229,10 @@ const pool = new Proxy(pool0, {
 // The crew as the status stream shows it: one team of `concurrency` code agents
 
 const machineFor = (role: Role) => pool0.machines.find((m) => m.machine.roles.includes(role))?.machine;
+// the engine's label names llama-server for any local address; say which server the crew file names
+const serverLabel = (m: { url: string; server: string }) => (opt.fake ? 'local · mock model' : backendLabel(m.url).replace('llama-server', m.server));
 const crew: CrewLayout = process.env.MUGGE_CREW?.trim() ? crewFromEnv(process.env, concurrency) : {
-  machines: pool0.machines.map((m) => ({ id: m.machine.name, slots: m.machine.slots, backend: backendLabel(m.machine.url), url: m.machine.url })),
+  machines: pool0.machines.map((m) => ({ id: m.machine.name, slots: m.machine.slots, backend: serverLabel(m.machine), url: m.machine.url })),
   teams: [{ id: 'a', domain: task, machine: machineFor('worker')!.name, agents: concurrency }],
   manager: machineFor('manager') ? { machine: machineFor('manager')!.name } : undefined,
 };

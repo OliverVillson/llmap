@@ -24,7 +24,10 @@ set -a; . deploy/crew.env; set +a
 bun demo/run.ts
 ```
 
-It needs `python3` (3.8 or newer) for the project's tests. The run prints the view's address and
+It needs `python3` (3.8 or newer), for `crew.env` and for the project's tests. The crew has 10
+code agents by default; set `CREW_WORKERS=24` (or 32, 64) before loading `crew.env`, and start
+the server with the same value. The built-in task never has more than 12 tickets ready at once,
+so agents beyond 12 stay idle there; a bigger crew pays off on a bigger `--prompt` task. The run prints the view's address and
 the run folder, and keeps the view up after the run ends until Ctrl-C. To keep it running after
 you log out, start it with `nohup bun demo/run.ts > demo.log 2>&1 &` (stop it with `kill`), or
 inside tmux.

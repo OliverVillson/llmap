@@ -305,13 +305,18 @@ function renderAgents(st) {
   const ws = st.agents.filter((a) => a.role === 'worker');
   $('#crew-n').textContent = `${ws.filter((a) => a.ticket && !['finished', 'failed', 'idle'].includes(a.state)).length} of ${ws.length} working`;
   $('#dots').innerHTML = ws.map((a) => `<button class="dot ${view.open === a.id ? 'sel' : ''}" data-open="${esc(a.id)}" aria-label="${esc(a.id)}: ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` on ${esc(a.ticket)}` : ''}" title="${esc(a.id)} · ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` · ${esc(a.ticket)}` : ''}"><span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span></button>`).join('');
-  $('#agents').innerHTML = ws.map((a) => {
+  // a big crew shows a cell per agent with work; the idle ones stay as dots, counted in one cell
+  const idle = (a) => !a.ticket && a.state === 'idle' && view.open !== a.id;
+  const big = ws.length > 12;
+  const shown = big ? ws.filter((a) => !idle(a)) : ws;
+  const rest = ws.length - shown.length;
+  $('#agents').innerHTML = shown.map((a) => {
     const on = a.ticket && !['finished', 'failed', 'idle'].includes(a.state);
     return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}">
       <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span> <span class="small">${esc(a.ticket ?? '')}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
       <span class="small trunc ${on ? '' : 'dimc'}">${esc(STATE_WORD[a.state] ?? a.state)}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
       <span class="xs dimc trunc">${esc(a.owns.join(' ') || '—')}</span></button>`;
-  }).join('');
+  }).join('') + (rest ? `<div class="cell"><span class="r1"><span><span class="g-idle">○</span> ${rest} idle</span></span><span class="small dimc trunc">waiting for a ready ticket</span><span class="xs dimc trunc">press a dot above to open one</span></div>` : '');
 }
 
 function ticketColumn(t, dg) {
