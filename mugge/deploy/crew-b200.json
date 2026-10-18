@@ -1,5 +1,5 @@
 [
-  {"name": "b200-workers", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["worker"], "slots": 10, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 32768},
-  {"name": "b200-leads", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["lead"], "slots": 2, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 32768},
-  {"name": "b200-orchestrator", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["manager"], "slots": 1, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 32768}
+  {"name": "b200-workers", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["worker"], "slots": 10, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 26624},
+  {"name": "b200-leads", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["lead"], "slots": 2, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 8192},
+  {"name": "b200-orchestrator", "url": "http://127.0.0.1:8000/v1", "server": "vllm", "roles": ["manager"], "slots": 1, "model": "qwen3.8-27b", "preset": "qwen3.8-27b", "cache_type": "bf16", "ctx": 24576}
 ]

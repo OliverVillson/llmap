@@ -38,8 +38,22 @@ diff <(python3 deploy/crew.py 10) deploy/crew-b200.json
 ( CREW_WORKERS=24; set -a; . deploy/crew.env; set +a
   [ "$MUGGE_CONCURRENCY" = 24 ]
   echo "$MUGGE_BACKENDS" | grep -q '"b200-workers".*"slots": 24'
-  echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 5' )
-CREW_WORKERS=80 deploy/qwen.sh cmd | grep -q -- '--max-num-seqs 97'
+  echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 2' )
+( CREW_WORKERS=64; set -a; . deploy/crew.env; set +a
+  [ "$MUGGE_CONCURRENCY" = 64 ]
+  echo "$MUGGE_BACKENDS" | grep -q '"b200-workers".*"slots": 64'
+  echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 4' )
+CREW_WORKERS=64 deploy/qwen.sh cmd | grep -q -- '--max-num-seqs 69 .*--gpu-memory-utilization 0.94'
+CREW_WORKERS=80 deploy/qwen.sh cmd | grep -q -- '--max-num-seqs 86'
+# the 64-agent start: wait reports the crew against the pool
+deploy/qwen.sh stop >/dev/null
+MOCK_KV_GIB=100 CREW_WORKERS=64 deploy/qwen.sh start >/dev/null
+# the size sticks: wait, check and crew.env read it back without being told
+deploy/qwen.sh wait 2>&1 | tee "$STATE/wait64.txt"
+grep -q 'crew: 64 workers + 4 leads + 1 orchestrator need at most 126 GB' "$STATE/wait64.txt"
+grep -q 'warning: if every call is long' "$STATE/wait64.txt"
+deploy/qwen.sh check > "$STATE/check64.txt"; grep -q 'ok    69 calls at once' "$STATE/check64.txt"
+( unset CREW_WORKERS; set -a; . deploy/crew.env; set +a; [ "$MUGGE_CONCURRENCY" = 64 ] )
 if MAX_NUM_SEQS=8 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "MAX_NUM_SEQS below the crew was allowed"; exit 1; fi
 # a public host is refused without a key
 if HOST=0.0.0.0 ALLOW_PUBLIC=1 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "public host without a key was allowed"; exit 1; fi

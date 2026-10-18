@@ -171,6 +171,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"mock vLLM for {', '.join(A['names'])} on {A['host']}:{A['port']}, max {A['seqs']} running", flush=True)
+    print(f"Available KV cache memory: {os.environ.get('MOCK_KV_GIB', '120.00')} GiB (mock)", flush=True)
     print(f"GPU KV cache size: 1,966,080 tokens, Maximum concurrency for {A['max_len']:,} tokens per request: {1966080 / A['max_len']:.2f}x (mock)", flush=True)
     ThreadingHTTPServer.request_queue_size = 128
     ThreadingHTTPServer((A["host"], A["port"]), H).serve_forever()

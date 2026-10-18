@@ -18,8 +18,8 @@
 # value can be overridden: MAX_MODEL_LEN, KV_DTYPE, MAX_NUM_SEQS, GPU_UTIL. MTP=3 turns on the
 # model's own multi-token prediction (3 draft tokens). QUANT=nvfp4 serves NVIDIA's NVFP4
 # checkpoint instead of Qwen's FP8 one (Blackwell only; give it to download and start, the rest
-# read what is running). CREW_WORKERS=N (default 10) sizes the server for a crew of N workers,
-# their leads and the orchestrator, as deploy/crew.env does for the engine. The server listens
+# read what is running). CREW_WORKERS=N (default 10) at start sizes the server for a crew of N
+# workers, their leads and the orchestrator; the other commands and deploy/crew.env read it back. The server listens
 # on 127.0.0.1 only; reach it from another machine through an ssh tunnel (README).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,10 +45,11 @@ PIDFILE="$STATE/serve.pid"
 RUNNING="$STATE/serve.quant"
 URL="http://127.0.0.1:$PORT"
 # the crew this server is for: N workers, their leads and the orchestrator (deploy/crew.py)
+# set it once at start; later commands (wait, check, bench, over ssh too) read it back
+CREW_FILE="$STATE/serve.crew"
+if [ -z "${CREW_WORKERS:-}" ] && [ -f "$CREW_FILE" ]; then CREW_WORKERS="$(cat "$CREW_FILE")"; fi
 CREW_WORKERS="${CREW_WORKERS:-10}"
 read -r _ CREW_LEADS _ CREW_TOTAL < <(python3 "$HERE/crew.py" "$CREW_WORKERS" --sizes)
-# tokens one crew call may reach: the pack plus MUGGE_MAX_CALL_TOKENS (crew.py --ctx)
-CREW_CTX="${CREW_CTX:-32768}"
 
 die() { echo "qwen.sh: $*" >&2; exit 1; }
 
@@ -74,7 +75,7 @@ profile() {
     die "MAX_NUM_SEQS=$MAX_NUM_SEQS is below the crew's $CREW_TOTAL calls (CREW_WORKERS=$CREW_WORKERS)"
   fi
   case "$g" in
-    b200) : "${MAX_MODEL_LEN:=65536}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=64}" "${GPU_UTIL:=0.90}" ;;
+    b200) : "${MAX_MODEL_LEN:=65536}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=64}" "${GPU_UTIL:=0.94}" ;;
     h100) : "${MAX_MODEL_LEN:=32768}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=16}" "${GPU_UTIL:=0.90}" ;;
     l40s) : "${MAX_MODEL_LEN:=16384}" "${KV_DTYPE:=fp8}" "${MAX_NUM_SEQS:=13}" "${GPU_UTIL:=0.92}" ;;
     *) die "unknown GPU '$(gpu_name)': set GPU=b200, h100 or l40s" ;;
@@ -143,6 +144,7 @@ case "${1:-}" in
     { echo "# $(date -Is) profile $PROFILE quant $QUANT"; printf '%q ' "${CMD[@]}"; echo; } > "$LOG"
     # what is running, as bench labels it: fp8, fp8+mtp3, nvfp4, ...
     echo "$QUANT$([ "$MTP" = 0 ] || echo "+mtp$MTP")" > "$RUNNING"
+    echo "$CREW_WORKERS" > "$CREW_FILE"
     # its own session, no terminal: the server outlives the ssh login that started it
     setsid nohup "${CMD[@]}" >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
@@ -158,14 +160,20 @@ case "${1:-}" in
     done
     echo "up after $(( $(date +%s) - start ))s"
     grep -m1 -o 'KV cache size: .*' "$LOG" || true
-    # does the crew fit, if every call reaches CREW_CTX tokens at once?
-    kv="$(grep -m1 -o 'KV cache size: [0-9,]* tokens' "$LOG" | tr -dc 0-9 || true)"
-    if [ -n "$kv" ]; then
-      need=$(( CREW_TOTAL * CREW_CTX ))
-      fit=$(( kv / CREW_CTX - CREW_LEADS - 1 ))
-      echo "crew: $CREW_WORKERS workers + $CREW_LEADS leads + 1 orchestrator need up to $need tokens at $CREW_CTX each; the pool holds $kv ($(( need * 100 / kv ))%)"
-      echo "      by memory, up to about $fit workers fit at $CREW_CTX tokens per call; deploy/qwen.sh bench says how many are worth it"
-      [ "$need" -le "$kv" ] || echo "warning: a crew this size can run out of KV cache when every call is long: lower CREW_WORKERS or CREW_CTX" >&2
+    # does the crew fit if every call is as long as it can get, all at once? (vLLM's own pool size)
+    pool_gib="$(grep -m1 -o 'Available KV cache memory: [0-9.]* GiB' "$LOG" | grep -o '[0-9.]*' || true)"
+    if [ -n "$pool_gib" ]; then
+      case "$(sed -n 2p "$LOG" | grep -o -- '--kv-cache-dtype [^ ]*' | cut -d' ' -f2)" in fp8*) kvb=32768 ;; *) kvb=65536 ;; esac
+      python3 - "$pool_gib" "$(python3 "$HERE/crew.py" "$CREW_WORKERS" --need "$kvb")" "$CREW_WORKERS" "$CREW_LEADS" "$kvb" <<'PY'
+import sys
+pool, need, workers, leads, kvb = float(sys.argv[1]) * 2**30, int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+per_worker = 26624 * kvb + 153_944_064
+print(f"crew: {workers} workers + {leads} leads + 1 orchestrator need at most {need / 1e9:.0f} GB of KV cache and state; the pool holds {pool / 1e9:.0f} GB ({100 * need / pool:.0f}%)")
+print(f"      by memory, about {int((pool - need) / per_worker) + workers} workers fit with every call at its longest; calls are rarely all that long at once")
+if need > pool:
+    print("warning: if every call is long at once, vLLM will pause some (preemptions in deploy/qwen.sh status);"
+          " if that happens a lot, restart with KV_DTYPE=fp8 (half the KV memory) or fewer CREW_WORKERS", file=sys.stderr)
+PY
     fi
     ;;
   status)
