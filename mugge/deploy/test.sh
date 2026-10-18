@@ -75,4 +75,13 @@ MODEL_GB=0 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1 || 
 grep -q "hf download Qwen/Qwen3.8-27B-FP8 into $STATE/data/hf" "$STATE/dl.txt"
 [ "$(cat "$STATE/data.dir")" = "$STATE/data" ]
 ( unset DATA_DIR; deploy/qwen.sh where ) > "$STATE/where.txt"; grep -q "data folder  $STATE/data " "$STATE/where.txt"
+# nvcc for FlashInfer: the venv's pip CUDA (nvidia/cu13) becomes CUDA_HOME; without it, a warning
+cu="$STATE/cv/lib/python3.12/site-packages/nvidia/cu13"; mkdir -p "$cu/bin" "$cu/lib" "$STATE/cv/bin"
+ln -s "$(command -v python3)" "$STATE/cv/bin/python"; touch "$cu/lib/libcudart.so.13"
+VENV="$STATE/cv" deploy/qwen.sh cmd > "$STATE/cmd.txt" 2>&1; grep -q 'warning: no nvcc' "$STATE/cmd.txt"
+printf '#!/bin/sh\necho nvcc\n' > "$cu/bin/nvcc"; chmod +x "$cu/bin/nvcc"
+( unset CUDA_HOME; VENV="$STATE/cv" deploy/qwen.sh cmd ) > "$STATE/cmd.txt" 2>&1
+if grep -q -- '--attention-backend' "$STATE/cmd.txt"; then cat "$STATE/cmd.txt"; echo "nvcc in the venv should keep FlashInfer"; exit 1; fi
+[ -L "$cu/lib64" ] && [ -L "$cu/lib/libcudart.so" ]
+ATTENTION=TRITON_ATTN deploy/qwen.sh cmd | grep -q -- '--attention-backend TRITON_ATTN'
 echo "deploy dry run: PASS"

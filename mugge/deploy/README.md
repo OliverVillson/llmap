@@ -19,7 +19,9 @@ is the target; H100 and L40S notes are at the end.
 
 Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200), the Python headers and a C
 compiler (Triton builds small C helpers at the first start: `sudo apt-get install -y python3.12-dev
-build-essential`; `setup` and `start` check, and install them when sudo needs no password), and about 50 GB free on one
+build-essential`; `setup` and `start` check, and install them when sudo needs no password),
+`nvcc` for FlashInfer's kernels (vLLM's own install puts it in the venv; `start` points `CUDA_HOME`
+at it, so no CUDA toolkit is needed on the box), and about 50 GB free on one
 disk (see "Disk" below: on the evroc B200 the root disk is 14 GB and the big disk must be mounted
 first).
 
@@ -218,7 +220,13 @@ bound by the checks rather than the GPU, and a smaller crew finishes as fast.
 | `--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype` | per GPU, above |
 | `MTP=3` (off by default) | `--speculative-config {"method":"mtp","num_speculative_tokens":3}`: the model's own draft head, faster decoding; turn it on once `check` passes without it, and run `check` again |
 
-Overrides: any of `MAX_MODEL_LEN`, `KV_DTYPE`, `MAX_NUM_SEQS`, `GPU_UTIL`, `PORT`, `TP`, or
+Attention kernels: vLLM picks FlashInfer with its TRT-LLM kernels on a B200, the fastest.
+`ATTENTION=FLASH_ATTN` (or `TRITON_ATTN`) forces another. FlashInfer compiles parts of itself on
+the first start (a few minutes, cached under the data folder) with the `nvcc` from the venv
+(`site-packages/nvidia/cu13`), which `start` sets as `CUDA_HOME`; vLLM uses FlashInfer for more
+than attention on this model, so it needs `nvcc` whichever attention is picked.
+
+Overrides: any of `ATTENTION`, `MAX_MODEL_LEN`, `KV_DTYPE`, `MAX_NUM_SEQS`, `GPU_UTIL`, `PORT`, `TP`, or
 `EXTRA_ARGS="..."`. `deploy/qwen.sh cmd` prints the command without running anything.
 
 ## NVFP4 instead of FP8 (B200 only)

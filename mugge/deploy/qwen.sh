@@ -17,7 +17,8 @@
 #
 # The GPU profile (b200, h100, l40s) is read from nvidia-smi; GPU=b200 forces one. Any profile
 # value can be overridden: MAX_MODEL_LEN, KV_DTYPE, MAX_NUM_SEQS, GPU_UTIL. MTP=3 turns on the
-# model's own multi-token prediction (3 draft tokens). QUANT=nvfp4 serves NVIDIA's NVFP4
+# model's own multi-token prediction (3 draft tokens). ATTENTION=FLASH_ATTN|TRITON_ATTN|FLASHINFER
+# picks the attention kernels (default: vLLM's choice, FlashInfer on a B200, given nvcc). QUANT=nvfp4 serves NVIDIA's NVFP4
 # checkpoint instead of Qwen's FP8 one (Blackwell only; give it to download and start, the rest
 # read what is running). CREW_WORKERS=N (default 10) at start sizes the server for a crew of N
 # workers, their leads and the orchestrator; the other commands and deploy/crew.env read it back. The server listens
@@ -141,6 +142,14 @@ serve_cmd() {
     --language-model-only
     --reasoning-parser qwen3)
   if [ "$MTP" != 0 ]; then CMD+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP}"); fi
+  # attention kernels: unset lets vLLM choose (FlashInfer with TRT-LLM kernels on a B200, the
+  # fastest). ATTENTION=FLASH_ATTN, TRITON_ATTN or FLASHINFER forces one. vLLM uses FlashInfer for
+  # more than attention on this model, so nvcc is needed whichever is picked (cuda_env).
+  cuda_env
+  if [ -x "$VENV/bin/python" ] && [ -z "${CUDA_HOME:-}" ] && ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
+    echo "warning: no nvcc; FlashInfer will fail to compile its kernels at start (README \"nvcc\")" >&2
+  fi
+  if [ -n "${ATTENTION:-}" ]; then CMD+=(--attention-backend "$ATTENTION"); fi
   # anything else, e.g. EXTRA_ARGS="--max-num-batched-tokens 16384"
   if [ -n "${EXTRA_ARGS:-}" ]; then read -r -a extra <<< "$EXTRA_ARGS"; CMD+=("${extra[@]}"); fi
 }
@@ -170,6 +179,26 @@ build_tools() {
   fi
 }
 
+# FlashInfer (vLLM's fastest attention on a B200) compiles parts of itself with nvcc on first use
+# and only looks in CUDA_HOME, PATH and /usr/local/cuda. vLLM's own dependencies put nvcc 13 and
+# the CUDA headers in the venv (site-packages/nvidia/cu13), so point CUDA_HOME there, with the
+# lib64, libcudart.so and libcuda.so names FlashInfer's link line expects. No system toolkit needed.
+cuda_env() {
+  [ -z "${CUDA_HOME:-}" ] || return 0
+  command -v nvcc >/dev/null && return 0
+  [ -x /usr/local/cuda/bin/nvcc ] && return 0
+  local d libcuda
+  d="$(ls -d "$VENV"/lib/python3*/site-packages/nvidia/cu13 2>/dev/null | head -1 || true)"
+  [ -n "$d" ] && [ -x "$d/bin/nvcc" ] || return 0
+  [ -e "$d/lib64" ] || ln -s lib "$d/lib64"
+  [ -e "$d/lib/libcudart.so" ] || ln -s libcudart.so.13 "$d/lib/libcudart.so"
+  if [ ! -e "$d/lib/stubs/libcuda.so" ]; then
+    libcuda="$(ldconfig -p 2>/dev/null | awk '/libcuda\.so\.1 /{print $NF; exit}')"
+    [ -z "$libcuda" ] || { mkdir -p "$d/lib/stubs"; ln -sf "$libcuda" "$d/lib/stubs/libcuda.so"; }
+  fi
+  export CUDA_HOME="$d" PATH="$d/bin:$PATH"
+}
+
 CMD_NAME="${1:-}"
 case "${1:-}" in
   where)
@@ -190,6 +219,12 @@ case "${1:-}" in
     VIRTUAL_ENV="$VENV" uv pip install "vllm==$VLLM_VERSION" --torch-backend=auto
     "$VLLM" --version
     build_tools
+    cuda_env
+    if [ -n "${CUDA_HOME:-}" ] || command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ]; then
+      echo "nvcc for FlashInfer: $(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
+    else
+      echo "warning: no nvcc found; FlashInfer cannot compile its kernels: VIRTUAL_ENV=$VENV uv pip install nvidia-cuda-nvcc, then setup again" >&2
+    fi
     echo "next: deploy/qwen.sh download"
     ;;
   download)
