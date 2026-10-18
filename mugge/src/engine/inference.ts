@@ -121,6 +121,14 @@ export function defaultSampling(thinking: boolean | undefined): Readonly<Require
 /** Default for InferenceConfig.timeoutMs: long enough for a 16K prefill on a busy laptop GPU. */
 export const DEFAULT_TIMEOUT_MS = 1_800_000;
 
+/** Default for InferenceConfig.serverWaitMs: a vLLM restart (load, compile cache warm, cudagraphs) fits well inside it. */
+export const DEFAULT_SERVER_WAIT_MS = 1_200_000;
+/** Pauses between sends to a server that is not answering, the last one repeating. */
+export let SERVER_RETRY_MS = [2_000, 5_000, 10_000, 20_000];
+export const setServerRetryMs = (ms: number[]) => { SERVER_RETRY_MS = ms; };
+/** A 500 is tried this many more times (it can be one request's own fault, unlike a server that is down). */
+export const MAX_500_RETRIES = 2;
+
 /** Throws unless top_k is a positive integer: finite, so llama.cpp never sorts the whole vocabulary. */
 export function checkTopK(topK: unknown, where = 'top_k'): number {
   if (typeof topK !== 'number' || !Number.isInteger(topK) || topK <= 0) {
@@ -170,6 +178,12 @@ export interface InferenceConfig {
   planMaxCallTokens?: number;
   /** One line per call on stderr (MUGGE_DEBUG_CALLS=1). */
   debug?: boolean;
+  /**
+   * Most milliseconds one call waits for a server that is down, restarting or answering 502/503/504
+   * before it fails (MUGGE_SERVER_WAIT_S; default DEFAULT_SERVER_WAIT_MS). Until then the call is
+   * sent again with a growing pause, so a restart does not spend the tickets' attempts.
+   */
+  serverWaitMs?: number;
 }
 
 export interface Inference {
@@ -200,7 +214,7 @@ export class OpenAICompatible implements Inference {
     return this.send(model, messages, maxTokens, signal, undefined, opts);
   }
 
-  private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks, refit = true): Promise<Completion<string>> {
+  private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks, refits = 2): Promise<Completion<string>> {
     const started = performance.now();
     const cap = opts?.planning ? this.cfg.planMaxCallTokens : this.cfg.maxCallTokens;
     const kwargs = {
@@ -222,23 +236,15 @@ export class OpenAICompatible implements Inference {
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
     else if (schema && guided === 'guided_json') body.guided_json = schema;
-    const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
-      body: JSON.stringify(body),
-      // the run's stop (POST /stop) ends a call in flight too, so it does not hold its slot for up to timeoutMs
-      signal: signal ? AbortSignal.any([AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS), signal]) : AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-      // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
-      timeout: false,
-    } as RequestInit);
+    const res = await this.post(body, signal);
     if (!res.ok) {
-      const text = await res.text();
-      // prompt + max_tokens over the server's context: ask once more for what fits
-      const fit = res.status === 400 && refit ? contextFit(text) : undefined;
-      if (fit !== undefined && fit < (body.max_tokens as number)) return this.send(model, messages, fit, signal, schema, opts, false);
-      throw new Error(`inference ${res.status}: ${text.slice(0, 500)}`);
+      // prompt + max_tokens over the server's context: ask again for what fits (twice, since vLLM
+      // 0.31 first refuses a max_tokens above the whole context without saying the prompt's size)
+      const fit = res.status === 400 && refits > 0 ? contextFit(res.text) : undefined;
+      if (fit !== undefined && fit < (body.max_tokens as number)) return this.send(model, messages, fit, signal, schema, opts, refits - 1);
+      throw new Error(`inference ${res.status}: ${res.text.slice(0, 500)}`);
     }
-    const data: any = await res.json();
+    const data: any = res.data;
     const choice = data?.choices?.[0];
     const raw: string = choice?.message?.content ?? '';
     // without vLLM's --reasoning-parser the thinking comes back inside content; Qwen's template
@@ -272,20 +278,89 @@ export class OpenAICompatible implements Inference {
     if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));
     return out;
   }
+
+  /**
+   * One POST, sent again while the server is down or restarting (refused or dropped connection,
+   * 502/503/504) for up to serverWaitMs, and a 500 up to MAX_500_RETRIES times, with growing
+   * pauses. The run's stop and the call's own timeout are never retried.
+   */
+  private async post(body: Record<string, unknown>, signal?: AbortSignal): Promise<{ ok: true; data: any } | { ok: false; status: number; text: string }> {
+    const url = `${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
+    const until = Date.now() + (this.cfg.serverWaitMs ?? DEFAULT_SERVER_WAIT_MS);
+    let tries = 0, fivehundreds = 0;
+    for (;;) {
+      let problem: string;
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}) },
+          body: JSON.stringify(body),
+          // the run's stop (POST /stop) ends a call in flight too, so it does not hold its slot for up to timeoutMs
+          signal: signal ? AbortSignal.any([AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS), signal]) : AbortSignal.timeout(this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+          // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
+          timeout: false,
+        } as RequestInit);
+        if (res.ok) return { ok: true, data: await res.json() };
+        const text = await res.text();
+        const down = res.status === 502 || res.status === 503 || res.status === 504;
+        if (!down && !(res.status === 500 && fivehundreds++ < MAX_500_RETRIES)) return { ok: false, status: res.status, text };
+        problem = `inference ${res.status}: ${text.slice(0, 200)}`;
+      } catch (e) {
+        // a stop or the call's own timeout ends the call; anything else (refused, reset, a body
+        // cut off) is the server going away
+        if (signal?.aborted || isAbort(e)) throw e;
+        problem = String((e as Error)?.message ?? e);
+      }
+      const pause = SERVER_RETRY_MS[Math.min(tries++, SERVER_RETRY_MS.length - 1)]!;
+      if (Date.now() + pause > until) throw new Error(`inference server ${this.cfg.baseUrl} not answering after ${tries} tries: ${problem}`);
+      serverNote(this.cfg.baseUrl, problem);
+      await sleepUnless(pause, signal);
+    }
+  }
+}
+
+const isAbort = (e: unknown) => ['AbortError', 'TimeoutError'].includes((e as Error)?.name);
+
+/** One line on stderr per server and half minute while calls wait for it (80 agents would print 80). */
+const noted = new Map<string, number>();
+function serverNote(url: string, problem: string) {
+  const now = Date.now();
+  if (now - (noted.get(url) ?? 0) < 30_000) return;
+  noted.set(url, now);
+  console.error(`${new Date().toTimeString().slice(0, 8)} inference server ${url} not answering (${problem.split('\n')[0]!.slice(0, 160)}); calls wait for it and are sent again`);
+}
+
+function sleepUnless(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'));
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(signal!.reason ?? new Error('aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** Fewest tokens worth asking for again after a context-length refusal. */
 export const MIN_REFIT_TOKENS = 1024;
 
 /**
- * The max_tokens that fits, from a server's context-length refusal (vLLM's two wordings and
- * SGLang's): the context less the prompt, less a little room. Undefined when the error is
- * something else or too little would fit.
+ * The max_tokens that fits, from a server's context-length refusal (vLLM's wordings up to 0.31
+ * and SGLang's): the context less the prompt, less a little room. vLLM 0.31 refuses a max_tokens
+ * above the whole context before it counts the prompt (`max_tokens=N cannot be greater than
+ * max_model_len=L`): that gives L - 1, and the next refusal then says the prompt's size.
+ * Undefined when the error is something else or too little would fit.
  */
 export function contextFit(error: string): number | undefined {
+  const whole = /max(?:_completion)?_tokens=\d+ cannot be greater than max_model_len=(\d+)/.exec(error)?.[1];
+  if (whole) return Number(whole) - 1;
   const limit = /maximum context length (?:is |of )?(\d+)/.exec(error)?.[1];
-  const m = /(\d+) in the messages|has (\d+) input tokens|(\d+) tokens from the input/.exec(error);
-  const input = m?.[1] ?? m?.[2] ?? m?.[3];
+  const m = /(\d+) in the messages|has (\d+) input tokens|(\d+) tokens from the input|contains (?:at least )?(\d+) input tokens/.exec(error);
+  const input = m?.[1] ?? m?.[2] ?? m?.[3] ?? m?.[4];
   if (!limit || !input) return undefined;
   const fit = Number(limit) - Number(input) - 16;
   return fit >= MIN_REFIT_TOKENS ? fit : undefined;

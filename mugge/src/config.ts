@@ -9,6 +9,9 @@
  *   MUGGE_API_KEY         bearer token, for hosted endpoints
  *   MUGGE_TIMEOUT_S       most seconds one model call may take once sent (default 1800; waiting
  *                         for a slot does not count, and Bun's own 300 s fetch cut is off)
+ *   MUGGE_SERVER_WAIT_S   most seconds a call waits for a server that is down or restarting
+ *                         (refused or dropped connection, 502/503/504) before it fails (default
+ *                         1200); meanwhile it is sent again, so a restart costs no ticket attempts
  *   MUGGE_CONCURRENCY     tickets at once, i.e. agents working (default 12)
  *   MUGGE_TEMPERATURE, MUGGE_TOP_K, MUGGE_TOP_P, MUGGE_MIN_P, MUGGE_PRESENCE_PENALTY
  *                         sampling for every call (defaults: Qwen3.8's set for the call's mode,
@@ -121,6 +124,7 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
     guided,
     apiKey: env.MUGGE_API_KEY || undefined,
     timeoutMs: Number(env.MUGGE_TIMEOUT_S) > 0 ? Number(env.MUGGE_TIMEOUT_S) * 1000 : undefined,
+    serverWaitMs: num(env, 'MUGGE_SERVER_WAIT_S', (n) => n >= 0, 'a number of seconds, 0 or more') !== undefined ? Number(env.MUGGE_SERVER_WAIT_S) * 1000 : undefined,
     sampling: samplingFromEnv(env),
     extra: Object.keys(kwargs).length ? { chat_template_kwargs: kwargs } : undefined,
     maxCallTokens: maxCall,
