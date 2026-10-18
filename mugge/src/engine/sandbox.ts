@@ -29,17 +29,49 @@ export interface Sandbox {
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
+/** How long the output may still take to end once a timed-out command was killed (a child that left the group). */
+const DRAIN_MS = 5_000;
+
+/** Process groups of commands still running: killed when this process exits, since detached ones outlive it. */
+const groups = new Set<number>();
+let exitHook = false;
+const killGroup = (pid: number) => {
+  try {
+    process.kill(-pid, 'SIGKILL');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeoutMs: number): Promise<RunResult> {
   const started = performance.now();
-  const p = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', env: process.env });
+  // its own process group, so a timeout kills what it started too: a test that runs the CLI in a
+  // subprocess which never ends would otherwise hold the output pipes open, and the check forever
+  const p = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', env: process.env, detached: true } as Parameters<typeof Bun.spawn>[1]);
+  groups.add(p.pid);
+  if (!exitHook) {
+    exitHook = true;
+    process.on('exit', () => groups.forEach(killGroup));
+  }
   let timedOut = false;
+  let drained: () => void = () => {};
+  const cutOff = new Promise<void>((resolve) => (drained = resolve));
   const timer = setTimeout(() => {
     timedOut = true;
-    p.kill('SIGKILL');
+    if (!killGroup(p.pid)) p.kill('SIGKILL');
+    setTimeout(drained, DRAIN_MS);
   }, timeoutMs);
-  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  const text = (s: ReadableStream<Uint8Array>) => {
+    const r = s.getReader();
+    const chunks: Uint8Array[] = [];
+    const pump = (): Promise<string> => r.read().then(({ done, value }) => (done ? Buffer.concat(chunks).toString() : (chunks.push(value), pump())));
+    return Promise.race([pump(), cutOff.then(() => (r.cancel().catch(() => {}), Buffer.concat(chunks).toString()))]);
+  };
+  const [out, err] = await Promise.all([text(p.stdout as ReadableStream<Uint8Array>), text(p.stderr as ReadableStream<Uint8Array>)]);
   const code = await p.exited;
   clearTimeout(timer);
+  groups.delete(p.pid);
   return { code: timedOut ? 124 : code, out: (out + err).trim(), ms: Math.round(performance.now() - started), timedOut };
 }
 
