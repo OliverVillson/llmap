@@ -6,9 +6,9 @@ B200 is the target; H100 and L40S notes are at the end.
 
 | File | What it is |
 |---|---|
-| `qwen.sh` | setup, download, start (detached), wait, status, check, bench, compare, logs, stop, cmd |
-| `check.py` | the server check: plain, thinking and JSON calls, then 13 calls at once; and the speed bench (stdlib only) |
-| `crew-b200.json` | the crew's machine list (`MUGGE_BACKENDS`) |
+| `qwen.sh` | setup, download, start (detached), wait, status, check, bench, sweep, compare, logs, stop, cmd |
+| `check.py` | the server check (plain, thinking and JSON calls, then the crew at once) and the speed bench (stdlib only) |
+| `crew.py`, `crew-b200.json` | the crew's machine list (`MUGGE_BACKENDS`) for `CREW_WORKERS`; the JSON is the default crew of 10 |
 | `crew.env` | the engine settings for that crew |
 | `mock_vllm.py`, `test.sh` | a no-GPU stand-in for vLLM and the dry run CI runs |
 
@@ -61,22 +61,37 @@ Do not open port 8000 to the internet: vLLM's `--api-key` does not cover every e
 ```bash
 cd llmap/mugge
 curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install
-set -a; . deploy/crew.env; set +a       # from the mugge folder: the machine list path is relative
+set -a; . deploy/crew.env; set +a       # from the mugge folder
 bun src/cli.ts backends                 # three entries, all "up"
 ```
 
-`crew-b200.json` lists the one server three times, so each kind of call has slots of its own
-and a burst of reviews never takes a worker's slot:
+The machine list (`deploy/crew.py`, loaded by `crew.env`) names the one server three times, so
+each kind of call has slots of its own and a burst of reviews never takes a worker's slot:
 
 | Entry | Role | Slots | Who |
 |---|---|---|---|
-| b200-workers | worker | 10 | the 10 code agents: each ticket's write and fix calls |
-| b200-leads | lead | 2 | lead review of each ticket whose checks pass |
+| b200-workers | worker | `CREW_WORKERS` (10) | the code agents: each ticket's write and fix calls |
+| b200-leads | lead | one per 5 workers, at least 2 | lead review of each ticket whose checks pass |
 | b200-orchestrator | manager | 1 | the architect, scaffold and ticket plan (`mugge plan`) |
 
-`MUGGE_CONCURRENCY=10` lets 10 tickets run at once. At most 13 calls are in flight; the server
-admits 32 at once (`MAX_NUM_SEQS`), so the crew can grow to about 25 workers by raising the
-worker slots and `MUGGE_CONCURRENCY`, with no server change.
+### Crew size: one setting
+
+`CREW_WORKERS` sets the crew everywhere at once: the worker and lead slots, `MUGGE_CONCURRENCY`
+(tickets at once), and the server's `--max-num-seqs` (raised to cover every call the crew can
+have in flight). Give the same value to the server and the engine:
+
+```bash
+CREW_WORKERS=24 deploy/qwen.sh start && CREW_WORKERS=24 deploy/qwen.sh wait   # wait says whether 24 fit in memory
+CREW_WORKERS=24; set -a; . deploy/crew.env; set +a
+```
+
+How to pick it: run `deploy/qwen.sh bench` and read the thinking table. "Together tok/s" is how
+fast the whole crew writes; "per call tok/s" is how fast one agent does. Raise the crew while
+together tok/s still grows clearly (more than about 1.3x from 13 to 32 at once) and per call
+tok/s stays fast enough that one attempt (4,096 tokens) finishes in an acceptable time. Past the
+point where together tok/s flattens, more agents only make each one slower. `wait` also prints
+how many workers fit by memory if every call reached 32K tokens at once; that is the ceiling, and
+on a B200 it is far above where speed flattens.
 
 Each entry uses the engine's `qwen3.8-27b` preset (16 KV layers × 4 × 256, plus the DeltaNet
 state) and `"server": "vllm"`. `crew.env` turns thinking on (`MUGGE_THINKING=on`, sent on every
@@ -102,11 +117,18 @@ pool (the server prints the real figure at start):
 
 | GPU | Memory × utilisation | Weights | Runtime | Left for KV | Profile | 13 calls need (at the profile's max) |
 |---|---|---|---|---|---|---|
-| B200 180 GB | 162 GB (0.90) | ~30 GB | ~10 GB | **~120 GB** | 64K max, bf16, 32 seqs | 58 GB at 64K each; 30 GB at 32K |
+| B200 180 GB | 162 GB (0.90) | ~30 GB | ~10 GB | **~120 GB** | 64K max, bf16, 64 seqs | 58 GB at 64K each; 30 GB at 32K |
 | H100 80 GB | 72 GB (0.90) | ~30 GB | ~6 GB | ~36 GB | 32K max, bf16, 16 seqs | 30 GB at 32K each |
 | L40S 48 GB | 44 GB (0.92) | ~30 GB | ~4 GB | ~10 GB | 16K max, fp8 KV, 13 seqs | 9 GB at 16K each |
 
 On the B200 the crew uses at most half the pool even if every call reaches 64K tokens.
+
+**How many agents fit on one B200, by memory:** with `MUGGE_MAX_CALL_TOKENS=16384` and packs up to
+about 10K, a worker call reaches at most ~26K tokens (1.85 GB), so ~120 GB holds about 60 calls
+at their longest at once, and about 95 at 16K. Leads and the orchestrator take 3 to 13 of those.
+Agents hold KV only while a call is in flight, not while their checks run, so this is a
+ceiling. Speed runs out well before it does: see "Crew size" and "Making it faster". The VM's
+CPUs and RAM matter too, since every worker runs its checks in a sandbox there.
 
 ## Server flags, and why
 
@@ -136,7 +158,7 @@ deploy/qwen.sh stop
 QUANT=nvfp4 deploy/qwen.sh download
 QUANT=nvfp4 deploy/qwen.sh start && deploy/qwen.sh wait && deploy/qwen.sh check
 deploy/qwen.sh bench                                   # saves ~/qwen/bench-nvfp4.json
-deploy/qwen.sh compare                                 # tok/s alone and with 13 at once, NVFP4 against FP8
+deploy/qwen.sh compare                                 # NVFP4 against FP8 at 1, 13, 32 and 64 calls at once
 ```
 
 Speed is half the question; the other half is whether the files still come out exact. Run the
@@ -150,6 +172,37 @@ the same on code (HumanEval 94.5 vs FP8's 95.1, MBPP 70.4 vs 69.3) with single-s
 thinking loops with every NVFP4 build it tried. On a B200 with 13 calls at once the gain will be
 smaller than on that box, since the B200 has the memory bandwidth FP8 needs; `compare` says how
 much. MTP with this checkpoint is not verified.
+
+## Making it faster
+
+Measure before changing anything, on the box, with the crew idle:
+
+```bash
+setsid nohup deploy/qwen.sh sweep > ~/qwen/sweep.log 2>&1 &     # about 30 minutes: FP8 with MTP off, then on
+tail -f ~/qwen/sweep.log                                          # ends with the comparison
+```
+
+`sweep` restarts the server once per variant (`SWEEP="fp8 fp8+mtp3"` by default; add `nvfp4` and
+`nvfp4+mtp3` after `QUANT=nvfp4 deploy/qwen.sh download`), runs `bench` on each, then `compare`.
+`bench` measures 1, 13, 32 and 64 calls at once, each reading its own ~8K-token pack, for two
+answer lengths: `thinking` (4,096 tokens, one thinking attempt) and `short` (1,024, an answer
+with thinking off). The server is left stopped; start the winner. Then, in this order:
+
+1. **MTP** (`MTP=3`). Speculative decoding with the model's own draft head: the answers are the
+   same tokens, only faster, so there is no quality cost. Keep it if `compare` shows it ahead at
+   your crew size (its gain shrinks as more calls share the GPU).
+2. **Fewer tokens per ticket.** Thinking is most of what a worker writes. `MUGGE_REASONING_EFFORT=medium`
+   in `crew.env` thinks less; `MUGGE_THINKING=off` drops it (compare the bench's thinking and
+   short tables for the time an attempt takes). Both can cost passed tickets: run the engine
+   smoke (`bun bench/smoke.ts --url http://127.0.0.1:8000/v1 --model qwen3.8-27b`) before and after.
+3. **Crew size.** Above: the most workers before together tok/s flattens.
+4. **Prefix caching** is already on (`status` says `prefix caching on` and the hit rate). Every call
+   shares the engine's system prompt, and a fix call shares its write call's pack, so nothing more
+   to do; a hit rate near 0 would mean the packs changed order between calls.
+5. **NVFP4** (above): only with the smoke matching FP8's.
+6. **More GPUs.** A second server (another B200, or a second GPU on the same box with its own
+   `PORT`) is another entry in the machine list with its own worker slots; the engine spreads
+   calls across both. One 27B model does not need tensor parallelism.
 
 ## H100 or L40S instead
 

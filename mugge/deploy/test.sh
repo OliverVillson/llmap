@@ -19,14 +19,28 @@ grep -q 'b200-orchestrator .* manager  1 slots' "$STATE/backends.txt"
 [ "$(grep -c '^  up ' "$STATE/backends.txt")" = 3 ]
 ! grep -q 'llama-server' "$STATE/backends.txt"
 # speed: bench saves per checkpoint, compare reads them back
-deploy/qwen.sh bench --rounds 1 --max-tokens 64
-cp "$STATE/bench-fp8.json" "$STATE/bench-nvfp4.json"
-deploy/qwen.sh compare | tee "$STATE/compare.txt"
-grep -q '1.00x' "$STATE/compare.txt"
+deploy/qwen.sh status > "$STATE/status.txt"; grep -q 'prefix caching on' "$STATE/status.txt"
+deploy/qwen.sh bench --levels 1,13,32 --prompt-tokens 500 --answers thinking:64,short:16 | tee "$STATE/bench.txt"
+grep -q '13 -> 32 at once' "$STATE/bench.txt"
+# the sweep restarts the server per variant (MTP off, then on) and compares
+SWEEP="fp8 fp8+mtp3" deploy/qwen.sh sweep --levels 1,13 --prompt-tokens 200 --answers thinking:32,short:8 | tee "$STATE/sweep.txt"
+grep -q 'fp8+mtp3 .* 13 ' "$STATE/sweep.txt"
+grep -q '^short answers' "$STATE/sweep.txt"
+grep -q 'vs fp8$' "$STATE/sweep.txt"
+ls "$STATE"/bench-fp8.json "$STATE"/bench-fp8+mtp3.json >/dev/null
+deploy/qwen.sh start && deploy/qwen.sh wait >/dev/null
 # NVFP4: NVIDIA's checkpoint with an fp8 KV cache, on Blackwell only
 QUANT=nvfp4 deploy/qwen.sh cmd | grep -q 'nvidia/Qwen3.8-27B-NVFP4 .*--kv-cache-dtype fp8_e4m3'
 QUANT=nvfp4 KV_DTYPE=auto deploy/qwen.sh cmd | grep -q -- '--kv-cache-dtype auto'
 if QUANT=nvfp4 GPU=h100 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "NVFP4 allowed on an H100"; exit 1; fi
+# one knob for the crew size: the machine list, the agents and the server agree
+diff <(python3 deploy/crew.py 10) deploy/crew-b200.json
+( CREW_WORKERS=24; set -a; . deploy/crew.env; set +a
+  [ "$MUGGE_CONCURRENCY" = 24 ]
+  echo "$MUGGE_BACKENDS" | grep -q '"b200-workers".*"slots": 24'
+  echo "$MUGGE_BACKENDS" | grep -q '"b200-leads".*"slots": 5' )
+CREW_WORKERS=80 deploy/qwen.sh cmd | grep -q -- '--max-num-seqs 97'
+if MAX_NUM_SEQS=8 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "MAX_NUM_SEQS below the crew was allowed"; exit 1; fi
 # a public host is refused without a key
 if HOST=0.0.0.0 ALLOW_PUBLIC=1 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "public host without a key was allowed"; exit 1; fi
 deploy/qwen.sh stop

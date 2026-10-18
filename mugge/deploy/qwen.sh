@@ -6,9 +6,10 @@
 #   deploy/qwen.sh start      the server, detached: it survives logging out of ssh
 #   deploy/qwen.sh wait       block until it answers (or exit 1 with the log tail if it died)
 #   deploy/qwen.sh status     running?, KV size, requests running/waiting, KV use, preemptions
-#   deploy/qwen.sh check      one plain call, one thinking call, one JSON call, then 13 at once
-#   deploy/qwen.sh bench      decode speed with 13 calls at once, saved per checkpoint
-#   deploy/qwen.sh compare    the saved bench results side by side (FP8 against NVFP4)
+#   deploy/qwen.sh check      one plain call, one thinking call, one JSON call, then the crew at once
+#   deploy/qwen.sh bench      speed at 1, 13, 32 and 64 calls at once, saved per checkpoint
+#   deploy/qwen.sh sweep      bench each server variant in turn (SWEEP="fp8 fp8+mtp3 nvfp4 ..."), then compare
+#   deploy/qwen.sh compare    the saved bench results side by side
 #   deploy/qwen.sh logs       follow the server log
 #   deploy/qwen.sh stop
 #   deploy/qwen.sh cmd        print the vllm command it would run, and change nothing
@@ -17,8 +18,9 @@
 # value can be overridden: MAX_MODEL_LEN, KV_DTYPE, MAX_NUM_SEQS, GPU_UTIL. MTP=3 turns on the
 # model's own multi-token prediction (3 draft tokens). QUANT=nvfp4 serves NVIDIA's NVFP4
 # checkpoint instead of Qwen's FP8 one (Blackwell only; give it to download and start, the rest
-# read what is running). The server listens on 127.0.0.1 only;
-# reach it from another machine through an ssh tunnel (README), never an open port.
+# read what is running). CREW_WORKERS=N (default 10) sizes the server for a crew of N workers,
+# their leads and the orchestrator, as deploy/crew.env does for the engine. The server listens
+# on 127.0.0.1 only; reach it from another machine through an ssh tunnel (README).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -42,6 +44,11 @@ LOG="$STATE/serve.log"
 PIDFILE="$STATE/serve.pid"
 RUNNING="$STATE/serve.quant"
 URL="http://127.0.0.1:$PORT"
+# the crew this server is for: N workers, their leads and the orchestrator (deploy/crew.py)
+CREW_WORKERS="${CREW_WORKERS:-10}"
+read -r _ CREW_LEADS _ CREW_TOTAL < <(python3 "$HERE/crew.py" "$CREW_WORKERS" --sizes)
+# tokens one crew call may reach: the pack plus MUGGE_MAX_CALL_TOKENS (crew.py --ctx)
+CREW_CTX="${CREW_CTX:-32768}"
 
 die() { echo "qwen.sh: $*" >&2; exit 1; }
 
@@ -58,18 +65,22 @@ detect_gpu() {
   esac
 }
 
-# Per-GPU defaults (the arithmetic is in README.md "Memory and slots"). A crew of 10 workers,
-# 2 leads and 1 orchestrator keeps 13 calls in flight; every profile admits at least that many.
+# Per-GPU defaults (the arithmetic is in README.md "Memory and slots"). The server admits at
+# least every call the crew can have in flight (CREW_TOTAL).
 profile() {
   local g; g="$(detect_gpu)"
   [ -z "${KV_DTYPE:-}" ] || KV_DTYPE_SET=1
+  if [ -n "${MAX_NUM_SEQS:-}" ] && [ "$MAX_NUM_SEQS" -lt "$CREW_TOTAL" ]; then
+    die "MAX_NUM_SEQS=$MAX_NUM_SEQS is below the crew's $CREW_TOTAL calls (CREW_WORKERS=$CREW_WORKERS)"
+  fi
   case "$g" in
-    b200) : "${MAX_MODEL_LEN:=65536}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=32}" "${GPU_UTIL:=0.90}" ;;
+    b200) : "${MAX_MODEL_LEN:=65536}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=64}" "${GPU_UTIL:=0.90}" ;;
     h100) : "${MAX_MODEL_LEN:=32768}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=16}" "${GPU_UTIL:=0.90}" ;;
     l40s) : "${MAX_MODEL_LEN:=16384}" "${KV_DTYPE:=fp8}" "${MAX_NUM_SEQS:=13}" "${GPU_UTIL:=0.92}" ;;
     *) die "unknown GPU '$(gpu_name)': set GPU=b200, h100 or l40s" ;;
   esac
   PROFILE="$g"
+  [ "$MAX_NUM_SEQS" -ge "$CREW_TOTAL" ] || MAX_NUM_SEQS="$CREW_TOTAL"
   if [ "$QUANT" = nvfp4 ]; then
     [ "$g" = b200 ] || die "NVFP4 needs a Blackwell GPU (B200); this profile is $g"
     # NVIDIA's serve command for this checkpoint uses an fp8 KV cache (KV_DTYPE=auto to compare like for like)
@@ -130,7 +141,8 @@ case "${1:-}" in
     [ -x "$VLLM" ] || die "$VLLM not found: run deploy/qwen.sh setup first (or set VLLM=)"
     mkdir -p "$STATE"
     { echo "# $(date -Is) profile $PROFILE quant $QUANT"; printf '%q ' "${CMD[@]}"; echo; } > "$LOG"
-    echo "$QUANT" > "$RUNNING"
+    # what is running, as bench labels it: fp8, fp8+mtp3, nvfp4, ...
+    echo "$QUANT$([ "$MTP" = 0 ] || echo "+mtp$MTP")" > "$RUNNING"
     # its own session, no terminal: the server outlives the ssh login that started it
     setsid nohup "${CMD[@]}" >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
@@ -146,20 +158,45 @@ case "${1:-}" in
     done
     echo "up after $(( $(date +%s) - start ))s"
     grep -m1 -o 'KV cache size: .*' "$LOG" || true
+    # does the crew fit, if every call reaches CREW_CTX tokens at once?
+    kv="$(grep -m1 -o 'KV cache size: [0-9,]* tokens' "$LOG" | tr -dc 0-9 || true)"
+    if [ -n "$kv" ]; then
+      need=$(( CREW_TOTAL * CREW_CTX ))
+      fit=$(( kv / CREW_CTX - CREW_LEADS - 1 ))
+      echo "crew: $CREW_WORKERS workers + $CREW_LEADS leads + 1 orchestrator need up to $need tokens at $CREW_CTX each; the pool holds $kv ($(( need * 100 / kv ))%)"
+      echo "      by memory, up to about $fit workers fit at $CREW_CTX tokens per call; deploy/qwen.sh bench says how many are worth it"
+      [ "$need" -le "$kv" ] || echo "warning: a crew this size can run out of KV cache when every call is long: lower CREW_WORKERS or CREW_CTX" >&2
+    fi
     ;;
   status)
     if pid_alive; then echo "running  pid $(cat "$PIDFILE")"; else echo "stopped"; fi
-    [ -f "$LOG" ] && { head -1 "$LOG"; grep -m1 -o 'KV cache size: .*' "$LOG" || true; }
+    [ -f "$LOG" ] && { head -1 "$LOG"; grep -m1 -o 'KV cache size: .*' "$LOG" || true
+      sed -n 2p "$LOG" | grep -q -- '--enable-prefix-caching' && echo "prefix caching on" || echo "prefix caching OFF"
+      sed -n 2p "$LOG" | grep -o -- '--speculative-config [^ ]*' || echo "MTP off"; }
     exec python3 "$HERE/check.py" --url "$URL" --status
     ;;
   check)
     shift
-    exec python3 "$HERE/check.py" --url "$URL" --model "$SERVED" "$@"
+    exec python3 "$HERE/check.py" --url "$URL" --model "$SERVED" --concurrency "$CREW_TOTAL" "$@"
     ;;
   bench)
     shift
     q="$(cat "$RUNNING" 2>/dev/null || echo "$QUANT")"
     exec python3 "$HERE/check.py" --url "$URL" --model "$SERVED" --bench --label "$q" --save "$STATE/bench-$q.json" "$@"
+    ;;
+  sweep)
+    # one bench per server variant, back to back, then the comparison; the server is left stopped.
+    # Takes about 15 minutes a variant. Run it detached:  setsid nohup deploy/qwen.sh sweep > ~/qwen/sweep.log 2>&1 &
+    shift
+    for v in ${SWEEP:-fp8 fp8+mtp3}; do
+      q="${v%%+*}"; m=0; [ "$v" = "$q" ] || m="${v#*+mtp}"
+      echo "=== $v ($(date -Is))"
+      "$0" stop >/dev/null
+      if ! QUANT="$q" MTP="$m" "$0" start || ! "$0" wait; then echo "$v did not start; skipped (deploy/qwen.sh logs)"; continue; fi
+      "$0" bench "$@" || echo "$v: bench failed"
+    done
+    "$0" stop >/dev/null
+    exec "$0" compare
     ;;
   compare)
     exec python3 "$HERE/check.py" --compare "$STATE"/bench-*.json
@@ -178,7 +215,7 @@ case "${1:-}" in
     echo stopped
     ;;
   *)
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

@@ -5,7 +5,8 @@ Standard library only, so it runs on a fresh box and on a Mac at the end of an s
 
   check.py --url http://127.0.0.1:8000 --model qwen3.8-27b          the full check
   check.py --url http://127.0.0.1:8000 --status                       what the server is doing now
-  check.py --url ... --bench --label fp8 --save bench-fp8.json         decode speed, 1 and 13 calls at once
+  check.py --url ... --bench --label fp8 --save bench-fp8.json         speed at 1, 13, 32 and 64 calls at once,
+                                                                       for thinking-length and short answers
   check.py --compare bench-fp8.json bench-nvfp4.json                   saved bench results side by side
 
 The full check, in order, stopping at the first failure:
@@ -71,11 +72,11 @@ def metrics(base, key=None):
     return out
 
 
-def chat(base, model, key, messages, max_tokens, thinking, **extra):
+def chat(base, model, key, messages, max_tokens, thinking, timeout=600, **extra):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, **SAMPLING,
             "chat_template_kwargs": {"enable_thinking": thinking}, **extra}
     t = time.monotonic()
-    _, raw = request(f"{base}/v1/chat/completions", body, key)
+    _, raw = request(f"{base}/v1/chat/completions", body, key, timeout)
     data = json.loads(raw)
     choice = data["choices"][0]
     msg = choice.get("message") or {}
@@ -240,30 +241,65 @@ def full(base, model, key, n, max_tokens):
     return 1 if c.failed else 0
 
 
-def burst(base, model, key, n, max_tokens):
-    """n calls at once, each writing exactly max_tokens; returns tokens together per second and per call."""
+def pack(i, tokens):
+    """A pack of about `tokens` tokens that no other call shares (only the system prompt is shared, as in the crew)."""
+    lines, n = [], 0
+    while n < tokens * 4:
+        line = f"def helper_{i}_{len(lines)}(xs):\n    return [x * {len(lines) % 7 + 2} + {i} for x in xs if x % {len(lines) % 5 + 2}]\n"
+        lines.append(line)
+        n += len(line)
+    return f"# file src/agent_{i}/helpers.py\n" + "".join(lines)
+
+
+def watch_metrics(base, key, stop, peak):
+    while not stop.is_set():
+        m = metrics(base, key)
+        for k in ("running", "waiting", "kv_use"):
+            peak[k] = max(peak.get(k, 0.0), m.get(k, 0.0))
+        stop.wait(0.5)
+
+
+def level(base, model, key, n, prompt_tokens, max_tokens):
+    """n calls at once, each with its own pack of ~prompt_tokens and writing exactly max_tokens."""
+    before, peak, stop = metrics(base, key), {}, threading.Event()
+    w = threading.Thread(target=watch_metrics, args=(base, key, stop, peak), daemon=True)
+    w.start()
     t0 = time.monotonic()
+    call = lambda i: chat(base, model, key, [{"role": "system", "content": SHARED},
+                                             {"role": "user", "content": pack(i, prompt_tokens) + f"\nWrite {TASKS[i % len(TASKS)]}, with tests."}],
+                          max_tokens, False, ignore_eos=True, timeout=3600)
     with cf.ThreadPoolExecutor(max_workers=n) as pool:
-        rs = list(pool.map(lambda i: chat(base, model, key, [{"role": "system", "content": SHARED}, {"role": "user", "content": f"Write {TASKS[i % len(TASKS)]}, with tests."}],
-                                          max_tokens, False, ignore_eos=True), range(n)))
+        rs = list(pool.map(call, range(n)))
     wall = time.monotonic() - t0
-    return {"calls": n, "tokens": sum(r["completion_tokens"] for r in rs), "wall_s": round(wall, 2),
-            "tok_s_together": round(sum(r["completion_tokens"] for r in rs) / wall, 1),
-            "tok_s_per_call": round(statistics.median(r["completion_tokens"] / r["s"] for r in rs), 1),
-            "latency_max_s": round(max(r["s"] for r in rs), 2)}
+    stop.set()
+    w.join(2)
+    after = metrics(base, key)
+    toks = sum(r["completion_tokens"] for r in rs)
+    return {"calls": n, "prompt_tokens": round(statistics.mean(r["prompt_tokens"] for r in rs)), "tokens": toks, "wall_s": round(wall, 1),
+            "tok_s_together": round(toks / wall, 1), "tok_s_per_call": round(statistics.median(r["completion_tokens"] / r["s"] for r in rs), 1),
+            "peak_running": round(peak.get("running", 0)), "peak_waiting": round(peak.get("waiting", 0)), "peak_kv_use": round(peak.get("kv_use", 0), 2),
+            "preemptions": round(after.get("preemptions", 0) - before.get("preemptions", 0)),
+            "prefix_hit": ((after.get("prefix_hits", 0) - before.get("prefix_hits", 0)) / dq) if (dq := after.get("prefix_queries", 0) - before.get("prefix_queries", 0)) else None}
 
 
-def bench(base, model, key, n, max_tokens, rounds, label, save):
-    """Decode speed as the crew sees it: 1 call alone, then n at once, each round writing max_tokens per call."""
+def bench(base, model, key, levels, prompt_tokens, answers, label, save):
+    """Decode speed at each crew size, for each answer length: every call is one ticket attempt (its own pack, one answer)."""
     chat(base, model, key, [{"role": "user", "content": "Say ok."}], 8, False)  # warm-up
-    out = {"label": label, "model": model, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": max_tokens, "single": [], "crew": []}
-    for i in range(rounds):
-        out["single"].append(burst(base, model, key, 1, max_tokens))
-        out["crew"].append(burst(base, model, key, n, max_tokens))
-        print(f"round {i + 1}: alone {out['single'][-1]['tok_s_per_call']} tok/s; {n} at once {out['crew'][-1]['tok_s_together']} tok/s together, {out['crew'][-1]['tok_s_per_call']} per call")
-    best = lambda k, f: max(r[f] for r in out[k])
-    out["summary"] = {"alone_tok_s": best("single", "tok_s_per_call"), "together_tok_s": best("crew", "tok_s_together"), "per_call_tok_s": best("crew", "tok_s_per_call"), "calls": n}
-    print(f"{label}: alone {out['summary']['alone_tok_s']} tok/s, {n} at once {out['summary']['together_tok_s']} tok/s together ({out['summary']['per_call_tok_s']} per call)")
+    out = {"label": label, "model": model, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "prompt_tokens": prompt_tokens, "runs": []}
+    for name, max_tokens in answers:
+        run = {"answer": name, "max_tokens": max_tokens, "levels": []}
+        out["runs"].append(run)
+        print(f"\n{label}, {name} answers: each call reads ~{prompt_tokens} tokens and writes {max_tokens}")
+        print(f"{'at once':>7} {'together tok/s':>15} {'per call tok/s':>15} {'wall s':>7} {'running':>8} {'waiting':>8} {'KV used':>8} {'prefix hit':>11} {'preempted':>10}")
+        for n in levels:
+            r = level(base, model, key, n, prompt_tokens, max_tokens)
+            run["levels"].append(r)
+            hit = f"{100 * r['prefix_hit']:.0f}%" if r["prefix_hit"] is not None else "n/a"
+            print(f"{n:>7} {r['tok_s_together']:>15} {r['tok_s_per_call']:>15} {r['wall_s']:>7} {r['peak_running']:>8} {r['peak_waiting']:>8} {100 * r['peak_kv_use']:>7.0f}% {hit:>11} {r['preemptions']:>10}")
+        ls = run["levels"]
+        for a, b in zip(ls, ls[1:]):
+            gain = b["tok_s_together"] / a["tok_s_together"] if a["tok_s_together"] else 0
+            print(f"{a['calls']} -> {b['calls']} at once: {gain:.2f}x the tokens together, each call at {b['tok_s_per_call'] / a['tok_s_per_call'] if a['tok_s_per_call'] else 0:.0%} of its speed")
     if save:
         with open(save, "w") as f:
             json.dump(out, f, indent=1)
@@ -279,14 +315,25 @@ def compare(paths):
                 rows.append(json.load(f))
         except (OSError, ValueError) as e:
             print(f"skipped {p}: {e}")
+    # fp8 first, then fp8+mtp3, nvfp4, ...: the plain FP8 server is the yardstick
+    rows = sorted((r for r in rows if "runs" in r), key=lambda r: r["label"])
     if not rows:
-        print("nothing to compare: run deploy/qwen.sh bench with each checkpoint first")
+        print("nothing to compare: run deploy/qwen.sh bench (or sweep) first")
         return 1
-    base = rows[0]["summary"]
-    print(f"{'checkpoint':<12} {'measured':<20} {'alone tok/s':>12} {'crew tok/s':>11} {'per call':>9} {'vs ' + rows[0]['label']:>10}")
-    for r in rows:
-        s = r["summary"]
-        print(f"{r['label']:<12} {r['at']:<20} {s['alone_tok_s']:>12} {s['together_tok_s']:>11} {s['per_call_tok_s']:>9} {s['together_tok_s'] / base['together_tok_s']:>9.2f}x")
+    ref = rows[0]
+    for name in dict.fromkeys(run["answer"] for r in rows for run in r["runs"]):
+        first = {lv["calls"]: lv for run in ref["runs"] if run["answer"] == name for lv in run["levels"]}
+        mt = next(run["max_tokens"] for r in rows for run in r["runs"] if run["answer"] == name)
+        print(f"\n{name} answers ({mt} tokens each)")
+        print(f"{'server':<14} {'at once':>7} {'together tok/s':>15} {'per call tok/s':>15} {'vs ' + ref['label']:>14}")
+        for r in rows:
+            for run in r["runs"]:
+                if run["answer"] != name:
+                    continue
+                for lv in run["levels"]:
+                    base_lv = first.get(lv["calls"])
+                    ratio = f"{lv['tok_s_together'] / base_lv['tok_s_together']:.2f}x" if base_lv and base_lv["tok_s_together"] else "-"
+                    print(f"{r['label']:<14} {lv['calls']:>7} {lv['tok_s_together']:>15} {lv['tok_s_per_call']:>15} {ratio:>14}")
     return 0
 
 
@@ -295,10 +342,12 @@ def main():
     p.add_argument("--url", default="http://127.0.0.1:8000", help="server root, without /v1")
     p.add_argument("--model", default="qwen3.8-27b")
     p.add_argument("--concurrency", type=int, default=13)
-    p.add_argument("--max-tokens", type=int, help="tokens each burst call writes, all of them (ignore_eos); default 384, 1024 for --bench")
+    p.add_argument("--max-tokens", type=int, help="tokens each call in the check's burst writes, all of them (ignore_eos); default 384")
     p.add_argument("--status", action="store_true")
     p.add_argument("--bench", action="store_true", help="decode speed instead of the check")
-    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--levels", default="1,13,32,64", help="--bench: calls at once to measure, comma-separated")
+    p.add_argument("--prompt-tokens", type=int, default=8000, help="--bench: tokens of pack each call reads")
+    p.add_argument("--answers", default="thinking:4096,short:1024", help="--bench: answer lengths to measure, name:tokens, comma-separated")
     p.add_argument("--label", default="")
     p.add_argument("--save", default="")
     p.add_argument("--compare", nargs="*", metavar="BENCH_JSON")
@@ -308,7 +357,9 @@ def main():
     base = a.url.rstrip("/").removesuffix("/v1")
     key = os.environ.get("VLLM_API_KEY") or None
     if a.bench:
-        sys.exit(bench(base, a.model, key, a.concurrency, a.max_tokens or 1024, a.rounds, a.label or a.model, a.save))
+        levels = [int(x) for x in a.levels.split(",") if x.strip()]
+        answers = [(x.split(":")[0], int(x.split(":")[1])) for x in a.answers.split(",") if x.strip()]
+        sys.exit(bench(base, a.model, key, levels, a.prompt_tokens, answers, a.label or a.model, a.save))
     sys.exit(status(base, key) if a.status else full(base, a.model, key, a.concurrency, a.max_tokens or 384))
 
 
