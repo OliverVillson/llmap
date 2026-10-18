@@ -487,14 +487,15 @@ process.on('SIGTERM', stop);
 console.log(`\nlive view: ${viewUrl}  (from your Mac: ssh -N -L ${server.port}:127.0.0.1:${server.port} <this machine>, then open http://127.0.0.1:${server.port}/)`);
 console.log(`run folder: ${out}\n`);
 
-const orchestratorInf = () => pool.forAgent({ role: 'manager', agent: 'orchestrator', team: 'orchestrator' });
+// the run's stop ends a planning call in flight too, so one kill stops a run that is still planning
+const orchestratorInf = () => pool.forAgent({ role: 'manager', agent: 'orchestrator', team: 'orchestrator', signal: abort.signal });
 
 /**
  * The orchestrator plans for the crew: about one ticket per code agent. Above 16 agents the
  * engine splits the scaffold and the tickets per design component and runs the parts at once,
  * on worker slots (idle while the plan is made), each part shown as orchestrator-<n>.
  */
-const planFor: PlanOptions = { crew: concurrency, parts: (i) => pool.forAgent({ role: 'worker', agent: `orchestrator-${i + 1}`, team: 'orchestrator' }) };
+const planFor: PlanOptions = { crew: concurrency, parts: (i) => pool.forAgent({ role: 'worker', agent: `orchestrator-${i + 1}`, team: 'orchestrator', signal: abort.signal }) };
 
 /** The planned tickets, with what the planner warned about logged and left out of plan.json. */
 function planned(p: PlannedTickets): Plan {
@@ -502,6 +503,16 @@ function planned(p: PlannedTickets): Plan {
   for (const w of warnings ?? []) log(`orchestrator: ${w}`, 'warn');
   return plan;
 }
+
+// while the orchestrator plans, demo.log would stay silent for minutes (a thinking design call
+// writes nothing until it ends): one line a minute says it is still at work
+const planStart = Date.now();
+const planBeat = setInterval(() => {
+  if (!['designing', 'scaffolding', 'planning'].includes(orchestrator.phase)) return;
+  const s = Math.round((Date.now() - planStart) / 1000);
+  const open = calls.filter((c) => c.endAt === null && (c.role !== 'worker' || c.ticket.startsWith('orchestrator')));
+  tell(`orchestrator: still ${orchestrator.phase} (${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s in; ${open.length} planning call${open.length === 1 ? '' : 's'} in flight, ${calls.filter((c) => c.endAt !== null && !c.error).length} answered)`);
+}, 60_000);
 
 try {
   if (opt.prompt) {
@@ -516,6 +527,7 @@ try {
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}" for ${src}`);
       const d = await design(inf, `${opt.prompt}\n\nThe work happens in an existing repository with these files:\n${files.slice(0, 400).map((f) => `- ${f}`).join('\n')}`, [], 'architect', planFor);
+      for (const w of d.warnings ?? []) log(`orchestrator: ${w}`, 'warn');
       writeFileSync(join(out, 'ARCHITECTURE.md'), architectureMarkdown(d));
       orchestrator.phase = 'planning';
       log('orchestrator: planning tickets');
@@ -524,6 +536,7 @@ try {
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}"`);
       const d = await design(inf, opt.prompt, [], 'architect', planFor);
+      for (const w of d.warnings ?? []) log(`orchestrator: ${w}`, 'warn');
       writeFileSync(join(repo, 'ARCHITECTURE.md'), architectureMarkdown(d));
       if (d.questions.length) log(`orchestrator: it would have asked ${d.questions.join(' / ')} (answered by nobody in a demo)`, 'warn');
       orchestrator.phase = 'scaffolding';
@@ -568,6 +581,7 @@ try {
   telemetry.setPlan(plan);
   for (const t of plan.tickets) digest(t.id);
   for (const c of plan.settled ?? []) log(`orchestrator: ${c.ticket} waits for ${c.with.join(', ')}: both write ${c.files.join(', ')}`);
+  clearInterval(planBeat);
   orchestrator.phase = 'dispatching';
   log(`orchestrator: ${plan.tickets.length} tickets, ${plan.tickets.filter((t) => !t.depends_on.length).length} ready at once, for ${concurrency} code agents; at most ${checkSlots} checks run at once (--checks)`);
 
@@ -617,6 +631,7 @@ try {
   if (existsSync(resultDir)) console.log(`\nthe built project (mugge/integration, every finished ticket merged): ${resultDir}`);
   console.log(`logs in ${out}`);
 } catch (e) {
+  clearInterval(planBeat);
   orchestrator.phase = 'failed';
   log(`demo stopped: ${String((e as Error).message ?? e)}`, 'error');
   try {
