@@ -45,6 +45,8 @@ DATA_DIR="${DATA_DIR:-$(python3 "$HERE/disk.py" pick)}"
 # the weights, vLLM's compile cache and Triton's kernels all go under the data folder
 export HF_HOME="${HF_HOME:-$DATA_DIR/hf}" XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DATA_DIR/cache}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DATA_DIR/cache/triton}" UV_CACHE_DIR="${UV_CACHE_DIR:-$DATA_DIR/cache/uv}"
+# FlashInfer's compiled kernels: <base>/.cache/flashinfer
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$DATA_DIR}"
 # a venv made before DATA_DIR existed stays where it is
 if [ -z "${VENV:-}" ] && [ -x "$HOME/venvs/qwen-vllm/bin/python" ]; then VENV="$HOME/venvs/qwen-vllm"; fi
 VENV="${VENV:-$DATA_DIR/venv}"
@@ -201,6 +203,19 @@ cuda_env() {
     [ -z "$libcuda" ] || { mkdir -p "$d/lib/stubs"; ln -sf "$libcuda" "$d/lib/stubs/libcuda.so"; }
   fi
   export CUDA_HOME="$d" PATH="$d/bin:$PATH"
+  # nvcc must be the same CUDA 13.x as the runtime headers torch brought, or FlashInfer's build
+  # stops at "CUDA compiler and CUDA toolkit headers are incompatible"; vLLM's deps pull the newest
+  local versions uv
+  versions="$("$VENV/bin/python" -c 'import importlib.metadata as m
+v = lambda p: ".".join(m.version(p).split(".")[:2])
+print(v("nvidia-cuda-runtime"), v("nvidia-cuda-nvcc"))' 2>/dev/null || true)"
+  set -- $versions
+  if [ $# -eq 2 ] && [ "$1" != "$2" ]; then
+    uv="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    echo "nvcc $2 does not match the CUDA $1 runtime: installing nvcc $1 in the venv"
+    VIRTUAL_ENV="$VENV" "$uv" pip install -q "nvidia-cuda-nvcc==$1.*" "nvidia-cuda-crt==$1.*" "nvidia-nvvm==$1.*" ||
+      die "could not install nvcc $1: VIRTUAL_ENV=$VENV uv pip install 'nvidia-cuda-nvcc==$1.*' 'nvidia-cuda-crt==$1.*' 'nvidia-nvvm==$1.*'"
+  fi
 }
 
 CMD_NAME="${1:-}"

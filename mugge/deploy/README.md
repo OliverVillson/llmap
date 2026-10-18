@@ -223,7 +223,10 @@ bound by the checks rather than the GPU, and a smaller crew finishes as fast.
 Attention kernels: vLLM picks FlashInfer with its TRT-LLM kernels on a B200, the fastest.
 `ATTENTION=FLASH_ATTN` (or `TRITON_ATTN`) forces another. FlashInfer compiles parts of itself on
 the first start (a few minutes, cached under the data folder) with the `nvcc` from the venv
-(`site-packages/nvidia/cu13`), which `start` sets as `CUDA_HOME`; vLLM uses FlashInfer for more
+(`site-packages/nvidia/cu13`), which `start` sets as `CUDA_HOME`. That `nvcc` must be the same CUDA
+13.x as the runtime PyTorch brought (vLLM's dependencies pull the newest), so `setup` and `start`
+install the matching `nvidia-cuda-nvcc`, `-crt` and `nvvm` in the venv when they differ. The
+kernels are cached in `<data folder>/.cache/flashinfer` (`FLASHINFER_WORKSPACE_BASE`); vLLM uses FlashInfer for more
 than attention on this model, so it needs `nvcc` whichever attention is picked.
 
 Overrides: any of `ATTENTION`, `MAX_MODEL_LEN`, `KV_DTYPE`, `MAX_NUM_SEQS`, `GPU_UTIL`, `PORT`, `TP`, or
