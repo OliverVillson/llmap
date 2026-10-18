@@ -44,6 +44,7 @@ all ended ─► integrate: merge done branches onto mugge/integration in depend
 | Engine API on the VM (status, SSE events, run, stop) | `src/api/server.ts` |
 | TUI: dog, matrix splash, run view, project list | `src/ui/` |
 | VM setup and vLLM with every adapter | `vm/setup.sh`, `vm/serve-vllm.sh` |
+| Qwen3.8-27B-FP8 on one GPU and the crew file for it (run sheet) | `deploy/` |
 
 ## The spike
 
