@@ -100,6 +100,8 @@ a{color:var(--accent)}
 @media (max-width:1000px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:560px){.board{grid-template-columns:1fr}}
 .col{display:flex;flex-direction:column;gap:6px;min-width:0}
+.col .list{display:flex;flex-direction:column;gap:6px;max-height:480px;overflow-y:auto;min-width:0}
+.agents.dense{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));max-height:560px;overflow-y:auto}
 .col .ch{color:var(--dim);font-size:11px;letter-spacing:.12em;text-transform:uppercase;border-bottom:1px solid var(--edge);padding-bottom:3px}
 .col .ch b{color:var(--pale);font-weight:700;letter-spacing:0}
 .tk{border:1px solid var(--edge);border-radius:3px;padding:4px 7px;text-align:left;display:flex;flex-direction:column;gap:1px;min-width:0}
@@ -266,12 +268,14 @@ function renderFinish(d) {
 function renderOrchestrator(d, st) {
   const o = d.orchestrator;
   const phaseWord = { starting: 'starting', designing: 'designing the project', scaffolding: 'writing the scaffold', planning: 'planning the tickets', dispatching: 'dispatching tickets and reviewing finished work', integrating: 'merging every finished ticket and running all the checks', finished: 'done', stopped: 'stopped', failed: 'stopped with an error' }[o.phase] ?? o.phase;
-  const reviewing = o.reviewing.length ? o.reviewing.map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') : '<span class="dimc">nothing right now</span>';
+  // a planning call can run for minutes on a big crew: say how long the one in flight has run
+  const own = ['designing', 'scaffolding', 'planning'].includes(o.phase) ? (d.inflight ?? []).find((c) => c.ticket === 'orchestrator') : null;
+  const reviewing = o.reviewing.length ? o.reviewing.slice(0, 6).map((x) => `<span class="pale">${esc(x)}</span>`).join(', ') + (o.reviewing.length > 6 ? ` <span class="dimc">and ${o.reviewing.length - 6} more</span>` : '') : '<span class="dimc">nothing right now</span>';
   $('#orch-machine').textContent = [o.machine && `plans on ${o.machine}`, o.leadMachine && `reviews on ${o.leadMachine}`].filter(Boolean).join(' · ');
   $('#orch').innerHTML = `<div class="orch">
     <button class="dot" data-open="orchestrator" aria-label="Open the orchestrator's view"><span class="role">${['finished', 'stopped'].includes(o.phase) ? '◎' : '◉'}</span></button>
     <div class="body">
-      <div><b class="pale">orchestrator</b> <span class="dimc">·</span> ${esc(phaseWord)}</div>
+      <div><b class="pale">orchestrator</b> <span class="dimc">·</span> ${esc(phaseWord)}${own ? ` <span class="dimc">· one call, running for</span> ${dur(d.now - own.sentAt)}` : ''}</div>
       <div class="small"><span class="dimc">plan</span> ${esc(o.planNote || '…')}</div>
       <div class="small"><span class="dimc">◆ lead review</span> ${o.reviews.approve} approved · ${o.reviews.problems} sent back${o.reviews.error ? ` · ${o.reviews.error} failed` : ''} <span class="dimc">· reading</span> ${reviewing}</div>
       ${o.rejected?.length ? `<div class="small"><span class="dimc">its own plan was not used:</span> ${esc(o.rejected.slice(0, 2).join('; '))}${o.rejected.length > 2 ? ` (+${o.rejected.length - 2})` : ''}</div>` : ''}
@@ -310,13 +314,16 @@ function renderAgents(st) {
   const big = ws.length > 12;
   const shown = big ? ws.filter((a) => !idle(a)) : ws;
   const rest = ws.length - shown.length;
-  $('#agents').innerHTML = shown.map((a) => {
+  const box = $('#agents'), top = box.scrollTop;
+  box.classList.toggle('dense', shown.length > 20);
+  box.innerHTML = shown.map((a) => {
     const on = a.ticket && !['finished', 'failed', 'idle'].includes(a.state);
     return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}">
       <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span> <span class="small">${esc(a.ticket ?? '')}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
       <span class="small trunc ${on ? '' : 'dimc'}">${esc(STATE_WORD[a.state] ?? a.state)}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
       <span class="xs dimc trunc">${esc(a.owns.join(' ') || '—')}</span></button>`;
   }).join('') + (rest ? `<div class="cell"><span class="r1"><span><span class="g-idle">○</span> ${rest} idle</span></span><span class="small dimc trunc">waiting for a ready ticket</span><span class="xs dimc trunc">press a dot above to open one</span></div>` : '');
+  box.scrollTop = top;
 }
 
 function ticketColumn(t, dg) {
@@ -335,13 +342,16 @@ function renderBoard(st, d) {
   const head = { waiting: 'Waiting', working: 'Working', review: 'In review', done: 'Done', failed: 'Failed' };
   $('#board-n').textContent = `${st.tickets.length} tickets`;
   $('#plan-note').textContent = d.plan ? (d.plan.source === 'orchestrator' ? 'plan written by the orchestrator' : 'prepared plan, settled by the orchestrator') : '';
-  $('#board').innerHTML = Object.entries(cols).map(([k, list]) => `<div class="col"><div class="ch">${head[k]} <b>${list.length}</b></div>${list.map((t) => {
+  // a big crew's columns scroll; keep where each one was scrolled across the redraw
+  const kept = Object.fromEntries([...document.querySelectorAll('#board .list')].map((el) => [el.dataset.col, el.scrollTop]));
+  $('#board').innerHTML = Object.entries(cols).map(([k, list]) => `<div class="col"><div class="ch">${head[k]} <b>${list.length}</b></div><div class="list" data-col="${k}">${list.map((t) => {
     const dg = digestOf(t.id);
     const s = dg?.state ?? t.state;
     const why = k === 'waiting' ? (t.settled ? `after ${t.dependsOn.join(', ')} (settled clash)` : t.state === 'ready' || t.error === 'waiting for a free agent' ? 'ready, waiting for a free agent' : t.dependsOn.length ? `waits on ${t.dependsOn.filter((x) => !['done'].includes(st.tickets.find((y) => y.id === x)?.state)).join(', ') || 'nothing now'}` : 'ready') : k === 'failed' ? (dg?.error ?? t.error ?? s) : k === 'done' ? (dg?.reviews?.some((r) => r.verdict === 'problems') ? 'fixed what the lead sent back' : dg?.reviews?.length ? '' : 'checks pass') : k === 'review' ? 'the lead is reading the diff' : `${STATE_WORD[s] ?? s} · attempt ${t.attempt}/${t.maxAttempts}`;
     const agent = t.agent ? `<span class="dimc xs">${esc(t.agent)}</span>` : '';
     return `<button class="tk ${k === 'done' ? 'done' : ''}" data-ticket="${esc(t.id)}" title="${esc(titles[t.id] ?? '')}"><span class="r1"><span class="tid trunc"><span class="g-${esc(s === 'done' ? 'finished' : s)}">${esc(glyph(s === 'done' ? 'finished' : s, t.attempt, t.maxAttempts))}</span> ${esc(t.id)}</span>${agent}</span>${why ? `<span class="xs dimc trunc">${esc(why)}</span>` : ''}</button>`;
-  }).join('')}</div>`).join('');
+  }).join('')}</div></div>`).join('');
+  for (const el of document.querySelectorAll('#board .list')) el.scrollTop = kept[el.dataset.col] ?? 0;
   const settled = d.plan?.settled ?? [];
   $('#settled').innerHTML = settled.length ? `<div class="settled small"><b class="pale">Settled by the orchestrator</b> ${settled.map((c) => `<span class="pale">${esc(c.ticket)}</span> runs after <span class="pale">${esc(c.with.join(', '))}</span>: both write <span class="pale">${esc(c.files.join(', '))}</span>`).join('; ')}. The later ticket starts from the earlier one's finished file.</div>` : '';
 }

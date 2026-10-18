@@ -1,18 +1,21 @@
 #!/usr/bin/env bun
 /**
- * The Centipede demo: one orchestrator and ten code agents build a small real project at the
- * same time, and a live view in the browser shows the crew while they work.
+ * The Centipede demo: an orchestrator and a crew of code agents build a project at the same
+ * time, and a live view in the browser shows the crew while they work.
  *
- *   bun demo/run.ts                      the built-in task (mdlite, demo/project) on MUGGE_BACKENDS
- *   bun demo/run.ts --fake               the same against a mock model, no GPU (a rehearsal)
- *   bun demo/run.ts --plan orchestrator  the orchestrator writes the ticket plan itself
  *   bun demo/run.ts --prompt "a CLI that …" [--repo DIR]
- *                                        your own task: the orchestrator designs, scaffolds (or
- *                                        reads DIR) and plans it, then the crew builds it
+ *                                        your task: the orchestrator designs, scaffolds (or reads
+ *                                        DIR) and plans it, about one ticket per agent, then the
+ *                                        crew builds it (the 64-agent first run, demo/README.md)
+ *   bun demo/run.ts                      the built-in task (mdlite, demo/project), for 10 agents
+ *   bun demo/run.ts --plan orchestrator  mdlite, with the orchestrator writing the ticket plan
+ *   bun demo/run.ts --fake [--prompt …]  the same against a mock model, no GPU (a rehearsal); with
+ *                                        --prompt the mock plans one module per agent
  *
  * Options: --port N (7340), --host H (127.0.0.1), --out DIR (demo/runs/<run id>),
  * --concurrency N (MUGGE_CONCURRENCY, else 10), --exit (stop once the run ends; by default the
- * view stays up until Ctrl-C), --fake-speed X (mock calls X times faster, default 1).
+ * view stays up until Ctrl-C), --checks N (acceptance runs at once, default this machine's CPU
+ * count), --fake-speed X (mock calls X times faster, default 1).
  *
  * Everything lands in the run folder: repo/ (the target project, branches mugge/<ticket> and
  * mugge/integration), result/ (the integrated project, its test run and README.html), events.jsonl
@@ -30,11 +33,13 @@ import { startFakeModel } from '../src/engine/fake-model.ts';
 import { git, headCommit, initRepo, INTEGRATION_BRANCH } from '../src/engine/git.ts';
 import type { CallTweaks, ChatMessage, Completion, Inference } from '../src/engine/inference.ts';
 import { REVIEW_SYSTEM } from '../src/engine/prompts.ts';
-import { sandboxFromEnv } from '../src/engine/sandbox.ts';
+import { sandboxFromEnv, type Sandbox } from '../src/engine/sandbox.ts';
+import { availableParallelism } from 'node:os';
 import { runPlan, type RunReport } from '../src/engine/scheduler.ts';
 import { backendLabel, crewFromEnv, formatCallSummary, runId, Telemetry, type CrewLayout } from '../src/engine/telemetry.ts';
-import { architectureMarkdown, design, scaffold, tickets } from '../src/plan/architect.ts';
-import { validatePlan, type Plan } from '../src/tickets/schema.ts';
+import { architectureMarkdown, design, DESIGN_JSON_SCHEMA, scaffold, tickets, type Design } from '../src/plan/architect.ts';
+import { fakeProject, type FakeProject } from './fake-prompt.ts';
+import { validatePlan, WORKER_OUTPUT_JSON_SCHEMA, type Plan } from '../src/tickets/schema.ts';
 import { DEMO_DIR, loadPlan, PLAN_PATH, PROJECT_DIR, referenceAnswers, REQUEST } from './lib.ts';
 import { orchestratorPlan } from './orchestrator.ts';
 
@@ -43,7 +48,7 @@ const { values: opt } = parseArgs({
     fake: { type: 'boolean' }, 'fake-speed': { type: 'string' },
     plan: { type: 'string' }, prompt: { type: 'string' }, repo: { type: 'string' },
     port: { type: 'string' }, host: { type: 'string' }, out: { type: 'string' },
-    concurrency: { type: 'string' }, exit: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+    concurrency: { type: 'string' }, checks: { type: 'string' }, exit: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
   },
 });
 if (opt.help) {
@@ -60,6 +65,9 @@ if (opt.prompt && opt.plan === 'prepared') die('--prompt is planned by the orche
 
 const concurrency = Number(opt.concurrency ?? process.env.MUGGE_CONCURRENCY ?? 10);
 if (!Number.isInteger(concurrency) || concurrency < 1) die('--concurrency must be a positive integer');
+// every agent's checks run on this machine's CPUs: at most this many at once, the rest wait their turn
+const checkSlots = Number(opt.checks ?? availableParallelism());
+if (!Number.isInteger(checkSlots) || checkSlots < 1) die('--checks must be a positive integer');
 const port = Number(opt.port ?? 7340);
 const host = opt.host ?? '127.0.0.1';
 const id = runId();
@@ -77,23 +85,27 @@ let fakeSpeed = 1;
 /** How long the mock server holds each call, so the call has its slot for most of its pace. */
 const FAKE_HOLD_MS = () => Math.round(10_000 / fakeSpeed);
 let stopFake: (() => void) | null = null;
+let fakeOwn: FakeProject | null = null;
 if (opt.fake) {
-  if (opt.prompt) die('--fake only knows the built-in task: it answers with demo/reference');
+  if (opt.repo) die('--fake cannot read your repo: it answers with a project of its own (drop --repo)');
   fakeSpeed = Number(opt['fake-speed'] ?? 1);
   if (!(fakeSpeed > 0)) die('--fake-speed must be a positive number');
+  // with --prompt the mock orchestrator plans a project sized to the crew, one module per agent
+  fakeOwn = opt.prompt ? fakeProject(concurrency) : null;
+  const [flakyId, sentBackId] = fakeOwn ? [fakeOwn.plan.tickets[2]?.id ?? '', fakeOwn.plan.tickets[4]?.id ?? ''] : ['block-list', 'block-quote'];
   const fake = startFakeModel({
-    solutions: referenceAnswers(loadPlan()),
+    solutions: fakeOwn?.solutions ?? referenceAnswers(loadPlan()),
     // a first answer with no file (the fix loop runs) and one send-back by the lead
-    flaky: ['block-list'],
+    flaky: [flakyId],
     // most of a call's pace is spent inside the server, so the pool shows the slot busy as with vLLM
     latencyMs: FAKE_HOLD_MS(),
-    reviews: { 'block-quote': [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
+    reviews: { [sentBackId]: fakeOwn ? [{ verdict: 'problems', problems: ['convert() returns the value without rounding it to 6 decimals as the docstring says.'], fix: 'Round the result to 6 decimals.' }, { verdict: 'approve', problems: [], fix: '' }] : [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
   });
   stopFake = fake.stop;
   // the same shape as deploy/crew-b200.json: one server, separate slots for workers, leads and the orchestrator
   process.env.MUGGE_BACKENDS = JSON.stringify([
     { name: 'mock-workers', url: fake.url, roles: ['worker'], slots: concurrency },
-    { name: 'mock-leads', url: fake.url, roles: ['lead'], slots: 2 },
+    { name: 'mock-leads', url: fake.url, roles: ['lead'], slots: Math.max(2, Math.ceil(concurrency / 16)) },
     { name: 'mock-orchestrator', url: fake.url, roles: ['manager'], slots: 1 },
   ]);
   process.env.MUGGE_MODEL ||= 'mock';
@@ -173,7 +185,7 @@ const brief = (c: CallLog) => ({ ...c, messages: undefined, answer: undefined, r
 /** Records every call an agent's inference makes; in a rehearsal also gives the mock a model's pace. */
 function recorded(inf: Inference, o: CallOptions): Inference {
   const role: Role = o.role ?? 'worker';
-  const log = async <T,>(messages: ChatMessage[], maxTokens: number, kind: CallLog['kind'] | null, call: () => Promise<Completion<T>>): Promise<Completion<T>> => {
+  const log = async <T,>(messages: ChatMessage[], maxTokens: number, kind: CallLog['kind'] | null, call: () => Promise<Completion<T>>, schema?: object): Promise<Completion<T>> => {
     const ticket = o.agent ?? 'orchestrator';
     const rec: CallLog = {
       id: calls.length + 1, ticket, role, kind: kind ?? callKind(messages), attempt: digests.get(ticket)?.attempt ?? 0,
@@ -185,6 +197,14 @@ function recorded(inf: Inference, o: CallOptions): Inference {
     try {
       const c = await call();
       if (opt.fake) {
+        // the mock has no orchestrator of its own: it answers the built-in task's plan call with the
+        // prepared plan, and --prompt's design, scaffold and ticket calls with the crew-sized project
+        if (rec.kind === 'plan') {
+          const value = schema === DESIGN_JSON_SCHEMA ? fakeOwn?.design : schema === WORKER_OUTPUT_JSON_SCHEMA ? fakeOwn?.scaffold : (fakeOwn?.plan ?? JSON.parse(readFileSync(PLAN_PATH, 'utf8')));
+          (c as Completion<unknown>).value = value;
+          c.raw = JSON.stringify(value);
+          c.completionTokens = Math.round(c.raw.length / 3.5);
+        }
         // a model's pace: about 60 tok/s per call, some thinking first
         const think = role === 'worker' ? 300 + Math.round(Math.random() * 900) : 120;
         const ms = Math.round(((c.completionTokens + think) / 60) * 1000 * (0.7 + Math.random() * 0.6) / fakeSpeed);
@@ -195,8 +215,6 @@ function recorded(inf: Inference, o: CallOptions): Inference {
         c.reasoningTokens = think;
         c.completionTokens += think;
         if (role === 'worker') c.reasoning = `(mock model: no real thinking; a real run shows the model's own here, about ${think} tokens of it)`;
-        // the mock has no planner: in a rehearsal of --plan orchestrator it answers with the prepared plan
-        if (rec.kind === 'plan') (c as Completion<unknown>).value = JSON.parse(readFileSync(PLAN_PATH, 'utf8'));
       }
       Object.assign(rec, { endAt: Date.now(), answer: typeof c.value === 'string' ? c.value : c.raw, reasoning: c.reasoning ?? null, promptTokens: c.promptTokens, completionTokens: c.completionTokens, reasoningTokens: c.reasoningTokens ?? null, reasoningChars: c.reasoningChars ?? null, ms: c.ms, cut: !!c.cut, thinking: c.thinking ?? null });
       return c;
@@ -212,7 +230,27 @@ function recorded(inf: Inference, o: CallOptions): Inference {
   return {
     text: (model, messages, maxTokens, signal, tweaks) => log(messages, maxTokens, null, () => inf.text(model, messages, maxTokens, signal, tweaks)),
     complete: <T,>(model: string, messages: ChatMessage[], schema: object, maxTokens: number, signal?: AbortSignal, tweaks?: CallTweaks) =>
-      log<T>(messages, maxTokens, messages[0]?.content === REVIEW_SYSTEM ? 'review' : 'plan', () => inf.complete<T>(model, messages, schema, maxTokens, signal, tweaks)),
+      log<T>(messages, maxTokens, messages[0]?.content === REVIEW_SYSTEM ? 'review' : 'plan', () => inf.complete<T>(model, messages, schema, maxTokens, signal, tweaks), schema),
+  };
+}
+
+/** A sandbox that runs at most n commands at once; the rest wait in order (the timeout starts when one runs). */
+function limited(sb: Sandbox, n: number): Sandbox {
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return {
+    name: sb.name,
+    async run(command, o) {
+      if (running >= n) await new Promise<void>((go) => waiting.push(go));
+      else running++;
+      try {
+        return await sb.run(command, o);
+      } finally {
+        const next = waiting.shift();
+        if (next) next();
+        else running--;
+      }
+    },
   };
 }
 
@@ -400,6 +438,17 @@ console.log(`run folder: ${out}\n`);
 
 const orchestratorInf = () => pool.forAgent({ role: 'manager', agent: 'orchestrator', team: 'orchestrator' });
 
+/**
+ * The crew size, for the orchestrator's design and plan: said in the request it designs from, and
+ * kept as a design decision so the scaffold and ticket calls (which see ARCHITECTURE.md) get it too.
+ */
+const crewRequest = (request: string) =>
+  `${request}\n\nThe crew: ${concurrency} code agents work at the same time. Split the work so about ${concurrency} tickets can start at once: one module per ticket, each with its own files and its own test file, and as few dependencies between tickets as possible.`;
+const withCrew = (d: Design): Design => ({
+  ...d,
+  decisions: [...d.decisions, { decision: `About ${concurrency} tickets that can start at once, one module each with its own test file`, why: `the crew has ${concurrency} code agents working at the same time` }],
+});
+
 try {
   if (opt.prompt) {
     mkdirSync(repo, { recursive: true });
@@ -412,7 +461,7 @@ try {
       files = git(src, ['ls-files']).code === 0 ? git(src, ['ls-files']).out.split('\n').filter(Boolean) : readdirSync(repo, { recursive: true }).map(String);
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}" for ${src}`);
-      const d = await design(inf, `${opt.prompt}\n\nThe work happens in an existing repository with these files:\n${files.slice(0, 400).map((f) => `- ${f}`).join('\n')}`);
+      const d = withCrew(await design(inf, `${crewRequest(opt.prompt)}\n\nThe work happens in an existing repository with these files:\n${files.slice(0, 400).map((f) => `- ${f}`).join('\n')}`));
       writeFileSync(join(out, 'ARCHITECTURE.md'), architectureMarkdown(d));
       orchestrator.phase = 'planning';
       log('orchestrator: planning tickets');
@@ -420,7 +469,7 @@ try {
     } else {
       orchestrator.phase = 'designing';
       log(`orchestrator: designing "${opt.prompt}"`);
-      const d = await design(inf, opt.prompt);
+      const d = withCrew(await design(inf, crewRequest(opt.prompt)));
       writeFileSync(join(repo, 'ARCHITECTURE.md'), architectureMarkdown(d));
       if (d.questions.length) log(`orchestrator: it would have asked ${d.questions.join(' / ')} (answered by nobody in a demo)`, 'warn');
       orchestrator.phase = 'scaffolding';
@@ -464,11 +513,11 @@ try {
   for (const t of plan.tickets) digest(t.id);
   for (const c of plan.settled ?? []) log(`orchestrator: ${c.ticket} waits for ${c.with.join(', ')}: both write ${c.files.join(', ')}`);
   orchestrator.phase = 'dispatching';
-  log(`orchestrator: ${plan.tickets.length} tickets, ${concurrency} code agents`);
+  log(`orchestrator: ${plan.tickets.length} tickets, ${plan.tickets.filter((t) => !t.depends_on.length).length} ready at once, for ${concurrency} code agents; at most ${checkSlots} checks run at once (--checks)`);
 
   const report = await runPlan({
     repo, base: headCommit(repo), plan, pool,
-    sandbox: sandboxFromEnv(),
+    sandbox: limited(sandboxFromEnv(), checkSlots),
     concurrency,
     worktreeRoot: join(out, 'worktrees'),
     emit,
@@ -482,10 +531,15 @@ try {
   if (git(repo, ['rev-parse', '--verify', '-q', INTEGRATION_BRANCH]).code === 0) {
     rmSync(resultDir, { recursive: true, force: true });
     git(repo, ['worktree', 'add', '-q', '--detach', resultDir, INTEGRATION_BRANCH]);
-    if (!opt.prompt) {
+    // a Python project with a tests/ folder (the built-in task, the mock's, or yours): its whole suite
+    const pyTests = existsSync(join(resultDir, 'tests')) && readdirSync(join(resultDir, 'tests')).some((f) => /^test_.*\.py$/.test(f));
+    if (pyTests) {
       const t = Bun.spawnSync(['bash', '-c', 'python3 -m unittest discover -s tests -t . 2>&1 | tail -4'], { cwd: resultDir });
       result.tests = t.stdout.toString().trim();
       result.testsOk = /\nOK\b|^OK\b/m.test(result.tests);
+      if (opt.prompt) log(`whole project: ${result.testsOk ? 'every test passes' : 'tests do not all pass'}`);
+    }
+    if (!opt.prompt) {
       const r = Bun.spawnSync(['python3', '-m', 'mdlite', 'README.md', '--standalone', '--toc', '-o', 'README.html'], { cwd: resultDir, stderr: 'pipe' });
       result.readme = r.exitCode === 0 && existsSync(join(resultDir, 'README.html'));
       log(`whole project: ${result.testsOk ? 'every test passes' : 'tests do not all pass'}; README.html ${result.readme ? 'rendered by mdlite itself' : 'not rendered'}`);

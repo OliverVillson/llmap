@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { ancestors, loadPlan, PROJECT_DIR, referenceAnswers } from '../demo/lib.ts';
+import { fakeProject } from '../demo/fake-prompt.ts';
 import { checkPlan, importsOf, plannerMessage } from '../demo/orchestrator.ts';
 
 describe('demo plan', () => {
@@ -56,5 +57,18 @@ describe('orchestrator plan check', () => {
     expect(m).toContain('- mdlite/block_heading.py (imports mdlite.slug)');
     expect(m).toContain('also owns mdlite/theme.css');
     expect(m).toContain('- tests/test_render.py: imports mdlite.render');
+  });
+});
+
+describe('the mock orchestrator for --fake --prompt', () => {
+  test('plans one ticket per agent, all ready at once, plus a registry that waits on them', () => {
+    const fp = fakeProject(64);
+    expect(fp.plan.tickets.length).toBe(65);
+    expect(fp.plan.tickets.filter((t) => !t.depends_on.length).length).toBe(64);
+    expect(fp.plan.tickets.at(-1)!.depends_on.length).toBe(64);
+    for (const t of fp.plan.tickets) {
+      expect(Object.keys(fp.solutions[t.id]!.files)).toEqual(t.owns);
+      for (const p of [...t.owns, ...t.reads]) expect(fp.scaffold.files[p]).toBeDefined();
+    }
   });
 });

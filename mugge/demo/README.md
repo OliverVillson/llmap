@@ -1,36 +1,54 @@
 # The Centipede demo
 
-One orchestrator and ten code agents build a small real project at the same time on one
-Qwen3.8-27B-FP8 server, and a live view in the browser shows the crew while they work: the
-plan, ten agents in parallel, a file clash the orchestrator settles, the lead's review of every
-finished ticket, and the integrated result with its tests green.
+One prompt in, a crew of code agents building it at once on one Qwen3.8-27B-FP8 server, and a
+live view in the browser while they work. The orchestrator designs the project, writes its
+scaffold and splits it into tickets, about one per code agent, so most of the crew starts at
+once. Each ticket's agent writes its files until its checks pass, a lead reviews every finished
+ticket, and the run ends by merging every branch and running the whole project's tests.
 
-The built-in task is **mdlite**, a Markdown to HTML converter in plain Python 3 with a command
-line. `project/` is its scaffold: 17 stub modules that raise `NotImplementedError`, each with its
-contract in the docstring, and 118 unit tests. `plan.json` cuts it into 17 tickets, one per
-module; 12 can start at once, so all ten agents have work from the first second. Two tickets
-(`block-table` and `block-code`) both add rules to `mdlite/theme.css`; the orchestrator settles
-that clash by running `block-code` after `block-table`. When every ticket is merged, the run
-runs the whole test suite and renders `project/README.md` with the crew's own tool.
+## First run: 64 agents from one prompt (B200)
 
-## On the B200
-
-Once `deploy/qwen.sh check` ends in PASS (deploy/README.md), from the mugge folder:
+From the mugge folder:
 
 ```bash
 git fetch origin && git checkout claude/centipede-demo   # until it is merged; it includes deploy/
 bun install
-set -a; . deploy/crew.env; set +a
-bun demo/run.ts
+CREW_WORKERS=64 deploy/qwen.sh start          # once; the server keeps the crew size
+deploy/qwen.sh wait && deploy/qwen.sh check   # check must end in PASS
+set -a; . deploy/crew.env; set +a             # reads 64 back: 64 workers, 4 leads, 1 orchestrator
+bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with 64 small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only."
 ```
 
-It needs `python3` (3.8 or newer), for `crew.env` and for the project's tests. The crew has 10
-code agents by default; set `CREW_WORKERS=24` (or 32, 64) before loading `crew.env`, and start
-the server with the same value. The built-in task never has more than 12 tickets ready at once,
-so agents beyond 12 stay idle there; a bigger crew pays off on a bigger `--prompt` task. The run prints the view's address and
-the run folder, and keeps the view up after the run ends until Ctrl-C. To keep it running after
-you log out, start it with `nohup bun demo/run.ts > demo.log 2>&1 &` (stop it with `kill`), or
-inside tmux.
+`deploy/README.md` covers the server itself. The demo needs `python3` (3.8 or newer), for
+`crew.env` and for Python projects' tests. It prints the view's address and the run folder, and
+keeps the view up after the run ends until Ctrl-C. To keep it running after you log out, start it
+with `nohup bun demo/run.ts --prompt "…" > demo.log 2>&1 &` (stop it with `kill`), or inside tmux.
+
+What to expect at 64:
+
+- **Planning comes first and takes a while.** The orchestrator makes three calls on its own
+  slot: design, scaffold and tickets. With 64 modules the scaffold is the long one (a stub and a
+  test per module), and the view shows how long the call in flight has run. A planning call is
+  capped at `MUGGE_MAX_CALL_TOKENS` (16,384), thinking included. If the scaffold or the plan is
+  cut there, the run stops with that error rather than starting a half plan; see "Not verified"
+  in the PR.
+- **Checks share the CPUs.** Each ticket's tests run on this machine, at most one per CPU at
+  once (`--checks N` to change it). An agent whose check is waiting shows "checking".
+- **Leads are fewer than agents.** 4 leads review 64 agents' tickets, so finished tickets can
+  queue for a review ("queued for a slot").
+
+Rehearse the same run with no GPU: `bun demo/run.ts --fake --concurrency 64 --prompt "anything"`.
+The mock orchestrator plans one module per agent, 64 at once, plus a registry ticket that waits
+on all of them, and the mock workers answer each ticket.
+
+## The built-in task (10 agents)
+
+`bun demo/run.ts` with no prompt runs **mdlite**, a Markdown to HTML converter in plain Python 3.
+`project/` is its scaffold: 17 stub modules that raise `NotImplementedError` and 118 unit tests.
+`plan.json` cuts it into 17 tickets, of which 12 can start at once, so it suits a crew of 10.
+Two tickets (`block-table` and `block-code`) both add rules to `mdlite/theme.css`, and the
+orchestrator settles that clash by running `block-code` after `block-table`. At the end the
+crew's own tool renders `project/README.md`.
 
 ## From the Mac
 
@@ -45,14 +63,16 @@ the internet (`--host 0.0.0.0` exists but has no password).
 
 | Command | What it does |
 |---|---|
-| `bun demo/run.ts --plan orchestrator` | the orchestrator writes the 17-ticket plan itself (one JSON call); a plan that does not cover the scaffold is not used, the prepared plan runs instead, and the view says why |
-| `bun demo/run.ts --prompt "a CLI that …"` | your own task: the orchestrator designs it, scaffolds it and plans the tickets, then the crew builds it |
+| `bun demo/run.ts --prompt "…"` | your task, planned into about one ticket per agent (the first run above) |
+| `bun demo/run.ts` | the built-in task, mdlite |
+| `bun demo/run.ts --plan orchestrator` | mdlite, with the orchestrator writing the 17-ticket plan itself (one JSON call); a plan that does not cover the scaffold is not used, the prepared plan runs instead, and the view says why |
 | `bun demo/run.ts --prompt "…" --repo DIR` | your own task on a copy of your repo (DIR itself is not touched) |
-| `bun demo/run.ts --fake` | a rehearsal against a mock model, no GPU (`--fake-speed 5` for a faster one) |
+| `bun demo/run.ts --fake [--prompt "…" --concurrency 64]` | a rehearsal against a mock model, no GPU (`--fake-speed 5` for a faster one) |
 | `bun demo/check.ts` | proves the built-in task is fair: each ticket fails on the scaffold and passes with its reference answer |
 
-Options: `--port N` (7340), `--out DIR`, `--concurrency N` (`MUGGE_CONCURRENCY`, else 10), `--exit`
-(stop when the run ends; the exit code says whether it succeeded).
+Options: `--port N` (7340), `--out DIR`, `--concurrency N` (`MUGGE_CONCURRENCY`, which
+`crew.env` sets to the crew size; else 10), `--checks N` (checks at once, default the CPU count),
+`--exit` (stop when the run ends; the exit code says whether it succeeded).
 
 ## The view
 
@@ -76,7 +96,7 @@ as it is written; the answer appears when the call returns.
 `demo/runs/<run id>/` holds:
 
 - `repo/`: the project, with branches `mugge/<ticket>` and `mugge/integration`.
-- `result/`: the integrated project, its test output and `README.html`.
+- `result/`: the integrated project, with its whole test run (and, for mdlite, `README.html`).
 - `prompts.jsonl`: every model call, with its messages and answer.
 - `events.jsonl`: every engine event.
 - `calls.jsonl` and `status.json`: the engine's per-call log and crew status.
@@ -87,6 +107,6 @@ as it is written; the answer appears when the call returns.
 - `run.ts`: the one command. It drives the engine as it is (`runPlan`) and serves the view.
 - `orchestrator.ts`: the planning call and the check an orchestrator's plan must pass.
 - `view/index.html`: the live view.
-- `project/`: the scaffold the crew starts from.
-- `reference/`: an answer for every ticket, used by `check.ts` and by the mock model.
-- `plan.json`: the prepared plan.
+- `fake-prompt.ts`: the mock orchestrator for `--fake --prompt`, one module per agent.
+- `project/`, `reference/`, `plan.json`: mdlite's scaffold, an answer for every ticket (used by
+  `check.ts` and the mock model), and its prepared plan.
