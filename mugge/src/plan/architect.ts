@@ -19,6 +19,7 @@
  * tests, then one call per component plans its tickets. A 64-ticket plan is about 13–16K tokens
  * of JSON and a 64-module scaffold about 55K, more than one call should write.
  */
+import { stripThinking } from '../engine/files.ts';
 import { thinkingOn } from '../engine/harness.ts';
 import type { CallTweaks, ChatMessage, Completion, Inference } from '../engine/inference.ts';
 import { IMAGES, PLAN_JSON_SCHEMA, safePath, settleClashes, validatePlan, WORKER_OUTPUT_JSON_SCHEMA, type Plan, type Ticket, type WorkerOutput } from '../tickets/schema.ts';
@@ -292,9 +293,13 @@ async function planCall<T>(client: Inference, model: string, messages: ChatMessa
     }
     const c = (e as { completion?: Completion<string> }).completion;
     const v = c?.raw ? salvageJson(c.raw) : undefined;
-    // thought until max_tokens with no complete answer to keep: once more, thinking less
-    if ((v === undefined || typeof v !== 'object') && c?.cut && c.thinking !== false && !tweaks.reasoningEffort && thinkingOn(client)) {
-      warnings.push(`${what} ran out of tokens (cut at ${c.completionTokens}${c.reasoningChars ? `, ${c.reasoningChars} characters of thinking` : ''}) with no answer to keep; asked once more, thinking low`);
+    // thought until max_tokens with no complete answer to keep, or ended inside its thinking with
+    // no answer at all (content empty, everything in reasoning): once more, thinking less
+    const empty = !!c && !c.cut && !stripThinking(c.raw ?? '').trim();
+    if ((v === undefined || typeof v !== 'object') && (c?.cut || empty) && c!.thinking !== false && !tweaks.reasoningEffort && thinkingOn(client)) {
+      warnings.push(empty
+        ? `${what} came back with no answer (${c!.reasoningChars ? `${c!.reasoningChars} characters of thinking, ` : ''}nothing after it); asked once more, thinking low`
+        : `${what} ran out of tokens (cut at ${c!.completionTokens}${c!.reasoningChars ? `, ${c!.reasoningChars} characters of thinking` : ''}) with no answer to keep; asked once more, thinking low`);
       return planCall<T>(client, model, messages, schema, max, what, warnings, retryMs, { ...PLANNING, thinking: true, reasoningEffort: 'low' });
     }
     if (v === undefined || typeof v !== 'object') throw e;
