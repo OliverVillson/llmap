@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { componentOf, crewShares, design, planShape, scaffold, tickets, type Design } from '../src/plan/architect.ts';
+import { componentOf, crewShares, design, normPath, planShape, salvageJson, scaffold, tickets, type Design } from '../src/plan/architect.ts';
 import { contextFit, OpenAICompatible, type CallTweaks, type ChatMessage, type Completion, type Inference } from '../src/engine/inference.ts';
 import { validatePlan } from '../src/tickets/schema.ts';
 
@@ -120,6 +120,121 @@ describe('planning one prompt into a crew of tickets', () => {
     await tickets(inf, DESIGN, ['a.py']);
     expect(seen).toHaveLength(2);
     expect(seen[1]!.user).not.toContain('## Crew');
+  });
+});
+
+describe('a 64-agent plan survives what a real model gets wrong (debug round 2026-10-18)', () => {
+  const parts5 = (fn: (i: number, system: string, user: string, turns: number) => unknown) => (i: number) => scripted(`part-${i}`, [], (system, user, turns) => fn(i, system, user, turns));
+  const stubs = (i: number) => Object.fromEntries(Array.from({ length: 16 }, (_, k) => [`${DESIGN.components[i]!.path}/m${k}.py`, '']));
+  const sharedFiles = { 'pyproject.toml': '', ...Object.fromEntries(DESIGN.components.flatMap((c) => c.interfaces.map((x) => [x.path, '']))) };
+  const manager = scripted('manager', [], () => ({ files: sharedFiles, note: '' }));
+  const fail = (message: string, completion?: Partial<Completion<string>>) => Object.assign(new Error(message), completion ? { completion } : {});
+
+  test('paths are made plain, and unsafe ones refused', () => {
+    expect(normPath('./src/a.py')).toBe('src/a.py');
+    expect(normPath('/src//a.py')).toBe('src/a.py');
+    expect(normPath('../a.py')).toBeUndefined();
+    expect(normPath('src/')).toBeUndefined();
+    expect(normPath('.git/hooks/x')).toBeUndefined();
+  });
+
+  test('a JSON answer cut at max_tokens keeps its whole files and whole tickets', () => {
+    expect(salvageJson('{"files": {"a.py": "x = 1\\n", "b.py": "y = {\\"k\\": [1,')).toEqual({ files: { 'a.py': 'x = 1\n' } });
+    const t = JSON.stringify(ticket('a', ['a.py']));
+    expect(salvageJson(`{"interfaces": ["i.py"], "tickets": [${t}, ${t.replace('"a"', '"b"')}, {"id": "c", "ow`)).toEqual({ interfaces: ['i.py'], tickets: [ticket('a', ['a.py']), { ...ticket('a', ['a.py']), id: 'b' }] });
+    expect(salvageJson('{"files": {"a.py": "unfinished')).toBeUndefined();
+    expect(salvageJson('')).toBeUndefined();
+  });
+
+  test('a cut scaffold part keeps its complete files; a failed one costs its component, not the plan', async () => {
+    const parts = (i: number) => ({
+      complete: async () => {
+        if (i === 1) throw fail('Unexpected end of JSON input', { raw: '{"files": {"src/render/m0.py": "", "src/render/m1.py": "", "src/render/m2', cut: true, completionTokens: 30000 });
+        if (i === 2) throw fail('inference 500: engine dead');
+        return { value: { files: stubs(i), note: '' }, raw: '', promptTokens: 0, completionTokens: 0, ms: 1 };
+      },
+      text: async () => { throw new Error('no'); },
+    }) as unknown as Inference;
+    const sc = await scaffold(manager, DESIGN, 'planner', { crew: 64, parts });
+    expect(Object.keys(sc.files).filter((f) => f.startsWith('src/render/m'))).toEqual(['src/render/m0.py', 'src/render/m1.py']);
+    expect(sc.warnings).toContain("Render's scaffold was cut at 30000 tokens; its complete part is kept");
+    expect(sc.warnings.some((w) => w.startsWith("Cli's scaffold failed (inference 500: engine dead)"))).toBe(true);
+    expect(sc.failed).toEqual([2]);
+    // the failed component gets no ticket call; the others plan as usual
+    const asked: number[] = [];
+    const plan = await tickets(manager, DESIGN, sc, 'planner', { crew: 64, parts: parts5((i, _s, user) => { asked.push(i); return { interfaces: [], tickets: Object.keys(sc.files).filter((f) => user.includes(`- ${f}`) && /m\d+\.py$/.test(f)).map((f, k) => ticket(`t${k}`, [f])) }; }) });
+    expect([...new Set(asked)].sort()).toEqual([0, 1, 3]);
+    expect(plan.tickets.some((t) => t.id.startsWith('cli-'))).toBe(false);
+    const dead = (() => ({ complete: async () => { throw fail('inference 500'); }, text: async () => '' })) as unknown as (i: number) => Inference;
+    expect(scaffold(manager, DESIGN, 'planner', { crew: 64, parts: dead })).rejects.toThrow(/every component's scaffold failed/);
+  });
+
+  test('a ticket part that fails costs its component; cycles, ./ paths, long ids and empty tickets are mended, not fatal', async () => {
+    const files = DESIGN.components.flatMap((_, i) => Object.keys(stubs(i)));
+    const plan = await tickets(manager, DESIGN, files, 'planner', {
+      crew: 64,
+      parts: parts5((i) => {
+        if (i === 3) throw new Error('inference 400: bad request');
+        const dir = DESIGN.components[i]!.path;
+        return { interfaces: [], tickets: [
+          ticket('a', [`./${dir}/m0.py`], ['b']), ticket('b', [`/${dir}/m1.py`], ['a']),
+          ticket(`${'very-long-ticket-name-'.repeat(3)}x`, [`${dir}/m2.py`]), ticket(`${'very-long-ticket-name-'.repeat(3)}y`, [`${dir}/m3.py`]),
+          ticket('nothing', []), ticket('escape', ['../etc/passwd']),
+        ] };
+      }),
+    });
+    expect(() => validatePlan(plan)).not.toThrow();
+    expect(plan.tickets.find((t) => t.id === 'parser-a')!.owns).toEqual(['src/parser/m0.py']);
+    expect(plan.tickets.find((t) => t.id === 'parser-b')!.owns).toEqual(['src/parser/m1.py']);
+    expect(plan.warnings!.some((w) => w.startsWith('dependency cycle parser-a -> parser-b -> parser-a'))).toBe(true);
+    const long = plan.tickets.filter((t) => t.id.startsWith('parser-very'));
+    expect(long).toHaveLength(2);
+    expect(long.every((t) => t.id.length <= 63)).toBe(true);
+    expect(long.map((t) => t.id.at(-1)).sort()).toEqual(['x', 'y']);
+    expect(plan.tickets.some((t) => t.id.endsWith('nothing') || t.id.endsWith('escape'))).toBe(false);
+    expect(plan.warnings!.some((w) => w.startsWith("Store's tickets failed (inference 400: bad request)"))).toBe(true);
+    expect(plan.tickets.filter((t) => t.id.startsWith('store-'))).toHaveLength(0);
+  });
+
+  test("files a part wrote outside its folder are its tickets' to own; components sharing a folder share its files", async () => {
+    const sc = await scaffold(manager, DESIGN, 'planner', { crew: 64, parts: parts5((i) => ({ files: { [`lib/${DESIGN.components[i]!.name.toLowerCase()}_impl.py`]: '' }, note: '' })) });
+    expect(sc.writtenBy!['lib/render_impl.py']).toBe(1);
+    const plan = await tickets(manager, DESIGN, sc, 'planner', { crew: 64, parts: parts5((i, _s, user) => {
+      expect(user).toContain(`- lib/${DESIGN.components[i]!.name.toLowerCase()}_impl.py`);
+      return { interfaces: [], tickets: [ticket('impl', [`lib/${DESIGN.components[i]!.name.toLowerCase()}_impl.py`])] };
+    }) });
+    expect(plan.tickets.map((t) => t.id).sort()).toEqual(['cli-impl', 'parser-impl', 'render-impl', 'store-impl']);
+    const oneDir: Design = { ...DESIGN, components: DESIGN.components.map((c) => ({ ...c, path: 'tk/' })) };
+    const p2 = await tickets(manager, oneDir, ['tk/a.py', 'tk/b.py', 'tk/c.py', 'tk/d.py'], 'planner', { crew: 64, parts: parts5((i) => ({ interfaces: [], tickets: [ticket('x', [`tk/${'abcd'[i]}.py`])] })) });
+    expect(p2.tickets).toHaveLength(4);
+  });
+
+  test('a part whose tickets all queue behind one file is asked again, naming the file', async () => {
+    const users: string[] = [];
+    const plan = await tickets(manager, DESIGN, DESIGN.components.flatMap((_, i) => Object.keys(stubs(i))), 'planner', { crew: 64, parts: parts5((i, _s, _u, turns) => {
+      const dir = DESIGN.components[i]!.path;
+      if (turns > 2) users.push(_u);
+      const n = crewShares(DESIGN, 64)[i]!;
+      return { interfaces: [], tickets: Array.from({ length: n }, (_, k) => ticket(`m${k}`, [`${dir}/m${k}.py`, ...(turns === 2 ? [`${dir}/__init__.py`] : [])])) };
+    }) });
+    expect(planShape(plan, 64).startable).toBe(64);
+    expect(plan.warnings).toBeUndefined();
+    const parser = await (async () => {
+      const seen: Seen[] = [];
+      await tickets(manager, DESIGN, [], 'planner', { crew: 64, parts: (i) => scripted(`p${i}`, seen, (_s, _u, turns) => ({ interfaces: [], tickets: Array.from({ length: 4 }, (_, k) => ticket(`m${k}`, [`src/x${i}/m${k}.py`.replace(`src/x${i}`, DESIGN.components[i]!.path), `${DESIGN.components[i]!.path}/__init__.py`])) })) });
+      return seen;
+    })();
+    const reask = parser.find((s) => s.turns > 2)!;
+    expect(reask).toBeDefined();
+  });
+
+  test('one component for a big crew: the design is asked again for more', async () => {
+    const seen: Seen[] = [];
+    const one = { ...DESIGN, components: DESIGN.components.slice(0, 1) };
+    const d = await design(scripted('m', seen, (_s, _u, turns) => (turns === 2 ? one : DESIGN)), 'build it', [], 'architect', { crew: 64, parts: () => scripted('p', [], () => ({})) });
+    expect(d.components).toHaveLength(4);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.user).toContain('Use at least 4 components');
   });
 });
 

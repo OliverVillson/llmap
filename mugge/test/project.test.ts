@@ -95,7 +95,10 @@ describe('architect and planner', () => {
     expect(ghost.tickets[0]!.depends_on).toEqual([]);
     expect(ghost.warnings).toEqual(['a: dropped dependencies on nope']);
     const cycle = { interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['b'] }, { id: 'b', owns: ['y'], depends_on: ['a'] }] };
-    expect(tickets(canned(cycle), d, [])).rejects.toThrow(/dependency cycle/);
+    // a cycle is opened at the edge that closes it and said, not fatal (debug round 2026-10-18)
+    const opened = await tickets(canned(cycle), d, []);
+    expect(opened.tickets.map((t) => t.depends_on)).toEqual([['b'], []]);
+    expect(opened.warnings).toEqual(['dependency cycle a -> b -> a: b no longer waits for a']);
   });
 });
 

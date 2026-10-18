@@ -223,7 +223,7 @@ async function main(argv: string[]) {
         mkdirSync(join(scDir, path, '..'), { recursive: true });
         writeFileSync(join(scDir, path), content);
       }
-      const { warnings, ...plan } = await tickets(inf, d, Object.keys(sc.files), 'planner', o);
+      const { warnings, ...plan } = await tickets(inf, d, sc, 'planner', o);
       for (const w of warnings ?? []) console.warn(`plan: ${w}`);
       writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan, null, 2) + '\n');
       console.log(`${plan.tickets.length} tickets on a ${Object.keys(sc.files).length}-file scaffold, saved in ${dir}`);
