@@ -40,9 +40,10 @@ Then on the Mac: `ssh -o ExitOnForwardFailure=yes -N -L 7340:127.0.0.1:7340 evro
 http://127.0.0.1:7340/. If it says the port is in use, an old tunnel holds it:
 `pkill -f 'L 7340:'` and run it again.
 
-Stop a run with `kill -INT <pid>` or plain `kill` (both write the summary); a second one quits at
-once. The view stays up after a run ends; before the next run, `pkill -INT -f 'bun demo/run.ts'`
-(or pass `--port 7341`), else the new run says the port is in use.
+Stop a run with `kill -INT <pid>` or plain `kill`: both write the summary and then end the demo,
+which frees the view's port; a second one quits at once. A run that finishes on its own keeps
+the view up; before the next run, `pkill -INT -f 'bun demo/run.ts'` (or pass `--port 7341`), else
+the new run says the port is in use.
 
 `crew.env` runs 80 code agents on the 64 worker slots (the extra 16 keep the slots busy while
 other agents run their checks), so the orchestrator plans for 80: **about 80 tickets for 64
@@ -67,7 +68,8 @@ What to expect at 64:
 - **Checks share the CPUs.** Each ticket's tests run on this machine, at most one per CPU at
   once (`--checks N` to change it). An agent whose check is waiting shows "checking".
 - **Leads are fewer than agents.** 8 leads review 80 agents' tickets, so finished tickets can
-  queue for a review ("queued for a slot").
+  queue for a review: "queued for a lead to review" in the view, "waiting for a lead" in the
+  log's progress line.
 
 Rehearse the same run with no GPU: load `crew.env` the same way (with no server started, give the
 size yourself: `CREW_WORKERS=64; set -a; . deploy/crew.env; set +a`), then

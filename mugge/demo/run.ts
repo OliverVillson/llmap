@@ -626,9 +626,10 @@ try {
   }
 }
 
-if (opt.exit) {
+// --exit, or a run stopped by a signal (kill, Ctrl-C): the summary is written, so end and free the view's port
+if (opt.exit || stops > 0) {
   stopFake?.();
   server.stop(true);
-  process.exit(result && result.summary.done === result.summary.tickets && result.integrated ? 0 : 1);
+  process.exit(stops > 0 ? 130 : result && result.summary.done === result.summary.tickets && result.integrated ? 0 : 1);
 }
 console.log(`\nthe view stays up at ${viewUrl}; Ctrl-C to quit`);
