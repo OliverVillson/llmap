@@ -8,29 +8,41 @@ ticket, and the run ends by merging every branch and running the whole project's
 
 ## First run: 64 agents from one prompt (B200)
 
-On the B200, from a fresh clone (the server steps are `deploy/README.md`'s; `setup` and
-`download` are needed once). The checkout lives on the big disk at `/data`, reached through the
-`~/llmap` symlink, so the demo's work trees under `demo/runs/` land there too; the root disk is
-too small for them. `deploy/qwen.sh where` shows where the venv, weights and server state are.
+On the B200. A fresh VM (or one that kept `/data` but lost its root disk) gets everything from
+one command, `deploy/fresh.sh`: apt packages, the data disk at `/data`, the checkout at
+`/data/llmap` with `~/llmap` pointing at it (so `demo/runs/` lands on the big disk), uv and bun on
+every shell's PATH, vLLM, the weights and a preflight (`deploy/README.md`, "On the B200, from a
+fresh VM"). It is safe to run again; if `/data` was never formatted it stops and prints the
+`--format /dev/vdc` line to run.
+
+On the Mac first, only when the VM was re-created (a new VM has a new host key):
 
 ```bash
-cd /data && git clone https://github.com/OliverVillson/llmap && ln -s /data/llmap ~/llmap && cd ~/llmap/mugge
-git checkout claude/centipede-demo            # until it is merged; it includes deploy/ and the engine
-curl -fsSL https://bun.sh/install | bash        # bun goes to ~/.bun/bin
-export PATH="$HOME/.bun/bin:$PATH"
-echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.bashrc   # so it is still there after you reconnect
-bun --version                                 # must print a version before you go on
-bun install
-deploy/qwen.sh setup                          # vLLM in the data folder on /data (deploy/qwen.sh where)
-deploy/qwen.sh download                       # the weights, ~31 GB
-CREW_WORKERS=64 deploy/qwen.sh start          # once; the server keeps the crew size
-deploy/qwen.sh wait                           # warns about memory for 64 on a 180 GB B200: expected
-deploy/qwen.sh check                          # must end in PASS
-set -a; . deploy/crew.env; set +a             # reads 64 back: 64 worker slots, 8 leads, 1 orchestrator, 80 agents
-bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only."
+ssh-keygen -R 194.14.80.240
 ```
 
-Then on the Mac: `ssh -N -L 7340:127.0.0.1:7340 evroc` and open http://127.0.0.1:7340/.
+Then:
+
+```bash
+ssh evroc
+curl -fsSLo /tmp/fresh.sh https://raw.githubusercontent.com/OliverVillson/llmap/claude/centipede-demo/mugge/deploy/fresh.sh
+bash /tmp/fresh.sh                            # ends in "preflight: PASS" and "ready"
+cd ~/llmap/mugge
+CREW_WORKERS=64 deploy/qwen.sh start          # runs the preflight again, then starts; the crew size sticks
+deploy/qwen.sh wait                           # warns about memory for 64 on a 180 GB B200: expected
+deploy/qwen.sh check                          # must end in PASS
+set -a; . deploy/crew.env; set +a             # reads 64 back (again in every new shell)
+nohup bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only." > demo.log 2>&1 &
+tail -f demo.log
+```
+
+Then on the Mac: `ssh -o ExitOnForwardFailure=yes -N -L 7340:127.0.0.1:7340 evroc` and open
+http://127.0.0.1:7340/. If it says the port is in use, an old tunnel holds it:
+`pkill -f 'L 7340:'` and run it again.
+
+Stop a run with `kill -INT <pid>` or plain `kill` (both write the summary); a second one quits at
+once. The view stays up after a run ends; before the next run, `pkill -INT -f 'bun demo/run.ts'`
+(or pass `--port 7341`), else the new run says the port is in use.
 
 `crew.env` runs 80 code agents on the 64 worker slots (the extra 16 keep the slots busy while
 other agents run their checks), so the orchestrator plans for 80: **about 80 tickets for 64

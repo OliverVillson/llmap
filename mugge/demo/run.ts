@@ -399,7 +399,18 @@ function resultFile(path: string): Response {
   return new Response(Bun.file(p));
 }
 
-const server = Bun.serve({
+// A view still up from an earlier run (it stays up after a run ends) holds the port: say how to free it
+function serve(opts: Parameters<typeof Bun.serve>[0]) {
+  try {
+    return Bun.serve(opts);
+  } catch (e) {
+    if (!/EADDRINUSE|in use/i.test(String((e as Error)?.message ?? e))) throw e;
+    console.error(`demo: port ${port} is in use, probably by an earlier demo run's view. Stop it with: pkill -INT -f 'bun demo/run.ts'  (or pass --port ${port + 1})`);
+    process.exit(1);
+  }
+}
+
+const server = serve({
   port, hostname: host, idleTimeout: 0,
   async fetch(req) {
     const url = new URL(req.url);
@@ -459,7 +470,8 @@ const viewUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.port
 
 const abort = new AbortController();
 let stops = 0;
-process.on('SIGINT', () => {
+// SIGINT (Ctrl-C, kill -INT) and SIGTERM (plain kill) both stop the crew and write the summary
+const stop = () => {
   if (++stops === 1 && orchestrator.phase !== 'finished' && orchestrator.phase !== 'failed') {
     console.log('\nstopping the crew (Ctrl-C again to quit now)');
     orchestrator.phase = 'stopped';
@@ -468,7 +480,9 @@ process.on('SIGINT', () => {
   }
   stopFake?.();
   process.exit(130);
-});
+};
+process.on('SIGINT', stop);
+process.on('SIGTERM', stop);
 
 console.log(`\nlive view: ${viewUrl}  (from your Mac: ssh -N -L ${server.port}:127.0.0.1:${server.port} <this machine>, then open http://127.0.0.1:${server.port}/)`);
 console.log(`run folder: ${out}\n`);
