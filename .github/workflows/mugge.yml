@@ -28,6 +28,8 @@ jobs:
           bun bench/run.ts --bench spike --out bench-run --fake --seeds 1
       - name: spike smoke (fake model, messy first answers)
         run: bun bench/smoke.ts --fake --fake-mess --out smoke-run
+      - name: deploy scripts (no-GPU stand-in for vLLM)
+        run: deploy/test.sh
       - uses: actions/upload-artifact@v4
         with:
           name: spike-metrics
