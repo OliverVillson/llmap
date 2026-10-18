@@ -177,7 +177,7 @@ input[type=radio]{accent-color:var(--accent)}
         <div class="board" id="board"></div>
       </section>
       <section class="card" aria-labelledby="h-log"><h2 class="h" id="h-log">Log</h2><div class="log" id="log" aria-live="polite"></div></section>
-      <div class="hint">Legend: ○ idle · ◌ queued for a slot · ● writing · ●… thinking · ●✓ checking · ●n/4 fixing · ●◇ in review · ●→ waiting · ✓ finished · [✗] failed · [!] blocked · ◉ orchestrator · ◆ lead review</div>
+      <div class="hint">Legend: ○ idle · ◌ queued for a slot (a write, or a lead to review) · ● writing · ●… thinking · ●✓ checking · ●n/4 fixing · ●◇ in review · ●→ waiting · ✓ finished · [✗] failed · [!] blocked · ◉ orchestrator · ◆ lead review</div>
     </div>
   </div>
 </div>
@@ -218,6 +218,8 @@ function glyph(state, attempt, of, waitingOn) {
 const STATE_WORD = { idle: 'idle', queued: 'queued for a slot', writing: 'writing', thinking: 'thinking', checking: 'checking', fixing: 'fixing', reviewing: 'in review', waiting: 'waiting', finished: 'finished', failed: 'failed', blocked: 'blocked', skipped: 'skipped' };
 
 function digestOf(t) { return S?.demo.tickets?.[t] ?? null; }
+// a queued ticket whose checks passed waits for a lead slot to be reviewed, not for a worker slot
+function stateWord(state, ticket) { return state === 'queued' && ticket && digestOf(ticket)?.queuedFor === 'lead' ? 'queued for a lead to review' : STATE_WORD[state] ?? state; }
 function inflightOf(t) { return (S?.demo.inflight ?? []).find((c) => c.ticket === t) ?? null; }
 
 // ------------------------------------------------------------------------------------------
@@ -304,13 +306,13 @@ function renderTps(st) {
 
 function agentNow(a) {
   if (!a.ticket) return a.state === 'finished' ? 'done for this run' : 'no ticket';
-  return a.lastNote || STATE_WORD[a.state] || a.state;
+  return a.lastNote || stateWord(a.state, a.ticket);
 }
 
 function renderAgents(st) {
   const ws = st.agents.filter((a) => a.role === 'worker');
   $('#crew-n').textContent = `${ws.filter((a) => a.ticket && !['finished', 'failed', 'idle'].includes(a.state)).length} of ${ws.length} working`;
-  $('#dots').innerHTML = ws.map((a) => `<button class="dot ${view.open === a.id ? 'sel' : ''}" data-open="${esc(a.id)}" aria-label="${esc(a.id)}: ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` on ${esc(a.ticket)}` : ''}" title="${esc(a.id)} · ${esc(STATE_WORD[a.state] ?? a.state)}${a.ticket ? ` · ${esc(a.ticket)}` : ''}"><span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span></button>`).join('');
+  $('#dots').innerHTML = ws.map((a) => `<button class="dot ${view.open === a.id ? 'sel' : ''}" data-open="${esc(a.id)}" aria-label="${esc(a.id)}: ${esc(stateWord(a.state, a.ticket))}${a.ticket ? ` on ${esc(a.ticket)}` : ''}" title="${esc(a.id)} · ${esc(stateWord(a.state, a.ticket))}${a.ticket ? ` · ${esc(a.ticket)}` : ''}"><span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span></button>`).join('');
   // a big crew shows a cell per agent with work; the idle ones stay as dots, counted in one cell
   const idle = (a) => !a.ticket && a.state === 'idle' && view.open !== a.id;
   const big = ws.length > 12;
@@ -322,7 +324,7 @@ function renderAgents(st) {
     const on = a.ticket && !['finished', 'failed', 'idle'].includes(a.state);
     return `<button class="cell ${on ? 'on' : ''}" data-open="${esc(a.id)}">
       <span class="r1"><span><span class="id">${esc(a.id)}</span> <span class="g-${a.state}">${esc(glyph(a.state, a.attempt, a.maxAttempts))}</span> <span class="small">${esc(a.ticket ?? '')}</span></span><span class="small">${a.ticket ? `${a.attempt}/${a.maxAttempts}` : ''} <span class="dimc">${fmt(a.tokS)} t/s</span></span></span>
-      <span class="small trunc ${on ? '' : 'dimc'}">${esc(STATE_WORD[a.state] ?? a.state)}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
+      <span class="small trunc ${on ? '' : 'dimc'}">${esc(stateWord(a.state, a.ticket))}${on ? ` for ${dur(S.demo.now - a.since)}` : ''} · ${esc(agentNow(a))}</span>
       <span class="xs dimc trunc">${esc(a.owns.join(' ') || '—')}</span></button>`;
   }).join('') + (rest ? `<div class="cell"><span class="r1"><span><span class="g-idle">○</span> ${rest} idle</span></span><span class="small dimc trunc">waiting for a ready ticket</span><span class="xs dimc trunc">press a dot above to open one</span></div>` : '');
   box.scrollTop = top;
@@ -349,7 +351,7 @@ function renderBoard(st, d) {
   $('#board').innerHTML = Object.entries(cols).map(([k, list]) => `<div class="col"><div class="ch">${head[k]} <b>${list.length}</b></div><div class="list" data-col="${k}">${list.map((t) => {
     const dg = digestOf(t.id);
     const s = dg?.state ?? t.state;
-    const why = k === 'waiting' ? (t.settled ? `after ${t.dependsOn.join(', ')} (settled clash)` : t.state === 'ready' || t.error === 'waiting for a free agent' ? 'ready, waiting for a free agent' : t.dependsOn.length ? `waits on ${t.dependsOn.filter((x) => !['done'].includes(st.tickets.find((y) => y.id === x)?.state)).join(', ') || 'nothing now'}` : 'ready') : k === 'failed' ? (dg?.error ?? t.error ?? s) : k === 'done' ? (dg?.reviews?.some((r) => r.verdict === 'problems') ? 'fixed what the lead sent back' : dg?.reviews?.length ? '' : 'checks pass') : k === 'review' ? 'the lead is reading the diff' : `${STATE_WORD[s] ?? s} · attempt ${t.attempt}/${t.maxAttempts}`;
+    const why = k === 'waiting' ? (t.settled ? `after ${t.dependsOn.join(', ')} (settled clash)` : t.state === 'ready' || t.error === 'waiting for a free agent' ? 'ready, waiting for a free agent' : t.dependsOn.length ? `waits on ${t.dependsOn.filter((x) => !['done'].includes(st.tickets.find((y) => y.id === x)?.state)).join(', ') || 'nothing now'}` : 'ready') : k === 'failed' ? (dg?.error ?? t.error ?? s) : k === 'done' ? (dg?.reviews?.some((r) => r.verdict === 'problems') ? 'fixed what the lead sent back' : dg?.reviews?.length ? '' : 'checks pass') : k === 'review' ? 'the lead is reading the diff' : `${stateWord(s, t.id)} · attempt ${t.attempt}/${t.maxAttempts}`;
     const agent = t.agent ? `<span class="dimc xs">${esc(t.agent)}</span>` : '';
     return `<button class="tk ${k === 'done' ? 'done' : ''}" data-ticket="${esc(t.id)}" title="${esc(titles[t.id] ?? '')}"><span class="r1"><span class="tid trunc"><span class="g-${esc(s === 'done' ? 'finished' : s)}">${esc(glyph(s === 'done' ? 'finished' : s, t.attempt, t.maxAttempts))}</span> ${esc(t.id)}</span>${agent}</span>${why ? `<span class="xs dimc trunc">${esc(why)}</span>` : ''}</button>`;
   }).join('')}</div></div>`).join('');
@@ -447,10 +449,10 @@ function nowText(s) {
   if (call) doing = `${call.role === 'worker' ? (call.kind === 'fix' ? 'writing a fix' : 'writing its files') : 'the lead is reviewing its diff'}${S.status.settings.thinking === 'on' && call.role === 'worker' ? ' (thinking first)' : ''}: call sent ${dur(d.now - call.sentAt)} ago, up to ${fmt(call.maxTokens)} tokens. Calls do not stream, so the answer shows when it is complete.`;
   else if (state === 'checking') doing = `running its checks: ${esc(plan?.acceptance.join(' ; ') ?? '')}`;
   else if (state === 'waiting') doing = row?.settled ? `waiting for ${esc(row.dependsOn.join(', '))} to finish (the orchestrator settled a file clash)` : row?.error === 'waiting for a free agent' ? 'ready; waiting for a free agent' : `waiting for ${esc((row?.dependsOn ?? []).join(', '))}`;
-  else if (state === 'queued') doing = 'its call waits for a free slot on the model server';
+  else if (state === 'queued') doing = dg.queuedFor === 'lead' ? 'its checks pass; the review waits for a free lead slot on the model server' : 'its call waits for a free slot on the model server';
   else if (state === 'finished') doing = `finished: checks pass${dg.reviews?.some((r) => r.verdict === 'problems') ? ', after a fix for what the lead sent back' : dg.reviews?.length ? ' and the lead approved' : ''}${dg.commit ? ` (commit ${esc(dg.commit.slice(0, 10))})` : ''}`;
   else if (['failed', 'skipped', 'blocked'].includes(state)) doing = `${esc(state)}: ${esc(dg.error ?? row?.error ?? '')}`;
-  else doing = esc(STATE_WORD[state] ?? state ?? '');
+  else doing = esc(stateWord(state, t) ?? '');
   const review = dg.reviews?.at(-1);
   return `<dl class="kv"><dt>now</dt><dd>${doing}</dd>
     <dt>ticket</dt><dd><b class="pale">${esc(t)}</b> ${esc(plan?.title ?? '')}</dd>
@@ -520,7 +522,7 @@ function renderDialog(force) {
   if (!force && view.tab === 'steer' && typing) return;
   if (!force && view.tab === 'history' && view.hist !== null) return; // a prompt open for reading stays still
   const title = s.kind === 'orchestrator' ? '<span class="role pale">◉</span> orchestrator' : s.kind === 'ticket' ? `ticket ${esc(s.ticket)}` : `<span class="g-${s.agent.state}">${esc(glyph(s.agent.state, s.agent.attempt, s.agent.maxAttempts))}</span> agent ${esc(s.agent.id)}`;
-  const sub = s.kind === 'orchestrator' ? esc(S.demo.orchestrator.phase) : s.agent ? `${esc(STATE_WORD[s.agent.state] ?? s.agent.state)}${s.ticket ? ` · ${esc(s.ticket)} · attempt ${s.agent.attempt}/${s.agent.maxAttempts}` : ''}` : esc(digestOf(s.ticket)?.state ?? '');
+  const sub = s.kind === 'orchestrator' ? esc(S.demo.orchestrator.phase) : s.agent ? `${esc(stateWord(s.agent.state, s.ticket))}${s.ticket ? ` · ${esc(s.ticket)} · attempt ${s.agent.attempt}/${s.agent.maxAttempts}` : ''}` : esc(digestOf(s.ticket)?.state ?? '');
   const tabs = [['now', 'Now'], ['history', 'Prompt history'], ['steer', 'Steer']];
   const body = view.tab === 'now' ? nowText(s) : view.tab === 'history' ? historyText(s) : steerText(s);
   inner.innerHTML = `<div class="dhead"><div id="dlg-title"><b class="pale">${title}</b> <span class="dimc">· ${sub}</span></div>${B('Close', 'esc', 'data-act="close"')}</div>

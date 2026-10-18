@@ -83,7 +83,7 @@ if (existsSync(repo)) die(`${repo} exists already; pick another --out`);
 
 let fakeSpeed = 1;
 /** How long the mock server holds each call, so the call has its slot for most of its pace. */
-const FAKE_HOLD_MS = () => Math.round(10_000 / fakeSpeed);
+const FAKE_HOLD_MS = () => Math.round(20_000 / fakeSpeed);
 let stopFake: (() => void) | null = null;
 let fakeOwn: FakeProject | null = null;
 if (opt.fake) {
@@ -99,6 +99,9 @@ if (opt.fake) {
     flaky: [flakyId],
     // most of a call's pace is spent inside the server, so the pool shows the slot busy as with vLLM
     latencyMs: FAKE_HOLD_MS(),
+    // a review answers a short verdict, so the mock makes it quicker than a write (with the lead's
+    // thinking on, as crew.env sets it, a real review can take as long as a write)
+    reviewLatencyMs: Math.round(FAKE_HOLD_MS() / 5),
     reviews: { [sentBackId]: fakeOwn ? [{ verdict: 'problems', problems: ['convert() does not round to 6 decimals as the docstring says.'], fix: 'Round the result to 6 decimals.' }, { verdict: 'approve', problems: [], fix: '' }] : [{ verdict: 'problems', problems: ['A quote line with only ">" and spaces must end the paragraph, not join it.'], fix: 'Treat a quote line that is blank after removing ">" as a paragraph break.' }, { verdict: 'approve', problems: [], fix: '' }] },
   });
   stopFake = fake.stop;
@@ -166,6 +169,8 @@ interface TicketDigest {
   error: string | null;
   commit: string | null;
   checks: { passed: number; failed: number };
+  /** While queued: 'lead' when the attempt's checks passed and it waits for a lead slot to be reviewed, else 'write'. */
+  queuedFor: 'write' | 'lead' | null;
 }
 
 const calls: CallLog[] = [];
@@ -295,7 +300,7 @@ pool0.subscribe((s) => telemetry.serving(s));
 
 function digest(t: string): TicketDigest {
   let d = digests.get(t);
-  if (!d) digests.set(t, (d = { state: 'waiting', attempt: 0, lastCheck: null, lastAnswer: null, reviews: [], error: null, commit: null, checks: { passed: 0, failed: 0 } }));
+  if (!d) digests.set(t, (d = { state: 'waiting', attempt: 0, lastCheck: null, lastAnswer: null, reviews: [], error: null, commit: null, checks: { passed: 0, failed: 0 }, queuedFor: null }));
   return d;
 }
 
@@ -318,6 +323,8 @@ const emit = (e: EngineEvent) => {
       case 'state':
         d.state = e.state;
         if (e.attempt) d.attempt = e.attempt;
+        // a slot wait after this attempt's checks passed is the review's call waiting for a lead
+        d.queuedFor = e.state !== 'queued' ? null : d.lastCheck?.ok && d.lastCheck.attempt === d.attempt && !d.reviews.some((r) => r.attempt === d.attempt) ? 'lead' : 'write';
         if (e.state === 'reviewing' && !orchestrator.reviewing.includes(e.ticket)) orchestrator.reviewing.push(e.ticket);
         else if (e.state !== 'queued') orchestrator.reviewing = orchestrator.reviewing.filter((x) => x !== e.ticket);
         break;
@@ -546,7 +553,8 @@ try {
   const progress = setInterval(() => {
     const ds = [...digests.values()], st = telemetry.status();
     const n = (...states: string[]) => ds.filter((x) => states.includes(x.state)).length;
-    tell(`progress: ${n('finished')}/${ds.length} tickets done${n('failed', 'skipped', 'blocked') ? `, ${n('failed', 'skipped', 'blocked')} failed` : ''} · ${n('writing', 'thinking', 'fixing')} writing, ${n('checking')} checking, ${n('reviewing')} in review, ${n('queued')} waiting for a slot · ${Math.round(st.tokS.total).toLocaleString('en-US')} tok/s`);
+    const forLead = ds.filter((x) => x.state === 'queued' && x.queuedFor === 'lead').length;
+    tell(`progress: ${n('finished')}/${ds.length} tickets done${n('failed', 'skipped', 'blocked') ? `, ${n('failed', 'skipped', 'blocked')} failed` : ''} · ${n('writing', 'thinking', 'fixing')} writing, ${n('checking')} checking, ${n('reviewing')} in review, ${forLead} waiting for a lead, ${n('queued') - forLead} waiting for a worker slot · ${Math.round(st.tokS.total).toLocaleString('en-US')} tok/s`);
   }, 30_000);
   const report = await runPlan({
     repo, base: headCommit(repo), plan, pool,
