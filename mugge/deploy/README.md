@@ -148,6 +148,10 @@ The B200 profile gives vLLM 94% of the GPU (`GPU_UTIL=0.94`); after ~30 GB of we
 runtime that leaves an estimated ~129 GB for the pool (the B200's 180 GB; if `nvidia-smi` shows
 more, there is more). So the worst case, every slot at its longest at once, is about 8 GB over.
 The 80 agents add nothing to this: the engine never has more calls in flight than the 73 slots.
+Planning is not part of this sum either: plan calls are not capped by `MUGGE_MAX_CALL_TOKENS` and
+can run to the server's 65,536-token limit, and above 16 agents the plan's parts are written in
+parallel on the worker slots, but all of that happens before any ticket starts, while the worker
+and lead slots are otherwise empty, so it uses a fraction of the same pool.
 
 We keep bf16 KV as the default anyway, because the worst case does not happen in practice: a
 worker at medium effort thinks far less than the 16,384 cap, an agent holds KV only while its

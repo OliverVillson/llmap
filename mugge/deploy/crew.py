@@ -16,7 +16,8 @@ cost no GPU memory. (Both from the engine's crew-scale measurements.)
 The longest each kind of call can get, which is what a slot costs at most:
   worker  26,624 tokens: a pack of up to ~10K plus MUGGE_MAX_CALL_TOKENS (16,384)
   lead    24,576 tokens: the review prompt and diff (up to ~8K) plus a thinking review capped at 16,384
-  manager 24,576 tokens: a plan call with thinking, capped at MUGGE_MAX_CALL_TOKENS
+  manager 24,576 tokens: the orchestrator's calls while tickets run; plan calls (uncapped, up to the
+                         server's 65,536) run before any ticket starts, when the pool is otherwise empty
 """
 import argparse
 import json
