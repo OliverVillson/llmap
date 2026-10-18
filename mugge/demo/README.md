@@ -9,14 +9,16 @@ ticket, and the run ends by merging every branch and running the whole project's
 ## First run: 64 agents from one prompt (B200)
 
 On the B200, from a fresh clone (the server steps are `deploy/README.md`'s; `setup` and
-`download` are needed once):
+`download` are needed once). The checkout lives on the big disk at `/data`, reached through the
+`~/llmap` symlink, so the demo's work trees under `demo/runs/` land there too; the root disk is
+too small for them. `deploy/qwen.sh where` shows where the venv, weights and server state are.
 
 ```bash
-git clone https://github.com/OliverVillson/llmap && cd llmap/mugge
+cd /data && git clone https://github.com/OliverVillson/llmap && ln -s /data/llmap ~/llmap && cd ~/llmap/mugge
 git checkout claude/centipede-demo            # until it is merged; it includes deploy/ and the engine
 curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH"
 bun install
-deploy/qwen.sh setup                          # vLLM in ~/venvs/qwen-vllm
+deploy/qwen.sh setup                          # vLLM in the data folder on /data (deploy/qwen.sh where)
 deploy/qwen.sh download                       # the weights, ~31 GB
 CREW_WORKERS=64 deploy/qwen.sh start          # once; the server keeps the crew size
 deploy/qwen.sh wait                           # warns about memory for 64 on a 180 GB B200: expected
