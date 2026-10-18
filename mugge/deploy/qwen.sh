@@ -152,6 +152,24 @@ pid_alive() {
   [ ! -f "$STATE/serve.boot" ] || [ "$(cat "$STATE/serve.boot")" = "$(boot_id)" ]
 }
 
+# Triton compiles small C helpers on the first start (and the model check fails without them), so
+# the venv's Python headers and a C compiler must be installed. Installs them with apt when sudo
+# needs no password, else says the apt line.
+build_tools() {
+  [ -x "$VENV/bin/python" ] || return 0
+  local missing=() dev
+  dev="$("$VENV/bin/python" -c 'import sys; print("python%d.%d-dev" % sys.version_info[:2])')"
+  "$VENV/bin/python" -c 'import os, sys, sysconfig; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")))' || missing+=("$dev")
+  command -v gcc >/dev/null || command -v cc >/dev/null || missing+=(build-essential)
+  [ "${#missing[@]}" -gt 0 ] || return 0
+  if command -v apt-get >/dev/null && sudo -n true 2>/dev/null; then
+    echo "installing ${missing[*]} (Triton builds C helpers at start)"
+    sudo apt-get install -y "${missing[@]}" >/dev/null || die "apt-get install ${missing[*]} failed"
+  else
+    die "vLLM's Triton kernels need ${missing[*]}: sudo apt-get install -y ${missing[*]}, then run this again"
+  fi
+}
+
 CMD_NAME="${1:-}"
 case "${1:-}" in
   where)
@@ -171,6 +189,7 @@ case "${1:-}" in
     # --torch-backend=auto picks the PyTorch build that matches the installed driver's CUDA
     VIRTUAL_ENV="$VENV" uv pip install "vllm==$VLLM_VERSION" --torch-backend=auto
     "$VLLM" --version
+    build_tools
     echo "next: deploy/qwen.sh download"
     ;;
   download)
@@ -193,6 +212,7 @@ case "${1:-}" in
     if pid_alive; then echo "already running (pid $(cat "$PIDFILE")); deploy/qwen.sh status"; exit 0; fi
     serve_cmd
     [ -x "$VLLM" ] || die "$VLLM not found: run deploy/qwen.sh setup first (or set VLLM=)"
+    build_tools
     [ -d "$MODEL" ] || [ -d "$HF_HOME/hub/models--${MODEL//\//--}/snapshots" ] ||
       echo "warning: $MODEL is not in $HF_HOME (deploy/qwen.sh download); vLLM will download it now" >&2
     mkdir -p "$STATE"
@@ -209,7 +229,12 @@ case "${1:-}" in
     timeout_s="${WAIT_S:-1800}"
     start=$(date +%s)
     until curl -fsS -m 5 "$URL/health" >/dev/null 2>&1; do
-      if ! pid_alive; then echo "the server is not running; last lines of $LOG:" >&2; tail -n 40 "$LOG" >&2 || true; exit 1; fi
+      if ! pid_alive; then
+        # the cause is usually far above the last lines (vLLM wraps it in a validation error)
+        echo "the server is not running. First errors in $LOG:" >&2
+        grep -m 8 -E 'fatal error|Error:|ERROR .*(Error|error)[^a-z]|No module named|CUDA error|out of memory' "$LOG" | grep -v 'Traceback' | cut -c1-300 >&2 || true
+        echo "last lines:" >&2; tail -n 25 "$LOG" >&2 || true; exit 1
+      fi
       [ $(( $(date +%s) - start )) -lt "$timeout_s" ] || { echo "not up after ${timeout_s}s; deploy/qwen.sh logs" >&2; exit 1; }
       sleep 5
     done

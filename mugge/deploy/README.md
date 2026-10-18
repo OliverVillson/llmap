@@ -17,7 +17,9 @@ is the target; H100 and L40S notes are at the end.
 
 ## On the B200, from a fresh clone
 
-Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200) and about 50 GB free on one
+Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200), the Python headers and a C
+compiler (Triton builds small C helpers at the first start: `sudo apt-get install -y python3.12-dev
+build-essential`; `setup` and `start` check, and install them when sudo needs no password), and about 50 GB free on one
 disk (see "Disk" below: on the evroc B200 the root disk is 14 GB and the big disk must be mounted
 first).
 
@@ -40,8 +42,8 @@ changes it.
 
 `wait` prints vLLM's own pool and checks the crew against it, for example
 `crew: 64 workers + 8 leads + 1 orchestrator need at most 137 GB of KV cache and state; the pool holds 1xx GB`.
-On a 180 GB B200 that is a little over 100% and `wait` warns; that is expected, see "64 agents
-and memory" below.
+The evroc B200 has 183,359 MiB (192 GB), which leaves an estimated ~140 GB, so 64 should come
+out just under 100%. If it is a little over, `wait` warns; see "64 agents and memory" below.
 
 `check` ends in `PASS` when: the model answers; thinking comes back apart from the answer
 (so file blocks never contain it); a JSON-schema call parses (the planner's calls); and the whole
@@ -159,7 +161,7 @@ pool (the server prints the real figure at start):
 
 | GPU | Memory × utilisation | Weights | Runtime | Left for KV | Profile | The default crew of 13 calls needs |
 |---|---|---|---|---|---|---|
-| B200 180 GB | 169 GB (0.94) | ~30 GB | ~10 GB | **~129 GB** | 64K max, bf16, 64+ seqs | 24 GB (64 workers: 137 GB, below) |
+| B200 192 GB (evroc: 183,359 MiB) | 181 GB (0.94) | ~31 GB | ~10 GB | **~140 GB** | 64K max, bf16, 64+ seqs | 24 GB (64 workers: 137 GB, below) |
 | H100 80 GB | 72 GB (0.90) | ~30 GB | ~6 GB | ~36 GB | 32K max, bf16, 16 seqs | 30 GB at 32K each |
 | L40S 48 GB | 44 GB (0.92) | ~30 GB | ~4 GB | ~10 GB | 16K max, fp8 KV, 13 seqs | 9 GB at 16K each |
 
@@ -175,20 +177,21 @@ The most each call can cost is its longest context plus the DeltaNet state (`dep
 | **64 + 8 + 1, all at their longest at once** | | **137 GB** | **74 GB** |
 
 The B200 profile gives vLLM 94% of the GPU (`GPU_UTIL=0.94`); after ~30 GB of weights and the
-runtime that leaves an estimated ~129 GB for the pool (the B200's 180 GB; if `nvidia-smi` shows
-more, there is more). So the worst case, every slot at its longest at once, is about 8 GB over.
+runtime that leaves an estimated ~140 GB for the pool on the evroc B200 (183,359 MiB in
+`nvidia-smi`), just above the worst case of every slot at its longest at once. `wait` compares
+against the pool vLLM actually reports, so it has the last word.
 The 80 agents add nothing to this: the engine never has more calls in flight than the 73 slots.
 Planning is not part of this sum either: plan calls are not capped by `MUGGE_MAX_CALL_TOKENS` and
 can run to the server's 65,536-token limit, and above 16 agents the plan's parts are written in
 parallel on the worker slots, but all of that happens before any ticket starts, while the worker
 and lead slots are otherwise empty, so it uses a fraction of the same pool.
 
-We keep bf16 KV as the default anyway, because the worst case does not happen in practice: a
+If the real pool comes out smaller, we keep bf16 KV as the default anyway, because the worst case does not happen in practice: a
 worker at medium effort thinks far less than the 16,384 cap, an agent holds KV only while its
 call runs (not while its checks run), calls start at their pack size and grow, and the 8 lead
 slots are full only when 8 tickets pass their checks at the same moment. vLLM handles a short
-overflow by pausing a call and resuming it. So `wait` will warn for 64 on a 180 GB B200; that is
-expected. Then watch `deploy/qwen.sh status` during the run: preemptions there mean vLLM
+overflow by pausing a call and resuming it. So a `wait` warning a few GB over is no reason to change
+anything. Watch `deploy/qwen.sh status` during the run: preemptions there mean vLLM
 paused calls for memory (they resume, slower). If they keep climbing, restart with an fp8 KV
 cache, which halves the KV memory at a small quality cost:
 
