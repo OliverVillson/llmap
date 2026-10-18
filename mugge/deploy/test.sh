@@ -17,6 +17,16 @@ grep -q 'b200-workers .* worker  10 slots' "$STATE/backends.txt"
 grep -q 'b200-leads .* lead  2 slots' "$STATE/backends.txt"
 grep -q 'b200-orchestrator .* manager  1 slots' "$STATE/backends.txt"
 [ "$(grep -c '^  up ' "$STATE/backends.txt")" = 3 ]
+! grep -q 'llama-server' "$STATE/backends.txt"
+# speed: bench saves per checkpoint, compare reads them back
+deploy/qwen.sh bench --rounds 1 --max-tokens 64
+cp "$STATE/bench-fp8.json" "$STATE/bench-nvfp4.json"
+deploy/qwen.sh compare | tee "$STATE/compare.txt"
+grep -q '1.00x' "$STATE/compare.txt"
+# NVFP4: NVIDIA's checkpoint with an fp8 KV cache, on Blackwell only
+QUANT=nvfp4 deploy/qwen.sh cmd | grep -q 'nvidia/Qwen3.8-27B-NVFP4 .*--kv-cache-dtype fp8_e4m3'
+QUANT=nvfp4 KV_DTYPE=auto deploy/qwen.sh cmd | grep -q -- '--kv-cache-dtype auto'
+if QUANT=nvfp4 GPU=h100 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "NVFP4 allowed on an H100"; exit 1; fi
 # a public host is refused without a key
 if HOST=0.0.0.0 ALLOW_PUBLIC=1 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "public host without a key was allowed"; exit 1; fi
 deploy/qwen.sh stop

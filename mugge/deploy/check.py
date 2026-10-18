@@ -5,6 +5,8 @@ Standard library only, so it runs on a fresh box and on a Mac at the end of an s
 
   check.py --url http://127.0.0.1:8000 --model qwen3.8-27b          the full check
   check.py --url http://127.0.0.1:8000 --status                       what the server is doing now
+  check.py --url ... --bench --label fp8 --save bench-fp8.json         decode speed, 1 and 13 calls at once
+  check.py --compare bench-fp8.json bench-nvfp4.json                   saved bench results side by side
 
 The full check, in order, stopping at the first failure:
   1. /health answers and /v1/models lists --model
@@ -238,17 +240,76 @@ def full(base, model, key, n, max_tokens):
     return 1 if c.failed else 0
 
 
+def burst(base, model, key, n, max_tokens):
+    """n calls at once, each writing exactly max_tokens; returns tokens together per second and per call."""
+    t0 = time.monotonic()
+    with cf.ThreadPoolExecutor(max_workers=n) as pool:
+        rs = list(pool.map(lambda i: chat(base, model, key, [{"role": "system", "content": SHARED}, {"role": "user", "content": f"Write {TASKS[i % len(TASKS)]}, with tests."}],
+                                          max_tokens, False, ignore_eos=True), range(n)))
+    wall = time.monotonic() - t0
+    return {"calls": n, "tokens": sum(r["completion_tokens"] for r in rs), "wall_s": round(wall, 2),
+            "tok_s_together": round(sum(r["completion_tokens"] for r in rs) / wall, 1),
+            "tok_s_per_call": round(statistics.median(r["completion_tokens"] / r["s"] for r in rs), 1),
+            "latency_max_s": round(max(r["s"] for r in rs), 2)}
+
+
+def bench(base, model, key, n, max_tokens, rounds, label, save):
+    """Decode speed as the crew sees it: 1 call alone, then n at once, each round writing max_tokens per call."""
+    chat(base, model, key, [{"role": "user", "content": "Say ok."}], 8, False)  # warm-up
+    out = {"label": label, "model": model, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": max_tokens, "single": [], "crew": []}
+    for i in range(rounds):
+        out["single"].append(burst(base, model, key, 1, max_tokens))
+        out["crew"].append(burst(base, model, key, n, max_tokens))
+        print(f"round {i + 1}: alone {out['single'][-1]['tok_s_per_call']} tok/s; {n} at once {out['crew'][-1]['tok_s_together']} tok/s together, {out['crew'][-1]['tok_s_per_call']} per call")
+    best = lambda k, f: max(r[f] for r in out[k])
+    out["summary"] = {"alone_tok_s": best("single", "tok_s_per_call"), "together_tok_s": best("crew", "tok_s_together"), "per_call_tok_s": best("crew", "tok_s_per_call"), "calls": n}
+    print(f"{label}: alone {out['summary']['alone_tok_s']} tok/s, {n} at once {out['summary']['together_tok_s']} tok/s together ({out['summary']['per_call_tok_s']} per call)")
+    if save:
+        with open(save, "w") as f:
+            json.dump(out, f, indent=1)
+        print(f"saved {save}")
+    return 0
+
+
+def compare(paths):
+    rows = []
+    for p in paths:
+        try:
+            with open(p) as f:
+                rows.append(json.load(f))
+        except (OSError, ValueError) as e:
+            print(f"skipped {p}: {e}")
+    if not rows:
+        print("nothing to compare: run deploy/qwen.sh bench with each checkpoint first")
+        return 1
+    base = rows[0]["summary"]
+    print(f"{'checkpoint':<12} {'measured':<20} {'alone tok/s':>12} {'crew tok/s':>11} {'per call':>9} {'vs ' + rows[0]['label']:>10}")
+    for r in rows:
+        s = r["summary"]
+        print(f"{r['label']:<12} {r['at']:<20} {s['alone_tok_s']:>12} {s['together_tok_s']:>11} {s['per_call_tok_s']:>9} {s['together_tok_s'] / base['together_tok_s']:>9.2f}x")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default="http://127.0.0.1:8000", help="server root, without /v1")
     p.add_argument("--model", default="qwen3.8-27b")
     p.add_argument("--concurrency", type=int, default=13)
-    p.add_argument("--max-tokens", type=int, default=384, help="tokens each burst call writes (ignore_eos, so all write this many)")
+    p.add_argument("--max-tokens", type=int, help="tokens each burst call writes, all of them (ignore_eos); default 384, 1024 for --bench")
     p.add_argument("--status", action="store_true")
+    p.add_argument("--bench", action="store_true", help="decode speed instead of the check")
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--label", default="")
+    p.add_argument("--save", default="")
+    p.add_argument("--compare", nargs="*", metavar="BENCH_JSON")
     a = p.parse_args()
+    if a.compare is not None:
+        sys.exit(compare(a.compare))
     base = a.url.rstrip("/").removesuffix("/v1")
     key = os.environ.get("VLLM_API_KEY") or None
-    sys.exit(status(base, key) if a.status else full(base, a.model, key, a.concurrency, a.max_tokens))
+    if a.bench:
+        sys.exit(bench(base, a.model, key, a.concurrency, a.max_tokens or 1024, a.rounds, a.label or a.model, a.save))
+    sys.exit(status(base, key) if a.status else full(base, a.model, key, a.concurrency, a.max_tokens or 384))
 
 
 if __name__ == "__main__":

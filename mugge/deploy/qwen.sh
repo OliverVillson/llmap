@@ -7,18 +7,28 @@
 #   deploy/qwen.sh wait       block until it answers (or exit 1 with the log tail if it died)
 #   deploy/qwen.sh status     running?, KV size, requests running/waiting, KV use, preemptions
 #   deploy/qwen.sh check      one plain call, one thinking call, one JSON call, then 13 at once
+#   deploy/qwen.sh bench      decode speed with 13 calls at once, saved per checkpoint
+#   deploy/qwen.sh compare    the saved bench results side by side (FP8 against NVFP4)
 #   deploy/qwen.sh logs       follow the server log
 #   deploy/qwen.sh stop
 #   deploy/qwen.sh cmd        print the vllm command it would run, and change nothing
 #
 # The GPU profile (b200, h100, l40s) is read from nvidia-smi; GPU=b200 forces one. Any profile
 # value can be overridden: MAX_MODEL_LEN, KV_DTYPE, MAX_NUM_SEQS, GPU_UTIL. MTP=3 turns on the
-# model's own multi-token prediction (3 draft tokens). The server listens on 127.0.0.1 only;
+# model's own multi-token prediction (3 draft tokens). QUANT=nvfp4 serves NVIDIA's NVFP4
+# checkpoint instead of Qwen's FP8 one (Blackwell only; give it to download and start, the rest
+# read what is running). The server listens on 127.0.0.1 only;
 # reach it from another machine through an ssh tunnel (README), never an open port.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-MODEL="${MODEL:-Qwen/Qwen3.8-27B-FP8}"
+QUANT="${QUANT:-fp8}"
+case "$QUANT" in
+  fp8) : "${MODEL:=Qwen/Qwen3.8-27B-FP8}" ;;
+  # ModelOpt mixed precision: NVFP4 MLPs and lm_head, FP8 attention and DeltaNet projections
+  nvfp4) : "${MODEL:=nvidia/Qwen3.8-27B-NVFP4}" ;;
+  *) echo "qwen.sh: QUANT must be fp8 or nvfp4" >&2; exit 1 ;;
+esac
 SERVED="${SERVED:-qwen3.8-27b}"
 VLLM_VERSION="${VLLM_VERSION:-0.31.0}"
 VENV="${VENV:-$HOME/venvs/qwen-vllm}"
@@ -30,6 +40,7 @@ TP="${TP:-1}"
 MTP="${MTP:-0}"
 LOG="$STATE/serve.log"
 PIDFILE="$STATE/serve.pid"
+RUNNING="$STATE/serve.quant"
 URL="http://127.0.0.1:$PORT"
 
 die() { echo "qwen.sh: $*" >&2; exit 1; }
@@ -51,6 +62,7 @@ detect_gpu() {
 # 2 leads and 1 orchestrator keeps 13 calls in flight; every profile admits at least that many.
 profile() {
   local g; g="$(detect_gpu)"
+  [ -z "${KV_DTYPE:-}" ] || KV_DTYPE_SET=1
   case "$g" in
     b200) : "${MAX_MODEL_LEN:=65536}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=32}" "${GPU_UTIL:=0.90}" ;;
     h100) : "${MAX_MODEL_LEN:=32768}" "${KV_DTYPE:=auto}" "${MAX_NUM_SEQS:=16}" "${GPU_UTIL:=0.90}" ;;
@@ -58,6 +70,11 @@ profile() {
     *) die "unknown GPU '$(gpu_name)': set GPU=b200, h100 or l40s" ;;
   esac
   PROFILE="$g"
+  if [ "$QUANT" = nvfp4 ]; then
+    [ "$g" = b200 ] || die "NVFP4 needs a Blackwell GPU (B200); this profile is $g"
+    # NVIDIA's serve command for this checkpoint uses an fp8 KV cache (KV_DTYPE=auto to compare like for like)
+    [ "$KV_DTYPE" != auto ] || [ -n "${KV_DTYPE_SET:-}" ] || KV_DTYPE=fp8_e4m3
+  fi
 }
 
 serve_cmd() {
@@ -104,7 +121,7 @@ case "${1:-}" in
     ;;
   cmd)
     serve_cmd
-    echo "# profile $PROFILE ($(gpu_name || true))"
+    echo "# profile $PROFILE ($(gpu_name || true)), $MODEL"
     printf '%q ' "${CMD[@]}"; echo
     ;;
   start)
@@ -112,11 +129,12 @@ case "${1:-}" in
     serve_cmd
     [ -x "$VLLM" ] || die "$VLLM not found: run deploy/qwen.sh setup first (or set VLLM=)"
     mkdir -p "$STATE"
-    { echo "# $(date -Is) profile $PROFILE"; printf '%q ' "${CMD[@]}"; echo; } > "$LOG"
+    { echo "# $(date -Is) profile $PROFILE quant $QUANT"; printf '%q ' "${CMD[@]}"; echo; } > "$LOG"
+    echo "$QUANT" > "$RUNNING"
     # its own session, no terminal: the server outlives the ssh login that started it
     setsid nohup "${CMD[@]}" >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
-    echo "started pid $! (profile $PROFILE), log $LOG; loading takes a few minutes: deploy/qwen.sh wait"
+    echo "started pid $! (profile $PROFILE, $MODEL), log $LOG; loading takes a few minutes: deploy/qwen.sh wait"
     ;;
   wait)
     timeout_s="${WAIT_S:-1800}"
@@ -138,6 +156,14 @@ case "${1:-}" in
     shift
     exec python3 "$HERE/check.py" --url "$URL" --model "$SERVED" "$@"
     ;;
+  bench)
+    shift
+    q="$(cat "$RUNNING" 2>/dev/null || echo "$QUANT")"
+    exec python3 "$HERE/check.py" --url "$URL" --model "$SERVED" --bench --label "$q" --save "$STATE/bench-$q.json" "$@"
+    ;;
+  compare)
+    exec python3 "$HERE/check.py" --compare "$STATE"/bench-*.json
+    ;;
   logs)
     exec tail -n "${LINES:-100}" -F "$LOG"
     ;;
@@ -148,11 +174,11 @@ case "${1:-}" in
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
     for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -0 "$pid" 2>/dev/null && { echo "still up after 60 s: killing"; kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid"; }
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$RUNNING"
     echo stopped
     ;;
   *)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

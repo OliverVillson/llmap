@@ -6,8 +6,8 @@ B200 is the target; H100 and L40S notes are at the end.
 
 | File | What it is |
 |---|---|
-| `qwen.sh` | setup, download, start (detached), wait, status, check, logs, stop, cmd |
-| `check.py` | the server check: plain, thinking and JSON calls, then 13 calls at once (stdlib only) |
+| `qwen.sh` | setup, download, start (detached), wait, status, check, bench, compare, logs, stop, cmd |
+| `check.py` | the server check: plain, thinking and JSON calls, then 13 calls at once; and the speed bench (stdlib only) |
 | `crew-b200.json` | the crew's machine list (`MUGGE_BACKENDS`) |
 | `crew.env` | the engine settings for that crew |
 | `mock_vllm.py`, `test.sh` | a no-GPU stand-in for vLLM and the dry run CI runs |
@@ -76,13 +76,13 @@ and a burst of reviews never takes a worker's slot:
 
 `MUGGE_CONCURRENCY=10` lets 10 tickets run at once. At most 13 calls are in flight; the server
 admits 32 at once (`MAX_NUM_SEQS`), so the crew can grow to about 25 workers by raising the
-worker slots and `MUGGE_CONCURRENCY`, with no server change. (`mugge backends` also prints a
-`llama-server` line per entry; ignore it, it is for llama.cpp machines.)
+worker slots and `MUGGE_CONCURRENCY`, with no server change.
 
-Thinking, sampling and the per-call token cap belong to the engine branch. The server does not
-pin sampling: the engine sends it on every call, and anything a call leaves out falls back to
-the model's own `generation_config.json`. Qwen3.8 thinks unless a call sends
-`chat_template_kwargs.enable_thinking: false`.
+Each entry uses the engine's `qwen3.8-27b` preset (16 KV layers × 4 × 256, plus the DeltaNet
+state) and `"server": "vllm"`. `crew.env` turns thinking on (`MUGGE_THINKING=on`, sent on every
+call; the review call goes out with thinking off) and caps a call at 16,384 tokens. It sets no
+sampling: the engine sends Qwen's set per call from that call's thinking switch, and the server
+pins none.
 
 ## Memory and slots
 
@@ -121,6 +121,35 @@ On the B200 the crew uses at most half the pool even if every call reaches 64K t
 
 Overrides: any of `MAX_MODEL_LEN`, `KV_DTYPE`, `MAX_NUM_SEQS`, `GPU_UTIL`, `PORT`, `TP`, or
 `EXTRA_ARGS="..."`. `deploy/qwen.sh cmd` prints the command without running anything.
+
+## NVFP4 instead of FP8 (B200 only)
+
+`QUANT=nvfp4` serves [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
+(NVIDIA ModelOpt, September 2026): NVFP4 in the MLPs and `lm_head`, FP8 in the attention and
+DeltaNet projections, and an fp8 KV cache, as in NVIDIA's own serve command. The crew file does
+not change: the server answers to `qwen3.8-27b` either way. FP8 stays the default until the two
+are measured on the box:
+
+```bash
+deploy/qwen.sh bench                                   # FP8 is running: saves ~/qwen/bench-fp8.json
+deploy/qwen.sh stop
+QUANT=nvfp4 deploy/qwen.sh download
+QUANT=nvfp4 deploy/qwen.sh start && deploy/qwen.sh wait && deploy/qwen.sh check
+deploy/qwen.sh bench                                   # saves ~/qwen/bench-nvfp4.json
+deploy/qwen.sh compare                                 # tok/s alone and with 13 at once, NVFP4 against FP8
+```
+
+Speed is half the question; the other half is whether the files still come out exact. Run the
+engine smoke against each (`bun bench/smoke.ts --url http://127.0.0.1:8000/v1 --model qwen3.8-27b`,
+15 tickets) and keep NVFP4 only if its pass count and lost answers match FP8's.
+
+What is known so far: NVIDIA's card shows NVFP4 within about 1 point of BF16 (GPQA 88.0 vs 88.9,
+Terminal-Bench 74.0 vs 75.6, IFBench 78.9 vs 80.1). A community comparison on a DGX Spark found
+the same on code (HumanEval 94.5 vs FP8's 95.1, MBPP 70.4 vs 69.3) with single-stream decode
+1.9x FP8's, but a token distribution further from BF16 than FP8's (KL 0.076 against 0.012), and
+thinking loops with every NVFP4 build it tried. On a B200 with 13 calls at once the gain will be
+smaller than on that box, since the B200 has the memory bandwidth FP8 needs; `compare` says how
+much. MTP with this checkpoint is not verified.
 
 ## H100 or L40S instead
 
