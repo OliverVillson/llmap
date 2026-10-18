@@ -25,7 +25,7 @@ set -a; . deploy/crew.env; set +a             # reads 64 back: 64 worker slots, 
 bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only."
 ```
 
-Then on the Mac: `ssh -N -L 7340:127.0.0.1:7340 b200` and open http://127.0.0.1:7340/.
+Then on the Mac: `ssh -N -L 7340:127.0.0.1:7340 evroc` and open http://127.0.0.1:7340/.
 
 `crew.env` runs 80 code agents on the 64 worker slots (the extra 16 keep the slots busy while
 other agents run their checks), so the orchestrator plans for 80: **about 80 tickets for 64
@@ -72,7 +72,7 @@ crew's own tool renders `project/README.md`.
 ## From the Mac
 
 ```bash
-ssh -N -L 7340:127.0.0.1:7340 b200
+ssh -N -L 7340:127.0.0.1:7340 evroc
 ```
 
 then open http://127.0.0.1:7340/. The view only listens on 127.0.0.1; do not open its port to
