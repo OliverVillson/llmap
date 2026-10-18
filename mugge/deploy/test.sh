@@ -4,6 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export STATE="$(mktemp -d)" VLLM="$PWD/deploy/mock_vllm.py" GPU=b200 PORT="${PORT:-18000}" MOCK_LOAD_S=2
+export DATA_DIR="$STATE/data"
 trap 'deploy/qwen.sh stop >/dev/null 2>&1 || true; rm -rf "$STATE"' EXIT
 deploy/qwen.sh cmd
 deploy/qwen.sh start
@@ -62,4 +63,14 @@ if MAX_NUM_SEQS=8 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "MAX_NUM_SEQS be
 # a public host is refused without a key
 if HOST=0.0.0.0 ALLOW_PUBLIC=1 deploy/qwen.sh cmd >/dev/null 2>&1; then echo "public host without a key was allowed"; exit 1; fi
 deploy/qwen.sh stop
+# the data folder: download checks free space before it starts, saves the folder, and fetches into it
+mkdir -p "$STATE/venv/bin"; ln -s "$(command -v python3)" "$STATE/venv/bin/python"
+printf '#!/bin/sh\necho "hf $* into $HF_HOME"\n' > "$STATE/venv/bin/hf"; chmod +x "$STATE/venv/bin/hf"
+if MODEL_GB=999999 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1; then echo "download should refuse a full disk"; exit 1; fi
+grep -q 'not enough space' "$STATE/dl.txt"
+if grep -q '^hf download' "$STATE/dl.txt"; then echo "download ran on a full disk"; exit 1; fi
+( unset DATA_DIR; MODEL_GB=0 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1 ) || { cat "$STATE/dl.txt"; exit 1; }
+grep -q "hf download Qwen/Qwen3.8-27B-FP8 into $STATE/data/hf" "$STATE/dl.txt"
+[ "$(cat "$STATE/data.dir")" = "$STATE/data" ]
+( unset DATA_DIR; deploy/qwen.sh where ) > "$STATE/where.txt"; grep -q "data folder  $STATE/data " "$STATE/where.txt"
 echo "deploy dry run: PASS"

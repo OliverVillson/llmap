@@ -8,7 +8,8 @@ is the target; H100 and L40S notes are at the end.
 
 | File | What it is |
 |---|---|
-| `qwen.sh` | setup, download, start (detached), wait, status, check, bench, sweep, compare, logs, stop, cmd |
+| `qwen.sh` | setup, download, where, start (detached), wait, status, check, bench, sweep, compare, logs, stop, cmd |
+| `disk.py` | picks the data folder (the biggest disk you can write to) and checks free space |
 | `check.py` | the server check (plain, thinking and JSON calls, then the crew at once) and the speed bench (stdlib only) |
 | `crew.py`, `crew-b200.json` | the crew's machine list (`MUGGE_BACKENDS`) for `CREW_WORKERS`; the JSON is the default crew of 10 |
 | `crew.env` | the engine settings for that crew |
@@ -16,14 +17,16 @@ is the target; H100 and L40S notes are at the end.
 
 ## On the B200, from a fresh clone
 
-Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200) and about 50 GB free disk.
+Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200) and about 50 GB free on one
+disk (see "Disk" below: on the evroc B200 the root disk is 14 GB and the big disk must be mounted
+first).
 
 ```bash
-git clone https://github.com/OliverVillson/llmap && cd llmap/mugge
+cd /data && git clone https://github.com/OliverVillson/llmap && ln -s /data/llmap ~/llmap && cd llmap/mugge
 git checkout claude/qwen-serving        # until it is merged
 
-deploy/qwen.sh setup                     # vLLM 0.31.0 in ~/venvs/qwen-vllm, matched to the driver's CUDA
-deploy/qwen.sh download                  # the weights into ~/.cache/huggingface
+deploy/qwen.sh setup                     # vLLM 0.31.0 in <data folder>/venv, matched to the driver's CUDA
+deploy/qwen.sh download                  # the weights (31 GB) into <data folder>/hf; checks space first, resumes
 CREW_WORKERS=64 deploy/qwen.sh start     # detached; survives logging out; the crew size sticks
 deploy/qwen.sh wait                      # first start takes several minutes (load, compile, CUDA graphs)
 deploy/qwen.sh check                     # must end in PASS
@@ -45,19 +48,44 @@ and memory" below.
 crew's calls at once (73) all answer, ran together and none was preempted. It prints tokens per
 second together and per call.
 
+## Disk
+
+Everything big goes in one data folder: the weights (`hf/`, 31 GB), the vLLM venv (`venv/`, about
+10 GB) and the uv, vLLM-compile and Triton caches (`cache/`). `setup` picks it the first time:
+`qwen-data` on the local disk with the most free space you can write to, and saves it in
+`~/qwen/data.dir` so every later command uses the same one. `DATA_DIR=/path` chooses another.
+`deploy/qwen.sh where` shows the folder, its free space and what is in it. `download` prints
+how many GB it still needs and stops before fetching anything when the disk has less, listing
+bigger disks it could not use; run it again after an interruption and it carries on.
+
+The evroc B200 has a 14 GB root disk and an empty 3.6 TB disk (`vdc`) that is not mounted.
+Mount it once at `/data` (the `mkfs` erases the disk, so check first that `blkid` prints nothing):
+
+```bash
+sudo blkid /dev/vdc                      # nothing printed = no filesystem on it yet
+sudo mkfs.ext4 -L data /dev/vdc
+sudo mkdir -p /data && sudo mount /dev/vdc /data && sudo chown "$USER:$USER" /data
+echo 'LABEL=data /data ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+```
+
+Keep the checkout on `/data` as well (the crew's work trees live in it). If an earlier `setup`
+put the venv in `~/venvs/qwen-vllm`, `qwen.sh` keeps using it; delete it
+(`rm -rf ~/venvs/qwen-vllm ~/.cache/uv ~/.cache/huggingface`) and run `setup` again to move
+everything onto the data disk.
+
 ## Checking in over ssh from the Mac
 
 ```bash
-ssh b200 'cd llmap/mugge && deploy/qwen.sh status'     # running?, requests running/waiting, KV use, preemptions
-ssh b200 'tail -n 50 ~/qwen/serve.log'                 # the server log
-ssh b200 'cd llmap/mugge && deploy/qwen.sh stop'
+ssh evroc 'cd llmap/mugge && deploy/qwen.sh status'     # running?, requests running/waiting, KV use, preemptions
+ssh evroc 'tail -n 50 ~/qwen/serve.log'                 # the server log
+ssh evroc 'cd llmap/mugge && deploy/qwen.sh stop'
 ```
 
 The server listens on 127.0.0.1 only. To use it from the Mac (an engine run there, or
 `check.py`), open a tunnel and talk to your own port 8000:
 
 ```bash
-ssh -N -L 8000:127.0.0.1:8000 b200 &
+ssh -N -L 8000:127.0.0.1:8000 evroc &
 python3 deploy/check.py --url http://127.0.0.1:8000 --status
 ```
 

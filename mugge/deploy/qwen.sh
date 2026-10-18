@@ -2,7 +2,8 @@
 # Qwen3.8-27B-FP8 behind vLLM on one GPU, for a Centipede crew (run sheet: deploy/README.md).
 #
 #   deploy/qwen.sh setup      vLLM $VLLM_VERSION in its own venv (uv), and a GPU/driver check
-#   deploy/qwen.sh download   the weights (~31 GB) into the Hugging Face cache
+#   deploy/qwen.sh download   the weights (~31 GB) into the data folder; checks free space first, resumes
+#   deploy/qwen.sh where      the data folder, its free space, and where the venv and weights are
 #   deploy/qwen.sh start      the server, detached: it survives logging out of ssh
 #   deploy/qwen.sh wait       block until it answers (or exit 1 with the log tail if it died)
 #   deploy/qwen.sh status     running?, KV size, requests running/waiting, KV use, preemptions
@@ -21,6 +22,9 @@
 # read what is running). CREW_WORKERS=N (default 10) at start sizes the server for a crew of N
 # workers, their leads and the orchestrator; the other commands and deploy/crew.env read it back. The server listens
 # on 127.0.0.1 only; reach it from another machine through an ssh tunnel (README).
+# DATA_DIR is where the weights, the vLLM venv and the caches go (about 50 GB). Unset, setup picks
+# the local filesystem with the most free space this user can write to, and every later command
+# uses the same folder (saved in ~/qwen/data.dir).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -33,9 +37,17 @@ case "$QUANT" in
 esac
 SERVED="${SERVED:-qwen3.8-27b}"
 VLLM_VERSION="${VLLM_VERSION:-0.31.0}"
-VENV="${VENV:-$HOME/venvs/qwen-vllm}"
-VLLM="${VLLM:-$VENV/bin/vllm}"
 STATE="${STATE:-$HOME/qwen}"
+DATA_FILE="$STATE/data.dir"
+if [ -z "${DATA_DIR:-}" ] && [ -f "$DATA_FILE" ]; then DATA_DIR="$(cat "$DATA_FILE")"; fi
+DATA_DIR="${DATA_DIR:-$(python3 "$HERE/disk.py" pick)}"
+# the weights, vLLM's compile cache and Triton's kernels all go under the data folder
+export HF_HOME="${HF_HOME:-$DATA_DIR/hf}" XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DATA_DIR/cache}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DATA_DIR/cache/triton}" UV_CACHE_DIR="${UV_CACHE_DIR:-$DATA_DIR/cache/uv}"
+# a venv made before DATA_DIR existed stays where it is
+if [ -z "${VENV:-}" ] && [ -x "$HOME/venvs/qwen-vllm/bin/python" ]; then VENV="$HOME/venvs/qwen-vllm"; fi
+VENV="${VENV:-$DATA_DIR/venv}"
+VLLM="${VLLM:-$VENV/bin/vllm}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 TP="${TP:-1}"
@@ -52,6 +64,20 @@ CREW_WORKERS="${CREW_WORKERS:-10}"
 read -r _ CREW_LEADS _ CREW_TOTAL CREW_AGENTS < <(python3 "$HERE/crew.py" "$CREW_WORKERS" --sizes)
 
 die() { echo "qwen.sh: $*" >&2; exit 1; }
+
+# Use DATA_DIR, after checking it has NEED GB free; remember it for every later command.
+use_data_dir() {
+  local need="$1" free
+  mkdir -p "$DATA_DIR" 2>/dev/null || die "cannot create DATA_DIR=$DATA_DIR; pick a folder you can write to: DATA_DIR=/path deploy/qwen.sh $CMD_NAME"
+  mkdir -p "$STATE"; echo "$DATA_DIR" > "$DATA_FILE"
+  free="$(python3 "$HERE/disk.py" free "$DATA_DIR")"
+  echo "data folder $DATA_DIR: ${free} GB free, ${need} GB needed"
+  if [ "$free" -lt "$need" ]; then
+    echo "qwen.sh: not enough space in $DATA_DIR (${free} GB free, ${need} GB needed)." >&2
+    python3 "$HERE/disk.py" bigger "$DATA_DIR" | sed 's/^/  bigger: /' >&2
+    die "free space there, or point DATA_DIR at a bigger disk you can write to (README \"Disk\"): DATA_DIR=/path deploy/qwen.sh $CMD_NAME"
+  fi
+}
 
 gpu_name() { command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true; }
 
@@ -116,13 +142,20 @@ pid_alive() {
   [ ! -f "$STATE/serve.boot" ] || [ "$(cat "$STATE/serve.boot")" = "$(boot_id)" ]
 }
 
+CMD_NAME="${1:-}"
 case "${1:-}" in
+  where)
+    echo "data folder  $DATA_DIR ($(python3 "$HERE/disk.py" free "$DATA_DIR") GB free)$([ -f "$DATA_FILE" ] || echo ', not chosen yet: setup or download saves it')"
+    echo "venv         $VENV$([ -x "$VENV/bin/python" ] || echo ' (not installed)')"
+    m="$HF_HOME/hub/models--${MODEL//\//--}"
+    echo "weights      $m$([ -d "$m" ] && echo " ($(du -sh "$m" 2>/dev/null | cut -f1))" || echo ' (not downloaded)')"
+    echo "state, log   $STATE"
+    ;;
   setup)
     command -v nvidia-smi >/dev/null || die "no nvidia-smi: this needs an NVIDIA GPU with its driver installed"
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
     echo "profile: $(detect_gpu)"
-    free_gb="$(df -BG --output=avail "$HOME" | tail -1 | tr -dc 0-9)"
-    [ "$free_gb" -ge 50 ] || echo "warning: ${free_gb} GB free in $HOME; the venv and weights need about 45 GB" >&2
+    use_data_dir 50
     command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
     [ -x "$VENV/bin/python" ] || uv venv -p 3.12 "$VENV"
     # --torch-backend=auto picks the PyTorch build that matches the installed driver's CUDA
@@ -132,6 +165,15 @@ case "${1:-}" in
     ;;
   download)
     [ -x "$VENV/bin/hf" ] || die "run deploy/qwen.sh setup first"
+    read -r total_gb left_gb < <(python3 "$HERE/disk.py" model-gb "$MODEL" "$HF_HOME" "$VENV/bin/python")
+    [ -z "${MODEL_GB:-}" ] || left_gb="$MODEL_GB"
+    echo "$MODEL: ${total_gb} GB, ${left_gb} GB still to download"
+    use_data_dir "$(python3 -c "import math,sys; print(math.ceil(float(sys.argv[1])) + 2)" "$left_gb")"
+    old="$HOME/.cache/huggingface/hub/models--${MODEL//\//--}"
+    if [ "$HF_HOME" != "$HOME/.cache/huggingface" ] && [ -d "$old" ]; then
+      echo "note: an earlier download is in $old ($(du -sh "$old" 2>/dev/null | cut -f1)); it is not used, remove it: rm -rf $old"
+    fi
+    # resumes: files already in the cache are kept, a half-written one continues where it stopped.
     # HF_TOKEN is not needed (the checkpoint is public) but avoids the anonymous rate limit
     "$VENV/bin/hf" download "$MODEL"
     echo "next: deploy/qwen.sh start && deploy/qwen.sh wait"
@@ -145,6 +187,8 @@ case "${1:-}" in
     if pid_alive; then echo "already running (pid $(cat "$PIDFILE")); deploy/qwen.sh status"; exit 0; fi
     serve_cmd
     [ -x "$VLLM" ] || die "$VLLM not found: run deploy/qwen.sh setup first (or set VLLM=)"
+    [ -d "$MODEL" ] || [ -d "$HF_HOME/hub/models--${MODEL//\//--}/snapshots" ] ||
+      echo "warning: $MODEL is not in $HF_HOME (deploy/qwen.sh download); vLLM will download it now" >&2
     mkdir -p "$STATE"
     { echo "# $(date -Is) profile $PROFILE quant $QUANT"; printf '%q ' "${CMD[@]}"; echo; } > "$LOG"
     # what is running, as bench labels it: fp8, fp8+mtp3, nvfp4, ...
