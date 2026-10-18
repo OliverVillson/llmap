@@ -20,6 +20,8 @@ export interface RunOptions {
   cwd: string;
   image: Image;
   timeoutMs?: number;
+  /** The run's stop: kills the command (and what it started) at once, as a timeout does. */
+  signal?: AbortSignal;
 }
 
 export interface Sandbox {
@@ -44,8 +46,9 @@ const killGroup = (pid: number) => {
   }
 };
 
-async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeoutMs: number): Promise<RunResult> {
+async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<RunResult> {
   const started = performance.now();
+  if (signal?.aborted) return { code: 130, out: '(stopped)', ms: 0, timedOut: false };
   // its own process group, so a timeout kills what it started too: a test that runs the CLI in a
   // subprocess which never ends would otherwise hold the output pipes open, and the check forever
   const p = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', env: process.env, detached: true } as Parameters<typeof Bun.spawn>[1]);
@@ -57,11 +60,16 @@ async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeout
   let timedOut = false;
   let drained: () => void = () => {};
   const cutOff = new Promise<void>((resolve) => (drained = resolve));
-  const timer = setTimeout(() => {
-    timedOut = true;
+  const kill = () => {
     if (!killGroup(p.pid)) p.kill('SIGKILL');
     setTimeout(drained, DRAIN_MS);
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill();
   }, timeoutMs);
+  // a stopped run does not wait out a check that may hang until its timeout
+  signal?.addEventListener('abort', kill, { once: true });
   const text = (s: ReadableStream<Uint8Array>) => {
     const r = s.getReader();
     const chunks: Uint8Array[] = [];
@@ -71,6 +79,7 @@ async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeout
   const [out, err] = await Promise.all([text(p.stdout as ReadableStream<Uint8Array>), text(p.stderr as ReadableStream<Uint8Array>)]);
   const code = await p.exited;
   clearTimeout(timer);
+  signal?.removeEventListener('abort', kill);
   groups.delete(p.pid);
   return { code: timedOut ? 124 : code, out: (out + err).trim(), ms: Math.round(performance.now() - started), timedOut };
 }
@@ -78,7 +87,7 @@ async function spawnWithTimeout(argv: string[], cwd: string | undefined, timeout
 export class LocalSandbox implements Sandbox {
   readonly name = 'local';
   run(command: string, o: RunOptions): Promise<RunResult> {
-    return spawnWithTimeout(['bash', '-c', command], o.cwd, o.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    return spawnWithTimeout(['bash', '-c', command], o.cwd, o.timeoutMs ?? DEFAULT_TIMEOUT_MS, o.signal);
   }
 }
 
@@ -115,7 +124,7 @@ export class ContainerSandbox implements Sandbox {
   }
 
   run(command: string, o: RunOptions): Promise<RunResult> {
-    return spawnWithTimeout(this.argv(command, o), undefined, o.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    return spawnWithTimeout(this.argv(command, o), undefined, o.timeoutMs ?? DEFAULT_TIMEOUT_MS, o.signal);
   }
 }
 

@@ -153,7 +153,7 @@ export async function runTicket(ticket: Ticket, worktree: string, ctx: HarnessCo
   // Every acceptance command in order; the first that fails, or null when all pass (their output goes to `passing`).
   const check = async (attempt: number, passing: Array<{ command: string; output: string }> = []) => {
     for (const command of ticket.acceptance) {
-      const res = await ctx.sandbox.run(command, { cwd: worktree, image: ticket.image, timeoutMs: ctx.checkTimeoutMs });
+      const res = await ctx.sandbox.run(command, { cwd: worktree, image: ticket.image, timeoutMs: ctx.checkTimeoutMs, signal: ctx.signal });
       r.checkMs += res.ms;
       const ok = res.code === 0;
       ctx.emit({ type: 'check', at: Date.now(), ticket: ticket.id, attempt, command, ok, ms: res.ms, tail: tail(res.out, 800) });
