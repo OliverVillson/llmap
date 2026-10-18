@@ -370,6 +370,8 @@ const log = (message: string, level: 'info' | 'warn' | 'error' = 'info') => {
 // The live view: GET / (the page), /api/status, /api/stream (SSE), /api/calls?ticket= (the list), /api/call?id= (one call in full), POST /api/steer
 
 const VIEW = join(DEMO_DIR, 'view', 'index.html');
+/** Frames a view's stream may have unsent before even engine events are skipped for it. */
+const BEHIND = 200;
 
 function status() {
   return {
@@ -433,7 +435,12 @@ const server = serve({
       const stream = new ReadableStream({
         start(c) {
           const enc = new TextEncoder();
+          // a tunnel slower than the stream (a slow link, a Mac asleep with ssh -N still open) would
+          // queue every frame in this process for as long as the run lasts: a status frame is
+          // skipped while the last ones are still unsent (the next supersedes it), and any frame
+          // once far behind
           send = (chunk) => {
+            if ((c.desiredSize ?? 1) <= (chunk.startsWith('event: status') ? 0 : -BEHIND)) return;
             try {
               c.enqueue(enc.encode(chunk));
             } catch {
@@ -633,7 +640,7 @@ try {
 } catch (e) {
   clearInterval(planBeat);
   orchestrator.phase = 'failed';
-  log(`demo stopped: ${String((e as Error).message ?? e)}`, 'error');
+  log(stops > 0 ? 'demo stopped while the orchestrator was planning: no ticket ran' : `demo stopped: ${String((e as Error).message ?? e)}`, 'error');
   try {
     telemetry.close();
   } catch {
