@@ -272,6 +272,14 @@ First start compiles: torch.compile (cached in `<data>/cache/vllm`), FlashInfer 
 (`<data>/.cache/flashinfer`), Triton (`<data>/cache/triton`). All are on the data disk, so a VM
 that keeps `/data` starts faster the second time. `wait` allows 60 minutes (`WAIT_S`) and reports a server that dies at once.
 
+Prebuilt FlashInfer kernels, if the first start's compile is slow or fails: FlashInfer
+0.7.0.post1 (the one vLLM 0.31.0 installs) can fetch its precompiled kernels from flashinfer.ai
+into the venv, `$(cat ~/qwen/data.dir)/venv/bin/python -m flashinfer download-kernels`, then
+`deploy/qwen.sh stop && deploy/qwen.sh start && deploy/qwen.sh wait`. It covers the common
+modules only, so nvcc stays set up for the rest. Not part of setup: untested here (flashinfer.ai
+is not reachable from where these scripts were tested). vLLM 0.32.0's `vllm download-kernels` is
+this same command; 0.32.0 pins the same FlashInfer and torch, so the scripts stay on 0.31.0.
+
 ## NVFP4 instead of FP8 (B200 only)
 
 `QUANT=nvfp4` serves [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
