@@ -15,42 +15,48 @@ every shell's PATH, vLLM, the weights and a preflight (`deploy/README.md`, "On t
 fresh VM"). It is safe to run again; if `/data` was never formatted it stops and prints the
 `--format /dev/vdc` line to run.
 
-On the Mac first, only when the VM was re-created (a new VM has a new host key):
+On the Mac, one line at a time (a re-created VM has a new host key: answer `yes`):
 
 ```bash
 ssh-keygen -R 194.14.80.240
+ssh evroc
 ```
 
-Then:
+On the box (each step runs only if the one before it worked):
 
 ```bash
-ssh evroc
 curl -fsSLo /tmp/fresh.sh https://raw.githubusercontent.com/OliverVillson/llmap/claude/centipede-demo/mugge/deploy/fresh.sh
-bash /tmp/fresh.sh                            # ends in "preflight: PASS" and "ready"
-cd ~/llmap/mugge
-CREW_WORKERS=64 deploy/qwen.sh start          # runs the preflight again, then starts; the crew size sticks
-deploy/qwen.sh wait                           # warns about memory for 64 on a 180 GB B200: expected
-deploy/qwen.sh check                          # must end in PASS
-set -a; . deploy/crew.env; set +a             # reads 64 back (again in every new shell)
-nohup bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only." > demo.log 2>&1 &
+bash /tmp/fresh.sh && cd ~/llmap/mugge && CREW_WORKERS=64 deploy/qwen.sh start && deploy/qwen.sh wait && deploy/qwen.sh check
+```
+
+If it stops at the disk, run `bash /tmp/fresh.sh --format /dev/vdc`, then the second line again.
+`wait` warns about memory for 64 on a 180 GB B200: expected. After `check` says `PASS`:
+
+```bash
+cd ~/llmap/mugge && set -a && . deploy/crew.env && set +a
+pgrep -f 'bun demo/run.ts' >/dev/null && echo 'a demo is already running: tail -f ~/llmap/mugge/demo.log' || { nohup bun demo/run.ts --prompt "A Python 3 command-line toolbox, tk, with many small subcommands (text, numbers, dates, encodings, validation), each in its own module with its own unittest file, standard library only." > demo.log 2>&1 & }
 tail -f demo.log
 ```
+
+The second line starts nothing when a demo is already running (a finished run's view counts:
+stop it first, below), so pasting the block again after an ssh drop cannot start a second run
+or empty `demo.log`. After an ssh drop, `ssh evroc` and `tail -f ~/llmap/mugge/demo.log` is all
+you need: `nohup` keeps the run going.
 
 Then on the Mac: `ssh -o ExitOnForwardFailure=yes -N -L 7340:127.0.0.1:7340 evroc` and open
 http://127.0.0.1:7340/. If it says the port is in use, an old tunnel holds it:
 `pkill -f 'L 7340:'` and run it again.
 
 Stop a run with `kill -INT <pid>` or plain `kill`: both write the summary and then end the demo,
-which frees the view's port; a second one quits at once. A run that finishes on its own keeps
-the view up; before the next run, `pkill -INT -f 'bun demo/run.ts'` (or pass `--port 7341`), else
-the new run says the port is in use.
+which frees the view's port; a second one quits at once. A run still planning stops at once. A
+run that finishes on its own keeps the view up; before the next run,
+`pkill -INT -f 'bun demo/run.ts'` (or pass `--port 7341`), else the new run says the port is in use.
 
 `crew.env` runs 80 code agents on the 64 worker slots (the extra 16 keep the slots busy while
 other agents run their checks), so the orchestrator plans for 80: **about 80 tickets for 64
 slots**. The demo needs `python3` (3.8 or newer), for `crew.env` and for Python projects' tests.
 It prints the view's address and the run folder, and keeps the view up after the run ends until
-Ctrl-C. To keep it running after you log out, start it with
-`nohup bun demo/run.ts --prompt "…" > demo.log 2>&1 &` (stop it with `kill`), or inside tmux.
+Ctrl-C.
 
 What to expect at 64:
 
@@ -58,13 +64,18 @@ What to expect at 64:
   agents) splits the work by design component: one call writes the shared and interface files,
   then one call per component writes its stubs and tests and one call per component plans its
   tickets, the components at the same time on worker slots that are idle until the plan is
-  ready. The view shows how long the planning calls have run. Planning calls are not capped by
+  ready. The view shows how long the planning calls have run, and `demo.log` says
+  `orchestrator: still designing (…)` once a minute. A planning call that thinks until its
+  token limit is asked once more thinking low (the log says so). Planning calls are not capped by
   `MUGGE_MAX_CALL_TOKENS`; they can run to the server's 65,536-token limit. If the plan comes out
   well short of 80 tickets, or with few that can start at once, the log says so.
 - **Memory.** `wait` warns that the worst case (every slot at its longest at once) is a little
   over the B200's pool; that is expected (`deploy/README.md`, "64 agents and memory"). Watch
   `deploy/qwen.sh status`: if preemptions keep climbing, restart with an fp8 KV cache:
-  `deploy/qwen.sh stop && KV_DTYPE=fp8 deploy/qwen.sh start && deploy/qwen.sh wait`.
+  `deploy/qwen.sh stop && KV_DTYPE=fp8 deploy/qwen.sh start && deploy/qwen.sh wait`. The
+  demo can keep running meanwhile: calls wait for the server to come back (up to 20 minutes,
+  `MUGGE_SERVER_WAIT_S`) instead of failing, and `demo.log` says
+  `inference server … not answering` while they wait.
 - **Checks share the CPUs.** Each ticket's tests run on this machine, at most one per CPU at
   once (`--checks N` to change it). An agent whose check is waiting shows "checking".
 - **Leads are fewer than agents.** 8 leads review 80 agents' tickets, so finished tickets can
