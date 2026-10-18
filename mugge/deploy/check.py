@@ -13,7 +13,8 @@ The full check, in order, stopping at the first failure:
   1. /health answers and /v1/models lists --model
   2. a plain call with thinking off: an answer, no thinking text in it
   3. a call with thinking on: the thinking comes back apart from the answer (reasoning parser)
-  4. a call constrained to a JSON schema, as the planner sends them: it parses
+  4. a call constrained to a JSON schema: it parses; then the same with thinking on, as the planner
+     sends it: the thinking stays apart and the answer after it still parses
   5. --concurrency calls at once (default 13: 10 workers, 2 leads, 1 orchestrator) sharing a
      long prompt prefix: all answer, the server ran them together (peak running requests from
      /metrics), and none was preempted (the KV cache held them all)
@@ -190,6 +191,18 @@ def full(base, model, key, n, max_tokens):
         (c.ok if isinstance(v.get("tickets"), list) else c.fail)("JSON schema call", f"{len(v.get('tickets', []))} tickets")
     except Exception as e:
         c.fail("JSON schema call", str(e))
+    # the planner's shape: thinking on and a schema; vLLM applies the schema once the thinking ends
+    try:
+        r = chat(base, model, key, [{"role": "user", "content": "Split 'a CLI that counts words in files' into two tickets, each owning one file."}], 8192, True,
+                 chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"},
+                 response_format={"type": "json_schema", "json_schema": {"name": "output", "schema": schema, "strict": True}})
+        if not r["content"].strip() and r["finish"] == "length":
+            c.ok("JSON schema call, thinking on", "it thought until the token cap (fine for this check)")
+        else:
+            v = json.loads(r["content"])
+            (c.ok if isinstance(v.get("tickets"), list) else c.fail)("JSON schema call, thinking on", f"{len(r['reasoning'])} chars of thinking, then {len(v.get('tickets', []))} tickets")
+    except Exception as e:
+        c.fail("JSON schema call, thinking on", f"{e} (the planner sends this shape; the orchestrator cannot plan without it)")
     # 5
     before = metrics(base, key)
     peak = {"running": 0.0, "waiting": 0.0}
