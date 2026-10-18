@@ -257,14 +257,27 @@ export function salvageJson(raw: string): unknown {
   return undefined;
 }
 
+/** Pause before a planning call that failed with a server error is sent once more. */
+export let PLAN_RETRY_MS = 5_000;
+export const setPlanRetryMs = (ms: number) => { PLAN_RETRY_MS = ms; };
+/** Errors worth one more try: the server's 5xx, a dropped or refused connection, a timeout. */
+const TRANSIENT = /inference 5\d\d|fetch failed|ECONNRESET|ECONNREFUSED|socket|connection|timed? ?out|aborted due to timeout/i;
+
 /**
  * One planning call. An answer cut at max_tokens keeps its complete part (salvageJson) and says
- * so in `warnings`; anything else that fails throws as before.
+ * so in `warnings`; a server error is tried once more; anything else that fails throws as before.
  */
-async function planCall<T>(client: Inference, model: string, messages: ChatMessage[], schema: object, max: number, what: string, warnings: string[]): Promise<T> {
+async function planCall<T>(client: Inference, model: string, messages: ChatMessage[], schema: object, max: number, what: string, warnings: string[], retryMs = PLAN_RETRY_MS): Promise<T> {
   try {
     return (await client.complete<T>(model, messages, schema, max, undefined, PLANNING)).value;
   } catch (e) {
+    // a server error or a dropped connection with nothing back: once more after a pause, so one
+    // 500 does not stop a run before its first ticket
+    if (!(e as { completion?: unknown }).completion && retryMs >= 0 && TRANSIENT.test(String((e as Error)?.message ?? e))) {
+      warnings.push(`${what} failed (${why(e)}); asked once more`);
+      await Bun.sleep(retryMs);
+      return planCall<T>(client, model, messages, schema, max, what, warnings, -1);
+    }
     const c = (e as { completion?: Completion<string> }).completion;
     const v = c?.raw ? salvageJson(c.raw) : undefined;
     if (v === undefined || typeof v !== 'object') throw e;

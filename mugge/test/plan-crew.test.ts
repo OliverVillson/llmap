@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { componentOf, crewShares, design, normPath, planShape, salvageJson, scaffold, tickets, type Design } from '../src/plan/architect.ts';
+import { componentOf, crewShares, design, normPath, planShape, salvageJson, scaffold, setPlanRetryMs, tickets, type Design } from '../src/plan/architect.ts';
 import { contextFit, OpenAICompatible, type CallTweaks, type ChatMessage, type Completion, type Inference } from '../src/engine/inference.ts';
 import { validatePlan } from '../src/tickets/schema.ts';
 
@@ -124,6 +124,7 @@ describe('planning one prompt into a crew of tickets', () => {
 });
 
 describe('a 64-agent plan survives what a real model gets wrong (debug round 2026-10-18)', () => {
+  setPlanRetryMs(0);
   const parts5 = (fn: (i: number, system: string, user: string, turns: number) => unknown) => (i: number) => scripted(`part-${i}`, [], (system, user, turns) => fn(i, system, user, turns));
   const stubs = (i: number) => Object.fromEntries(Array.from({ length: 16 }, (_, k) => [`${DESIGN.components[i]!.path}/m${k}.py`, '']));
   const sharedFiles = { 'pyproject.toml': '', ...Object.fromEntries(DESIGN.components.flatMap((c) => c.interfaces.map((x) => [x.path, '']))) };
@@ -226,6 +227,20 @@ describe('a 64-agent plan survives what a real model gets wrong (debug round 202
     })();
     const reask = parser.find((s) => s.turns > 2)!;
     expect(reask).toBeDefined();
+  });
+
+  test('a server error on a planning call is tried once more; a second one costs that part', async () => {
+    let n = 0;
+    const flaky = { complete: async () => { if (n++ === 0) throw fail('inference 500: Internal Server Error'); return { value: { files: sharedFiles, note: '' }, raw: '', promptTokens: 0, completionTokens: 0, ms: 1 }; }, text: async () => '' } as unknown as Inference;
+    const sc = await scaffold(flaky, DESIGN, 'planner', { crew: 64, parts: parts5((i) => ({ files: stubs(i), note: '' })) });
+    expect(n).toBe(2);
+    expect(sc.warnings[0]).toBe('the shared scaffold failed (inference 500: Internal Server Error); asked once more');
+    // a refusal that is not the server's fault is not retried
+    let m = 0;
+    const refused = { complete: async () => { m++; throw fail('inference 400: bad schema'); }, text: async () => '' } as unknown as Inference;
+    expect(scaffold(refused, DESIGN, 'planner', { crew: 64, parts: parts5(() => ({})) })).rejects.toThrow(/400/);
+    await Bun.sleep(5);
+    expect(m).toBe(1);
   });
 
   test('one component for a big crew: the design is asked again for more', async () => {
