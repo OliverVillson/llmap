@@ -299,6 +299,11 @@ function digest(t: string): TicketDigest {
   return d;
 }
 
+/** A line in the terminal (demo.log under nohup), with the time: what someone over ssh follows with tail -f. */
+const clock = () => new Date().toTimeString().slice(0, 8);
+const tell = (line: string) => console.log(`${clock()} ${line}`);
+const firstLine = (s: string | undefined) => (s ?? '').split('\n').find((l) => l.trim())?.trim().slice(0, 200) ?? '';
+
 const emit = (e: EngineEvent) => {
   events.push(e);
   appendFileSync(join(out, 'events.jsonl'), JSON.stringify(e) + '\n');
@@ -326,23 +331,28 @@ const emit = (e: EngineEvent) => {
       case 'review':
         d.reviews.push({ attempt: e.attempt, verdict: e.verdict, problems: e.problems, fix: e.fix, at: e.at });
         orchestrator.reviews[e.verdict]++;
+        if (e.verdict === 'problems') tell(`lead sends ${e.ticket} back: ${firstLine(e.problems[0] ?? e.fix)}`);
+        else if (e.verdict === 'error') tell(`lead review of ${e.ticket} failed: ${firstLine(e.error)}`);
         break;
       case 'call_error':
         d.error = e.error;
+        tell(`${e.ticket}: a model call failed: ${firstLine(e.error)}`);
         break;
       case 'finish':
         d.state = e.state === 'done' ? 'finished' : e.state;
         d.error = e.error ?? null;
         d.commit = e.commit ?? null;
+        tell(e.state === 'done' ? `${e.ticket} done${e.attempts > 1 ? ` (attempt ${e.attempts})` : ''}` : `${e.ticket} ${e.state}${e.attempts ? ` after ${e.attempts} attempt${e.attempts > 1 ? 's' : ''}` : ''}${e.error ? `: ${firstLine(e.error)}` : ''}`);
         if (plan && [...digests.values()].filter((x) => ['finished', 'failed', 'skipped', 'blocked'].includes(x.state)).length >= plan.tickets.length) orchestrator.phase = 'integrating';
         break;
     }
   }
+  if (e.type === 'integrate') tell(`merged ${e.merged.length} tickets into ${e.branch}; the checks after merging ${e.ok ? 'pass' : `FAIL${e.failed.length ? ` for ${e.failed.join(', ')}` : ''}${e.error ? `: ${firstLine(e.error)}` : ''}`}`);
   broadcast('engine', e);
 };
 
 const log = (message: string, level: 'info' | 'warn' | 'error' = 'info') => {
-  console.log(message);
+  tell(message);
   emit({ type: 'log', at: Date.now(), level, message });
 };
 
@@ -531,6 +541,12 @@ try {
   orchestrator.phase = 'dispatching';
   log(`orchestrator: ${plan.tickets.length} tickets, ${plan.tickets.filter((t) => !t.depends_on.length).length} ready at once, for ${concurrency} code agents; at most ${checkSlots} checks run at once (--checks)`);
 
+  // every 30 s while the crew works, one line of where the run stands
+  const progress = setInterval(() => {
+    const ds = [...digests.values()], st = telemetry.status();
+    const n = (...states: string[]) => ds.filter((x) => states.includes(x.state)).length;
+    tell(`progress: ${n('finished')}/${ds.length} tickets done${n('failed', 'skipped', 'blocked') ? `, ${n('failed', 'skipped', 'blocked')} failed` : ''} · ${n('writing', 'thinking', 'fixing')} writing, ${n('checking')} checking, ${n('reviewing')} in review, ${n('queued')} waiting for a slot · ${Math.round(st.tokS.total).toLocaleString('en-US')} tok/s`);
+  }, 30_000);
   const report = await runPlan({
     repo, base: headCommit(repo), plan, pool,
     sandbox: limited(sandboxFromEnv(), checkSlots),
@@ -538,7 +554,7 @@ try {
     worktreeRoot: join(out, 'worktrees'),
     emit,
     signal: abort.signal,
-  });
+  }).finally(() => clearInterval(progress));
   const s = report.summary;
   result = { integrated: s.integrated, merged: report.integration?.merged ?? [], failedChecks: report.integration?.failedChecks ?? [], tests: null, testsOk: null, readme: false, summary: s };
 
@@ -567,7 +583,8 @@ try {
   console.log(`\n${s.done}/${s.tickets} tickets done, ${s.failed} failed, ${s.skipped} skipped; ${s.peakParallel} at once at the peak; integration ${s.integrated ? 'green' : 'not green'}`);
   console.log(`${(s.wallMs / 1000).toFixed(0)} s wall, ${(s.serialMs / 1000).toFixed(0)} s of ticket time (${(s.serialMs / Math.max(1, s.wallMs)).toFixed(1)}x)`);
   console.log(`\n${formatCallSummary(callSummary.calls)}`);
-  console.log(`\nlogs in ${out}`);
+  if (existsSync(resultDir)) console.log(`\nthe built project (mugge/integration, every finished ticket merged): ${resultDir}`);
+  console.log(`logs in ${out}`);
 } catch (e) {
   orchestrator.phase = 'failed';
   log(`demo stopped: ${String((e as Error).message ?? e)}`, 'error');
