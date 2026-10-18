@@ -169,7 +169,8 @@ build_tools() {
   local missing=() dev
   dev="$("$VENV/bin/python" -c 'import sys; print("python%d.%d-dev" % sys.version_info[:2])')"
   "$VENV/bin/python" -c 'import os, sys, sysconfig; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")))' || missing+=("$dev")
-  command -v gcc >/dev/null || command -v cc >/dev/null || missing+=(build-essential)
+  # gcc for Triton's helpers, g++ as nvcc's host compiler for FlashInfer's kernels
+  { command -v gcc >/dev/null || command -v cc >/dev/null; } && command -v g++ >/dev/null || missing+=(build-essential)
   [ "${#missing[@]}" -gt 0 ] || return 0
   if command -v apt-get >/dev/null && sudo -n true 2>/dev/null; then
     echo "installing ${missing[*]} (Triton builds C helpers at start)"
@@ -184,6 +185,9 @@ build_tools() {
 # the CUDA headers in the venv (site-packages/nvidia/cu13), so point CUDA_HOME there, with the
 # lib64, libcudart.so and libcuda.so names FlashInfer's link line expects. No system toolkit needed.
 cuda_env() {
+  # FlashInfer builds with ninja, which vLLM installs in the venv; vllm serve runs without the venv
+  # activated, so its bin goes on PATH
+  [ ! -x "$VENV/bin/ninja" ] || export PATH="$VENV/bin:$PATH"
   [ -z "${CUDA_HOME:-}" ] || return 0
   command -v nvcc >/dev/null && return 0
   [ -x /usr/local/cuda/bin/nvcc ] && return 0

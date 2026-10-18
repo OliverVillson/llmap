@@ -83,5 +83,9 @@ printf '#!/bin/sh\necho nvcc\n' > "$cu/bin/nvcc"; chmod +x "$cu/bin/nvcc"
 ( unset CUDA_HOME; VENV="$STATE/cv" deploy/qwen.sh cmd ) > "$STATE/cmd.txt" 2>&1
 if grep -q -- '--attention-backend' "$STATE/cmd.txt"; then cat "$STATE/cmd.txt"; echo "nvcc in the venv should keep FlashInfer"; exit 1; fi
 [ -L "$cu/lib64" ] && [ -L "$cu/lib/libcudart.so" ]
+# ninja from the venv is on the server's PATH
+touch "$STATE/cv/bin/ninja"; chmod +x "$STATE/cv/bin/ninja"
+( unset CUDA_HOME; VENV="$STATE/cv" bash -c 'source <(sed -n "/^cuda_env()/,/^}/p" deploy/qwen.sh); cuda_env; command -v ninja; echo "$CUDA_HOME"' ) > "$STATE/env.txt"
+grep -qx "$STATE/cv/bin/ninja" "$STATE/env.txt"; grep -qx "$cu" "$STATE/env.txt"
 ATTENTION=TRITON_ATTN deploy/qwen.sh cmd | grep -q -- '--attention-backend TRITON_ATTN'
 echo "deploy dry run: PASS"
