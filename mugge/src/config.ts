@@ -37,7 +37,7 @@
  *                         (unset: the server's default). The bench's --thinking flag is the same switch.
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
- *                         spend in one call)
+ *                         spend in one call). The lead review writes up to this too (unset: 2,048)
  *   MUGGE_CUT_RETRY       nothink | same (default nothink): once a thinking call of a ticket runs out
  *                         of tokens (cut with no usable file, or forced), that ticket's later calls go
  *                         out with thinking off; same keeps thinking on. Read by the harness itself.

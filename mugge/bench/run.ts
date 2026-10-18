@@ -109,7 +109,7 @@ export async function runOne(p: BenchProject, t: BenchTicket, seed: number, o: B
   tel?.emit({ type: 'start', at: Date.now(), ticket: id, attempt: 1, worktree });
   try {
     prepare(p, worktree, t.deps);
-    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs, thinking: thinkingOn(base), review: o.review ?? (process.env.MUGGE_REVIEW ? reviewFromEnv() : false) });
+    const r = await runTicket(t.ticket, worktree, { plan: p.plan, inference, sandbox: o.sandbox, emit, checkTimeoutMs: o.checkTimeoutMs, thinking: thinkingOn(base), review: o.review ?? (process.env.MUGGE_REVIEW ? reviewFromEnv() : false), reviewMaxTokens: o.maxTokens });
     let hiddenError: string | null = null;
     if (r.ok && t.tags.hidden.length) {
       applyHidden(p, t.ticket.id, worktree);
