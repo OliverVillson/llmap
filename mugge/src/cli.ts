@@ -204,20 +204,27 @@ async function main(argv: string[]) {
       const p = loadProject(rest[0] ?? die('which project?'));
       if (!p.request) die(`${p.name} has no request`);
       // the same start check as run: an optional manager machine that is down is left out
-      const inf = (await checkedPoolFromEnv(process.env, concurrencyFromEnv(), undefined, ['manager']).catch((e) => die(String((e as Error).message ?? e)))).forAgent({ role: 'manager' });
-      const d = await design(inf, p.request);
+      const crew = concurrencyFromEnv();
+      const pool = await checkedPoolFromEnv(process.env, crew, undefined, ['manager']).catch((e) => die(String((e as Error).message ?? e)));
+      const inf = pool.forAgent({ role: 'manager' });
+      // a big crew's scaffold and tickets are planned per component, in parallel on the worker slots
+      const serves = (role: 'worker') => { try { pool.forAgent({ role }); return true; } catch { return false; } };
+      const o = { crew, parts: serves('worker') ? (i: number) => pool.forAgent({ role: 'worker', agent: `planner-${i + 1}`, team: 'orchestrator' }) : () => inf };
+      const d = await design(inf, p.request, [], 'architect', o);
       if (d.questions.length) {
         console.log('The architect asks:\n' + d.questions.map((q) => `  - ${q}`).join('\n'));
       }
       const dir = stateDir(p.name);
       writeFileSync(join(dir, 'ARCHITECTURE.md'), architectureMarkdown(d));
-      const sc = await scaffold(inf, d);
+      const sc = await scaffold(inf, d, 'planner', o);
+      for (const w of sc.warnings) console.warn(`scaffold: ${w}`);
       const scDir = join(dir, 'scaffold');
       for (const [path, content] of Object.entries(sc.files)) {
         mkdirSync(join(scDir, path, '..'), { recursive: true });
         writeFileSync(join(scDir, path), content);
       }
-      const plan = await tickets(inf, d, Object.keys(sc.files));
+      const { warnings, ...plan } = await tickets(inf, d, Object.keys(sc.files), 'planner', o);
+      for (const w of warnings ?? []) console.warn(`plan: ${w}`);
       writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan, null, 2) + '\n');
       console.log(`${plan.tickets.length} tickets on a ${Object.keys(sc.files).length}-file scaffold, saved in ${dir}`);
       return;

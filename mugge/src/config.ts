@@ -45,6 +45,9 @@
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
  *                         spend in one call). The lead review writes up to this too (unset: 2,048)
+ *                         Planning calls (design, scaffold, tickets) are not capped by it
+ *   MUGGE_PLAN_MAX_CALL_TOKENS most tokens one planning call may write (unset: no cap; a call
+ *                         over the server's context is asked again with what fits)
  *   MUGGE_CUT_RETRY       nothink | same (default nothink): once a thinking call of a ticket runs out
  *                         of tokens (cut with no usable file, or forced), that ticket's later calls go
  *                         out with thinking off; same keeps thinking on. Read by the harness itself.
@@ -109,6 +112,8 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
   };
   const maxCall = env.MUGGE_MAX_CALL_TOKENS ? Number(env.MUGGE_MAX_CALL_TOKENS) : undefined;
   if (maxCall !== undefined && !(Number.isInteger(maxCall) && maxCall > 0)) throw new Error('MUGGE_MAX_CALL_TOKENS must be a positive integer');
+  const planCall = env.MUGGE_PLAN_MAX_CALL_TOKENS ? Number(env.MUGGE_PLAN_MAX_CALL_TOKENS) : undefined;
+  if (planCall !== undefined && !(Number.isInteger(planCall) && planCall > 0)) throw new Error('MUGGE_PLAN_MAX_CALL_TOKENS must be a positive integer');
   return {
     baseUrl: env.MUGGE_INFERENCE_URL || 'http://127.0.0.1:8000/v1',
     defaultModel: env.MUGGE_MODEL || 'mugge-small',
@@ -119,6 +124,7 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
     sampling: samplingFromEnv(env),
     extra: Object.keys(kwargs).length ? { chat_template_kwargs: kwargs } : undefined,
     maxCallTokens: maxCall,
+    planMaxCallTokens: planCall,
     debug: env.MUGGE_DEBUG_CALLS === '1',
   };
 }

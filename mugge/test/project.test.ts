@@ -90,8 +90,12 @@ describe('architect and planner', () => {
     const settled = await tickets(canned(clash), d, []);
     expect(settled.settled).toEqual([{ ticket: 'b', files: ['x'], with: ['a'] }]);
     expect(settled.tickets[1]!.depends_on).toEqual(['a']);
-    const bad = { interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['nope'] }] };
-    expect(tickets(canned(bad), d, [])).rejects.toThrow(/unknown ticket/);
+    // a dependency on a ticket the plan does not have is dropped and said, not fatal
+    const ghost = await tickets(canned({ interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['nope'] }] }), d, []);
+    expect(ghost.tickets[0]!.depends_on).toEqual([]);
+    expect(ghost.warnings).toEqual(['a: dropped dependencies on nope']);
+    const cycle = { interfaces: [], tickets: [{ id: 'a', owns: ['x'], depends_on: ['b'] }, { id: 'b', owns: ['y'], depends_on: ['a'] }] };
+    expect(tickets(canned(cycle), d, [])).rejects.toThrow(/dependency cycle/);
   });
 });
 

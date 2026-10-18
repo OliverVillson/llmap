@@ -47,6 +47,8 @@ export interface CallTweaks {
   reasoningEffort?: ReasoningEffort;
   /** `thinking` is only the caller's default (the lead review's off): a role's or machine's effort wins over it. */
   thinkingIsDefault?: boolean;
+  /** A planning call (design, scaffold, tickets): capped by planMaxCallTokens, not maxCallTokens. */
+  planning?: boolean;
 }
 
 /** Qwen3.8's reasoning_effort levels. */
@@ -164,6 +166,8 @@ export interface InferenceConfig {
   timeoutMs?: number;
   /** Most tokens one call may write, however much the caller offers (MUGGE_MAX_CALL_TOKENS). */
   maxCallTokens?: number;
+  /** The same for planning calls, whose answers grow with the crew (MUGGE_PLAN_MAX_CALL_TOKENS; unset: no cap). */
+  planMaxCallTokens?: number;
   /** One line per call on stderr (MUGGE_DEBUG_CALLS=1). */
   debug?: boolean;
 }
@@ -196,9 +200,9 @@ export class OpenAICompatible implements Inference {
     return this.send(model, messages, maxTokens, signal, undefined, opts);
   }
 
-  private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks): Promise<Completion<string>> {
+  private async send(model: string, messages: ChatMessage[], maxTokens: number, signal?: AbortSignal, schema?: object, opts?: CallTweaks, refit = true): Promise<Completion<string>> {
     const started = performance.now();
-    const cap = this.cfg.maxCallTokens;
+    const cap = opts?.planning ? this.cfg.planMaxCallTokens : this.cfg.maxCallTokens;
     const kwargs = {
       ...(this.cfg.extra?.chat_template_kwargs as Record<string, unknown> | undefined),
       ...(typeof opts?.thinking === 'boolean' ? { enable_thinking: opts.thinking } : {}),
@@ -227,7 +231,13 @@ export class OpenAICompatible implements Inference {
       // Bun also cuts every fetch at 300 s unless told not to; timeoutMs is the only limit
       timeout: false,
     } as RequestInit);
-    if (!res.ok) throw new Error(`inference ${res.status}: ${(await res.text()).slice(0, 500)}`);
+    if (!res.ok) {
+      const text = await res.text();
+      // prompt + max_tokens over the server's context: ask once more for what fits
+      const fit = res.status === 400 && refit ? contextFit(text) : undefined;
+      if (fit !== undefined && fit < (body.max_tokens as number)) return this.send(model, messages, fit, signal, schema, opts, false);
+      throw new Error(`inference ${res.status}: ${text.slice(0, 500)}`);
+    }
     const data: any = await res.json();
     const choice = data?.choices?.[0];
     const raw: string = choice?.message?.content ?? '';
@@ -262,6 +272,23 @@ export class OpenAICompatible implements Inference {
     if (this.cfg.debug) console.error(describeCall(body.model as string, body.max_tokens as number, out));
     return out;
   }
+}
+
+/** Fewest tokens worth asking for again after a context-length refusal. */
+export const MIN_REFIT_TOKENS = 1024;
+
+/**
+ * The max_tokens that fits, from a server's context-length refusal (vLLM's two wordings and
+ * SGLang's): the context less the prompt, less a little room. Undefined when the error is
+ * something else or too little would fit.
+ */
+export function contextFit(error: string): number | undefined {
+  const limit = /maximum context length (?:is |of )?(\d+)/.exec(error)?.[1];
+  const m = /(\d+) in the messages|has (\d+) input tokens|(\d+) tokens from the input/.exec(error);
+  const input = m?.[1] ?? m?.[2] ?? m?.[3];
+  if (!limit || !input) return undefined;
+  const fit = Number(limit) - Number(input) - 16;
+  return fit >= MIN_REFIT_TOKENS ? fit : undefined;
 }
 
 /** The MUGGE_DEBUG_CALLS line: what one call cost and whether it finished. */

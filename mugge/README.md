@@ -104,6 +104,16 @@ Speed levers, first to try first:
 - Give the lead about one slot for every eight worker slots. Reviews are short, but a ticket waits
   for its review while it holds its agent.
 
+Planning for a crew: `design`, `scaffold` and `tickets` (src/plan/architect.ts) take
+`{ crew, parts }`. `crew` (the code agents, `MUGGE_CONCURRENCY` in `mugge plan`) goes into every
+prompt, so one prompt becomes about that many tickets, most free to start at once; a plan with
+fewer than three quarters of the crew is asked for again once. Above 16 agents, with `parts`
+given, one call writes the shared and interface files, then each design component's stubs and
+tests and its tickets are written by parallel calls on the worker slots, which sit idle while
+planning. Planning calls are not capped by `MUGGE_MAX_CALL_TOKENS` (a 64-ticket plan is 13–16K
+tokens of JSON, a 64-module scaffold about 55K); `MUGGE_PLAN_MAX_CALL_TOKENS` caps them if set,
+and a call over the server's context length is asked once more with what fits.
+
 `bun bench/scale.ts --agents 80 --slots 64 --tickets 768 --latency 5000` measures the engine at
 crew size against the fake model: how busy the slots stay, event-loop stalls, CPU per call and
 log sizes. Without a GPU, `bun bench/smoke.ts --fake --fake-qwen` runs the same path
