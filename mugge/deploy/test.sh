@@ -69,7 +69,9 @@ printf '#!/bin/sh\necho "hf $* into $HF_HOME"\n' > "$STATE/venv/bin/hf"; chmod +
 if MODEL_GB=999999 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1; then echo "download should refuse a full disk"; exit 1; fi
 grep -q 'not enough space' "$STATE/dl.txt"
 if grep -q '^hf download' "$STATE/dl.txt"; then echo "download ran on a full disk"; exit 1; fi
-( unset DATA_DIR; MODEL_GB=0 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1 ) || { cat "$STATE/dl.txt"; exit 1; }
+# a folder that failed the check is not remembered (the next plain download picks again)
+if [ -f "$STATE/data.dir" ]; then echo "a data folder without room was saved"; exit 1; fi
+MODEL_GB=0 VENV="$STATE/venv" deploy/qwen.sh download > "$STATE/dl.txt" 2>&1 || { cat "$STATE/dl.txt"; exit 1; }
 grep -q "hf download Qwen/Qwen3.8-27B-FP8 into $STATE/data/hf" "$STATE/dl.txt"
 [ "$(cat "$STATE/data.dir")" = "$STATE/data" ]
 ( unset DATA_DIR; deploy/qwen.sh where ) > "$STATE/where.txt"; grep -q "data folder  $STATE/data " "$STATE/where.txt"

@@ -68,15 +68,25 @@ die() { echo "qwen.sh: $*" >&2; exit 1; }
 # Use DATA_DIR, after checking it has NEED GB free; remember it for every later command.
 use_data_dir() {
   local need="$1" free
+  # an earlier download into the default cache (before DATA_DIR) is often what filled the home disk
+  local old="$HOME/.cache/huggingface/hub/models--${MODEL//\//--}"
+  if [ "$HF_HOME" != "$HOME/.cache/huggingface" ] && [ -d "$old" ]; then
+    echo "note: an earlier download is in $old ($(du -sh "$old" 2>/dev/null | cut -f1)); it is not used, remove it: rm -rf $old"
+  fi
   mkdir -p "$DATA_DIR" 2>/dev/null || die "cannot create DATA_DIR=$DATA_DIR; pick a folder you can write to: DATA_DIR=/path deploy/qwen.sh $CMD_NAME"
-  mkdir -p "$STATE"; echo "$DATA_DIR" > "$DATA_FILE"
+  # the server's log, pid and crew size live in STATE (in the home folder): it needs a little room too
+  { mkdir -p "$STATE" && touch "$DATA_FILE.new"; } 2>/dev/null ||
+    die "cannot write $STATE: its disk is full ($(python3 "$HERE/disk.py" free "$STATE") GB free). Free some space there first$([ -d "$old" ] && echo " (rm -rf $old)"), then run deploy/qwen.sh $CMD_NAME again"
   free="$(python3 "$HERE/disk.py" free "$DATA_DIR")"
   echo "data folder $DATA_DIR: ${free} GB free, ${need} GB needed"
   if [ "$free" -lt "$need" ]; then
     echo "qwen.sh: not enough space in $DATA_DIR (${free} GB free, ${need} GB needed)." >&2
     python3 "$HERE/disk.py" bigger "$DATA_DIR" | sed 's/^/  bigger: /' >&2
+    rm -f "$DATA_FILE.new"
     die "free space there, or point DATA_DIR at a bigger disk you can write to (README \"Disk\"): DATA_DIR=/path deploy/qwen.sh $CMD_NAME"
   fi
+  # remembered only once it has room, so a folder that failed the check is not picked again
+  echo "$DATA_DIR" > "$DATA_FILE.new" && mv "$DATA_FILE.new" "$DATA_FILE"
 }
 
 gpu_name() { command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true; }
@@ -169,10 +179,6 @@ case "${1:-}" in
     [ -z "${MODEL_GB:-}" ] || left_gb="$MODEL_GB"
     echo "$MODEL: ${total_gb} GB, ${left_gb} GB still to download"
     use_data_dir "$(python3 -c "import math,sys; print(math.ceil(float(sys.argv[1])) + 2)" "$left_gb")"
-    old="$HOME/.cache/huggingface/hub/models--${MODEL//\//--}"
-    if [ "$HF_HOME" != "$HOME/.cache/huggingface" ] && [ -d "$old" ]; then
-      echo "note: an earlier download is in $old ($(du -sh "$old" 2>/dev/null | cut -f1)); it is not used, remove it: rm -rf $old"
-    fi
     # resumes: files already in the cache are kept, a half-written one continues where it stopped.
     # HF_TOKEN is not needed (the checkpoint is public) but avoids the anonymous rate limit
     "$VENV/bin/hf" download "$MODEL"

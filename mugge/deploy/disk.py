@@ -6,8 +6,9 @@ Where qwen.sh keeps the big things (the weights, the vLLM venv and caches): the 
                                 most free space that this user can write to ($HOME/qwen-data when that
                                 is the home filesystem)
   disk.py free DIR              free GB on DIR's filesystem
-  disk.py bigger DIR            local filesystems with more free space than DIR's that this user cannot
-                                write to, and disks with no filesystem mounted (lsblk), one line each
+  disk.py bigger DIR            local filesystems with more free space than DIR's (the folder to use, or
+                                that this user cannot write there), and disks with no filesystem mounted
+                                (lsblk), one line each
   disk.py model-gb MODEL HF_HOME [PYTHON]
                                 GB still to download for MODEL: its size on the Hub (asked with PYTHON's
                                 huggingface_hub; 31 if that fails) minus what is already in HF_HOME
@@ -82,8 +83,9 @@ def free_gb(d):
 def bigger(d):
     mine = free_gb(d)
     for target, free in mounts():
-        if free / GB > mine + 1 and candidate(target) is None:
-            print(f"{target}: {free / GB:.0f} GB free, not writable by {os.environ.get('USER', 'you')}")
+        if free / GB > mine + 1:
+            d = candidate(target)
+            print(f"{target}: {free / GB:.0f} GB free, not writable by {os.environ.get('USER', 'you')}" if d is None else f"{target}: {free / GB:.0f} GB free; use it with DATA_DIR={d}")
     try:
         tree = json.loads(subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT"], capture_output=True, text=True, timeout=10).stdout)
     except Exception:
