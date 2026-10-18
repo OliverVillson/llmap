@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B-FP8 behind vLLM on one GPU, for a Centipede crew (run sheet: deploy/README.md).
 #
+#   deploy/qwen.sh fresh      a bare Ubuntu VM to ready: apt packages, the data disk, the checkout, uv and
+#                             bun, setup, download, bun install, preflight; safe to rerun (deploy/fresh.sh)
 #   deploy/qwen.sh setup      vLLM $VLLM_VERSION in its own venv (uv), and a GPU/driver check
+#   deploy/qwen.sh preflight  every start prerequisite (GPU, disk, venv, compilers, nvcc, weights, bun);
+#                             each FAIL line says the command that fixes it; start runs it (PREFLIGHT=0 skips)
 #   deploy/qwen.sh download   the weights (~31 GB) into the data folder; checks free space first, resumes
 #   deploy/qwen.sh where      the data folder, its free space, and where the venv and weights are
 #   deploy/qwen.sh start      the server, detached: it survives logging out of ssh
@@ -28,6 +32,10 @@
 # uses the same folder (saved in ~/qwen/data.dir).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# before anything that needs python3: fresh installs it
+[ "${1:-}" != fresh ] || { shift; exec bash "$HERE/fresh.sh" "$@"; }
+# uv and bun land here; /usr/local/bin links are made by fresh, this covers older installs
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin"
 
 QUANT="${QUANT:-fp8}"
 case "$QUANT" in
@@ -218,6 +226,169 @@ print(v("nvidia-cuda-runtime"), v("nvidia-cuda-nvcc"))' 2>/dev/null || true)"
   fi
 }
 
+# Every prerequisite of a start, checked in a few seconds before anything loads, each failure with
+# the line that fixes it: the failures seen on the B200 (disk full, Python.h, nvcc, ninja, g++,
+# nvcc vs CUDA headers, bun off PATH) and the next likely ones (GPU held by an old server, port
+# taken, half-downloaded weights, driver older than torch's CUDA). NO_GPU=1 skips the GPU lines.
+preflight() {
+  local fails=0 warns=0 py="$VENV/bin/python" tmp free v
+  ok() { printf 'ok    %s\n' "$1"; }
+  bad() { printf 'FAIL  %s\n      fix: %s\n' "$1" "$2"; fails=$((fails + 1)); }
+  warn() { printf 'warn  %s\n' "$1"; warns=$((warns + 1)); }
+
+  # the GPU: driver up, nothing else holding its memory, libcuda for Triton
+  if [ -z "${NO_GPU:-}" ]; then
+    if ! command -v nvidia-smi >/dev/null || ! nvidia-smi -L >/dev/null 2>&1; then
+      bad "GPU: nvidia-smi does not work (no driver loaded)" "sudo reboot, or a VM made from evroc's GPU image (sudo ubuntu-drivers install --gpgpu && sudo reboot)"
+    else
+      local used total apps drv
+      read -r used total < <(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -1 | tr -d ',')
+      apps="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | tr '\n' ';')"
+      if [ "${used:-0}" -gt 2048 ] && ! pid_alive; then
+        bad "GPU: ${used} MiB of ${total} MiB already in use (${apps:-no process listed})" "kill the process holding it: nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill"
+      else
+        ok "GPU: $(gpu_name), ${used} MiB of ${total} MiB in use"
+      fi
+      drv="$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9.]*' | grep -o '[0-9.]*$' || true)"
+      v="$("$py" -c 'import importlib.metadata as m; print(".".join(m.version("nvidia-cuda-runtime").split(".")[:2]))' 2>/dev/null || true)"
+      if [ -n "$drv" ] && [ -n "$v" ] && python3 -c 'import sys; a, b = (tuple(map(int, x.split("."))) for x in sys.argv[1:]); sys.exit(a <= b)' "$v" "$drv"; then
+        bad "driver: CUDA $drv is older than the CUDA $v runtime in the venv" "rm -rf $VENV && TORCH_BACKEND=cu${drv/./} deploy/qwen.sh setup   (or a newer driver)"
+      elif [ -n "$drv" ]; then ok "driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1), CUDA $drv${v:+, venv runtime $v}"; fi
+      ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1 ' && ok "libcuda.so.1 (Triton loads it)" ||
+        bad "libcuda.so.1 is not in the linker cache (Triton cannot start)" "sudo ldconfig; if it is still missing the driver is not installed properly: sudo ubuntu-drivers install --gpgpu && sudo reboot"
+    fi
+  fi
+
+  # disks: the data folder for weights, venv and caches; the home folder for the log and state
+  if [ ! -d "$DATA_DIR" ] || [ ! -w "$DATA_DIR" ]; then
+    bad "data folder $DATA_DIR missing or not writable$(mountpoint -q /data 2>/dev/null || echo ' (/data is not mounted)')" "deploy/qwen.sh fresh   (mounts the data disk and makes the folder)"
+  else
+    free="$(python3 "$HERE/disk.py" free "$DATA_DIR")"
+    if [ "$free" -lt 10 ]; then bad "data folder $DATA_DIR: only ${free} GB free (caches and compiled kernels need ~10 GB)" "deploy/qwen.sh where; free space there, e.g. rm -rf $DATA_DIR/cache/uv"
+    else ok "data folder $DATA_DIR: ${free} GB free"; fi
+  fi
+  free="$(python3 "$HERE/disk.py" free "$HOME")"
+  [ "$free" -ge 1 ] && ok "home disk: ${free} GB free" ||
+    bad "home disk: ${free} GB free (the server log and state go in $STATE)" "sudo apt-get clean; rm -rf ~/.cache/uv ~/.cache/huggingface ~/.cache/pip; df -h ~"
+
+  # the venv and vLLM
+  if ! "$py" -c '' 2>/dev/null; then
+    bad "venv: $VENV has no working Python" "deploy/qwen.sh setup"
+  else
+    v="$("$py" -c 'import importlib.metadata as m; print(m.version("vllm"))' 2>/dev/null || true)"
+    [ "$v" = "$VLLM_VERSION" ] && ok "vLLM $v in $VENV" || bad "vLLM in $VENV is '${v:-not installed}', expected $VLLM_VERSION" "deploy/qwen.sh setup"
+    # Triton compiles a C helper against Python.h and its own cuda.h at the first start
+    local inc tinc
+    inc="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
+    tinc="$("$py" -c 'import importlib.util, os; s = importlib.util.find_spec("triton"); print(os.path.join(os.path.dirname(s.origin), "backends", "nvidia", "include") if s else "")' 2>/dev/null || true)"
+    if [ ! -f "$inc/Python.h" ]; then
+      bad "Python.h missing ($inc): Triton cannot build its helpers" "sudo apt-get install -y python$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-dev"
+    elif ! command -v gcc >/dev/null; then
+      bad "gcc missing: Triton cannot build its helpers" "sudo apt-get install -y build-essential"
+    elif [ -n "$tinc" ] && ! printf '#include <Python.h>\n#include <cuda.h>\n' | gcc -fsyntax-only -x c -I"$inc" -I"$tinc" - 2>/dev/null; then
+      bad "a test of Triton's helper build (Python.h + cuda.h with gcc) fails" "sudo apt-get install -y build-essential python3-dev"
+    else ok "Triton helper build: gcc, Python.h${tinc:+, cuda.h}"; fi
+  fi
+  command -v g++ >/dev/null && ok "g++ (nvcc's host compiler)" || bad "g++ missing (nvcc needs it for FlashInfer's kernels)" "sudo apt-get install -y build-essential"
+
+  # FlashInfer's kernels: ninja on PATH, nvcc matching the CUDA headers, and the link line it uses
+  cuda_env
+  command -v ninja >/dev/null && ok "ninja $(ninja --version)" || bad "ninja not on PATH (FlashInfer builds with it)" "sudo apt-get install -y ninja-build"
+  local nvcc="${CUDA_HOME:+$CUDA_HOME/bin/nvcc}"; [ -n "$nvcc" ] || nvcc="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
+  if [ ! -x "$nvcc" ]; then
+    bad "no nvcc (FlashInfer compiles kernels at the first start)" "deploy/qwen.sh setup   (vLLM's install brings nvcc into the venv)"
+  else
+    tmp="$(mktemp -d)"
+    printf '#include <cuda_runtime.h>\n#include <cuda/std/cstdint>\n__global__ void k(cuda::std::int32_t *x) { *x = 1; }\nint probe() { return cudaGetLastError(); }\n' > "$tmp/p.cu"
+    local home="${CUDA_HOME:-$(dirname "$(dirname "$nvcc")")}"
+    if ! "$nvcc" -std=c++17 -gencode arch=compute_100a,code=sm_100a -Xcompiler -fPIC -c "$tmp/p.cu" -o "$tmp/p.o" > "$tmp/out" 2>&1; then
+      bad "nvcc $("$nvcc" --version | grep -o 'release [0-9.]*' | cut -d' ' -f2) cannot build a sm_100a kernel: $(grep -m1 -iE 'error|incompatible' "$tmp/out" | cut -c1-160)" "deploy/qwen.sh setup   (pins nvcc to the CUDA runtime's version)"
+    elif ! "$nvcc" -shared "$tmp/p.o" -o "$tmp/p.so" -L"$home/lib64" -L"$home/lib64/stubs" -lcudart -lcuda > "$tmp/out" 2>&1; then
+      bad "nvcc builds but cannot link like FlashInfer ($(grep -m1 -iE 'cannot find|error' "$tmp/out" | cut -c1-120))" "$(ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1 ' && echo 'deploy/qwen.sh setup   (makes the lib64, libcudart.so and stubs/libcuda.so links)' || echo 'the NVIDIA driver (libcuda.so.1) is missing: sudo ldconfig, else reinstall the driver')"
+    else
+      ok "nvcc $("$nvcc" --version | grep -o 'release [0-9.]*' | cut -d' ' -f2) builds and links a sm_100a kernel (CUDA_HOME=${CUDA_HOME:-$home})"
+    fi
+    rm -rf "$tmp"
+  fi
+
+  # the weights: every shard the index names is on the disk
+  if [ -d "$MODEL" ]; then ok "weights: $MODEL (a folder)"
+  else
+    v="$(python3 - "$HF_HOME/hub/models--${MODEL//\//--}" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+snaps = os.path.join(d, "snapshots")
+if not os.path.isdir(snaps):
+    print("not downloaded"); sys.exit()
+best = None
+for s in os.listdir(snaps):
+    p = os.path.join(snaps, s)
+    idx = os.path.join(p, "model.safetensors.index.json")
+    if not os.path.exists(os.path.join(p, "config.json")):
+        continue
+    want = set(json.load(open(idx))["weight_map"].values()) if os.path.exists(idx) else {"model.safetensors"}
+    gone = [f for f in want if not os.path.exists(os.path.join(p, f))]
+    best = "ok" if not gone else f"{len(gone)} of {len(want)} weight files missing"
+    if best == "ok":
+        break
+part = [f for f in os.listdir(os.path.join(d, "blobs"))] if os.path.isdir(os.path.join(d, "blobs")) else []
+if best == "ok" and any(f.endswith(".incomplete") for f in part):
+    best = "ok (a stale .incomplete file is left over)"
+print(best or "no complete snapshot")
+PY
+)"
+    case "$v" in ok*) ok "weights: $MODEL in $HF_HOME${v#ok}" ;;
+      *) bad "weights: $MODEL $v in $HF_HOME" "deploy/qwen.sh download   (resumes)" ;; esac
+  fi
+
+  # the port, unless it is this server
+  if ! pid_alive && ! python3 -c 'import socket, sys; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1])))' "$PORT" 2>/dev/null; then
+    bad "port $PORT is taken by another process" "ss -ltnp | grep :$PORT   (stop it), or PORT=8001 deploy/qwen.sh start"
+  else ok "port $PORT free$(pid_alive && echo ' (this server is running on it)')"; fi
+
+  # the demo side: bun and git on the plain PATH (nohup and `ssh evroc 'cmd'` do not read ~/.bashrc)
+  if env -i PATH=/usr/local/bin:/usr/bin:/bin bun --version >/dev/null 2>&1; then ok "bun $(env -i PATH=/usr/local/bin:/usr/bin:/bin bun --version) on PATH"
+  elif command -v bun >/dev/null; then bad "bun is only on this shell's PATH ($(command -v bun)); ssh commands and new logins will not find it" "sudo ln -sfn $(command -v bun) /usr/local/bin/bun"
+  else bad "bun not installed" "deploy/qwen.sh fresh   (or: curl -fsSL https://bun.sh/install | bash && sudo ln -sfn ~/.bun/bin/bun /usr/local/bin/bun)"; fi
+  command -v git >/dev/null && ok "git" || bad "git missing" "sudo apt-get install -y git"
+
+  # worth knowing, not fatal
+  # FlashInfer fetches NVIDIA's prebuilt TRT-LLM attention kernels from here at the first start;
+  # unreachable, it quietly builds slower ones of its own with nvcc
+  curl -s -o /dev/null -m 5 https://edge.urm.nvidia.com/ 2>/dev/null ||
+    warn "edge.urm.nvidia.com unreachable: FlashInfer will use its own (slower) attention kernels instead of NVIDIA's prebuilt ones"
+  if [ -z "${NO_GPU:-}" ]; then
+    free="$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)"
+    [ "$free" -ge 40 ] || warn "only ${free} GB of RAM available; loading 31 GB of weights wants more"
+  fi
+  free="$(df -B1G --output=avail /dev/shm 2>/dev/null | tail -1 | tr -d ' ' || echo 0)"
+  [ "${free:-0}" -ge 1 ] || warn "/dev/shm has ${free} GB; vLLM's processes talk through it"
+
+  if [ "$fails" -gt 0 ]; then echo "preflight: $fails problem(s); run each fix above, then deploy/qwen.sh preflight again"; return 1; fi
+  echo "preflight: PASS$([ "$warns" = 0 ] || echo " ($warns warning(s))")"
+}
+
+# After a failed start: the known causes in the log, each with what to run next (README "If start fails").
+start_hint() {
+  local log="$1" h=""
+  grep -q 'toolkit headers are incompatible' "$log" && h="nvcc does not match the CUDA headers: deploy/qwen.sh setup (pins it), then start again"
+  [ -n "$h" ] || ! grep -q 'Python.h: No such file' "$log" || h="sudo apt-get install -y python3-dev build-essential, then start again"
+  [ -n "$h" ] || ! grep -qE "ninja: (command )?not found|No such file or directory: 'ninja'|Ninja is required" "$log" || h="sudo apt-get install -y ninja-build, then start again"
+  [ -n "$h" ] || ! grep -qE "nvcc: (command )?not found|No such file or directory: '[^']*nvcc'|Could not find nvcc|CUDA_HOME environment variable is not set" "$log" || h="no nvcc for FlashInfer: deploy/qwen.sh setup, then start again (or deploy/qwen.sh preflight)"
+  [ -n "$h" ] || ! grep -qE "cannot find -lcuda|libcuda.so cannot found" "$log" || h="libcuda is not found: sudo ldconfig; deploy/qwen.sh preflight"
+  [ -n "$h" ] || ! grep -qiE 'edge\.urm\.nvidia\.com|cubin' "$log" || h="FlashInfer could not fetch its prebuilt attention kernels: EXTRA_ARGS='--attention-config {\"use_trtllm_attention\":false}' deploy/qwen.sh start"
+  [ -n "$h" ] || ! grep -qiE 'gdn_prefill|cute.?dsl' "$log" || h="the FlashInfer DeltaNet prefill kernel failed: EXTRA_ARGS='--gdn-prefill-backend triton' deploy/qwen.sh start"
+  [ -n "$h" ] || ! grep -qiE 'deep_?gemm' "$log" || h="DeepGEMM failed: VLLM_USE_DEEP_GEMM=0 deploy/qwen.sh start"
+  [ -n "$h" ] || ! grep -qiE 'sampling|top_k_top_p|flashinfer.*sampl' "$log" || h="FlashInfer's sampler failed: VLLM_USE_FLASHINFER_SAMPLER=0 deploy/qwen.sh start"
+  [ -n "$h" ] || ! grep -qiE 'out of memory|CUDA error: out of memory|OutOfMemory' "$log" || h="out of GPU memory: nvidia-smi (anything else on it?), else GPU_UTIL=0.90 deploy/qwen.sh start"
+  [ -n "$h" ] || ! grep -qiE 'free memory on device|less than desired GPU memory utilization' "$log" || h="something else holds GPU memory: nvidia-smi, kill it, start again"
+  [ -n "$h" ] || ! grep -qiE 'cuda.?graph|capture' "$log" || h="CUDA graph capture failed: EXTRA_ARGS='-cc.cudagraph_mode=PIECEWISE' deploy/qwen.sh start (slower), or GPU_UTIL=0.90"
+  [ -n "$h" ] || ! grep -qiE 'No space left on device' "$log" || h="a disk is full: deploy/qwen.sh where; df -h ~ /data"
+  [ -n "$h" ] || ! grep -qiE 'Address already in use' "$log" || h="port $PORT is taken: ss -ltnp | grep :$PORT"
+  [ -n "$h" ] || ! grep -qiE 'HTTPError|ConnectionError|huggingface\.co|LocalEntryNotFound' "$log" || h="could not reach the Hub: if the weights are downloaded, HF_HUB_OFFLINE=1 deploy/qwen.sh start"
+  if [ -n "$h" ]; then echo "likely fix: $h"; else echo "no known cause matched; send the lines above (README \"If start fails\")"; fi
+}
+
 CMD_NAME="${1:-}"
 case "${1:-}" in
   where)
@@ -228,15 +399,22 @@ case "${1:-}" in
     echo "state, log   $STATE"
     ;;
   setup)
-    command -v nvidia-smi >/dev/null || die "no nvidia-smi: this needs an NVIDIA GPU with its driver installed"
-    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-    echo "profile: $(detect_gpu)"
+    if [ -z "${NO_GPU:-}" ]; then
+      command -v nvidia-smi >/dev/null || die "no nvidia-smi: this needs an NVIDIA GPU with its driver installed"
+      nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+      echo "profile: $(detect_gpu)"
+    fi
     use_data_dir 50
     command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
-    [ -x "$VENV/bin/python" ] || uv venv -p 3.12 "$VENV"
-    # --torch-backend=auto picks the PyTorch build that matches the installed driver's CUDA
-    VIRTUAL_ENV="$VENV" uv pip install "vllm==$VLLM_VERSION" --torch-backend=auto
-    "$VLLM" --version
+    # a venv kept on the data disk whose Python went with the old root disk: made again (from the uv cache)
+    if [ -e "$VENV" ] && ! "$VENV/bin/python" -c '' 2>/dev/null; then echo "the venv's Python is gone ($VENV): making it again"; rm -rf "$VENV"; fi
+    [ -x "$VENV/bin/python" ] || uv venv -q --python-preference system -p 3.12 "$VENV"
+    # --torch-backend=auto picks the PyTorch build that matches the installed driver's CUDA;
+    # TORCH_BACKEND=cu130 (etc.) forces one, TORCH_BACKEND=pypi takes PyPI's default build
+    tb=(--torch-backend="${TORCH_BACKEND:-auto}"); [ "${TORCH_BACKEND:-}" != pypi ] || tb=()
+    VIRTUAL_ENV="$VENV" uv pip install "vllm==$VLLM_VERSION" "${tb[@]}"
+    # the version from the package metadata: `vllm --version` needs a GPU to start
+    "$VENV/bin/python" -c 'import importlib.metadata as m; print("vLLM", m.version("vllm"), "torch", m.version("torch"))'
     build_tools
     cuda_env
     if [ -n "${CUDA_HOME:-}" ] || command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ]; then
@@ -257,6 +435,9 @@ case "${1:-}" in
     "$VENV/bin/hf" download "$MODEL"
     echo "next: deploy/qwen.sh start && deploy/qwen.sh wait"
     ;;
+  preflight)
+    preflight
+    ;;
   cmd)
     serve_cmd
     echo "# profile $PROFILE ($(gpu_name || true)), $MODEL"
@@ -267,6 +448,9 @@ case "${1:-}" in
     serve_cmd
     [ -x "$VLLM" ] || die "$VLLM not found: run deploy/qwen.sh setup first (or set VLLM=)"
     build_tools
+    if [ "${PREFLIGHT:-1}" != 0 ]; then
+      preflight || die "not starting: fix the FAIL lines above (PREFLIGHT=0 deploy/qwen.sh start skips the checks)"
+    fi
     [ -d "$MODEL" ] || [ -d "$HF_HOME/hub/models--${MODEL//\//--}/snapshots" ] ||
       echo "warning: $MODEL is not in $HF_HOME (deploy/qwen.sh download); vLLM will download it now" >&2
     mkdir -p "$STATE"
@@ -274,6 +458,8 @@ case "${1:-}" in
     # what is running, as bench labels it: fp8, fp8+mtp3, nvfp4, ...
     echo "$QUANT$([ "$MTP" = 0 ] || echo "+mtp$MTP")" > "$RUNNING"
     echo "$CREW_WORKERS" > "$CREW_FILE"
+    # no usage report to vLLM's servers (it only adds a network call)
+    export VLLM_NO_USAGE_STATS=1
     # its own session, no terminal: the server outlives the ssh login that started it
     setsid nohup "${CMD[@]}" >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"; boot_id > "$STATE/serve.boot"
@@ -287,7 +473,8 @@ case "${1:-}" in
         # the cause is usually far above the last lines (vLLM wraps it in a validation error)
         echo "the server is not running. First errors in $LOG:" >&2
         grep -m 8 -E 'fatal error|Error:|ERROR .*(Error|error)[^a-z]|No module named|CUDA error|out of memory' "$LOG" | grep -v 'Traceback' | cut -c1-300 >&2 || true
-        echo "last lines:" >&2; tail -n 25 "$LOG" >&2 || true; exit 1
+        echo "last lines:" >&2; tail -n 25 "$LOG" >&2 || true
+        start_hint "$LOG" >&2; exit 1
       fi
       [ $(( $(date +%s) - start )) -lt "$timeout_s" ] || { echo "not up after ${timeout_s}s; deploy/qwen.sh logs" >&2; exit 1; }
       sleep 5

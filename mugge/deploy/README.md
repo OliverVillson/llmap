@@ -15,27 +15,38 @@ is the target; H100 and L40S notes are at the end.
 | `crew.env` | the engine settings for that crew |
 | `mock_vllm.py`, `test.sh` | a no-GPU stand-in for vLLM and the dry run CI runs |
 
-## On the B200, from a fresh clone
+## On the B200, from a fresh VM
 
-Needs an NVIDIA driver (`nvidia-smi` works; 570 or newer for a B200), the Python headers and a C
-compiler (Triton builds small C helpers at the first start: `sudo apt-get install -y python3.12-dev
-build-essential`; `setup` and `start` check, and install them when sudo needs no password),
-`nvcc` for FlashInfer's kernels (vLLM's own install puts it in the venv; `start` points `CUDA_HOME`
-at it, so no CUDA toolkit is needed on the box), and about 50 GB free on one
-disk (see "Disk" below: on the evroc B200 the root disk is 14 GB and the big disk must be mounted
-first).
+One command takes a bare Ubuntu 24.04 VM (or one that lost its root disk but kept `/data`) to
+ready, and is safe to run again: `deploy/fresh.sh` (also `deploy/qwen.sh fresh`). It installs the
+apt packages (`python3-dev`, `build-essential`, `ninja-build`, `git`, `curl`, `unzip`,
+`python-is-python3`, `python3-pytest`), mounts the disk labelled `data` at `/data` (and adds it to
+`/etc/fstab` with `nofail`), clones or updates the checkout at `/data/llmap` with `~/llmap` pointing
+at it, installs pinned uv and bun linked into `/usr/local/bin` (so `ssh evroc 'cmd'` and `nohup`
+find them), then runs `setup` (venv on `/data`, vLLM, nvcc pinned to the CUDA runtime),
+`download` (keeps weights already there), `bun install` and `preflight`.
 
 ```bash
-cd /data && git clone https://github.com/OliverVillson/llmap && ln -s /data/llmap ~/llmap && cd llmap/mugge
-git checkout claude/qwen-serving        # until it is merged
-
-deploy/qwen.sh setup                     # vLLM 0.31.0 in <data folder>/venv, matched to the driver's CUDA
-deploy/qwen.sh download                  # the weights (31 GB) into <data folder>/hf; checks space first, resumes
-CREW_WORKERS=64 deploy/qwen.sh start     # detached; survives logging out; the crew size sticks
+curl -fsSLo /tmp/fresh.sh https://raw.githubusercontent.com/OliverVillson/llmap/claude/centipede-demo/mugge/deploy/fresh.sh
+bash /tmp/fresh.sh                       # stops and names the disk if /data has never been formatted
+cd ~/llmap/mugge
+CREW_WORKERS=64 deploy/qwen.sh start     # runs preflight first; detached; the crew size sticks
 deploy/qwen.sh wait                      # first start takes several minutes (load, compile, CUDA graphs)
 deploy/qwen.sh check                     # must end in PASS
-nproc; free -g                           # the agents' checks run on these CPUs (see "CPUs" below)
 ```
+
+It never erases a disk on its own. With no disk labelled `data` it lists the blank ones and stops
+with the exact line, e.g. `bash /tmp/fresh.sh --format /dev/vdc`. `--format` refuses any disk with
+partitions, a filesystem signature, non-zero data in its first MiB, that is mounted, or that it
+could not read. Needs sudo (asked once) and an NVIDIA driver (`nvidia-smi`; evroc's GPU image).
+
+`deploy/qwen.sh preflight` checks every start prerequisite in a few seconds and prints `ok`, or
+`FAIL` with the line that fixes it: the GPU (driver loaded, memory free, driver CUDA not older than
+the venv's, `libcuda.so.1`), the data folder and home disk free space, vLLM's version, Triton's
+helper build (gcc + `Python.h` + its `cuda.h`), g++, ninja on PATH, nvcc building and linking a
+`sm_100a` kernel the way FlashInfer does (this is the check that catches the nvcc-vs-headers
+mismatch), every weight shard on disk, the port, bun on the plain PATH, and git. `start` runs it
+and refuses to launch on a FAIL (`PREFLIGHT=0` skips it).
 
 `CREW_WORKERS=64` is given once, at `start`: the server then admits 73 calls at once (64 workers,
 8 leads, 1 orchestrator), and `wait`, `check`, `bench`, `status` and `deploy/crew.env` read the
@@ -62,8 +73,9 @@ Everything big goes in one data folder: the weights (`hf/`, 31 GB), the vLLM ven
 how many GB it still needs and stops before fetching anything when the disk has less, listing
 bigger disks it could not use; run it again after an interruption and it carries on.
 
-The evroc B200 has a 14 GB root disk and an empty 3.6 TB disk (`vdc`) that is not mounted.
-Mount it once at `/data` (the `mkfs` erases the disk, so check first that `blkid` prints nothing):
+The evroc B200 has a 14 GB root disk and a 3.6 TB disk (`vdc`). `fresh.sh` mounts it (and
+formats it only with `--format /dev/vdc`, only if it is blank). By hand, the same thing
+(the `mkfs` erases the disk, so check first that `blkid` prints nothing):
 
 ```bash
 sudo blkid /dev/vdc                      # nothing printed = no filesystem on it yet
@@ -100,8 +112,7 @@ Do not open port 8000 to the internet: vLLM's `--api-key` does not cover every e
 
 ```bash
 cd llmap/mugge
-curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install
-set -a; . deploy/crew.env; set +a       # from the mugge folder; picks up the 64 from start
+set -a; . deploy/crew.env; set +a       # from the mugge folder; picks up the 64 from start (again in every new shell)
 bun src/cli.ts backends                 # three entries (64, 8 and 1 slots), all "up"
 ```
 
@@ -231,6 +242,31 @@ than attention on this model, so it needs `nvcc` whichever attention is picked.
 
 Overrides: any of `ATTENTION`, `MAX_MODEL_LEN`, `KV_DTYPE`, `MAX_NUM_SEQS`, `GPU_UTIL`, `PORT`, `TP`, or
 `EXTRA_ARGS="..."`. `deploy/qwen.sh cmd` prints the command without running anything.
+
+## If start fails
+
+`wait` prints the first errors and a `likely fix:` line for the known causes. The ladder, one
+change at a time, each with `deploy/qwen.sh stop` first:
+
+| Symptom in the log | Change |
+|---|---|
+| `toolkit headers are incompatible`, `Python.h`, `ninja`, `nvcc`, `-lcuda` | `deploy/qwen.sh preflight` and run the fix it prints |
+| FlashInfer cubin / `edge.urm.nvidia.com` errors (prebuilt TRT-LLM attention kernels are downloaded at the first start) | `EXTRA_ARGS='--attention-config {"use_trtllm_attention":false}'` |
+| FlashInfer's DeltaNet prefill (CuTe-DSL, first prefill on a B200) | `EXTRA_ARGS='--gdn-prefill-backend triton'` |
+| FlashInfer sampler (`top_k_top_p`, sampling module) | `VLLM_USE_FLASHINFER_SAMPLER=0` |
+| DeepGEMM (should be auto-disabled for Qwen3.5-family text models on Blackwell: the log says "Auto-disabled DeepGemm") | `VLLM_USE_DEEP_GEMM=0` |
+| out of memory during load or CUDA graph capture | `nvidia-smi` for other processes; else `GPU_UTIL=0.90` |
+| CUDA graph capture errors | `EXTRA_ARGS='-cc.cudagraph_mode=PIECEWISE'` (slower decode) |
+| the Hub unreachable with the weights already downloaded | `HF_HUB_OFFLINE=1` |
+| anything with `MTP=3` | start without MTP |
+
+All of these are environment variables or `EXTRA_ARGS` given to `start`, e.g.
+`VLLM_USE_FLASHINFER_SAMPLER=0 deploy/qwen.sh start && deploy/qwen.sh wait`. None is in the
+default profile: each costs speed, and none is known to be needed.
+
+First start compiles: torch.compile (cached in `<data>/cache/vllm`), FlashInfer kernels
+(`<data>/.cache/flashinfer`), Triton (`<data>/cache/triton`). All are on the data disk, so a VM
+that keeps `/data` starts faster the second time. `wait` allows 30 minutes (`WAIT_S`).
 
 ## NVFP4 instead of FP8 (B200 only)
 

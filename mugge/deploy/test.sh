@@ -4,6 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export STATE="$(mktemp -d)" VLLM="$PWD/deploy/mock_vllm.py" GPU=b200 PORT="${PORT:-18000}" MOCK_LOAD_S=2
+# the mock is not a real install: start skips its preflight here (tested on its own at the end)
+export PREFLIGHT=0
 export DATA_DIR="$STATE/data"
 trap 'deploy/qwen.sh stop >/dev/null 2>&1 || true; rm -rf "$STATE"' EXIT
 deploy/qwen.sh cmd
@@ -88,4 +90,28 @@ touch "$STATE/cv/bin/ninja"; chmod +x "$STATE/cv/bin/ninja"
 ( unset CUDA_HOME; VENV="$STATE/cv" bash -c 'source <(sed -n "/^cuda_env()/,/^}/p" deploy/qwen.sh); cuda_env; command -v ninja; echo "$CUDA_HOME"' ) > "$STATE/env.txt"
 grep -qx "$STATE/cv/bin/ninja" "$STATE/env.txt"; grep -qx "$cu" "$STATE/env.txt"
 ATTENTION=TRITON_ATTN deploy/qwen.sh cmd | grep -q -- '--attention-backend TRITON_ATTN'
+# preflight: on a box with no GPU, venv or weights it fails, and every FAIL comes with a fix line
+if NO_GPU=1 VENV="$STATE/novenv" deploy/qwen.sh preflight > "$STATE/pf.txt" 2>&1; then cat "$STATE/pf.txt"; echo "preflight passed with no venv"; exit 1; fi
+grep -q '^FAIL  venv: ' "$STATE/pf.txt"; grep -q '^FAIL  weights: ' "$STATE/pf.txt"
+[ "$(grep -c '^FAIL' "$STATE/pf.txt")" = "$(grep -c '^      fix: ' "$STATE/pf.txt")" ]
+# start refuses to launch when preflight fails, and says so
+if PREFLIGHT=1 NO_GPU=1 deploy/qwen.sh start > "$STATE/st.txt" 2>&1; then deploy/qwen.sh stop; echo "start ran past a failed preflight"; exit 1; fi
+grep -q 'not starting: fix the FAIL lines' "$STATE/st.txt"
+# a complete snapshot counts as downloaded; a missing shard does not
+snap="$STATE/data/hf/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/abc"; mkdir -p "$snap"
+echo '{}' > "$snap/config.json"; echo '{"weight_map": {"a": "m-1.safetensors", "b": "m-2.safetensors"}}' > "$snap/model.safetensors.index.json"
+touch "$snap/m-1.safetensors"
+NO_GPU=1 deploy/qwen.sh preflight > "$STATE/pf.txt" 2>&1 || true; grep -q 'FAIL  weights: .*1 of 2 weight files missing' "$STATE/pf.txt"
+touch "$snap/m-2.safetensors"
+NO_GPU=1 deploy/qwen.sh preflight > "$STATE/pf.txt" 2>&1 || true; grep -q '^ok    weights: ' "$STATE/pf.txt"
+# a failed start names the likely fix (the B200's nvcc/header mismatch)
+printf '# x\nvllm serve\n#error "CUDA compiler and CUDA toolkit headers are incompatible, please check your include paths"\n' > "$STATE/serve.log"
+echo 999999 > "$STATE/serve.pid"
+deploy/qwen.sh wait > "$STATE/w.txt" 2>&1 && exit 1; grep -q 'likely fix: nvcc does not match' "$STATE/w.txt"
+rm -f "$STATE/serve.pid"
+# the bootstrap parses, and refuses to format anything that is not a blank disk
+bash -n deploy/fresh.sh
+if bash -c 'source <(sed -n "/^SUDO=/p;/^mounted_at()/p" deploy/fresh.sh; sed -n "/^empty_disk()/,/^}/p" deploy/fresh.sh); empty_disk "$(findmnt -n -o SOURCE /)"'; then echo "the root disk counted as empty"; exit 1; fi
+# crew.env says when it falls back to the default crew
+env -u CREW_WORKERS STATE="$STATE/nostate" bash -c 'set -a; . deploy/crew.env; set +a' 2>&1 | grep -q 'no crew size saved'
 echo "deploy dry run: PASS"
