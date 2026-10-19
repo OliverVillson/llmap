@@ -38,7 +38,9 @@ if (-not $KvTypeBytes.ContainsKey($KV)) { throw "KV must be q4_0, q8_0 or f16, n
 $M = $Models[$Model]
 $StateBytes = 24 * 4 * (32 * 128 * 128 + 3 * (32 * 128 + 2 * 16 * 128))
 $CudaContextGB = 0.3
-$MarginGB = 0.25
+# Windows keeps part of the card for itself and, when a program asks for more than is left, quietly
+# moves the rest into normal RAM, which made an 8-slot 4060 crawl at ~1 tok/s: a bigger margin than Linux
+$MarginGB = 0.75
 
 # 1. the GPU
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { throw 'nvidia-smi not found: install the NVIDIA driver (nvidia.com/drivers), then run this again' }
