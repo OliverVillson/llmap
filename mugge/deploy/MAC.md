@@ -151,7 +151,10 @@ Paste failures in the project chat.
 
 ## Not verified until it runs on the Mac
 
-- Metal speed: [est] ~15–20 tok/s for one call; 60–120 tok/s together at 11 calls.
+- Metal speed: measured on Oliver's M5 Air (16 GB, llama.cpp brew 0.7.0, 2026-10-19). With calls that read 500 tokens and write 128,
+  1 call made 13 tok/s and 8 at once made 22 tok/s together, with the GPU 99% busy. The 9B is limited by the GPU's compute, not
+  memory, so more slots add little, and the 17-ticket demo takes about an hour. llama.cpp 0.5.0 (build 11146) made 8 calls at once
+  no faster than 1; `mac.sh` now refuses builds before 11669.
 - The real Metal compute-buffer size (the plan assumes 1 GB).
 - Whether 11 slots at full context stay out of swap with a browser open.
 - How well the 9B plans and codes the demo task.

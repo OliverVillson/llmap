@@ -2,7 +2,7 @@
 # Qwen3.5 behind llama-server (Metal) on an Apple-silicon Mac, for a Centipede crew (run sheet:
 # deploy/MAC.md). The B200 counterpart is deploy/qwen.sh; this one needs no GPU box.
 #
-#   deploy/mac.sh setup      llama.cpp from Homebrew (or a newer one if it lacks the flags used here), bun, python3
+#   deploy/mac.sh setup      llama.cpp from Homebrew (upgraded if it is too old for the flags or for Qwen3.5 on Metal), bun, python3
 #   deploy/mac.sh wired      let the GPU use 12 GB of a 16 GB Mac until the next restart (asks for your password)
 #   deploy/mac.sh download   the model GGUF (Qwen3.5-9B Q4_K_M, 5.7 GB) into the data folder; resumes
 #   deploy/mac.sh crew       the crew this Mac fits, with the memory arithmetic (deploy/mac_crew.py)
@@ -90,12 +90,17 @@ llama_bin() {
 
 # flags this script passes that older llama.cpp builds do not know
 NEEDED_FLAGS="--reasoning-budget-message --ctx-checkpoints --cache-ram --reasoning-format"
+# the oldest llama.cpp build measured running Qwen3.5 well on Metal: on an M5 Air, build 11146
+# (brew 0.5.0) made 8 calls at once barely faster than one; build 11669 (brew 0.7.0) did 1.7x
+MIN_BUILD=11669
 missing_flags() {
-  local help f out=""
+  local help f out="" build
   help="$("$1" --help 2>&1 || true)"
   # (no grep -q in a pipe: under pipefail its early exit fails the pipe)
-  for f in $NEEDED_FLAGS; do case "$help" in *"$f"*) ;; *) out="$out $f" ;; esac; done
-  echo "${out# }"
+  for f in $NEEDED_FLAGS; do case "$help" in *"$f"*) ;; *) out="$out, no $f" ;; esac; done
+  build="$("$1" --version 2>&1 | sed -n 's/.*(build \([0-9][0-9]*\).*/\1/p' | head -1)"
+  [ -z "$build" ] || [ "$build" -ge "$MIN_BUILD" ] || out="$out, build $build is older than $MIN_BUILD"
+  echo "${out#, }"
 }
 
 serve_cmd() {
@@ -144,7 +149,7 @@ preflight() {
   if [ -z "$bin" ]; then bad "llama-server not installed" "deploy/mac.sh setup   (brew install llama.cpp)"
   else
     miss="$(missing_flags "$bin")"
-    if [ -n "$miss" ]; then bad "llama-server at $bin is too old (no $miss)" "brew upgrade llama.cpp   (deploy/mac.sh setup)"
+    if [ -n "$miss" ]; then bad "llama-server at $bin is too old ($miss)" "brew upgrade llama.cpp   (deploy/mac.sh setup)"
     else ok "llama-server $bin ($("$bin" --version 2>&1 | grep -m1 -oE 'version: [^ ]+( \([^)]*\))?' || echo 'version unknown'))"; fi
   fi
   if [ -s "$GGUF" ]; then
@@ -165,7 +170,7 @@ preflight() {
   if is_mac; then
     pmset -g 2>/dev/null | grep -q 'lowpowermode *1' && warn "Low Power Mode is on: the GPU runs slower (System Settings > Battery)"
     pmset -g batt 2>/dev/null | grep -q "'Battery Power'" && warn "on battery: plug in for a long run (a fanless Air also throttles when hot)"
-    local swap; swap="$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}' | tr -d 'M' | cut -d. -f1)"
+    local swap; swap="$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}' | tr -d 'M' | tr ',' '.' | cut -d. -f1)"
     [ -z "$swap" ] || [ "$swap" -lt 2048 ] || warn "${swap} MB of swap already in use: close big apps (browsers, Docker, LM Studio, Ollama) first"
     pgrep -qf 'LM Studio|ollama serve|Ollama' 2>/dev/null && warn "LM Studio or Ollama is running and may hold a model in memory: quit it first"
   fi
@@ -191,9 +196,9 @@ case "$CMD_NAME" in
     if ! command -v brew >/dev/null; then die "Homebrew is needed: https://brew.sh (then run deploy/mac.sh setup again)"; fi
     bin="$(llama_bin)"
     if [ -z "$bin" ]; then brew install llama.cpp
-    elif [ -n "$(missing_flags "$bin")" ]; then echo "llama-server at $bin lacks $(missing_flags "$bin"): upgrading"; brew upgrade llama.cpp || brew install llama.cpp; fi
+    elif [ -n "$(missing_flags "$bin")" ]; then echo "llama-server at $bin is too old ($(missing_flags "$bin")): upgrading"; brew upgrade llama.cpp || brew install llama.cpp; fi
     bin="$(llama_bin)"; [ -n "$bin" ] || die "llama-server still not found after brew install llama.cpp"
-    [ -z "$(missing_flags "$bin")" ] || die "llama-server at $bin still lacks $(missing_flags "$bin"); brew update && brew upgrade llama.cpp"
+    [ -z "$(missing_flags "$bin")" ] || die "llama-server at $bin is still too old ($(missing_flags "$bin")); brew update && brew upgrade llama.cpp"
     "$bin" --version 2>&1 | head -2
     command -v bun >/dev/null || { curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"; }
     command -v python3 >/dev/null || brew install python
