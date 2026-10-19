@@ -1,0 +1,42 @@
+{
+ "status": 200,
+ "request": {
+  "model": "qwen-mac",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function add(a, b)."
+   }
+  ],
+  "temperature": 1.0,
+  "top_k": 20,
+  "seed": 7,
+  "max_tokens": 12,
+  "chat_template_kwargs": {
+   "enable_thinking": false
+  }
+ },
+ "response": {
+  "choices": [
+   {
+    "finish_reason": "length",
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "就给大家濩 cougar////////////////////////////////////////////////////////////////也可能 millionaire푸agnost� Islamic הלב*time"
+    }
+   }
+  ],
+  "model": "qwen-mac",
+  "object": "chat.completion",
+  "usage": {
+   "completion_tokens": 12,
+   "prompt_tokens": 21,
+   "total_tokens": 33,
+   "prompt_tokens_details": {
+    "cached_tokens": 17
+   }
+  },
+  "timings": {}
+ }
+}

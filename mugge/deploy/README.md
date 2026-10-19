@@ -6,6 +6,10 @@ slot, with 80 code agents taking turns on the worker slots (`CREW_WORKERS=64`; w
 crew is 10 worker slots, 13 agents, 2 leads and 1 orchestrator). The evroc B200
 is the target; H100 and L40S notes are at the end.
 
+On an Apple-silicon Mac instead (no GPU box): `deploy/MAC.md`, with `deploy/mac.sh`. It serves
+Qwen3.5-9B with llama.cpp to a crew sized to the Mac's memory (10 agents on 16 GB).
+On gaming laptops with NVIDIA GPUs (one head, more helpers): `deploy/SERVER.md`.
+
 | File | What it is |
 |---|---|
 | `qwen.sh` | setup, download, where, start (detached), wait, status, check, bench, sweep, compare, logs, stop, cmd |

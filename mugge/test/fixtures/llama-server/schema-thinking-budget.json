@@ -1,0 +1,73 @@
+{
+ "status": 200,
+ "request": {
+  "model": "qwen-mac",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function add(a, b)."
+   }
+  ],
+  "temperature": 1.0,
+  "top_k": 20,
+  "seed": 7,
+  "max_tokens": 200,
+  "chat_template_kwargs": {
+   "enable_thinking": true,
+   "reasoning_effort": "low"
+  },
+  "thinking_budget_tokens": 6,
+  "response_format": {
+   "type": "json_schema",
+   "json_schema": {
+    "name": "output",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "verdict": {
+       "type": "string",
+       "enum": [
+        "approve",
+        "send_back"
+       ]
+      },
+      "reason": {
+       "type": "string",
+       "maxLength": 16
+      }
+     },
+     "required": [
+      "verdict",
+      "reason"
+     ],
+     "additionalProperties": false
+    },
+    "strict": true
+   }
+  }
+ },
+ "response": {
+  "choices": [
+   {
+    "finish_reason": "stop",
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "{\n\n\t       \t\t\t\t\t       \"verdict\":\n\t\t   \t\t\t\t\t  \t    \t\t\"send_back\",\n\n        \t\t\t\t\t\t\t\t\t\t  \"reason\":\"峰会ogens去看jitÂ+F𝙀\"\n\n\t                   }",
+     "reasoning_content": ".prod턱เวิร์灌主動\n"
+    }
+   }
+  ],
+  "model": "qwen-mac",
+  "object": "chat.completion",
+  "usage": {
+   "completion_tokens": 46,
+   "prompt_tokens": 19,
+   "total_tokens": 65,
+   "prompt_tokens_details": {
+    "cached_tokens": 17
+   }
+  },
+  "timings": {}
+ }
+}

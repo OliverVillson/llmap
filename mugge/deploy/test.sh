@@ -114,4 +114,85 @@ bash -n deploy/fresh.sh
 if bash -c 'source <(sed -n "/^SUDO=/p;/^mounted_at()/p" deploy/fresh.sh; sed -n "/^empty_disk()/,/^}/p" deploy/fresh.sh); empty_disk "$(findmnt -n -o SOURCE /)"'; then echo "the root disk counted as empty"; exit 1; fi
 # crew.env says when it falls back to the default crew
 env -u CREW_WORKERS STATE="$STATE/nostate" bash -c 'set -a; . deploy/crew.env; set +a' 2>&1 | grep -q 'no crew size saved'
+# the Mac path (deploy/mac.sh): deploy/mock_llama.py stands in for llama-server, a stub file for the GGUF
+( export STATE="$STATE/mac" PORT=$((PORT + 1)) MAC_SH_ANY_OS=1 LLAMA_SERVER="$PWD/deploy/mock_llama.py" MOCK_LOAD_S=1
+  mkdir -p "$STATE"; head -c 1000 /dev/zero > "$STATE/stub.gguf"
+  trap 'deploy/mac.sh stop >/dev/null 2>&1 || true' EXIT
+  # the 16 GB plan: Qwen3.5-9B Q4_K_M, 8 workers + 2 leads + 1 orchestrator, one slot of 16384 each, no shared pool
+  python3 deploy/mac_crew.py --mem-gb 16 --wired-mb 0 | tee "$STATE/crew.txt"
+  grep -q 'Qwen3.5-9B-Q4_K_M.gguf (5.68 GB)' "$STATE/crew.txt"; grep -q 'crew: 8 workers + 2 leads + 1 orchestrator = 11 slots' "$STATE/crew.txt"
+  MODEL=9b deploy/mac.sh cmd | grep -q -- "-m $STATE/models/Qwen3.5-9B-Q4_K_M.gguf --alias qwen3.5-9b .*-np 11 -c 180224 -ctk q8_0 -ctv q8_0 .*--reasoning-format deepseek"
+  if MODEL=9b deploy/mac.sh cmd | grep -q -- '--kv-unified'; then echo "mac.sh must not share one KV pool"; exit 1; fi
+  MODEL=4b KV_V=q4_0 deploy/mac.sh cmd | grep -q -- 'Qwen3.5-4B-Q6_K.gguf .*-ctk q8_0 -ctv q4_0'
+  # a crew that does not fit is refused, with what to change
+  if python3 deploy/mac_crew.py --mem-gb 8 --wired-mb 0 --workers 8 > "$STATE/no.txt" 2>&1; then echo "an 8 GB Mac took 8 workers of 9B"; exit 1; fi
+  grep -q 'does not fit' "$STATE/no.txt"
+  # no model yet: preflight fails with the fix, start refuses
+  if MODEL=9b deploy/mac.sh preflight > "$STATE/pf.txt" 2>&1; then echo "preflight passed with no model"; exit 1; fi
+  grep -q 'FAIL  model .* not downloaded' "$STATE/pf.txt"; [ "$(grep -c '^FAIL' "$STATE/pf.txt")" = "$(grep -c '^      fix: ' "$STATE/pf.txt")" ]
+  # an old llama-server (no --reasoning-budget-message) is caught before start
+  printf '#!/bin/sh\necho "usage: llama-server -np N"\n' > "$STATE/old-llama"; chmod +x "$STATE/old-llama"
+  if LLAMA_SERVER="$STATE/old-llama" MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/mac.sh preflight > "$STATE/old.txt" 2>&1; then echo "preflight passed an old llama-server"; exit 1; fi
+  grep -q 'FAIL  llama-server at .* is too old' "$STATE/old.txt"; grep -qE 'fix: (brew upgrade llama.cpp|deploy/mac.sh setup)' "$STATE/old.txt"
+  # the run: start, wait, check (thinking with a budget, JSON with thinking, the whole crew at once), status
+  MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/mac.sh start
+  deploy/mac.sh wait | tee "$STATE/wait.txt"; grep -q 'crew: 8 workers + 2 leads + 1 orchestrator on 11 slots of 16384 tokens' "$STATE/wait.txt"
+  deploy/mac.sh check | tee "$STATE/check.txt"; grep -q 'ok    11 calls at once' "$STATE/check.txt"; grep -q '^PASS' "$STATE/check.txt"
+  deploy/mac.sh status > "$STATE/status.txt"; grep -q 'health  ok' "$STATE/status.txt"
+  # the crew file matches what started, from bash and from sh (zsh users source it the same way)
+  ( set -a; . deploy/mac.env; set +a
+    [ "$MUGGE_CONCURRENCY" = 10 ] && [ "$MUGGE_MODEL" = stub ] && [ "$MUGGE_THINKING_BUDGET" = low=1024,medium=4096,xhigh=8192 ]
+    echo "$MUGGE_BACKENDS" | grep -q '"mac-workers".*"slots": 8'
+    bun src/cli.ts backends > "$STATE/backends.txt"; [ "$(grep -c '^  up ' "$STATE/backends.txt")" = 3 ] )
+  sh -c 'set -a; . deploy/mac.env; set +a; [ "$MUGGE_CONCURRENCY" = 10 ]'
+  deploy/mac.sh bench --levels 1,4 --prompt-tokens 200 --answers thinking:32,short:8 > "$STATE/bench.txt"; grep -q '1 -> 4 at once' "$STATE/bench.txt"
+  deploy/mac.sh stop )
+# centipede-server (deploy/box.sh: the same script on Linux with an NVIDIA GPU): a mock nvidia-smi
+# (an 8 GB laptop RTX 3070), the head and a helper llama-server on this machine
+( export STATE="$STATE/box" PORT=$((PORT + 2)) LLAMA_SERVER="$PWD/deploy/mock_llama.py" MOCK_LOAD_S=1
+  HPORT=$((PORT + 1)) HSTATE="$STATE/helper"
+  mkdir -p "$STATE/bin"; ln -sf "$PWD/deploy/mock_nvidia_smi.py" "$STATE/bin/nvidia-smi"; export PATH="$STATE/bin:$PATH"
+  head -c 1000 /dev/zero > "$STATE/stub.gguf"
+  trap 'deploy/box.sh stop >/dev/null 2>&1 || true; STATE="$HSTATE" PORT="$HPORT" deploy/box.sh stop >/dev/null 2>&1 || true' EXIT
+  # an 8 GB card: q4_0 KV and 12,288 tokens a slot; the head 4 workers + 2 leads + 1 orchestrator, a helper with 600 MiB in use 4 slots
+  deploy/box.sh crew | tee "$STATE/crew.txt"
+  grep -q 'GPU: NVIDIA GeForce RTX 3070 Laptop GPU' "$STATE/crew.txt"; grep -q 'crew: 4 workers + 2 leads + 1 orchestrator = 7 slots' "$STATE/crew.txt"
+  deploy/box.sh cmd > "$STATE/cmd.txt"; grep -q -- '-np 7 -c 86016 -ctk q4_0 -ctv q4_0' "$STATE/cmd.txt"
+  MOCK_GPU_USED_MIB=600 ROLE=helper deploy/box.sh crew > "$STATE/out1.txt"; grep -q 'crew: 4 worker slots' "$STATE/out1.txt"
+  MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/box.sh preflight > "$STATE/out2.txt"; grep -q 'ok    NVIDIA GPU: NVIDIA GeForce RTX 3070 Laptop GPU, 8192 MiB' "$STATE/out2.txt"
+  # an old driver is refused before anything downloads
+  if MOCK_DRIVER=550.1 LLAMA_SERVER= deploy/box.sh setup > "$STATE/drv.txt" 2>&1; then echo "setup took driver 550"; exit 1; fi
+  grep -q 'driver 550 is too old' "$STATE/drv.txt"
+  # llama.cpp's latest release is a version without binaries: setup takes the build it names
+  mkdir -p "$STATE/gh"; cat > "$STATE/gh/curl" <<'SH'
+#!/bin/sh
+for a; do u="$a"; done
+case "$u" in
+  */releases/latest) echo '{"tag_name": "v0.7.0"}' ;;
+  */v0.7.0/nightly-tag.txt) [ -z "$NO_NIGHTLY" ] || exit 22; echo b11669 ;;
+  *'/releases?per_page=30') echo '[{"tag_name": "v0.7.0"}, {"tag_name": "b11732"}, {"tag_name": "b11731"}]' ;;
+  *) exit 22 ;;
+esac
+SH
+  chmod +x "$STATE/gh/curl"
+  [ "$(PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11669 ]
+  [ "$(NO_NIGHTLY=1 PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11732 ]
+  [ "$(LLAMA_TAG=b11700 PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11700 ]
+  # the helper, then the head, then the head's crew with the helper's slots
+  STATE="$HSTATE" PORT="$HPORT" CREW_WORKERS=4 ROLE=helper HOST=0.0.0.0 MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/box.sh start
+  STATE="$HSTATE" PORT="$HPORT" deploy/box.sh wait > "$STATE/out3.txt"; grep -q "crew: 4 worker slots for another box's crew on 4 slots of 12288 tokens" "$STATE/out3.txt"
+  CREW_WORKERS=4 MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/box.sh start
+  deploy/box.sh wait > "$STATE/out4.txt"; grep -q 'crew: 4 workers + 2 leads + 1 orchestrator on 7 slots of 12288 tokens' "$STATE/out4.txt"
+  if deploy/box.sh helper add "127.0.0.1:$((PORT + 9))" > "$STATE/dead.txt" 2>&1; then echo "added a helper that is not there"; exit 1; fi
+  if deploy/box.sh helper add http://WINDOWS-ADDRESS:8080 > "$STATE/ph.txt" 2>&1; then echo "added a placeholder"; exit 1; fi
+  grep -q 'is a placeholder' "$STATE/ph.txt"
+  deploy/box.sh helper add "127.0.0.1:$HPORT" > "$STATE/out5.txt"; grep -q '4 slots of 12288 tokens' "$STATE/out5.txt"
+  deploy/box.sh status > "$STATE/out6.txt"; grep -q "helper   http://127.0.0.1:$HPORT up" "$STATE/out6.txt"
+  ( set -a; . deploy/mac.env; set +a
+    [ "$MUGGE_CONCURRENCY" = 10 ] && [ "$MUGGE_MAX_CALL_TOKENS" = 6144 ] && [ "$MUGGE_PLAN_MAX_CALL_TOKENS" = 8192 ]
+    [[ "$(echo "$MUGGE_BACKENDS" | tr -d '\n ')" == *'"name":"helper-1"'*'"slots":4'* ]]
+    bun src/cli.ts backends > "$STATE/backends.txt"; [ "$(grep -c '^  up ' "$STATE/backends.txt")" = 4 ] )
+  deploy/box.sh check | tee "$STATE/check.txt"; grep -q '^PASS' "$STATE/check.txt"
+  deploy/box.sh ssh-config > "$STATE/out7.txt"; grep -q '^Host centipede-server' "$STATE/out7.txt"
+  deploy/box.sh stop; STATE="$HSTATE" PORT="$HPORT" deploy/box.sh stop )
 echo "deploy dry run: PASS"
