@@ -23,10 +23,12 @@ Then the demo:
 
 ```sh
 cd ~/llmap-demo/mugge && set -a && . deploy/mac.env && set +a && nohup bun demo/run.ts --plan orchestrator > demo.log 2>&1 &
+until curl -fs -o /dev/null http://127.0.0.1:7340/; do sleep 2; done; open http://127.0.0.1:7340/
 tail -f ~/llmap-demo/mugge/demo.log
 ```
 
-Open http://127.0.0.1:7340/ in a browser to watch. No tunnel is needed, because it runs on this Mac.
+The third line opens the live view in your browser as soon as the demo serves it. It stays up while
+the crew works, and after the run ends. No tunnel is needed, because it runs on this Mac.
 `--plan orchestrator` runs the built-in task (mdlite, 17 tickets) with the orchestrator writing the
 ticket plan. If that plan fails, it falls back to the prepared one.
 
