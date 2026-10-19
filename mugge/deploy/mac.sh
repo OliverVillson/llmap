@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Qwen3.5 behind llama-server (Metal) on an Apple-silicon Mac, for a Centipede crew (run sheet:
 # deploy/MAC.md). The B200 counterpart is deploy/qwen.sh; this one needs no GPU box.
+# The same script runs llama.cpp's CUDA build on a Linux box with an NVIDIA GPU (centipede-server,
+# deploy/SERVER.md; deploy/box.sh is this file): setup installs llama.cpp's release build there,
+# and `helper add URL` lets the crew use another box's llama-server too.
 #
 #   deploy/mac.sh setup      llama.cpp from Homebrew (upgraded if it is too old for the flags or for Qwen3.5 on Metal), bun, python3
 #   deploy/mac.sh wired      let the GPU use 12 GB of a 16 GB Mac until the next restart (asks for your password)
@@ -15,6 +18,8 @@
 #   deploy/mac.sh bench      speed at 1, 4, 8 and all-slots calls at once
 #   deploy/mac.sh logs       follow the server log
 #   deploy/mac.sh stop
+#   deploy/mac.sh helper add|list|clear [URL]   (Linux head) another box's llama-server whose slots the crew uses
+#   deploy/mac.sh ssh-config  (Linux head) the lines for your Mac's ~/.ssh/config: ssh centipede-server
 #
 # Knobs (give them to start; the other commands and deploy/mac.env read back what is running):
 #   MODEL=9b|4b|/path/to.gguf   9b (default) is Qwen3.5-9B; 4b is Qwen3.5-4B (faster, codes worse);
@@ -25,13 +30,13 @@
 #   CREW_WORKERS=N              this many worker slots, whatever memory says (default: as many as fit, at most MAX_WORKERS=8)
 #   PORT=8080 HOST=127.0.0.1 EXTRA_ARGS="..." (appended to llama-server) LLAMA_SERVER=/path/to/llama-server
 #   MODELS_DIR (default ~/qwen-mac/models) STATE (default ~/qwen-mac: log, pid, what is running)
+#   ROLE=helper (Linux) every slot a worker slot, for another box's crew; with HOST=0.0.0.0
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.bun/bin"
 
 STATE="${STATE:-$HOME/qwen-mac}"
 MODELS_DIR="${MODELS_DIR:-$STATE/models}"
-HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 URL="http://127.0.0.1:$PORT"
 LOG="$STATE/serve.log"
@@ -46,6 +51,10 @@ BUDGET_MESSAGE="${BUDGET_MESSAGE:-Considering the limited time, I have to write 
 
 die() { echo "mac.sh: $*" >&2; exit 1; }
 is_mac() { [ "$(uname -s)" = Darwin ]; }
+has_nvidia() { ! is_mac && command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; }
+HELPERS_FILE="$STATE/helpers"
+# llama.cpp's release build for Linux + CUDA (setup), when no LLAMA_SERVER is given
+LLAMA_DIR="$STATE/llama.cpp"
 
 # The knobs start saved, unless this command was given its own: a later `mac.sh check` or
 # `mac.sh status` describes the server that is running, not the defaults.
@@ -54,7 +63,7 @@ load_knobs() {
   local k v line
   while IFS= read -r line; do
     k="${line%%=*}"; v="${line#*=}"
-    case "$k" in MODEL|QUANT|PRESET|KV|KV_K|KV_V|CTX|CREW_WORKERS|MAX_WORKERS) ;; *) continue ;; esac
+    case "$k" in MODEL|QUANT|PRESET|KV|KV_K|KV_V|CTX|CREW_WORKERS|MAX_WORKERS|ROLE|HOST) ;; *) continue ;; esac
     # the environment wins over what was saved
     if [ -z "$(eval "echo \${$k:-}")" ]; then eval "$k=\$v"; fi
   done < "$KNOBS_FILE"
@@ -62,14 +71,14 @@ load_knobs() {
 save_knobs() {
   mkdir -p "$STATE"
   : > "$KNOBS_FILE.new"
-  for k in MODEL QUANT PRESET KV KV_K KV_V CTX CREW_WORKERS MAX_WORKERS; do
+  for k in MODEL QUANT PRESET KV KV_K KV_V CTX CREW_WORKERS MAX_WORKERS ROLE HOST; do
     v="$(eval "echo \${$k:-}")"; [ -z "$v" ] || echo "$k=$v" >> "$KNOBS_FILE.new"
   done
   mv "$KNOBS_FILE.new" "$KNOBS_FILE"
 }
 
 # the crew plan for this Mac and these knobs, as JSON (deploy/mac_crew.py)
-plan_json() { MODEL="${MODEL:-}" QUANT="${QUANT:-}" PRESET="${PRESET:-}" KV="${KV:-}" KV_K="${KV_K:-}" KV_V="${KV_V:-}" CTX="${CTX:-}" CREW_WORKERS="${CREW_WORKERS:-}" MAX_WORKERS="${MAX_WORKERS:-}" python3 "$HERE/mac_crew.py" --url "$URL/v1" "$@"; }
+plan_json() { MODEL="${MODEL:-}" QUANT="${QUANT:-}" PRESET="${PRESET:-}" KV="${KV:-}" KV_K="${KV_K:-}" KV_V="${KV_V:-}" CTX="${CTX:-}" CREW_WORKERS="${CREW_WORKERS:-}" MAX_WORKERS="${MAX_WORKERS:-}" ROLE="${ROLE:-}" python3 "$HERE/mac_crew.py" --url "$URL/v1" "$@"; }
 # one field of a plan held in $PLAN
 field() { python3 -c 'import json, sys; v = json.loads(sys.argv[1])[sys.argv[2]]; print("" if v is None else v)' "$PLAN" "$1"; }
 
@@ -85,7 +94,36 @@ read_plan() {
 
 llama_bin() {
   if [ -n "${LLAMA_SERVER:-}" ]; then echo "$LLAMA_SERVER"; return; fi
+  if ! is_mac && [ -x "$LLAMA_DIR/current/llama-server" ]; then echo "$LLAMA_DIR/current/llama-server"; return; fi
   command -v llama-server 2>/dev/null || true
+}
+
+# Linux + NVIDIA: llama.cpp's latest release build for CUDA (the binaries and the CUDA runtime
+# libraries beside them) into $LLAMA_DIR/llama-<tag>, linked as current. CUDA 13.4 needs driver
+# 580 or newer, CUDA 12.8 driver 570.
+install_llama_linux() {
+  local drv cuda tag base t
+  drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)"
+  [ -n "$drv" ] || die "nvidia-smi does not answer: install the NVIDIA driver (sudo ubuntu-drivers install && sudo reboot), then deploy/mac.sh setup"
+  if [ "$drv" -ge 580 ]; then cuda=13.4; elif [ "$drv" -ge 570 ]; then cuda=12.8
+  else die "NVIDIA driver $drv is too old for llama.cpp's CUDA build (570 or newer): sudo ubuntu-drivers install && sudo reboot"; fi
+  tag="${LLAMA_TAG:-$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')}" \
+    || die "could not read llama.cpp's latest release from GitHub; LLAMA_TAG=b<number> deploy/mac.sh setup"
+  [ "${tag#b}" -ge "$MIN_BUILD" ] 2>/dev/null || die "llama.cpp release $tag is older than build $MIN_BUILD"
+  if [ -x "$LLAMA_DIR/llama-$tag/llama-server" ]; then ln -sfn "llama-$tag" "$LLAMA_DIR/current"; echo "llama.cpp $tag (CUDA) already here"; return; fi
+  base="https://github.com/ggml-org/llama.cpp/releases/download/$tag"
+  mkdir -p "$LLAMA_DIR"
+  t="$(mktemp -d)"
+  echo "llama.cpp $tag for CUDA $cuda (driver $drv) -> $LLAMA_DIR/llama-$tag"
+  curl -fL --retry 3 -o "$t/bin.tar.gz" "$base/llama-$tag-bin-ubuntu-cuda-$cuda-x64.tar.gz"
+  curl -fL --retry 3 -o "$t/cudart.tar.gz" "$base/cudart-llama-$tag-bin-ubuntu-cuda-$cuda-x64.tar.gz"
+  tar -xzf "$t/bin.tar.gz" -C "$LLAMA_DIR"
+  # the runtime goes next to the binaries, which find it through their $ORIGIN rpath
+  tar -xzf "$t/cudart.tar.gz" -C "$t"
+  cp -L "$t"/cudart-llama-*/* "$LLAMA_DIR/llama-$tag/"
+  rm -rf "$t"
+  [ -x "$LLAMA_DIR/llama-$tag/llama-server" ] || die "no llama-server in the $tag release archive"
+  ln -sfn "llama-$tag" "$LLAMA_DIR/current"
 }
 
 # flags this script passes that older llama.cpp builds do not know
@@ -142,14 +180,16 @@ preflight() {
   read_plan
   if is_mac; then
     [ "$(uname -m)" = arm64 ] && ok "Apple silicon ($(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo arm64))" || bad "not Apple silicon: Metal needs an M-series Mac" "run the B200 path instead (deploy/qwen.sh)"
+  elif has_nvidia; then
+    ok "NVIDIA GPU: $(nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv,noheader 2>/dev/null | head -1 | awk -F', ' '{print $1 ", " $2 " (" $3 " in use), driver " $4}')"
   else
-    [ "${MAC_SH_ANY_OS:-}" = 1 ] && warn "not macOS ($(uname -s)): running anyway (MAC_SH_ANY_OS=1; CPU only)" || bad "this is $(uname -s), not macOS" "use deploy/qwen.sh on a Linux GPU box (MAC_SH_ANY_OS=1 forces this script)"
+    [ "${MAC_SH_ANY_OS:-}" = 1 ] && warn "no Mac and no NVIDIA GPU ($(uname -s)): running anyway (MAC_SH_ANY_OS=1; CPU only)" || bad "this is $(uname -s) with no NVIDIA GPU (nvidia-smi)" "install the NVIDIA driver: sudo ubuntu-drivers install && sudo reboot"
   fi
   bin="$(llama_bin)"
-  if [ -z "$bin" ]; then bad "llama-server not installed" "deploy/mac.sh setup   (brew install llama.cpp)"
+  if [ -z "$bin" ]; then bad "llama-server not installed" "deploy/mac.sh setup   ($(is_mac && echo 'brew install llama.cpp' || echo "llama.cpp's CUDA release build"))"
   else
     miss="$(missing_flags "$bin")"
-    if [ -n "$miss" ]; then bad "llama-server at $bin is too old ($miss)" "brew upgrade llama.cpp   (deploy/mac.sh setup)"
+    if [ -n "$miss" ]; then bad "llama-server at $bin is too old ($miss)" "$(is_mac && echo 'brew upgrade llama.cpp   (deploy/mac.sh setup)' || echo 'deploy/mac.sh setup   (the latest llama.cpp release)')"
     else ok "llama-server $bin ($("$bin" --version 2>&1 | grep -m1 -oE 'version: [^ ]+( \([^)]*\))?' || echo 'version unknown'))"; fi
   fi
   if [ -s "$GGUF" ]; then
@@ -159,7 +199,7 @@ preflight() {
   if plan_json > "$STATE/.plan.txt" 2>&1; then
     ok "crew fits in GPU memory: $(grep '^crew:' "$STATE/.plan.txt" | cut -d: -f2- | sed 's/^ //')"
   else
-    bad "the crew does not fit in GPU memory: $(grep '^GPU total' "$STATE/.plan.txt" | cut -d: -f2-)" "KV=q4_0, CTX=12288, fewer CREW_WORKERS, MODEL=4b, or deploy/mac.sh wired (deploy/mac.sh crew shows the arithmetic)"
+    bad "the crew does not fit in GPU memory: $(grep '^GPU total' "$STATE/.plan.txt" | cut -d: -f2-)" "KV=q4_0, a smaller CTX, fewer CREW_WORKERS, MODEL=4b$(is_mac && echo ', or deploy/mac.sh wired') (deploy/mac.sh crew shows the arithmetic)"
   fi
   rm -f "$STATE/.plan.txt"
   if ! pid_alive && port_taken "$PORT"; then bad "port $PORT is taken by another process" "lsof -nP -iTCP:$PORT -sTCP:LISTEN   (stop it), or PORT=8081 deploy/mac.sh start"
@@ -181,7 +221,7 @@ preflight() {
 start_hint() {
   local log="$1" h=""
   grep -qiE 'unknown argument|invalid argument|error: unrecognized' "$log" && h="this llama.cpp is too old for a flag: brew upgrade llama.cpp, then start again"
-  [ -n "$h" ] || ! grep -qiE 'failed to allocate|out of memory|insufficient memory|kIOGPUCommandBufferCallbackErrorOutOfMemory|failed to create context' "$log" || h="not enough GPU memory: quit other apps, then KV=q4_0 or CREW_WORKERS=6 deploy/mac.sh start (or deploy/mac.sh wired)"
+  [ -n "$h" ] || ! grep -qiE 'failed to allocate|out of memory|insufficient memory|kIOGPUCommandBufferCallbackErrorOutOfMemory|failed to create context|cudaMalloc failed|CUDA error: out of memory' "$log" || h="not enough GPU memory: quit other GPU programs, then CREW_WORKERS=<fewer> deploy/mac.sh start (or KV=q4_0, MODEL=4b$(is_mac && echo '; or deploy/mac.sh wired'))"
   [ -n "$h" ] || ! grep -qiE 'failed to load model|error loading model|invalid magic|unknown model architecture' "$log" || h="the model file is broken or unsupported: deploy/mac.sh download (it checks the size), and brew upgrade llama.cpp"
   [ -n "$h" ] || ! grep -qiE 'couldn.t bind|address already in use' "$log" || h="port $PORT is taken: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
   if [ -n "$h" ]; then echo "likely fix: $h"; else echo "no known cause matched; paste the lines above in the project chat"; fi
@@ -189,10 +229,28 @@ start_hint() {
 
 CMD_NAME="${1:-}"
 load_knobs
+HOST="${HOST:-127.0.0.1}"
 
 case "$CMD_NAME" in
   setup)
-    is_mac || [ "${MAC_SH_ANY_OS:-}" = 1 ] || die "this is for macOS (deploy/qwen.sh is the Linux GPU path)"
+    if ! is_mac && has_nvidia; then
+      miss=""; for c in curl git python3 tar unzip lsof; do command -v "$c" >/dev/null || miss="$miss $c"; done
+      # llama.cpp's release build links OpenMP
+      [ -e /usr/lib/x86_64-linux-gnu/libgomp.so.1 ] || miss="$miss libgomp1"
+      [ -z "$miss" ] || { echo "installing:$miss"; sudo apt-get update -q && sudo apt-get install -y $miss; }
+      [ -n "${LLAMA_SERVER:-}" ] || install_llama_linux
+      bin="$(llama_bin)"; [ -n "$bin" ] || die "llama-server not found after setup"
+      libs="$(ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')"
+      [ -z "$libs" ] || die "llama-server needs libraries this box lacks: $libs(apt search them, or paste this line in the project chat)"
+      [ -z "$(missing_flags "$bin")" ] || die "llama-server at $bin is too old ($(missing_flags "$bin")); LLAMA_TAG=b<newer> deploy/mac.sh setup"
+      "$bin" --version 2>&1 | grep -m2 -E 'version|built' || true
+      command -v bun >/dev/null || { curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"; }
+      grep -q '.bun/bin' "$HOME/.bashrc" 2>/dev/null || echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$HOME/.bashrc"
+      mkdir -p "$STATE" "$MODELS_DIR"
+      echo "next: deploy/mac.sh download"
+      exit 0
+    fi
+    is_mac || [ "${MAC_SH_ANY_OS:-}" = 1 ] || die "this is for macOS, or Linux with an NVIDIA GPU (no nvidia-smi here: sudo ubuntu-drivers install && sudo reboot)"
     if ! command -v brew >/dev/null; then die "Homebrew is needed: https://brew.sh (then run deploy/mac.sh setup again)"; fi
     bin="$(llama_bin)"
     if [ -z "$bin" ]; then brew install llama.cpp
@@ -278,7 +336,9 @@ case "$CMD_NAME" in
       python3 - "$PLAN_FILE" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))
-print(f"crew: {p['workers']} workers + {p['leads']} leads + 1 orchestrator on {p['slots']} slots of {p['ctx']} tokens;"
+crew = (f"{p['workers']} worker slots for another box's crew" if p.get("role") == "helper"
+        else f"{p['workers']} workers + {p['leads']} leads + 1 orchestrator")
+print(f"crew: {crew} on {p['slots']} slots of {p['ctx']} tokens;"
       f" GPU memory planned {p['need_bytes'] / 1e9:.1f} of {p['wired_bytes'] / 1e9:.1f} GB")
 PY
     fi
@@ -291,6 +351,14 @@ PY
     if is_mac; then
       echo "swap     $(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}') used (growing during a run means the crew is too big for this Mac: fewer CREW_WORKERS or KV=q4_0)"
       memory_pressure 2>/dev/null | grep -m1 'free percentage' | sed 's/^.*: /free     /;s/$/ of memory/' || true
+    elif has_nvidia; then
+      echo "gpu      $(nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | awk -F', ' '{print $1 ": " $2 " of " $3 " in use, " $4 " busy"}')"
+    fi
+    if [ -s "$HELPERS_FILE" ]; then
+      while read -r h; do
+        [ -n "$h" ] || continue
+        curl -fsS -m 5 "$h/health" >/dev/null 2>&1 && echo "helper   $h up" || echo "helper   $h NOT ANSWERING (the crew runs without it)"
+      done < "$HELPERS_FILE"
     fi
     exec python3 "$HERE/check.py" --url "$URL" --status
     ;;
@@ -308,6 +376,39 @@ PY
     ;;
   logs)
     exec tail -n "${LINES:-100}" -F "$LOG"
+    ;;
+  helper)
+    # another box's llama-server (deploy/helper.ps1 on Windows, or ROLE=helper HOST=0.0.0.0 deploy/mac.sh start
+    # on Linux): its slots join the crew's workers when deploy/mac.env loads (deploy/SERVER.md)
+    sub="${2:-list}"; mkdir -p "$STATE"; touch "$HELPERS_FILE"
+    case "$sub" in
+      add)
+        h="${3:-}"; [ -n "$h" ] || die "usage: deploy/mac.sh helper add http://ADDRESS:8080"
+        case "$h" in http://*|https://*) ;; *) h="http://$h" ;; esac
+        h="${h%/}"; h="${h%/v1}"
+        case "$h" in *:[0-9]*) ;; *) h="$h:8080" ;; esac
+        props="$(curl -fsS -m 10 "$h/props" 2>/dev/null)" || die "$h does not answer: is its llama-server running, and is the address right? (on the helper: the window deploy/helper.ps1 opened; Windows asks once to allow it on the network)"
+        python3 - "$props" "$h" <<'PY'
+import json, sys
+p = json.loads(sys.argv[1])
+print(f"{sys.argv[2]}: {p.get('model_alias')}, {p.get('total_slots')} slots of {(p.get('default_generation_settings') or {}).get('n_ctx')} tokens")
+PY
+        grep -qxF "$h" "$HELPERS_FILE" || echo "$h" >> "$HELPERS_FILE"
+        echo "added; the next demo run uses it (set -a; . deploy/mac.env; set +a loads it)"
+        ;;
+      list) if [ -s "$HELPERS_FILE" ]; then cat "$HELPERS_FILE"; else echo "no helpers (deploy/mac.sh helper add http://ADDRESS:8080)"; fi ;;
+      clear) : > "$HELPERS_FILE"; echo "no helpers" ;;
+      *) die "usage: deploy/mac.sh helper add URL | list | clear" ;;
+    esac
+    ;;
+  ssh-config)
+    # what your Mac needs for `ssh centipede-server`, with this box's addresses and user; the live view
+    # comes along as http://127.0.0.1:7341/ on the Mac while that ssh session is open
+    ips="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' || true)"
+    first="$(echo "$ips" | head -1)"
+    echo "# on your Mac: add this to ~/.ssh/config (one address of this box: ${ips//$'\n'/, })"
+    printf 'Host %s\n  HostName %s\n  User %s\n  LocalForward 7341 127.0.0.1:7340\n  ServerAliveInterval 30\n' "${SSH_NAME:-centipede-server}" "${first:-ADDRESS}" "$(id -un)"
+    command -v sshd >/dev/null || [ -x /usr/sbin/sshd ] || echo "# this box has no ssh server yet: sudo apt-get install -y openssh-server"
     ;;
   stop)
     pid_alive || { echo "not running"; rm -f "$PIDFILE"; exit 0; }

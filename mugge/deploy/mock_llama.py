@@ -3,7 +3,7 @@
 A stand-in for llama-server with no Mac, for dry runs of mac.sh and check.py (deploy/test.sh, CI).
 It takes llama-server's command line (-m FILE --alias NAME --port N -np SLOTS -c CTX, other flags
 ignored), prints a --help that lists the flags mac.sh checks for, and answers what the crew and
-check.py use the way a real llama-server does (test/fixtures/llama-server): /health, /v1/models,
+check.py use the way a real llama-server does (test/fixtures/llama-server): /health, /props, /v1/models,
 /v1/chat/completions (thinking in reasoning_content, cut at thinking_budget_tokens, JSON-schema
 answers, ignore_eos, the 400 exceed_context_size_error when a prompt does not fit a slot), and
 /metrics with llama.cpp's names. At most -np requests run at once; the rest wait.
@@ -90,6 +90,8 @@ class H(BaseHTTPRequestHandler):
                      f"llamacpp:tokens_predicted_total {s['generated']}", f"llamacpp:prompt_tokens_total {s['prompt']}",
                      f"llamacpp:prompt_tokens_cached_total {s['cached']}"]
             return self.send(200, "\n".join(lines) + "\n", "text/plain")
+        if self.path == "/props":
+            return self.send(200, {"total_slots": A["np"], "model_alias": A["alias"], "default_generation_settings": {"n_ctx": SLOT_CTX}})
         if self.path == "/v1/models":
             return self.send(200, {"object": "list", "data": [{"id": A["alias"], "object": "model", "owned_by": "llamacpp"}]})
         self.send(404, {"error": {"code": 404, "message": "File Not Found", "type": "not_found_error"}})

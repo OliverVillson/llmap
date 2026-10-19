@@ -37,6 +37,8 @@ For your own task, use `bun demo/run.ts --prompt "…"`. It plans about one tick
 Quit LM Studio, Ollama and other heavy apps first. Plug the Mac in. `mac.sh start` keeps it awake
 while the server runs.
 
+Two gaming laptops with NVIDIA GPUs instead (one Ubuntu, one Windows): `deploy/SERVER.md` (`ssh centipede-server`).
+
 ## What it runs, and why
 
 **Server: llama.cpp `llama-server`, not mlx-lm.**
