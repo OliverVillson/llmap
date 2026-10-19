@@ -98,6 +98,21 @@ llama_bin() {
   command -v llama-server 2>/dev/null || true
 }
 
+# The b<number> build whose binaries to fetch. llama.cpp's "latest" release is a version (v0.7.0)
+# that carries no binaries, only nightly-tag.txt naming its b<number> build; the b<number> builds
+# are marked prerelease. LLAMA_TAG may be either form.
+llama_release_tag() {
+  local tag gh=https://github.com/ggml-org/llama.cpp/releases/download
+  tag="${LLAMA_TAG:-$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')}" || tag=""
+  case "$tag" in b[0-9]*) echo "$tag"; return 0 ;; esac
+  [ -z "$tag" ] || tag="$(curl -fsSL "$gh/$tag/nightly-tag.txt" | tr -d '[:space:]')" || tag=""
+  case "$tag" in b[0-9]*) echo "$tag"; return 0 ;; esac
+  # no nightly-tag.txt: the newest b<number> release
+  tag="$(curl -fsSL 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' \
+    | python3 -c 'import json, re, sys; print(next(r["tag_name"] for r in json.load(sys.stdin) if re.fullmatch(r"b[0-9]+", r["tag_name"])))')" || return 1
+  echo "$tag"
+}
+
 # Linux + NVIDIA: llama.cpp's latest release build for CUDA (the binaries and the CUDA runtime
 # libraries beside them) into $LLAMA_DIR/llama-<tag>, linked as current. CUDA 13.4 needs driver
 # 580 or newer, CUDA 12.8 driver 570.
@@ -107,8 +122,7 @@ install_llama_linux() {
   [ -n "$drv" ] || die "nvidia-smi does not answer: install the NVIDIA driver (sudo ubuntu-drivers install && sudo reboot), then deploy/mac.sh setup"
   if [ "$drv" -ge 580 ]; then cuda=13.4; elif [ "$drv" -ge 570 ]; then cuda=12.8
   else die "NVIDIA driver $drv is too old for llama.cpp's CUDA build (570 or newer): sudo ubuntu-drivers install && sudo reboot"; fi
-  tag="${LLAMA_TAG:-$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')}" \
-    || die "could not read llama.cpp's latest release from GitHub; LLAMA_TAG=b<number> deploy/mac.sh setup"
+  tag="$(llama_release_tag)" || die "could not find llama.cpp's latest release build on GitHub; LLAMA_TAG=b<number> deploy/mac.sh setup"
   [ "${tag#b}" -ge "$MIN_BUILD" ] 2>/dev/null || die "llama.cpp release $tag is older than build $MIN_BUILD"
   if [ -x "$LLAMA_DIR/llama-$tag/llama-server" ]; then ln -sfn "llama-$tag" "$LLAMA_DIR/current"; echo "llama.cpp $tag (CUDA) already here"; return; fi
   base="https://github.com/ggml-org/llama.cpp/releases/download/$tag"
@@ -401,6 +415,9 @@ PY
       *) die "usage: deploy/mac.sh helper add URL | list | clear" ;;
     esac
     ;;
+  release-tag)
+    # the llama.cpp build setup fetches on Linux
+    llama_release_tag ;;
   ssh-config)
     # what your Mac needs for `ssh centipede-server`, with this box's addresses and user; the live view
     # comes along as http://127.0.0.1:7341/ on the Mac while that ssh session is open

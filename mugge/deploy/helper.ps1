@@ -57,14 +57,26 @@ function Get-Build($exe) {
 }
 $Exe = Get-ChildItem -Path $LlamaDir -Filter llama-server.exe -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $Exe -or (Get-Build $Exe.FullName) -lt $MinBuild) {
+  # llama.cpp's "latest" release is a version (v0.7.0) with no binaries, only nightly-tag.txt naming
+  # its b<number> build; the b<number> builds are marked prerelease
   $tag = (Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest').tag_name
+  if ($tag -notmatch '^b\d+$') {
+    $nt = Join-Path $LlamaDir 'nightly-tag.txt'
+    try { Invoke-WebRequest -UseBasicParsing "https://github.com/ggml-org/llama.cpp/releases/download/$tag/nightly-tag.txt" -OutFile $nt; $tag = (Get-Content -Raw $nt).Trim() } catch { $tag = '' }
+  }
+  if ($tag -notmatch '^b\d+$') {
+    # assigned first: Windows PowerShell passes a JSON array down a pipe as one object
+    $rels = Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30'
+    $tag = ($rels | Where-Object { $_.tag_name -match '^b\d+$' } | Select-Object -First 1).tag_name
+  }
+  if ($tag -notmatch '^b\d+$') { throw "could not find llama.cpp's latest release build on GitHub" }
   if ([int]($tag.TrimStart('b')) -lt $MinBuild) { throw "llama.cpp release $tag is older than build $MinBuild" }
   $base = "https://github.com/ggml-org/llama.cpp/releases/download/$tag"
   $dir = Join-Path $LlamaDir $tag
   Write-Host "llama.cpp $tag for CUDA 12.4 -> $dir"
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  Invoke-WebRequest "$base/llama-$tag-bin-win-cuda-12.4-x64.zip" -OutFile (Join-Path $LlamaDir 'bin.zip')
-  Invoke-WebRequest "$base/cudart-llama-bin-win-cuda-12.4-x64.zip" -OutFile (Join-Path $LlamaDir 'cudart.zip')
+  Invoke-WebRequest -UseBasicParsing "$base/llama-$tag-bin-win-cuda-12.4-x64.zip" -OutFile (Join-Path $LlamaDir 'bin.zip')
+  Invoke-WebRequest -UseBasicParsing "$base/cudart-llama-bin-win-cuda-12.4-x64.zip" -OutFile (Join-Path $LlamaDir 'cudart.zip')
   Expand-Archive (Join-Path $LlamaDir 'bin.zip') -DestinationPath $dir -Force
   Expand-Archive (Join-Path $LlamaDir 'cudart.zip') -DestinationPath $dir -Force
   Remove-Item (Join-Path $LlamaDir 'bin.zip'), (Join-Path $LlamaDir 'cudart.zip')

@@ -163,6 +163,21 @@ env -u CREW_WORKERS STATE="$STATE/nostate" bash -c 'set -a; . deploy/crew.env; s
   # an old driver is refused before anything downloads
   if MOCK_DRIVER=550.1 LLAMA_SERVER= deploy/box.sh setup > "$STATE/drv.txt" 2>&1; then echo "setup took driver 550"; exit 1; fi
   grep -q 'driver 550 is too old' "$STATE/drv.txt"
+  # llama.cpp's latest release is a version without binaries: setup takes the build it names
+  mkdir -p "$STATE/gh"; cat > "$STATE/gh/curl" <<'SH'
+#!/bin/sh
+for a; do u="$a"; done
+case "$u" in
+  */releases/latest) echo '{"tag_name": "v0.7.0"}' ;;
+  */v0.7.0/nightly-tag.txt) [ -z "$NO_NIGHTLY" ] || exit 22; echo b11669 ;;
+  *'/releases?per_page=30') echo '[{"tag_name": "v0.7.0"}, {"tag_name": "b11732"}, {"tag_name": "b11731"}]' ;;
+  *) exit 22 ;;
+esac
+SH
+  chmod +x "$STATE/gh/curl"
+  [ "$(PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11669 ]
+  [ "$(NO_NIGHTLY=1 PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11732 ]
+  [ "$(LLAMA_TAG=b11700 PATH="$STATE/gh:$PATH" deploy/box.sh release-tag)" = b11700 ]
   # the helper, then the head, then the head's crew with the helper's slots
   STATE="$HSTATE" PORT="$HPORT" CREW_WORKERS=4 ROLE=helper HOST=0.0.0.0 MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/box.sh start
   STATE="$HSTATE" PORT="$HPORT" deploy/box.sh wait > "$STATE/out3.txt"; grep -q "crew: 4 worker slots for another box's crew on 4 slots of 12288 tokens" "$STATE/out3.txt"
