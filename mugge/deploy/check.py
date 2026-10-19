@@ -34,6 +34,8 @@ import urllib.request
 
 # The model card's non-thinking sampling for Qwen3.8; the engine sends its own on every call.
 SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0}
+# the engine's thinking sampling (engine/inference.ts THINKING_SAMPLING), for the planner-shaped call
+THINKING_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0}
 # --thinking-budget: thinking calls also send thinking_budget_tokens (llama-server ends the thinking there)
 THINK_BUDGET = None
 
@@ -101,6 +103,19 @@ def chat(base, model, key, messages, max_tokens, thinking, timeout=600, **extra)
         "completion_tokens": data.get("usage", {}).get("completion_tokens", 0),
         "s": time.monotonic() - t,
     }
+
+
+def describe_answer(r):
+    """What a broken JSON answer looked like: its size, how it ended, and its start and end."""
+    a = r["content"]
+    print(f"      finish {r['finish']}, {r['completion_tokens']} tokens, {len(r['reasoning'])} chars of thinking, {len(a)} chars of answer")
+    print(f"      answer starts: {a[:160]!r}")
+    print(f"      answer ends:   {a[-160:]!r}")
+    tail = a[-400:]
+    for n in range(1, 101):
+        if len(tail) >= 3 * n and tail[-n:] * (len(tail) // n) == tail[-(len(tail) // n) * n:]:
+            print(f"      it ends repeating a {n}-char piece: {tail[-n:]!r}")
+            break
 
 
 class Check:
@@ -204,18 +219,32 @@ def full(base, model, key, n, max_tokens):
         (c.ok if isinstance(v.get("tickets"), list) else c.fail)("JSON schema call", f"{len(v.get('tickets', []))} tickets")
     except Exception as e:
         c.fail("JSON schema call", str(e))
-    # the planner's shape: thinking on and a schema; vLLM applies the schema once the thinking ends
+    # the planner's shape: thinking on and a schema (vLLM and llama-server apply the schema once the
+    # thinking ends), with the engine's thinking sampling (engine/inference.ts THINKING_SAMPLING)
+    planner = lambda **pen: chat(base, model, key, [{"role": "user", "content": "Split 'a CLI that counts words in files' into two tickets, each owning one file."}], 8192, True,
+                                 chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"},
+                                 response_format={"type": "json_schema", "json_schema": {"name": "output", "schema": schema, "strict": True}},
+                                 **{**THINKING_SAMPLING, **pen})
+    r = None
     try:
-        r = chat(base, model, key, [{"role": "user", "content": "Split 'a CLI that counts words in files' into two tickets, each owning one file."}], 8192, True,
-                 chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"},
-                 response_format={"type": "json_schema", "json_schema": {"name": "output", "schema": schema, "strict": True}})
+        r = planner()
         if not r["content"].strip() and r["finish"] == "length":
             c.ok("JSON schema call, thinking on", "it thought until the token cap (fine for this check)")
         else:
             v = json.loads(r["content"])
             (c.ok if isinstance(v.get("tickets"), list) else c.fail)("JSON schema call, thinking on", f"{len(r['reasoning'])} chars of thinking, then {len(v.get('tickets', []))} tickets")
+            r = None
     except Exception as e:
         c.fail("JSON schema call, thinking on", f"{e} (the planner sends this shape; the orchestrator cannot plan without it)")
+        if r is not None:
+            describe_answer(r)
+            # the model card's remedy for endless repetition; say whether it helps, for the run sheet
+            try:
+                r2 = planner(presence_penalty=1.5)
+                v = json.loads(r2["content"])
+                print(f"info  the same call with presence_penalty 1.5 parses: {len(v.get('tickets', []))} tickets after {len(r2['reasoning'])} chars of thinking")
+            except Exception as e2:
+                print(f"info  the same call with presence_penalty 1.5 fails too: {e2}")
     # 5
     before = metrics(base, key)
     peak = {"running": 0.0, "waiting": 0.0}
