@@ -184,6 +184,8 @@ SH
   CREW_WORKERS=4 MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/box.sh start
   deploy/box.sh wait > "$STATE/out4.txt"; grep -q 'crew: 4 workers + 2 leads + 1 orchestrator on 7 slots of 12288 tokens' "$STATE/out4.txt"
   if deploy/box.sh helper add "127.0.0.1:$((PORT + 9))" > "$STATE/dead.txt" 2>&1; then echo "added a helper that is not there"; exit 1; fi
+  if deploy/box.sh helper add http://WINDOWS-ADDRESS:8080 > "$STATE/ph.txt" 2>&1; then echo "added a placeholder"; exit 1; fi
+  grep -q 'is a placeholder' "$STATE/ph.txt"
   deploy/box.sh helper add "127.0.0.1:$HPORT" > "$STATE/out5.txt"; grep -q '4 slots of 12288 tokens' "$STATE/out5.txt"
   deploy/box.sh status > "$STATE/out6.txt"; grep -q "helper   http://127.0.0.1:$HPORT up" "$STATE/out6.txt"
   ( set -a; . deploy/mac.env; set +a

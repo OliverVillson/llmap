@@ -398,6 +398,7 @@ PY
     case "$sub" in
       add)
         h="${3:-}"; [ -n "$h" ] || die "usage: deploy/mac.sh helper add http://ADDRESS:8080"
+        case "$h" in *ADDRESS*) die "$h is a placeholder: put in the address the helper window printed, such as http://192.168.1.23:8080 (ipconfig on Windows shows it)" ;; esac
         case "$h" in http://*|https://*) ;; *) h="http://$h" ;; esac
         h="${h%/}"; h="${h%/v1}"
         case "$h" in *:[0-9]*) ;; *) h="$h:8080" ;; esac
