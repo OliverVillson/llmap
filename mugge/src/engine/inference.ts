@@ -51,6 +51,34 @@ export interface CallTweaks {
   planning?: boolean;
 }
 
+/** MUGGE_THINKING_BUDGET: thinking tokens per reasoning_effort level, and for any level (`all`). */
+export interface ThinkingBudget {
+  all?: number;
+  levels: Partial<Record<ReasoningEffort, number>>;
+}
+
+/**
+ * MUGGE_THINKING_BUDGET: one number for every thinking call (`2048`), numbers per level
+ * (`low=1024,medium=4096,xhigh=8192`), or both (`2048,xhigh=8192`).
+ */
+export function thinkingBudgetFromEnv(env: Record<string, string | undefined> = process.env): ThinkingBudget | undefined {
+  const raw = env.MUGGE_THINKING_BUDGET?.trim();
+  if (!raw) return undefined;
+  const out: ThinkingBudget = { levels: {} };
+  const count = (v: string, where: string) => {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0) throw new Error(`${where} must be a whole number of tokens, 0 or more (got ${JSON.stringify(v)})`);
+    return n;
+  };
+  for (const part of raw.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const [k, v] = part.includes('=') ? part.split('=', 2).map((x) => x.trim().toLowerCase()) : [undefined, part];
+    if (k === undefined) out.all = count(v!, 'MUGGE_THINKING_BUDGET');
+    else if ((REASONING_EFFORTS as readonly string[]).includes(k)) out.levels[k as ReasoningEffort] = count(v!, `MUGGE_THINKING_BUDGET ${k}`);
+    else throw new Error(`MUGGE_THINKING_BUDGET: ${k} is not xhigh, medium or low`);
+  }
+  return out;
+}
+
 /** Qwen3.8's reasoning_effort levels. */
 export const REASONING_EFFORTS = ['xhigh', 'medium', 'low'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
@@ -176,6 +204,13 @@ export interface InferenceConfig {
   maxCallTokens?: number;
   /** The same for planning calls, whose answers grow with the crew (MUGGE_PLAN_MAX_CALL_TOKENS; unset: no cap). */
   planMaxCallTokens?: number;
+  /**
+   * Most tokens a thinking call may think, by its reasoning_effort level (`all` for any level),
+   * sent as thinking_budget_tokens: llama-server then ends the thinking itself and the answer
+   * follows within max_tokens (MUGGE_THINKING_BUDGET). For models whose chat template ignores
+   * reasoning_effort (Qwen3.5), this is what makes the levels differ.
+   */
+  thinkingBudget?: ThinkingBudget;
   /** One line per call on stderr (MUGGE_DEBUG_CALLS=1). */
   debug?: boolean;
   /**
@@ -232,6 +267,9 @@ export class OpenAICompatible implements Inference {
       ...this.cfg.extra,
     };
     if (Object.keys(kwargs).length) body.chat_template_kwargs = kwargs;
+    const level = kwargs.reasoning_effort as ReasoningEffort | undefined;
+    const budget = thinks === false || !this.cfg.thinkingBudget ? undefined : (level !== undefined ? this.cfg.thinkingBudget.levels[level] : undefined) ?? this.cfg.thinkingBudget.all;
+    if (budget !== undefined) body.thinking_budget_tokens = budget;
     checkTopK(body.top_k);
     const guided = this.cfg.guided ?? 'response_format';
     if (schema && guided === 'response_format') body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema, strict: true } };
@@ -378,8 +416,8 @@ function sleepUnless(ms: number, signal?: AbortSignal): Promise<void> {
 export const MIN_REFIT_TOKENS = 1024;
 
 /**
- * The max_tokens that fits, from a server's context-length refusal (vLLM's wordings up to 0.31
- * and SGLang's): the context less the prompt, less a little room. A refusal that does not count
+ * The max_tokens that fits, from a server's context-length refusal (vLLM's wordings up to 0.31,
+ * SGLang's and llama-server's): the context less the prompt, less a little room. A refusal that does not count
  * the prompt (`max_tokens=N cannot be greater than max_model_len=L`) gives L - 1; an "at least N"
  * count is taken as it is. send() counts the prompt itself for both (contextRefusal).
  * Undefined when the error is something else or too little would fit.
@@ -402,6 +440,14 @@ export const PROMPT_CHARS_PER_TOKEN = 2.5;
  * "contains N characters" when it was too long to tokenize). Undefined for any other error.
  */
 export function contextRefusal(error: string): { limit: number; input?: number; atLeast: boolean } | undefined {
+  // llama-server: the prompt alone fills the slot ("request (N tokens) exceeds the available context
+  // size (M tokens)", type exceed_context_size_error, with n_prompt_tokens and n_ctx beside it)
+  const llama = /request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/.exec(error);
+  if (llama) return { limit: Number(llama[2]), input: Number(llama[1]), atLeast: false };
+  if (error.includes('exceed_context_size_error')) {
+    const n = /"n_prompt_tokens"\s*:\s*(\d+)/.exec(error)?.[1], c = /"n_ctx"\s*:\s*(\d+)/.exec(error)?.[1];
+    if (n && c) return { limit: Number(c), input: Number(n), atLeast: false };
+  }
   const whole = /max(?:_completion)?_tokens=\d+ cannot be greater than max_model_len=(\d+)/.exec(error)?.[1];
   if (whole) return { limit: Number(whole), atLeast: true };
   const limit = /maximum context length (?:is |of )?(\d+)/.exec(error)?.[1];

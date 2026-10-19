@@ -1,0 +1,23 @@
+{
+ "status": 400,
+ "request": {
+  "model": "qwen-mac",
+  "messages": "word x 2100",
+  "temperature": 1.0,
+  "top_k": 20,
+  "seed": 7,
+  "max_tokens": 10,
+  "chat_template_kwargs": {
+   "enable_thinking": false
+  }
+ },
+ "response": {
+  "error": {
+   "code": 400,
+   "message": "request (2112 tokens) exceeds the available context size (2048 tokens), try increasing it",
+   "type": "exceed_context_size_error",
+   "n_prompt_tokens": 2112,
+   "n_ctx": 2048
+  }
+ }
+}

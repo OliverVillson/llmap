@@ -75,7 +75,8 @@ describe('KV budget', () => {
   test('llama-server flags: one slot per call, total context for all of them, finite top_k, the preset min_p', () => {
     const m = resolveMachine({ name: 'laptop', url: 'http://x/v1', preset: 'minicpm5-2b', slots: 15, ctx: 16384 });
     const args = llamaServerArgs(m).join(' ');
-    expect(args).toContain('-np 15 -c 245760 --kv-unified');
+    expect(args).toContain('-np 15 -c 245760 -fa on');
+    expect(args).not.toContain('--kv-unified');
     expect(args).toContain('-ctk q8_0 -ctv q8_0');
     expect(args).toContain('--top-k 20');
     expect(args).toContain('--min-p 0');

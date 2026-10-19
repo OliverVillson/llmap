@@ -1,6 +1,6 @@
 /**
  * The machines a crew runs on. Each machine is one OpenAI-compatible URL (llama-server with
- * `-np N --kv-unified`, vLLM, SGLang, a hosted service later) serving one shared copy of the
+ * `-np N`, vLLM, SGLang, a hosted service later) serving one shared copy of the
  * model to many one-shot calls at once, so the 8 GB laptop can serve workers while the Mac
  * serves the manager and leads.
  *
@@ -49,6 +49,12 @@ export const MODEL_PRESETS: Record<string, ModelPreset> = {
   // 48 × 128 × 128 state each at fp32, plus conv state: 153,944,064 B a sequence, an estimate
   // until a real vLLM run reports its numbers
   'qwen3.8-27b': { kvLayers: 16, kvHeads: 4, headDim: 256, stateBytesPerSlot: 153_944_064, note: 'Qwen/Qwen3.8-27B-FP8, the demo model: hybrid, 16 of 64 layers keep a KV cache (64 KiB a token at bf16, 32 KiB at fp8); recurrent state per sequence estimated' },
+  // the Mac demo (deploy/mac_crew.py): 32 layers, 8 full attention (4 KV heads × 256), 24 Gated
+  // DeltaNet with 32 value heads × 128 × 128 at fp32 plus conv state: 52,690,944 B a sequence
+  'qwen3.5-9b': { kvLayers: 8, kvHeads: 4, headDim: 256, stateBytesPerSlot: 52_690_944, note: 'Qwen3.5-9B GGUF on a Mac (llama-server): hybrid, 8 of 32 layers keep a KV cache (32 KiB a token at f16, 17 KiB at q8_0)' },
+  'qwen3.5-4b': { kvLayers: 8, kvHeads: 4, headDim: 256, stateBytesPerSlot: 52_690_944, note: 'Qwen3.5-4B GGUF on a Mac: the same KV layout as 9B' },
+  // 40 layers, 10 full attention (2 KV heads × 256), 30 Gated DeltaNet: also its expert-pruned GGUFs
+  'qwen3.6-35b-a3b': { kvLayers: 10, kvHeads: 2, headDim: 256, stateBytesPerSlot: 65_863_680, note: 'Qwen3.6-35B-A3B (3B active) and expert-pruned GGUFs of it: 10 of 40 layers keep a KV cache (20 KiB a token at f16)' },
   'qwen3.5-2b': { kvLayers: 6, kvHeads: 2, headDim: 256, note: 'hybrid: 6 of 24 layers keep a KV cache; the rest hold a fixed recurrent state per sequence (set state_bytes_per_slot from footprint.sh)' },
   'minicpm5-2b': { kvLayers: 42, kvHeads: 2, headDim: 128, sampling: { min_p: 0 }, note: 'plain attention; min_p 0 (llama.cpp default 0.05 makes it repeat)' },
   'granite-4.2-3b': { kvLayers: 40, kvHeads: 8, headDim: 64, note: 'every layer keeps a KV cache; Centipede run 1 base' },
@@ -269,10 +275,15 @@ export function resolveMachines(raw: MachineInput[], base: Sampling = {}): Machi
   return machines;
 }
 
-/** The llama-server flags that match a machine: one slot per call, one shared unified KV cache. */
+/**
+ * The llama-server flags that match a machine: one slot per call, each with its own ctxPerCall of
+ * KV cache. Not --kv-unified: when a shared pool runs out, llama-server fails every call running
+ * on it at once ("Context size has been exceeded", HTTP 500), while a slot of its own only cuts the
+ * one call that outgrew it (finish_reason length). The memory is the same either way.
+ */
 export function llamaServerArgs(m: Machine): string[] {
   const top_k = m.sampling.top_k ?? DEFAULT_SAMPLING.top_k;
-  return ['-np', String(m.slots), '-c', String(m.slots * m.ctxPerCall), '--kv-unified', '-fa', 'on', '-ctk', m.cacheType, '-ctv', m.cacheType, '--top-k', String(top_k),
+  return ['-np', String(m.slots), '-c', String(m.slots * m.ctxPerCall), '-fa', 'on', '-ctk', m.cacheType, '-ctv', m.cacheType, '--top-k', String(top_k),
     ...(m.sampling.min_p !== undefined ? ['--min-p', String(m.sampling.min_p)] : [])];
 }
 

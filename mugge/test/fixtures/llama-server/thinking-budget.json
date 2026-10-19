@@ -1,0 +1,44 @@
+{
+ "status": 200,
+ "request": {
+  "model": "qwen-mac",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function add(a, b)."
+   }
+  ],
+  "temperature": 1.0,
+  "top_k": 20,
+  "seed": 7,
+  "max_tokens": 24,
+  "chat_template_kwargs": {
+   "enable_thinking": true
+  },
+  "thinking_budget_tokens": 6
+ },
+ "response": {
+  "choices": [
+   {
+    "finish_reason": "length",
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "akşizzare boilsDragon淌.restartอากาศ Constructor等症状[PAD151682] OPEN eines/ts הקודDans-n con",
+     "reasoning_content": ".prod턱เวิร์灌主動\n"
+    }
+   }
+  ],
+  "model": "qwen-mac",
+  "object": "chat.completion",
+  "usage": {
+   "completion_tokens": 24,
+   "prompt_tokens": 19,
+   "total_tokens": 43,
+   "prompt_tokens_details": {
+    "cached_tokens": 17
+   }
+  },
+  "timings": {}
+ }
+}

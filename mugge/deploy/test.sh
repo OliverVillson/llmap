@@ -114,4 +114,37 @@ bash -n deploy/fresh.sh
 if bash -c 'source <(sed -n "/^SUDO=/p;/^mounted_at()/p" deploy/fresh.sh; sed -n "/^empty_disk()/,/^}/p" deploy/fresh.sh); empty_disk "$(findmnt -n -o SOURCE /)"'; then echo "the root disk counted as empty"; exit 1; fi
 # crew.env says when it falls back to the default crew
 env -u CREW_WORKERS STATE="$STATE/nostate" bash -c 'set -a; . deploy/crew.env; set +a' 2>&1 | grep -q 'no crew size saved'
+# the Mac path (deploy/mac.sh): deploy/mock_llama.py stands in for llama-server, a stub file for the GGUF
+( export STATE="$STATE/mac" PORT=$((PORT + 1)) MAC_SH_ANY_OS=1 LLAMA_SERVER="$PWD/deploy/mock_llama.py" MOCK_LOAD_S=1
+  mkdir -p "$STATE"; head -c 1000 /dev/zero > "$STATE/stub.gguf"
+  trap 'deploy/mac.sh stop >/dev/null 2>&1 || true' EXIT
+  # the 16 GB plan: Qwen3.5-9B Q4_K_M, 8 workers + 2 leads + 1 orchestrator, one slot of 16384 each, no shared pool
+  python3 deploy/mac_crew.py --mem-gb 16 --wired-mb 0 | tee "$STATE/crew.txt"
+  grep -q 'Qwen3.5-9B-Q4_K_M.gguf (5.68 GB)' "$STATE/crew.txt"; grep -q 'crew: 8 workers + 2 leads + 1 orchestrator = 11 slots' "$STATE/crew.txt"
+  MODEL=9b deploy/mac.sh cmd | grep -q -- "-m $STATE/models/Qwen3.5-9B-Q4_K_M.gguf --alias qwen3.5-9b .*-np 11 -c 180224 -ctk q8_0 -ctv q8_0 .*--reasoning-format deepseek"
+  if MODEL=9b deploy/mac.sh cmd | grep -q -- '--kv-unified'; then echo "mac.sh must not share one KV pool"; exit 1; fi
+  MODEL=4b KV_V=q4_0 deploy/mac.sh cmd | grep -q -- 'Qwen3.5-4B-Q6_K.gguf .*-ctk q8_0 -ctv q4_0'
+  # a crew that does not fit is refused, with what to change
+  if python3 deploy/mac_crew.py --mem-gb 8 --wired-mb 0 --workers 8 > "$STATE/no.txt" 2>&1; then echo "an 8 GB Mac took 8 workers of 9B"; exit 1; fi
+  grep -q 'does not fit' "$STATE/no.txt"
+  # no model yet: preflight fails with the fix, start refuses
+  if MODEL=9b deploy/mac.sh preflight > "$STATE/pf.txt" 2>&1; then echo "preflight passed with no model"; exit 1; fi
+  grep -q 'FAIL  model .* not downloaded' "$STATE/pf.txt"; [ "$(grep -c '^FAIL' "$STATE/pf.txt")" = "$(grep -c '^      fix: ' "$STATE/pf.txt")" ]
+  # an old llama-server (no --reasoning-budget-message) is caught before start
+  printf '#!/bin/sh\necho "usage: llama-server -np N"\n' > "$STATE/old-llama"; chmod +x "$STATE/old-llama"
+  if LLAMA_SERVER="$STATE/old-llama" MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/mac.sh preflight > "$STATE/old.txt" 2>&1; then echo "preflight passed an old llama-server"; exit 1; fi
+  grep -q 'FAIL  llama-server at .* is too old' "$STATE/old.txt"; grep -q 'fix: brew upgrade llama.cpp' "$STATE/old.txt"
+  # the run: start, wait, check (thinking with a budget, JSON with thinking, the whole crew at once), status
+  MODEL="$STATE/stub.gguf" PRESET=qwen3.5-9b deploy/mac.sh start
+  deploy/mac.sh wait | tee "$STATE/wait.txt"; grep -q 'crew: 8 workers + 2 leads + 1 orchestrator on 11 slots of 16384 tokens' "$STATE/wait.txt"
+  deploy/mac.sh check | tee "$STATE/check.txt"; grep -q 'ok    11 calls at once' "$STATE/check.txt"; grep -q '^PASS' "$STATE/check.txt"
+  deploy/mac.sh status > "$STATE/status.txt"; grep -q 'health  ok' "$STATE/status.txt"
+  # the crew file matches what started, from bash and from sh (zsh users source it the same way)
+  ( set -a; . deploy/mac.env; set +a
+    [ "$MUGGE_CONCURRENCY" = 10 ] && [ "$MUGGE_MODEL" = stub ] && [ "$MUGGE_THINKING_BUDGET" = low=1024,medium=4096,xhigh=8192 ]
+    echo "$MUGGE_BACKENDS" | grep -q '"mac-workers".*"slots": 8'
+    bun src/cli.ts backends > "$STATE/backends.txt"; [ "$(grep -c '^  up ' "$STATE/backends.txt")" = 3 ] )
+  sh -c 'set -a; . deploy/mac.env; set +a; [ "$MUGGE_CONCURRENCY" = 10 ]'
+  deploy/mac.sh bench --levels 1,4 --prompt-tokens 200 --answers thinking:32,short:8 > "$STATE/bench.txt"; grep -q '1 -> 4 at once' "$STATE/bench.txt"
+  deploy/mac.sh stop )
 echo "deploy dry run: PASS"

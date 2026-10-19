@@ -1,0 +1,43 @@
+{
+ "status": 200,
+ "request": {
+  "model": "qwen-mac",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function add(a, b)."
+   }
+  ],
+  "temperature": 1.0,
+  "top_k": 20,
+  "seed": 7,
+  "max_tokens": 12,
+  "chat_template_kwargs": {
+   "enable_thinking": true
+  }
+ },
+ "response": {
+  "choices": [
+   {
+    "finish_reason": "length",
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": ".prod턱เวิร์灌主動>\r\n\r\n全部采取Initializing_ddобходим世"
+    }
+   }
+  ],
+  "model": "qwen-mac",
+  "object": "chat.completion",
+  "usage": {
+   "completion_tokens": 12,
+   "prompt_tokens": 19,
+   "total_tokens": 31,
+   "prompt_tokens_details": {
+    "cached_tokens": 17
+   }
+  },
+  "timings": {}
+ }
+}

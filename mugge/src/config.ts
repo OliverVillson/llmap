@@ -45,6 +45,11 @@
  *                         Levels xhigh | medium | low go out as chat_template_kwargs.reasoning_effort;
  *                         off sends that kind of call with thinking off. Unset: the template's
  *                         default, xhigh on Qwen3.8. A machine's reasoning_effort wins for its calls.
+ *   MUGGE_THINKING_BUDGET most tokens a thinking call may think before llama-server ends the
+ *                         thinking and the answer follows: one number for all (2048), per
+ *                         reasoning_effort level (low=1024,medium=4096,xhigh=8192), or both. Sent as
+ *                         thinking_budget_tokens (llama-server); unset sends nothing. On Qwen3.5,
+ *                         whose template ignores reasoning_effort, this is what the levels mean
  *   MUGGE_MAX_CALL_TOKENS most tokens one model call may write, whatever the ticket's budget leaves
  *                         (unset: the budget's remainder, 60K by default, which a thinking model can
  *                         spend in one call). The lead review writes up to this too (unset: 2,048)
@@ -61,7 +66,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { BackendPool, describeProbe, MODEL_PRESETS, PROBE_TIMEOUT_MS, probeMachines, resolveMachine, resolveMachines, usableMachines, type CallRole, type Machine, type MachineInput } from './engine/backends.ts';
-import { checkTopK, effortsFromEnv, type InferenceConfig, type Sampling } from './engine/inference.ts';
+import { checkTopK, effortsFromEnv, thinkingBudgetFromEnv, type InferenceConfig, type Sampling } from './engine/inference.ts';
 
 function num(env: NodeJS.ProcessEnv, key: string, check: (n: number) => boolean, what: string): number | undefined {
   const v = env[key]?.trim();
@@ -129,6 +134,7 @@ export function inferenceFromEnv(env: NodeJS.ProcessEnv = process.env): Inferenc
     extra: Object.keys(kwargs).length ? { chat_template_kwargs: kwargs } : undefined,
     maxCallTokens: maxCall,
     planMaxCallTokens: planCall,
+    thinkingBudget: thinkingBudgetFromEnv(env),
     debug: env.MUGGE_DEBUG_CALLS === '1',
   };
 }

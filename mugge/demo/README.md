@@ -6,6 +6,9 @@ scaffold and splits it into tickets, about one per code agent, so most of the cr
 once. Each ticket's agent writes its files until its checks pass, a lead reviews every finished
 ticket, and the run ends by merging every branch and running the whole project's tests.
 
+No GPU box? The same demo runs on an Apple-silicon Mac with a smaller model and crew:
+`deploy/MAC.md`.
+
 ## First run: 64 agents from one prompt (B200)
 
 On the B200. A fresh VM (or one that kept `/data` but lost its root disk) gets everything from

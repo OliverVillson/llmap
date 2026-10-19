@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Checks a running vLLM server the way a Centipede crew will use it (deploy/README.md).
+Checks a running vLLM server (or llama-server, deploy/mac.sh) the way a Centipede crew will use it (deploy/README.md).
 Standard library only, so it runs on a fresh box and on a Mac at the end of an ssh tunnel.
 
   check.py --url http://127.0.0.1:8000 --model qwen3.8-27b          the full check
@@ -34,6 +34,8 @@ import urllib.request
 
 # The model card's non-thinking sampling for Qwen3.8; the engine sends its own on every call.
 SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0}
+# --thinking-budget: thinking calls also send thinking_budget_tokens (llama-server ends the thinking there)
+THINK_BUDGET = None
 
 
 def request(url, body=None, key=None, timeout=600):
@@ -61,6 +63,12 @@ def metrics(base, key=None):
         "vllm:prefix_cache_hits_total": "prefix_hits",
         "vllm:prefix_cache_queries_total": "prefix_queries",
         "vllm:generation_tokens_total": "generated",
+        # llama-server (--metrics): no preemption (a slot holds its own context) and no KV gauge
+        "llamacpp:requests_processing": "running",
+        "llamacpp:requests_deferred": "waiting",
+        "llamacpp:tokens_predicted_total": "generated",
+        "llamacpp:prompt_tokens_cached_total": "prefix_hits",
+        "llamacpp:prompt_tokens_total": "prompt_processed",
     }
     out = {}
     for line in text.splitlines():
@@ -70,12 +78,16 @@ def metrics(base, key=None):
         if m and m.group(1) in want:
             k = want[m.group(1)]
             out[k] = out.get(k, 0.0) + float(m.group(3))
+    # llama-server counts prompt tokens taken from the cache and those it had to process
+    if "prompt_processed" in out:
+        out["prefix_queries"] = out.get("prefix_hits", 0.0) + out.pop("prompt_processed")
     return out
 
 
 def chat(base, model, key, messages, max_tokens, thinking, timeout=600, **extra):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, **SAMPLING,
-            "chat_template_kwargs": {"enable_thinking": thinking}, **extra}
+            "chat_template_kwargs": {"enable_thinking": thinking},
+            **({"thinking_budget_tokens": THINK_BUDGET} if thinking and THINK_BUDGET is not None else {}), **extra}
     t = time.monotonic()
     _, raw = request(f"{base}/v1/chat/completions", body, key, timeout)
     data = json.loads(raw)
@@ -118,7 +130,8 @@ def status(base, key):
     m = metrics(base, key)
     if m:
         hit = f"{100 * m['prefix_hits'] / m['prefix_queries']:.0f}%" if m.get("prefix_queries") else "n/a"
-        print(f"now     {m.get('running', 0):.0f} running, {m.get('waiting', 0):.0f} waiting, KV cache {100 * m.get('kv_use', 0):.0f}% used")
+        kv = f", KV cache {100 * m['kv_use']:.0f}% used" if "kv_use" in m else ""
+        print(f"now     {m.get('running', 0):.0f} running, {m.get('waiting', 0):.0f} waiting{kv}")
         print(f"total   {m.get('generated', 0):.0f} tokens generated, {m.get('preemptions', 0):.0f} preemptions, prefix cache hit {hit}")
     return 0
 
@@ -179,7 +192,7 @@ def full(base, model, key, n, max_tokens):
         elif r["reasoning"] and r["finish"] == "length":
             c.ok("thinking call", "thinking kept apart; it ran out of tokens before answering (fine for this check)")
         else:
-            c.fail("thinking call", "no reasoning_content: start the server with --reasoning-parser qwen3" if not r["reasoning"] else "thinking text in the answer")
+            c.fail("thinking call", "no reasoning_content: start the server with --reasoning-parser qwen3 (vLLM) or --reasoning-format deepseek (llama-server)" if not r["reasoning"] else "thinking text in the answer")
     except Exception as e:
         c.fail("thinking call", str(e))
     # 4
@@ -241,7 +254,7 @@ def full(base, model, key, n, max_tokens):
         if peak["running"] >= n:
             c.ok("ran together", f"peak {peak['running']:.0f} running, {peak['waiting']:.0f} waiting")
         else:
-            c.fail("ran together", f"peak only {peak['running']:.0f} running and {peak['waiting']:.0f} waiting: raise --max-num-seqs or the KV cache (MAX_NUM_SEQS, GPU_UTIL, MAX_MODEL_LEN)")
+            c.fail("ran together", f"peak only {peak['running']:.0f} running and {peak['waiting']:.0f} waiting: raise --max-num-seqs or the KV cache (MAX_NUM_SEQS, GPU_UTIL, MAX_MODEL_LEN; on a Mac, llama-server's -np)")
         pre = after.get("preemptions", 0) - before.get("preemptions", 0)
         (c.ok if pre == 0 else c.fail)("no preemptions", "" if pre == 0 else f"{pre:.0f} preempted: the KV cache is too small for {n} calls; lower MAX_MODEL_LEN or use KV_DTYPE=fp8")
         if after.get("prefix_queries"):
@@ -356,6 +369,7 @@ def main():
     p.add_argument("--model", default="qwen3.8-27b")
     p.add_argument("--concurrency", type=int, default=13)
     p.add_argument("--max-tokens", type=int, help="tokens each call in the check's burst writes, all of them (ignore_eos); default 384")
+    p.add_argument("--thinking-budget", type=int, help="thinking calls also send thinking_budget_tokens (llama-server)")
     p.add_argument("--status", action="store_true")
     p.add_argument("--bench", action="store_true", help="decode speed instead of the check")
     p.add_argument("--levels", default="1,13,32,64", help="--bench: calls at once to measure, comma-separated")
@@ -365,6 +379,8 @@ def main():
     p.add_argument("--save", default="")
     p.add_argument("--compare", nargs="*", metavar="BENCH_JSON")
     a = p.parse_args()
+    global THINK_BUDGET
+    THINK_BUDGET = a.thinking_budget
     if a.compare is not None:
         sys.exit(compare(a.compare))
     base = a.url.rstrip("/")
