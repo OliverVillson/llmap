@@ -44,8 +44,10 @@ From your Mac:
 ssh centipede-server
 cd ~/llmap-demo/mugge && deploy/box.sh helper add http://WINDOWS-ADDRESS:8080
 set -a && . deploy/mac.env && set +a && nohup bun demo/run.ts > demo.log 2>&1 &
-tail -f demo.log
+sleep 3; tail -f demo.log
 ```
+
+Replace `WINDOWS-ADDRESS` with the Wi-Fi address the helper window printed, such as `192.168.1.23` (`ipconfig` shows it too). Start the demo only after `helper add` has reported the helper's slots; a demo started before that runs on the head alone.
 
 While that ssh session is open, the live view is at http://127.0.0.1:7341/ on your Mac. The `LocalForward` line in the ssh config carries it.
 
